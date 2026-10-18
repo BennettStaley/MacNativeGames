@@ -132,7 +132,7 @@ static NSString *shortcut_text(void){
  else if(w==2560&&h==1440)picture=@(TOTK_UI("原生 2K","native 2K"));
  else if(w!=1920||h!=1080)picture=[NSString stringWithFormat:@(TOTK_UI("原生 %u×%u","native %u×%u")),w,h];
  else picture=@(TOTK_UI("关闭","off"));
- return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  提示：全部 → 只显示 FPS → 隐藏\n2  补帧：当前 %@（按键切换）\n3  画质：当前 %@（按键切换）\n4  21:9 宽屏：开 / 关\n5  边缘平滑（MetalFX 时间性）：%@\n6  作弊码","Shortcuts\n1  Overlays: all → FPS only → off\n2  Interpolation: %@ (current; press to cycle)\n3  Picture: %@ (current; press to cycle)\n4  Ultrawide 21:9: on / off\n5  Edge smoothing (MetalFX Temporal): %@\n6  Cheats")),[NSString stringWithUTF8String:interp],picture,
+ return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  提示：全部 → 只显示 FPS → 隐藏\n2  补帧：当前 %@（按键切换）\n3  画质：当前 %@（按键切换）\n4  21:9 宽屏：开 / 关\n5  边缘平滑（MetalFX 时间性）：%@\n6 / L3+R3  作弊码","Shortcuts\n1  Overlays: all → FPS only → off\n2  Interpolation: %@ (current; press to cycle)\n3  Picture: %@ (current; press to cycle)\n4  Ultrawide 21:9: on / off\n5  Edge smoothing (MetalFX Temporal): %@\n6 / L3+R3  Cheats")),[NSString stringWithUTF8String:interp],picture,
   taa_enabled()?@(TOTK_UI("开","on")):@(TOTK_UI("关","off"))];
 }
 -(instancetype)initWithFrame:(NSRect)frame{if((self=[super initWithFrame:frame])){int compact=hud_compact();self.wantsLayer=YES;self.layer.backgroundColor=[NSColor colorWithCalibratedWhite:0.04 alpha:compact?0.72:0.86].CGColor;self.layer.cornerRadius=compact?7:14;self.layer.borderWidth=1;self.layer.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:compact?0.14:0.2].CGColor;
@@ -281,7 +281,7 @@ static TOTKCheatMenu *cheatMenu;
 -(instancetype)initWithFrame:(NSRect)frame{if((self=[super initWithFrame:frame])){
  self.wantsLayer=YES;self.layer.backgroundColor=[NSColor colorWithCalibratedWhite:0.05 alpha:0.92].CGColor;self.layer.cornerRadius=12;self.layer.borderWidth=1;self.layer.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:0.2].CGColor;
  self.title=[NSTextField labelWithString:@(TOTK_UI("作弊码","Cheats"))];self.title.font=[NSFont systemFontOfSize:15 weight:NSFontWeightSemibold];self.title.textColor=NSColor.whiteColor;[self addSubview:self.title];
- self.hint=[NSTextField labelWithString:@(TOTK_UI("↑↓ 选择 · 空格切换 · 4 / Esc 关闭 · 修改代码的作弊码下次启动生效","↑↓ select · Space toggles · 4 / Esc closes · code patches apply at next launch"))];
+ self.hint=[NSTextField labelWithString:@(TOTK_UI("↑↓ / 方向键 选择 · 空格 / A 切换 · 6 / Esc / B / L3+R3 关闭 · 修改代码的作弊码下次启动生效","↑↓ or D-pad select · Space or A toggles · 6, Esc, B or L3+R3 closes · code patches apply at next launch"))];
  self.hint.font=[NSFont systemFontOfSize:11];self.hint.textColor=[NSColor colorWithCalibratedWhite:0.7 alpha:1];self.hint.lineBreakMode=NSLineBreakByTruncatingTail;[self addSubview:self.hint];
  self.list=[[TOTKFlippedView alloc] initWithFrame:NSZeroRect];
  self.scroll=[[NSScrollView alloc] initWithFrame:NSZeroRect];self.scroll.drawsBackground=NO;self.scroll.hasVerticalScroller=YES;self.scroll.autohidesScrollers=YES;self.scroll.documentView=self.list;[self addSubview:self.scroll];
@@ -317,6 +317,19 @@ static void cheat_panel_toggle(void){
  TOTKCheatPanel *p=(TOTKCheatPanel *)cheatPanel;if(!p)return;
  if(p.hidden){[p reload];p.hidden=NO;runtime_input_clear();}   // keys held when it opens must not stay pressed in the game
  else p.hidden=YES;
+}
+/* Controllers: both sticks pressed together (L3+R3) open and close the panel; D-pad or left stick select, A toggles,
+   B closes. While it is open the game gets no controller input (runtime/gamepad.m). */
+enum { PAD_A = 1, PAD_B = 2, PAD_L3 = 16, PAD_R3 = 32, PAD_UP = 1 << 13, PAD_DOWN = 1 << 15, PAD_STICK_UP = 1 << 16, PAD_STICK_DOWN = 1 << 17 };
+static int cheat_panel_pad(uint64_t held, uint64_t pressed){
+ TOTKCheatPanel *p=(TOTKCheatPanel *)cheatPanel;if(!p)return 0;
+ if((held&(PAD_L3|PAD_R3))==(PAD_L3|PAD_R3)&&(pressed&(PAD_L3|PAD_R3))){cheat_panel_toggle();return 1;}
+ if(p.hidden)return 0;
+ if(pressed&(PAD_UP|PAD_STICK_UP))[p move:-1];
+ if(pressed&(PAD_DOWN|PAD_STICK_DOWN))[p move:1];
+ if(pressed&PAD_A)[p toggleSelected];
+ if(pressed&PAD_B)p.hidden=YES;   // returning 1 keeps this B from the game; it stays hidden until released
+ return 1;
 }
 static int cheat_panel_key(NSEvent *e){
  if(e.keyCode==22){if(!e.isARepeat)cheat_panel_toggle();return 1;}   // key 6 (1-5 are the game's display keys)
@@ -382,7 +395,7 @@ void runtime_front_run(void(*callback)(void)){
   [window.contentView addSubview:shortcutHelp positioned:NSWindowBelow relativeTo:bootOverlay];
   [(TOTKShortcutHelp *)shortcutHelp position];
   cheatPanel=[[TOTKCheatPanel alloc] initWithFrame:NSZeroRect];cheatPanel.hidden=YES;cheatPanel.autoresizingMask=NSViewMinXMargin|NSViewMaxXMargin|NSViewMinYMargin|NSViewMaxYMargin;
-  [window.contentView addSubview:cheatPanel];
+  [window.contentView addSubview:cheatPanel];runtime_gamepad_set_overlay(cheat_panel_pad);
   /* The FPS, shader and load lines: in the corner panel above (compact HUD), or with TOTK_HUD=corners drawn into the game picture's corners by the present encoder (gfx/nvn/fps_overlay.c). */
   [window makeFirstResponder:window.contentView];[window center];front_sync_drawable();
   if(assume_focus()){[window orderFrontRegardless];}else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
