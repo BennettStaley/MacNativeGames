@@ -184,6 +184,13 @@ void runtime_touch_pad_set(const RuntimeGamepadState *s) {
     pthread_mutex_unlock(&gamepadLock);
 }
 
+/* Cheats: the held buttons without consuming the press edges the game's next read still has to see. */
+uint64_t runtime_gamepad_held(void) {
+    pthread_mutex_lock(&gamepadLock);
+    uint64_t b = gamepadState.buttons | touchState.buttons;
+    pthread_mutex_unlock(&gamepadLock);
+    return b;
+}
 void runtime_gamepad_read(RuntimeGamepadState *out) {
     pthread_mutex_lock(&gamepadLock);
     *out = gamepadState;

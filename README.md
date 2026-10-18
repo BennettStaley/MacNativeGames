@@ -194,6 +194,16 @@ Version 1.4.3 has been played on an **iPhone 14 (iOS 26.6.1)** and an **iPad wit
 - **Shaders:** an iPhone or iPad cannot translate shaders while playing. A draw whose shader variant the app does not carry is skipped, so objects can be missing in places no player has reported yet. The device records what it missed in `shader-list-contribution.txt` (Files app › On My iPhone › Tears of the Kingdom); the game never asks about it during play. While the device is connected to the Mac that built the app (cable or the same Wi-Fi), the Mac checks every 10 minutes and every 500 new shaders asks once to send the file in a [GitHub issue](https://github.com/ly05010419/MacNativeGames/issues/new?template=shader-list.yml) (`games/totk/ios/tools/shader_contrib_watch.py`, installed by the iOS build; `--no-shader-reminder` skips it, `shader_contrib_watch.py uninstall` removes it). Once merged into the [shared shader list](docs/shader-list.md), the next build carries them for everyone. With a Mac, `games/totk/ios/tools/fill_shaders.py` also translates them and sends them to the device right away.
 - **Memory:** the game uses close to 4 GB on an iPhone 14, near what the phone can give it. In busy areas iOS can close the game after several minutes of play when the phone runs out of memory (seen twice on an iPhone 14, about 8 minutes in). Reducing the game's memory on iOS is the next piece of work.
 
+### Cheats (optional)
+
+`--cheats` builds a cheat file into the app: an Atmosphère cheat file (the format Atmosphère, Yuzu and Ryujinx use) named after the selected version's build ID, or a folder that holds it. Base 1.0.0 is `082CE09B06E33A12.txt`. Only the file for the version you build is used; one for another version stops the build. The repository ships no cheat codes.
+
+```sh
+python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys --cheats ~/Games/cheats/
+```
+
+The app then has a **Cheats** menu with every cheat in the file, all off until you choose them; your choices are kept. Cheats that only change values in memory (arrows, rupees, moon jump) switch on and off immediately. Cheats that patch the game's code (for example infinite durability) take effect at the next launch: the code is never made writable while the game runs. A code patch is refused, and listed as not supported, when it would overwrite an instruction this project rewrites or jump out of the game's code. The first time you enable a cheat, your profile is copied to `profile-before-cheats`; cheats can corrupt saves on a real console too.
+
 ## Controls
 
 On Mac, controllers recognized by macOS (such as DualSense and Xbox controllers) are mapped to a Switch Pro Controller. PlayStation and Xbox face buttons map by position, so each one sits where the game's prompt shows it: the right button is A, the bottom B, the top X and the left Y (Circle / Cross / Triangle / Square; Xbox B / A / Y / X). Nintendo controllers map by label. `TOTK_FACE_BUTTONS=label` maps every controller by label instead. Rumble and motion require the corresponding features to be exposed by the controller and macOS; not every controller has a gyroscope. Mac keyboard mappings use physical key positions corresponding to a US layout:
@@ -461,6 +471,16 @@ python3.14 build_app.py ~/Games/botw-base.nsp -k ~/keys/prod.keys --update ~/Gam
 - **画面：** 游戏以掌机模式运行，和 Switch 不接底座时一样：1280×720。
 - **着色器：** iPhone 和 iPad 不能在游玩时翻译着色器。App 里没有的着色器变体，对应的绘制会被跳过，所以还没有玩家报告过的地方可能缺少物体。设备会把缺的记进 `shader-list-contribution.txt`（“文件”App › 我的 iPhone › Tears of the Kingdom），玩的时候游戏从不因此打扰你。设备连着打包它的那台 Mac（线连或同一 Wi‑Fi）时，Mac 每 10 分钟检查一次，每多 500 个问一次要不要用 [GitHub Issue](https://github.com/ly05010419/MacNativeGames/issues/new?template=shader-list.yml) 发送（`games/totk/ios/tools/shader_contrib_watch.py`，打包 iOS 版时自动安装；`--no-shader-reminder` 不装，`shader_contrib_watch.py uninstall` 卸掉）；并入[公共着色器清单](docs/shader-list.md)后，下一次打包时所有人就都有了。有 Mac 的话，也可以用 `games/totk/ios/tools/fill_shaders.py` 马上翻译这些变体并推回设备。
 - **内存：** 在 iPhone 14 上游戏占用接近 4 GB，接近手机能给它的上限。在复杂的区域玩几分钟后，手机内存耗尽时 iOS 可能会关掉游戏（iPhone 14 上出现过两次，都在约 8 分钟时）。降低 iOS 上的内存占用是下一步要做的事。
+
+### 作弊码（可选）
+
+`--cheats` 把作弊码文件装进 App：以所选版本 build ID 命名的 Atmosphère 作弊码文件（Atmosphère、Yuzu、Ryujinx 通用格式），或包含该文件的文件夹。本体 1.0.0 为 `082CE09B06E33A12.txt`。只使用所构建版本的文件；其他版本的文件会让构建停止。仓库本身不附带作弊码。
+
+```sh
+python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys --cheats ~/Games/cheats/
+```
+
+App 菜单栏随即出现 **作弊** 菜单，列出文件中的全部作弊码，默认全部关闭，选择会被保存。只改内存数值的作弊码（箭、卢比、月球跳）立即开关；修改游戏代码的作弊码（如无限耐久）在下次启动时生效，游戏运行期间不会让代码变为可写。若代码补丁会覆盖本项目改写的指令，或跳出游戏代码，则拒绝并标为不支持。第一次启用作弊码时，档案会先复制到 `profile-before-cheats`；与实机一样，作弊码可能损坏存档。
 
 ## 操作
 

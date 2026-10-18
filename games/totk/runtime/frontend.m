@@ -236,13 +236,37 @@ static void note_occlusion(const char *when){int v=(window.occlusionState&NSWind
 static TOTKWindowDelegate *windowDelegate;
 int runtime_front_window_visible(void){return atomic_load(&windowVisible);}
 void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(), ^{[window performClose:nil];});}
+/* Cheats menu (runtime/cheats.c): one item per cheat baked into the app, rebuilt each time the menu opens. Code patches
+   take effect at the next launch, so their items say so until then; refused cheats are listed, disabled, with the reason. */
+@interface TOTKCheatMenu:NSObject<NSMenuDelegate>
+@end
+@implementation TOTKCheatMenu
+-(void)menuNeedsUpdate:(NSMenu *)menu{
+ [menu removeAllItems];int n=runtime_cheats_count();
+ if(!n){NSMenuItem *none=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("此 App 未内置作弊码","No cheats are built into this app")) action:nil keyEquivalent:@""];none.enabled=NO;[menu addItem:none];return;}
+ for(int i=0;i<n;i++){
+  int st=runtime_cheats_state(i);const char *why=runtime_cheats_problem(i);
+  NSString *title=@(runtime_cheats_name(i))?:@"?";
+  if(st&CHEAT_REFUSED)title=[title stringByAppendingFormat:@(TOTK_UI("（不支持：%s）"," (not supported: %s)")),why];
+  else if((st&CHEAT_AT_LAUNCH)&&!!(st&CHEAT_ON)!=!!(st&CHEAT_APPLIED))title=[title stringByAppendingString:@(st&CHEAT_ON?TOTK_UI("（下次启动时生效）"," (takes effect at next launch)"):TOTK_UI("（下次启动时关闭）"," (turns off at next launch)"))];
+  else if(why[0])title=[title stringByAppendingFormat:@" (%s)",why];
+  NSMenuItem *item=[[NSMenuItem alloc] initWithTitle:title action:(st&CHEAT_REFUSED)?nil:@selector(toggle:) keyEquivalent:@""];
+  item.target=self;item.tag=i;item.state=(st&CHEAT_ON)?NSControlStateValueOn:NSControlStateValueOff;item.enabled=!(st&CHEAT_REFUSED);[menu addItem:item];
+ }
+}
+-(void)toggle:(NSMenuItem *)item{runtime_cheats_set((int)item.tag,!(runtime_cheats_state((int)item.tag)&CHEAT_ON));}
+@end
+static TOTKCheatMenu *cheatMenu;
 /* Use the window-close path, not terminate:, so Command-Q also waits for active saves. */
 static void front_install_menu(void){
  NSMenu *menu=[NSMenu new],*appMenu=[NSMenu new];
  NSMenuItem *appItem=[NSMenuItem new];appItem.submenu=appMenu;[menu addItem:appItem];
  NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("退出 " GAME_NAME,"Quit " GAME_NAME)) action:@selector(performClose:) keyEquivalent:@"q"];
  quit.keyEquivalentModifierMask=NSEventModifierFlagCommand;quit.target=window;
- [appMenu addItem:quit];front_menubar_fps_add(menu);NSApp.mainMenu=menu;
+ [appMenu addItem:quit];front_menubar_fps_add(menu);
+ NSMenu *cheats=[[NSMenu alloc] initWithTitle:@(TOTK_UI("作弊","Cheats"))];cheatMenu=[TOTKCheatMenu new];cheats.delegate=cheatMenu;cheats.autoenablesItems=NO;
+ NSMenuItem *cheatsItem=[NSMenuItem new];cheatsItem.submenu=cheats;[menu addItem:cheatsItem];
+ NSApp.mainMenu=menu;
 }
 static void *guest_main(void *callback){@autoreleasepool{((void(*)(void))callback)();}return NULL;}
 void runtime_front_run(void(*callback)(void)){
