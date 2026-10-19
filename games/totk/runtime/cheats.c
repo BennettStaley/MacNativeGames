@@ -17,8 +17,9 @@
    - Cheats that write instructions into the main module's code (with a code cave in the padding after its text) are
      applied once at launch, before the modules are sealed r-x: the code is never made writable while guest threads run
      it, so toggling one takes effect at the next launch. A patch is refused when its site is a rewritten instruction
-     (a branch into the rewrite's patch area) or when a branch it writes leaves the code (into data, which is not
-     executable here), or when it is conditional.
+     (a branch into the rewrite's patch area), when a branch it writes leaves the code (into data, which is not
+     executable here), when it is conditional, or when its cave would overwrite padding the runtime's own patches
+     already use (game_patches*.c and aspect_patch.h put veneers at the start of main's text padding).
    - Every other cheat (pointer chains into the heap, button conditions) runs about 30 times a second on a host thread,
      reading and writing guest memory with mach_vm_read/write, so a stale pointer fails instead of crashing.
    The chosen cheats are saved beside the profile (cheats-enabled.txt). The first time one is enabled the profile is copied
@@ -61,6 +62,8 @@ static int branch_target(uint32_t insn, uint64_t at, uint64_t *to) {   // B / BL
     *to = at + (uint64_t)imm;
     return 1;
 }
+/* A padding word another cheat wrote this launch (identical or not: different values are left to conflicts()). */
+static int patched_by_cheat(uint64_t off) { for (int p = 0; p < npatched; p++) if (patched[p].off == off) return 1; return 0; }
 /* Classifies cheat k (CHEAT_AT_LAUNCH when it writes main-module code) and checks every code write. apply: write them,
    unless a word was already written with a different value by another cheat this launch (then nothing of k is written). */
 static int conflicts(int k);
@@ -86,6 +89,9 @@ static int code_patches(int k, int apply) {
                     uint64_t at = off + 4 * j, to;
                     if (at < main_text && branch_target(word_at(at), at, &to) && to >= main_patch) {
                         snprintf(problem[k], sizeof problem[k], "patches a rewritten instruction at main+%#llx", (unsigned long long)at); return -1;
+                    }
+                    if (at >= main_text && word_at(at) && !patched_by_cheat(at)) {   // the runtime's own veneers live here too
+                        snprintf(problem[k], sizeof problem[k], "overlaps the game runtime's own patch code at main+%#llx", (unsigned long long)at); return -1;
                     }
                     if (branch_target(nw[j], at, &to) && to >= main_rx) {
                         snprintf(problem[k], sizeof problem[k], "branches out of the game's code (main+%#llx)", (unsigned long long)to); return -1;
