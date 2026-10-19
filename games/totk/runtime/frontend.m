@@ -246,8 +246,8 @@ static NSString *cheat_title(int i){
  int st=runtime_cheats_state(i);const char *why=runtime_cheats_problem(i);
  NSString *title=@(runtime_cheats_name(i))?:@"?";
  if(st&CHEAT_REFUSED)return [title stringByAppendingFormat:@(TOTK_UI("（不支持：%s）"," (not supported: %s)")),why];
+ if(why[0])return [title stringByAppendingFormat:@" (%s)",why];   // e.g. a code patch that conflicts with another
  if((st&CHEAT_AT_LAUNCH)&&!!(st&CHEAT_ON)!=!!(st&CHEAT_APPLIED))return [title stringByAppendingString:@(st&CHEAT_ON?TOTK_UI("（下次启动时生效）"," (takes effect at next launch)"):TOTK_UI("（下次启动时关闭）"," (turns off at next launch)"))];
- if(why[0])return [title stringByAppendingFormat:@" (%s)",why];
  return title;
 }
 @implementation TOTKCheatMenu
