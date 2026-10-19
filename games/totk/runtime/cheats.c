@@ -141,15 +141,17 @@ static int guest_read(void *ctx, uint64_t a, void *out, unsigned n) {
     return allowed(a, n, 0) && mach_vm_read_overwrite(mach_task_self(), a, n, (mach_vm_address_t)(uintptr_t)out, &got) == KERN_SUCCESS && got == n;
 }
 static int guest_write(void *ctx, uint64_t a, const void *in, unsigned n) {
-    if (dry_run) {   // log once per target: where the chain led, what is there now and what would be written
-        static uint64_t seen[256]; static int nseen;
+    if (dry_run) {   // log a target when first seen and whenever its value changes (a save loaded after the title)
+        typedef struct { uint64_t addr, value; int logs; } Seen;
+        static Seen seen[256]; static int nseen;
         uint64_t now = 0, v = 0;
         int readable = guest_read(NULL, a, &now, n);
         memcpy(&v, in, n);
-        int fresh = 1;
-        for (int i = 0; i < nseen; i++) if (seen[i] == a) fresh = 0;
-        if (fresh && nseen < 256) {
-            seen[nseen++] = a;
+        int k = 0;
+        while (k < nseen && seen[k].addr != a) k++;
+        if (k == nseen && nseen < 256) seen[nseen++] = (Seen){a, ~now, 0};
+        if (k < nseen && seen[k].value != now && seen[k].logs < 8) {
+            seen[k].value = now; seen[k].logs++;
             fprintf(stderr, "[totk] cheat dry run \"%s\": %#llx (%u bytes) is %s%#llx, would write %#llx\n", ctx ? (const char *)ctx : "?",
                     (unsigned long long)a, n, readable ? "" : "unreadable ", (unsigned long long)now, (unsigned long long)v);
         }
