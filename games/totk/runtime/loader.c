@@ -485,6 +485,8 @@ int main(int argc,char **argv) {
  need(argc==3,"usage: totk-native rewritten-dir probe|boot");
  /* One game or GPU probe at a time (memory, GPU time): wait for the slot before anything is loaded. */
  if(!strcmp(argv[2],"boot")||!strncmp(argv[2],"probe-gpu",9))runtime_game_slot_acquire(argv[2]);
+ /* The player's settings (runtime/settings.c): TOTK_SETTINGS from the Mac launcher; the iOS app loaded them already. */
+ if(!strcmp(argv[2],"boot")){extern void settings_init(const char *);settings_init(getenv("TOTK_SETTINGS"));}
  if(strcmp(argv[2],"boot"))setenv("TOTK_PROBE_GPU","1",1);   /* standalone probes submit GPU work; the game does not unless TOTK_GPU_ALLOW_SUBMIT=1 */
  else unsetenv("TOTK_PROBE_GPU");need(sysconf(_SC_PAGESIZE)==0x4000,"expected 16KB Apple pages");
  struct sigaction a={0};a.sa_sigaction=crash;a.sa_flags=SA_SIGINFO|SA_ONSTACK;sigemptyset(&a.sa_mask);

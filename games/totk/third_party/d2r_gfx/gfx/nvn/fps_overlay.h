@@ -16,6 +16,7 @@ int fps_overlay_enabled(void);
 /* Shared user toggle for every in-picture HUD layer: FPS, shader collection and load telemetry. */
 int fps_overlay_hints_enabled(void);
 int fps_overlay_toggle_hints(void);   /* atomically toggles all HUD layers and returns the new visibility */
+void fps_overlay_set_hints(int visible);   /* the settings menu; TOTK_HINTS=0 starts hidden */
 /* Pixel scale (1..FPS_OVERLAY_MAX_SCALE) for a game picture view_h pixels tall: one text line is about 3% of its height. */
 int fps_overlay_scale(double view_h);
 /* The line in a 5x7 pixel font on a dark box, as BGRA8 pixels in out (FPS_OVERLAY_TEX_W x FPS_OVERLAY_TEX_H,

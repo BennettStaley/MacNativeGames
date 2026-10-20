@@ -2465,6 +2465,17 @@ static int uncapped_cap(int scr) {
     return v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
 }
 void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; }
+/* The settings menu's frame rate limit at run time: the uncapped clock's ceiling (hz 30..120, 0 = the display's refresh
+   rate), as TOTK_UNCAPPED_HZ sets it at start. Before the first present only the variable changes; with fixed pacing
+   (TOTK_UNCAPPED=0, frame interpolation) there is no ceiling to move and the value waits for the next start. */
+void nvn_fps_cap_set(int hz) {
+    char text[16]; if (hz > 0) snprintf(text, sizeof text, "%d", hz); else snprintf(text, sizeof text, "display");
+    setenv("TOTK_UNCAPPED_HZ", text, 1);
+    if (g_hz < 0) return;
+    if (!g_uncapped) { LOG("[nvn] frame rate limit %s: applies at the next start (pacing is not uncapped now)", text); return; }
+    g_hz = uncapped_cap(mtl_display_hz());
+    LOG("[nvn] frame rate limit: %d fps (TOTK_UNCAPPED_HZ=%s)", g_hz, text);
+}
 static void present_cfg(const win_t *o) {
     if (g_hz >= 0) return;
     // 有窗口仍缺省 display 间隔模式；无窗口缺省 game 模式。环境变量可覆盖固定 60 Hz。

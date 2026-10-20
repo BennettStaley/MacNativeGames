@@ -37,9 +37,16 @@ static const Glyph FONT[] = {
     {' ', {0, 0, 0, 0, 0, 0, 0}},
 };
 
-static _Atomic int g_hints_visible = 1;
-int fps_overlay_hints_enabled(void) { return atomic_load_explicit(&g_hints_visible, memory_order_relaxed); }
-int fps_overlay_toggle_hints(void) { return !atomic_fetch_xor_explicit(&g_hints_visible, 1, memory_order_relaxed); }
+/* TOTK_HINTS=0: start with every HUD layer hidden (the settings menu's "Performance readout"). */
+static _Atomic int g_hints_visible = -1;
+static int hints_now(void) {
+    int v = atomic_load_explicit(&g_hints_visible, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("TOTK_HINTS"); int start = !(e && !strcmp(e, "0")); atomic_compare_exchange_strong(&g_hints_visible, &v, start); v = atomic_load(&g_hints_visible); }
+    return v;
+}
+int fps_overlay_hints_enabled(void) { return hints_now(); }
+void fps_overlay_set_hints(int visible) { (void)hints_now(); atomic_store(&g_hints_visible, visible ? 1 : 0); }
+int fps_overlay_toggle_hints(void) { (void)hints_now(); return !atomic_fetch_xor_explicit(&g_hints_visible, 1, memory_order_relaxed); }
 
 int fps_overlay_enabled(void) {
     static int on = -1;

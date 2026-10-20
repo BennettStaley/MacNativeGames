@@ -16,6 +16,7 @@
 #include "dmsh_chain.h"   // DMSH_CHAIN: the shader translation chain the cache folder is named after
 #include "game_version.h"
 #include "controller_map.h"
+#include "settings_schema.h"
 #include "include/totk_ui_lang.h"
 #include "totk_shader_contrib.h"   // the shared shader list contribution and its reminder
 
@@ -154,6 +155,14 @@ int main(int argc, char **argv) {
             int line = text ? controller_map_parse(text.UTF8String, map, modes, &problem) : 1;
             if (line) { show_error([NSString stringWithFormat:@"%@, line %d: %s", controls, line, problem]); return 1; }
         }
+        /* The player's settings (runtime/settings_schema.h): what the game reads at start goes to it as its variables; the
+           game reloads the file for the settings menu (TOTK_SETTINGS). A variable already set wins. */
+        { NSString *settings = env_or("TOTK_SETTINGS", [data stringByAppendingPathComponent:@"settings.txt"]);
+          int values[SETTINGS_COUNT]; settings_defaults(values, 0);
+          NSData *text = [NSData dataWithContentsOfFile:settings];
+          if (text.length && text.length < 16384) settings_parse_text([[NSString alloc] initWithData:text encoding:NSUTF8StringEncoding].UTF8String, values);
+          settings_take_env(values); settings_export_env(values);
+          setenv("TOTK_SETTINGS", settings.fileSystemRepresentation, 1); }
         setenv("TOTK_CONTROLS", controls.fileSystemRepresentation, 1);
         setenv("TOTK_PROFILE_DIR", profile.fileSystemRepresentation, 1);
         setenv("TOTK_SHADER_CACHE", cache.fileSystemRepresentation, 1);

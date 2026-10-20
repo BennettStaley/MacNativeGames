@@ -161,6 +161,9 @@ void runtime_gamepad_start(void) {
     [GCController startWirelessControllerDiscoveryWithCompletionHandler:nil];
 }
 
+/* The settings menu's face-button choice (TOTK_FACE_BUTTONS, read per controller): lay every controller out again. */
+void runtime_gamepad_relayout(void) { dispatch_async(dispatch_get_main_queue(), ^{ refresh_gamepads(); }); }
+
 void runtime_gamepad_clear(void) {
     runtime_feedback_quiet();
     physicalPrev = 0;
