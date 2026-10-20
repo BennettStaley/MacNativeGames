@@ -48,6 +48,11 @@ int fps_overlay_hints_enabled(void) { return hints_now(); }
 void fps_overlay_set_hints(int visible) { (void)hints_now(); atomic_store(&g_hints_visible, visible ? 1 : 0); }
 int fps_overlay_toggle_hints(void) { (void)hints_now(); return !atomic_fetch_xor_explicit(&g_hints_visible, 1, memory_order_relaxed); }
 
+/* The settings menu's "Readout detail": 1 adds the average and the 1% low of the last seconds to the FPS line. */
+static _Atomic int g_detail;
+void fps_overlay_set_detail(int detailed) { atomic_store(&g_detail, detailed ? 1 : 0); }
+int fps_overlay_detail(void) { return atomic_load(&g_detail); }
+
 int fps_overlay_enabled(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("TOTK_FPS_OVERLAY"); on = !(e && !strcmp(e, "0")); }
@@ -160,7 +165,14 @@ void fps_overlay_text(const fps_overlay_info *info, char *text, size_t n) {
     if (info->gen > 0 && info->fps >= 0) snprintf(gen, sizeof gen, "+%d", info->gen > 999 ? 999 : info->gen);   // interpolated frames a second (key 2)
     // MetalFX did the upscale in the last frames (key 3 selects the manual MetalFX mode); 2K: true 2K output.
     // The whole line in the system font, so switching MetalFX does not switch the font.
-    snprintf(text, n, "FPS %s%s  %s%s%s", fps, gen, ss, info->mfx ? TOTK_UI("  MetalFX已开启", "  MetalFX on") : "", info->big ? "  2K" : "");
+    char detail[48] = "";
+    if (info->detail) {   // "avg 59  1% low 48" over the last FPS_STATS_SECONDS (settings: Readout detail)
+        char avg[8], low[8];
+        if (info->avg < 0) snprintf(avg, sizeof avg, "--"); else snprintf(avg, sizeof avg, "%d", info->avg > 999 ? 999 : info->avg);
+        if (info->low < 0) snprintf(low, sizeof low, "--"); else snprintf(low, sizeof low, "%d", info->low > 999 ? 999 : info->low);
+        snprintf(detail, sizeof detail, TOTK_UI("  平均 %s  1%%低帧 %s", "  avg %s  1%% low %s"), avg, low);
+    }
+    snprintf(text, n, "FPS %s%s%s  %s%s%s", fps, gen, detail, ss, info->mfx ? TOTK_UI("  MetalFX已开启", "  MetalFX on") : "", info->big ? "  2K" : "");
 }
 
 void fps_overlay_raster(const fps_overlay_info *info, int scale, uint8_t *out, int *box_w, int *box_h) {
@@ -233,7 +245,45 @@ static void rate_note(rate_meter *m, uint64_t k, double now_s) {
     pthread_mutex_unlock(&m->mu);
 }
 
-void fps_overlay_note(uint64_t ticket, double now_s) { rate_note(&g_game, ticket, now_s); }
+/* Average and 1% low over the last FPS_STATS_SECONDS of game presents: a ring of (present number, time); a present that
+   carries several game frames (merged by the display link) counts each of them at its share of the interval. Re-measured
+   every half second. 1% low: the frame rate of the slowest 1% of those frames (their mean frame time), at least one. */
+enum { STATS_RING = 2048 };
+static struct { pthread_mutex_t mu; double t[STATS_RING]; uint64_t k[STATS_RING]; unsigned head, n; double last_calc; _Atomic int avg, low; }
+    g_stats = {PTHREAD_MUTEX_INITIALIZER, {0}, {0}, 0, 0, -1, -1, -1};
+static int cmp_desc(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? 1 : x > y ? -1 : 0; }
+static void stats_note(uint64_t k, double now_s) {
+    pthread_mutex_lock(&g_stats.mu);
+    if (g_stats.n && k < g_stats.k[(g_stats.head + STATS_RING - 1) % STATS_RING]) g_stats.n = 0;   // the count started again
+    g_stats.t[g_stats.head] = now_s; g_stats.k[g_stats.head] = k; g_stats.head = (g_stats.head + 1) % STATS_RING;
+    if (g_stats.n < STATS_RING) g_stats.n++;
+    while (g_stats.n > 1 && now_s - g_stats.t[(g_stats.head + STATS_RING - g_stats.n) % STATS_RING] > FPS_STATS_SECONDS) g_stats.n--;
+    if (g_stats.last_calc < 0 || now_s - g_stats.last_calc >= 0.5 || now_s < g_stats.last_calc) {
+        g_stats.last_calc = now_s;
+        unsigned first = (g_stats.head + STATS_RING - g_stats.n) % STATS_RING;
+        double span = now_s - g_stats.t[first]; uint64_t frames = k - g_stats.k[first];
+        if (g_stats.n >= 2 && span >= 1.0 && frames > 0) {
+            static double ft[STATS_RING * 4]; size_t m = 0;
+            for (unsigned i = 1; i < g_stats.n; i++) {
+                unsigned a = (first + i - 1) % STATS_RING, b = (first + i) % STATS_RING;
+                uint64_t dk = g_stats.k[b] - g_stats.k[a]; double dt = g_stats.t[b] - g_stats.t[a];
+                for (uint64_t j = 0; j < dk && m < sizeof ft / sizeof *ft; j++) ft[m++] = dt / (double)dk;
+            }
+            atomic_store(&g_stats.avg, (int)lround((double)frames / span));
+            if (m) {
+                qsort(ft, m, sizeof *ft, cmp_desc);
+                size_t worst = m / 100 ? m / 100 : 1; double sum = 0;
+                for (size_t i = 0; i < worst; i++) sum += ft[i];
+                atomic_store(&g_stats.low, sum > 0 ? (int)lround((double)worst / sum) : -1);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_stats.mu);
+}
+int fps_overlay_avg_value(void) { return atomic_load(&g_stats.avg); }
+int fps_overlay_low_value(void) { return atomic_load(&g_stats.low); }
+
+void fps_overlay_note(uint64_t ticket, double now_s) { rate_note(&g_game, ticket, now_s); stats_note(ticket, now_s); }
 int fps_overlay_value(void) { return atomic_load(&g_game.value); }
 void fps_overlay_note_gen(uint64_t n, double now_s) { rate_note(&g_gen, n, now_s); }
 int fps_overlay_gen_value(void) { return atomic_load(&g_gen.value); }

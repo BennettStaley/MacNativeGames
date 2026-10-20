@@ -88,15 +88,15 @@ int main(void) {
     /* The FPS box: the system font (it has "MetalFX已开启", user 2026-10-17), one line on the dark box; the box grows with
        what is shown. */
     int base, grown;
-    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 0, 0, 0}, 2, px, &base, &h);
+    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 0, 0, 0, 0, 0, 0}, 2, px, &base, &h);
     CHECK(base > 40 && h == 11 * 2, "\"FPS 97  2560x1440\" at scale 2: box %dx%d", base, h);
-    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 1, 0, 0}, 2, px, &grown, &h);
+    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 1, 0, 0, 0, 0, 0}, 2, px, &grown, &h);
     CHECK(grown > base + 60, "MetalFX on: \"  MetalFX已开启\" after the size (box %d, without it %d)", grown, base);
-    fps_overlay_raster(&(fps_overlay_info){50, 2560, 1440, 0, 50, 0}, 2, px, &grown, &h);
+    fps_overlay_raster(&(fps_overlay_info){50, 2560, 1440, 0, 50, 0, 0, 0, 0}, 2, px, &grown, &h);
     CHECK(grown > base, "frame interpolation on: \"+50\" after the fps (box %d, without it %d)", grown, base);
-    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 0, 0, 1}, 2, px, &grown, &h);
+    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 0, 0, 1, 0, 0, 0}, 2, px, &grown, &h);
     CHECK(grown > base, "true 2K: \"  2K\" at the end (box %d, without it %d)", grown, base);
-    fps_overlay_raster(&(fps_overlay_info){999, 99999, 99999, 1, 5000, 1}, FPS_OVERLAY_MAX_SCALE, px, &w, &h);   /* longest line: fits, or drops a scale */
+    fps_overlay_raster(&(fps_overlay_info){999, 99999, 99999, 1, 5000, 1, 0, 0, 0}, FPS_OVERLAY_MAX_SCALE, px, &w, &h);   /* longest line: fits, or drops a scale */
     CHECK(w > 0 && w <= FPS_OVERLAY_TEX_W && h <= FPS_OVERLAY_TEX_H, "longest FPS line %dx%d outside the texture", w, h);
 
     const int values[] = {-1, 0, 7, 30, 60, 120, 999, 5000};
@@ -105,7 +105,7 @@ int main(void) {
         for (size_t z = 0; z < sizeof sizes / sizeof sizes[0]; z++)
         for (int mfx = 0; mfx <= 1; mfx++)
         for (int s = 1; s <= FPS_OVERLAY_MAX_SCALE; s++) {
-            fps_overlay_raster(&(fps_overlay_info){values[i], sizes[z][0], sizes[z][1], mfx, 0, 0}, s, px, &w, &h);
+            fps_overlay_raster(&(fps_overlay_info){values[i], sizes[z][0], sizes[z][1], mfx, 0, 0, 0, 0, 0}, s, px, &w, &h);
             CHECK(w > 0 && h > 0 && w <= FPS_OVERLAY_TEX_W && h <= FPS_OVERLAY_TEX_H, "value %d scale %d box %dx%d outside texture", values[i], s, w, h);
             colours(w, h, &green, &yellow);
             int dirty = outside_dirty(w, h);
@@ -130,7 +130,7 @@ int main(void) {
     CHECK(!strcmp(line, "Shaders 2 compiling / 3 new / 7428 total"), "English shader box text \"%s\"", line);
     CHECK(!fps_overlay_line_pixel_font(line), "English shader line \"%s\" drawn with the pixel font, which lacks its lower-case letters", line);
     CHECK(fps_overlay_line_pixel_font("FPS 60  2560x1440"), "the FPS line left the pixel font");
-    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 1, 0, 0}, 2, px, &grown, &h);
+    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 1, 0, 0, 0, 0, 0}, 2, px, &grown, &h);
     CHECK(grown > base + 40, "English MetalFX on: \"  MetalFX on\" after the size (box %d, without it %d)", grown, base);
     setenv("TOTK_UI_LANG", "zh", 1);
     shader_overlay_text(line, sizeof line, 123456, 123456, 9999999, 123456);
@@ -148,6 +148,7 @@ int main(void) {
     CHECK(yellow == 0 && green > 0, "plain line: %d yellow and %d green pixels", yellow, green);
 
     CHECK(fps_overlay_value() == -1, "value before any present");
+    CHECK(fps_overlay_avg_value() == -1 && fps_overlay_low_value() == -1, "average / 1%% low before any present");
     uint64_t k = 0; double t = 100.0;
     for (int i = 0; i < 120; i++) { fps_overlay_note(++k, t); t += 1.0 / 60; }
     CHECK(fps_overlay_value() == 60, "60 presents per second measured as %d", fps_overlay_value());
@@ -155,6 +156,41 @@ int main(void) {
     CHECK(fps_overlay_value() == 30, "30 presents per second measured as %d", fps_overlay_value());
     for (int i = 0; i < 60; i++) { k += 2; fps_overlay_note(k, t); t += 1.0 / 30; }   /* display link merged every other game frame */
     CHECK(fps_overlay_value() == 60, "merged frames: 60 game presents per second measured as %d", fps_overlay_value());
+    /* Readout detail: the average and the 1% low over the last FPS_STATS_SECONDS. Steady 60 first (the earlier presents
+       fall out of the window after a pause), then one 100 ms hitch a second: five slow frames among ~270, so the slowest
+       1% (two frames) are hitches -> 10 fps, while the average barely moves. */
+    t += 20.0;
+    for (int i = 0; i < 6 * 60; i++) { fps_overlay_note(++k, t); t += 1.0 / 60; }
+    CHECK(fps_overlay_avg_value() == 60 && fps_overlay_low_value() == 60, "steady 60: average %d, 1%% low %d", fps_overlay_avg_value(), fps_overlay_low_value());
+    for (int sec = 0; sec < 6; sec++) {
+        for (int i = 0; i < 54; i++) { fps_overlay_note(++k, t); t += 1.0 / 60; }
+        fps_overlay_note(++k, t); t += 0.1;
+    }
+    CHECK(fps_overlay_avg_value() >= 52 && fps_overlay_avg_value() <= 57, "one hitch a second: average %d (about 55)", fps_overlay_avg_value());
+    CHECK(fps_overlay_low_value() == 10, "one 100 ms hitch a second: 1%% low %d, expected 10", fps_overlay_low_value());
+    for (int i = 0; i < 6 * 30; i++) { k += 2; fps_overlay_note(k, t); t += 1.0 / 30; }   /* merged: two game frames a present */
+    CHECK(fps_overlay_avg_value() == 60 && fps_overlay_low_value() == 60, "merged presents: average %d, 1%% low %d (each frame its half)", fps_overlay_avg_value(), fps_overlay_low_value());
+    {
+        char ft[128];
+        setenv("TOTK_UI_LANG", "en", 1);
+        fps_overlay_text(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 1, 59, 48}, ft, sizeof ft);
+        CHECK(!strcmp(ft, "FPS 60  avg 59  1% low 48  2560x1440"), "detailed line \"%s\"", ft);
+        fps_overlay_text(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 1, -1, -1}, ft, sizeof ft);
+        CHECK(!strcmp(ft, "FPS 60  avg --  1% low --  2560x1440"), "detailed line before a measurement \"%s\"", ft);
+        fps_overlay_text(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 0, 59, 48}, ft, sizeof ft);
+        CHECK(!strcmp(ft, "FPS 60  2560x1440"), "simple line \"%s\" (detail off hides the numbers)", ft);
+        int simple, detailed;
+        fps_overlay_raster(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 0, 0, 0}, 2, px, &simple, &h);
+        fps_overlay_raster(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 1, 59, 48}, 2, px, &detailed, &h);
+        CHECK(detailed > simple + 60, "detailed box %d wider than simple %d", detailed, simple);
+        for (int s = 1; s <= FPS_OVERLAY_MAX_SCALE; s++) {
+            fps_overlay_raster(&(fps_overlay_info){999, 99999, 99999, 1, 5000, 1, 1, 999, 999}, s, px, &w, &h);
+            CHECK(w > 0 && w <= FPS_OVERLAY_TEX_W && h <= FPS_OVERLAY_TEX_H && outside_dirty(w, h) == 0, "longest detailed line at scale %d: box %dx%d", s, w, h);
+        }
+        setenv("TOTK_UI_LANG", "zh", 1);
+        fps_overlay_text(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 1, 59, 48}, ft, sizeof ft);
+        CHECK(!strcmp(ft, "FPS 60  平均 59  1%低帧 48  2560x1440"), "Chinese detailed line \"%s\"", ft);
+    }
     /* Interpolated frames shown: their own rate, independent of the game rate; a gap of more than a second (interpolation
        switched off and on) starts a new window instead of averaging the off time in. */
     CHECK(fps_overlay_gen_value() == -1, "generated rate before any interpolated frame");
@@ -199,7 +235,7 @@ int main(void) {
     atomic_store(&g_spin_stop, 1); pthread_join(spin, NULL);
     if (got) { sysload_text(line, sizeof line, &real); fprintf(stderr, "this machine now: %s (busiest thread %s)\n", line, real.thread_name); }
 
-    printf("{\"status\":\"%s\",\"probe\":\"probe-fps-overlay\",\"checked\":%d,\"failures\":%d,\"scope\":\"5x7 glyph pixels (ASCII lines), the system-font FPS box (MetalFX label, box growth, text colour, nothing outside the box), box bounds for values -1..5000 and screen sizes at scales 1..%d, scale choice, game-present and interpolated-frame rate measurement, FPS 50+50 form, bottom-right load line (text, glyphs, width, GPU busy union, busiest thread found, one real sample), shader collection box text / glyphs / bounds / highlight; negative controls flip one pixel and ask for a missing glyph\"}\n",
+    printf("{\"status\":\"%s\",\"probe\":\"probe-fps-overlay\",\"checked\":%d,\"failures\":%d,\"scope\":\"5x7 glyph pixels (ASCII lines), the system-font FPS box (MetalFX label, box growth, text colour, nothing outside the box), box bounds for values -1..5000 and screen sizes at scales 1..%d, scale choice, game-present and interpolated-frame rate measurement, FPS 50+50 form, Readout detail (average and 1%% low over the last 5 s: steady, hitches, merged presents; the detailed line and its box), bottom-right load line (text, glyphs, width, GPU busy union, busiest thread found, one real sample), shader collection box text / glyphs / bounds / highlight; negative controls flip one pixel and ask for a missing glyph\"}\n",
            failures ? "fail" : "pass", checks, failures, FPS_OVERLAY_MAX_SCALE);
     return failures ? 1 : 0;
 }
