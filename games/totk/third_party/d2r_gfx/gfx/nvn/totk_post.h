@@ -3,10 +3,13 @@
      draw (1.4.3: fragment shader 22a61cb1, FXAA 3.11 console) from the tone-mapped picture into its own target at the
      render size, before the game's upscale (a3a570eb / ac58fc18, or MetalFX) and the UI. For modes 1-3 that draw is not
      encoded; our passes read the same input and write the same target over the same viewport / scissor (dynamic
-     resolution keeps working), so everything after it, the UI included, is unchanged. Other game versions: the key of
-     their FXAA draw has to be added to pp_is_fxaa (a nonzero mode then logs that it found nothing).
-   - "sharpen" (TOTK_SHARPEN): 0..100, FidelityFX CAS on the canvas after the upscale, at the first UI draw into it
-     (the hook TOTK_MFX uses); a frame without UI is sharpened before the canvas is copied to the presented texture.
+     resolution keeps working), so everything after it, the UI included, is unchanged. Handheld (1.4.3, also every
+     iPhone / iPad) has no FXAA and no upscale: the tone map 0ac9a549 writes the canvas directly and the UI follows. A
+     frame without the game's FXAA draw gets modes 2 / 3 on the canvas instead, before its first UI draw (pp_ui_hook),
+     and mode 1 is the game's own picture. Other game versions: the key of their FXAA draw has to be added to
+     pp_is_fxaa (docked they would otherwise get our AA on top of theirs).
+   - "sharpen" (TOTK_SHARPEN): 0..100, FidelityFX CAS on the canvas after the upscale (and after the canvas AA), at the
+     first UI draw into it (the hook TOTK_MFX uses); a frame without UI before the canvas is copied to the window.
    - "aniso" (TOTK_ANISO): 0 the game's, 2/4/8/16 at least that much anisotropy for mipmapped, linear, repeating samplers
      without compare / min-max reduction; "lod_bias" (TOTK_LOD_BIAS): -100..0 hundredths added to every sampler's LOD
      bias. The game's own LOD bias is passed to Metal now as well (it was dropped; TOTK_GAME_LOD_BIAS=0 leaves it out).
@@ -26,8 +29,8 @@ static struct {
     id<MTL4ArgumentTable> args[PP_NFN];
     id<MTLTexture> area, search, edges, blend, cas_src;
     __weak id<MTLTexture> canvas;   // this frame's canvas, once drawn into (CAS fallback for a frame without UI)
-    int ui_done; MTLClearColor cc;   // cc: a clear the game had pending for the FXAA target (pp_pass clear 2)
-    uint64_t aa_n, aa_kept[6], cas_n, frames, last_aa_n;
+    int ui_done, fxaa_seen; MTLClearColor cc;   // cc: a clear the game had pending for the FXAA target (pp_pass clear 2)
+    uint64_t aa_n, aa_kept[6], cas_n, canvas_aa_n, frames, last_aa_n;
 } g_postfx;
 
 static int pp_flag(const char *name, int v) {
@@ -84,13 +87,13 @@ static void pp_latch(void) {
         registry_unlock();
         MLOG("[pp] samplers: anisotropy %d, LOD bias %+d/100; %d sampler objects rebuilt on use", an, lb, n);
     }
-    g_postfx.ui_done = 0; g_postfx.canvas = nil;
+    g_postfx.ui_done = g_postfx.fxaa_seen = 0; g_postfx.canvas = nil;
     if (g_pp_aa && ++g_postfx.frames == 600 && g_postfx.aa_n == g_postfx.last_aa_n)
-        MLOG("【红】[pp] anti-aliasing %s: no game FXAA draw replaced in the 600 frames since it was chosen (a loading screen, or a game version pp_is_fxaa does not cover); kept %llu/%llu/%llu/%llu",
-             k_pp_aa_name[g_pp_aa], (unsigned long long)g_postfx.aa_kept[1], (unsigned long long)g_postfx.aa_kept[2], (unsigned long long)g_postfx.aa_kept[3], (unsigned long long)g_postfx.aa_kept[4]);
+        MLOG("[pp] anti-aliasing %s: no game FXAA draw in the 600 frames since it was chosen (handheld / a loading screen, or a game version pp_is_fxaa does not cover): on the canvas %llu times; kept %llu/%llu/%llu/%llu",
+             k_pp_aa_name[g_pp_aa], (unsigned long long)g_postfx.canvas_aa_n, (unsigned long long)g_postfx.aa_kept[1], (unsigned long long)g_postfx.aa_kept[2], (unsigned long long)g_postfx.aa_kept[3], (unsigned long long)g_postfx.aa_kept[4]);
     if (atomic_load(&g_cur_frame) % 3600 == 0 && (g_pp_aa || g_pp_sharpen))
-        MLOG("[pp] to frame %llu: anti-aliasing passes %llu (game FXAA kept: replay %llu, targets %llu, state %llu, textures %llu), sharpen passes %llu",
-             (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)g_postfx.aa_n, (unsigned long long)g_postfx.aa_kept[1], (unsigned long long)g_postfx.aa_kept[2],
+        MLOG("[pp] to frame %llu: anti-aliasing passes %llu, on the canvas %llu (game FXAA kept: replay %llu, targets %llu, state %llu, textures %llu), sharpen passes %llu",
+             (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)g_postfx.aa_n, (unsigned long long)g_postfx.canvas_aa_n, (unsigned long long)g_postfx.aa_kept[1], (unsigned long long)g_postfx.aa_kept[2],
              (unsigned long long)g_postfx.aa_kept[3], (unsigned long long)g_postfx.aa_kept[4], (unsigned long long)g_postfx.cas_n);
 }
 static int pp_is_fxaa(const char *key) {
@@ -148,9 +151,31 @@ static int pp_pass(int fn, id<MTLTexture> dst, int clear, __unsafe_unretained id
     return 1;
 }
 static void pp_done_encoding(void) { args_dirty_all(); g_pso_dirty = g_dss_dirty = 1; }
+static int pp_aa_ready(MTLPixelFormat pf) {   // shaders that do not build: the game's picture stays
+    return g_pp_aa != 3 ? pp_pso(g_pp_aa == 1 ? PP_COPY : PP_FXAA, pf) != nil
+                        : pp_pso(PP_EDGE, MTLPixelFormatRG8Unorm) && pp_pso(PP_WEIGHT, MTLPixelFormatRGBA8Unorm) && pp_pso(PP_BLEND, pf);
+}
+/* aa_mode 1-3 from src into dst (same size) within sc; dclr as pp_pass's clear for dst. */
+static void pp_aa_run(id<MTLTexture> src, id<MTLTexture> dst, MTLScissorRect sc, int dclr) {
+    float k[12] = {1.f / src.width, 1.f / src.height, (float)src.width, (float)src.height, (float)sc.x, (float)sc.y, (float)(sc.x + sc.width), (float)(sc.y + sc.height), 0, 0, 0, 0};
+    __unsafe_unretained id<MTLTexture> t[3] = {src};
+    if (g_pp_aa != 3) pp_pass(g_pp_aa == 1 ? PP_COPY : PP_FXAA, dst, dclr, t, 1, k, sc);
+    else {
+        if (!g_postfx.area) { g_postfx.area = pp_table(k_smaa_area_hex, SMAA_AREA_W, SMAA_AREA_H, MTLPixelFormatRG8Unorm, 2); g_postfx.search = pp_table(k_smaa_search_hex, SMAA_SEARCH_W, SMAA_SEARCH_H, MTLPixelFormatR8Unorm, 1); }
+        MTLTextureUsage u = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        id<MTLTexture> edges = pp_tex(&g_postfx.edges, src.width, src.height, MTLPixelFormatRG8Unorm, u), blend = pp_tex(&g_postfx.blend, src.width, src.height, MTLPixelFormatRGBA8Unorm, u);
+        if (pp_pass(PP_EDGE, edges, 1, t, 1, k, sc)) {
+            t[0] = edges; t[1] = g_postfx.area; t[2] = g_postfx.search; pp_pass(PP_WEIGHT, blend, 1, t, 3, k, sc);
+            t[0] = src; t[1] = blend; pp_pass(PP_BLEND, dst, dclr, t, 2, k, sc);
+        }
+    }
+    pp_done_encoding();
+}
 /* The game's FXAA draw with aa_mode 1-3: our anti-aliasing instead. Returns 1 when the draw was replaced. */
 static int pp_aa_draw(__unsafe_unretained NvProg *pr) {
-    if (!g_pp_aa || !pr || !pr->sh[1] || !pp_is_fxaa(pr->sh[1]->key)) return 0;
+    if (!pr || !pr->sh[1] || !pp_is_fxaa(pr->sh[1]->key)) return 0;
+    g_postfx.fxaa_seen = 1;   // this frame has the game's AA step: no canvas AA (pp_ui_hook)
+    if (!g_pp_aa) return 0;
     __unsafe_unretained NvShader *f = pr->sh[1];
     const view_t *cv = &R.rt.cview[0]; int hv = R.rt.has_cview[0], why = 0;
     if (g_defer_replaying || g_frz_state) why = 1;
@@ -172,52 +197,50 @@ static int pp_aa_draw(__unsafe_unretained NvProg *pr) {
     if (S.has_vp) { x0 = MAX(x0, lroundf(S.vp[0][0])); y0 = MAX(y0, lroundf(S.vp[0][1])); x1 = MIN(x1, lroundf(S.vp[0][0] + S.vp[0][2])); y1 = MIN(y1, lroundf(S.vp[0][1] + S.vp[0][3])); }
     if (R.has_sc) { x0 = MAX(x0, (long)R.sc.x); y0 = MAX(y0, (long)R.sc.y); x1 = MIN(x1, (long)R.sc.x + R.sc.w); y1 = MIN(y1, (long)R.sc.y + R.sc.h); }
     if (x1 <= x0 || y1 <= y0) return 1;
-    int ready = g_pp_aa != 3 ? pp_pso(g_pp_aa == 1 ? PP_COPY : PP_FXAA, dst.pixelFormat) != nil   // shaders that do not build: the game's FXAA
-              : pp_pso(PP_EDGE, MTLPixelFormatRG8Unorm) && pp_pso(PP_WEIGHT, MTLPixelFormatRGBA8Unorm) && pp_pso(PP_BLEND, dst.pixelFormat);
-    if (!ready) { g_postfx.aa_kept[5]++; return 0; }
+    if (!pp_aa_ready(dst.pixelFormat)) { g_postfx.aa_kept[5]++; return 0; }
     { static int once; if (!once++) MLOG("[pp] anti-aliasing %s replaces the game FXAA %.8s: %lux%lu format %lu -> format %lu, region %ld,%ld-%ld,%ld",
                                          k_pp_aa_name[g_pp_aa], f->key, (unsigned long)src.width, (unsigned long)src.height, (unsigned long)src.pixelFormat, (unsigned long)dst.pixelFormat, x0, y0, x1, y1); }
     rp_end();
     int dclr = 0; if (R.clear_c[0]) { dclr = 2; g_postfx.cc = R.cc[0]; R.clear_c[0] = 0; }   // a clear still pending for the target lands with our pass, as with the game's draw
     gpu_owned_mark(R.rt.color[0]->serial);
-    MTLScissorRect sc = {(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)};
-    float k[12] = {1.f / src.width, 1.f / src.height, (float)src.width, (float)src.height, (float)x0, (float)y0, (float)x1, (float)y1, 0, 0, 0, 0};
-    __unsafe_unretained id<MTLTexture> t[3] = {src};
-    if (g_pp_aa != 3) pp_pass(g_pp_aa == 1 ? PP_COPY : PP_FXAA, dst, dclr, t, 1, k, sc);
-    else {
-        if (!g_postfx.area) { g_postfx.area = pp_table(k_smaa_area_hex, SMAA_AREA_W, SMAA_AREA_H, MTLPixelFormatRG8Unorm, 2); g_postfx.search = pp_table(k_smaa_search_hex, SMAA_SEARCH_W, SMAA_SEARCH_H, MTLPixelFormatR8Unorm, 1); }
-        MTLTextureUsage u = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-        id<MTLTexture> edges = pp_tex(&g_postfx.edges, src.width, src.height, MTLPixelFormatRG8Unorm, u), blend = pp_tex(&g_postfx.blend, src.width, src.height, MTLPixelFormatRGBA8Unorm, u);
-        if (pp_pass(PP_EDGE, edges, 1, t, 1, k, sc)) {
-            t[0] = edges; t[1] = g_postfx.area; t[2] = g_postfx.search; pp_pass(PP_WEIGHT, blend, 1, t, 3, k, sc);
-            t[0] = src; t[1] = blend; pp_pass(PP_BLEND, dst, dclr, t, 2, k, sc);
-        }
-    }
-    pp_done_encoding(); g_postfx.aa_n++;
+    pp_aa_run(src, dst, (MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)}, dclr);
+    g_postfx.aa_n++;
     return 1;
 }
-/* CAS on the canvas: copy it, then sharpen the copy back into it. */
-static void pp_cas(id<MTLTexture> c) {
-    if (!c || c.textureType != MTLTextureType2D) return;
-    if (g_enc) rp_end();
+static id<MTLTexture> pp_canvas_copy(id<MTLTexture> c) {
     id<MTLTexture> s = pp_tex(&g_postfx.cas_src, c.width, c.height, c.pixelFormat, MTLTextureUsageShaderRead);
     id<MTL4ComputeCommandEncoder> b = blit();
     enc_b_copy_texture(b, c, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(c.width, c.height, 1), s, 0, 0, MTLOriginMake(0, 0, 0));
     enc_b_end(g_blit); g_blit = nil;
+    return s;
+}
+/* The finished scene in the canvas, before the UI: anti-aliasing when this frame had no game FXAA draw (handheld), then
+   CAS; each from a copy of the canvas back into it. */
+static void pp_canvas(id<MTLTexture> c) {
+    g_postfx.ui_done = 1;
+    if (!c || c.textureType != MTLTextureType2D) return;
+    if (g_enc) rp_end();
+    if (g_pp_aa >= 2 && !g_postfx.fxaa_seen && pp_aa_ready(c.pixelFormat)) {
+        { static int once; if (!once++) MLOG("[pp] anti-aliasing %s on the canvas (no game FXAA draw this frame): %lux%lu format %lu",
+                                             k_pp_aa_name[g_pp_aa], (unsigned long)c.width, (unsigned long)c.height, (unsigned long)c.pixelFormat); }
+        pp_aa_run(pp_canvas_copy(c), c, (MTLScissorRect){0, 0, c.width, c.height}, 0); g_postfx.canvas_aa_n++;
+    }
+    if (!g_pp_sharpen) return;
+    id<MTLTexture> s = pp_canvas_copy(c);
     float sharp = g_pp_sharpen / 100.f, k[12] = {1.f / c.width, 1.f / c.height, (float)c.width, (float)c.height, 0, 0, (float)c.width, (float)c.height, -1.f / (8.f + (5.f - 8.f) * sharp), 0, 0, 0};
     __unsafe_unretained id<MTLTexture> t[1] = {s};
     pp_pass(PP_CAS, c, 0, t, 1, k, (MTLScissorRect){0, 0, c.width, c.height});
-    pp_done_encoding(); g_postfx.ui_done = 1; g_postfx.cas_n++;
+    pp_done_encoding(); g_postfx.cas_n++;
 }
-/* Before a draw opens its pass: the first UI draw into the canvas sharpens the canvas first; a frame whose canvas got no
-   UI is sharpened before its first draw into a presented texture (the copy of the canvas to the window). */
+/* Before a draw opens its pass: the first UI draw into the canvas runs pp_canvas first; a frame whose canvas got no UI
+   runs it before its first draw into a presented texture (the copy of the canvas to the window). */
 static void pp_ui_hook(__unsafe_unretained NvProg *pr) {
-    if (!g_pp_sharpen || g_postfx.ui_done || g_defer_replaying || !pr || !R.rt.n || !R.rt.color[0] || !g_mfx.canvas) return;
+    if (!(g_pp_sharpen || g_pp_aa >= 2) || g_postfx.ui_done || g_defer_replaying || !pr || !R.rt.n || !R.rt.color[0] || !g_mfx.canvas) return;
     uint64_t ser = R.rt.color[0]->serial;
     if (ser == g_mfx.canvas) {
-        if (pr->sh[0] && mfx_ui_vs(pr->sh[0]->key)) pp_cas(tex_mtl(R.rt.color[0]));
+        if (pr->sh[0] && mfx_ui_vs(pr->sh[0]->key)) pp_canvas(tex_mtl(R.rt.color[0]));
         else if (!g_postfx.canvas) g_postfx.canvas = tex_mtl(R.rt.color[0]);
         return;
     }
-    if (g_postfx.canvas) for (int i = 0; i < g_mfx.nswap; i++) if (g_mfx.swap[i] == ser) { pp_cas(g_postfx.canvas); return; }
+    if (g_postfx.canvas) for (int i = 0; i < g_mfx.nswap; i++) if (g_mfx.swap[i] == ser) { pp_canvas(g_postfx.canvas); return; }
 }

@@ -4429,7 +4429,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
       void ts_note(id pd, NSUInteger nc); ts_note(pd, (NSUInteger)R.rt.n); }
     ser_gate();
     if (mfx_enabled()) mfx_pass_setup(pd);   // TOTK: MetalFX scene / UI attachments, G-buffer depth
-    else if (uw_ratio() || g_pp_sharpen) canvas_learn(pd);   // key 4: the canvas the UI is squeezed in; sharpen: the canvas it sharpens
+    else if (uw_ratio() || g_pp_sharpen || g_pp_aa >= 2) canvas_learn(pd);   // key 4: the canvas the UI is squeezed in; picture settings: the canvas they process
     g_enc = enc_r_begin(pd);
     args_dirty_all();
     g_stat_pass++;
@@ -9675,7 +9675,7 @@ frz_plain:;
     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
     if (g_enc && g_lay.active && !lay_draw_ok(pr, dw, di)) {   // TOTK: this draw cannot write its layer: end the layered pass, draw in a plain one
         PD("L %llu 分层通道内的绘制不能写层号，在此切开", g_stat_pass); rp_end(); g_lay.refuse = 1; g_lay.refused++; }
-    if (g_pp_sharpen) pp_ui_hook(pr);   // sharpen: the canvas before the UI is drawn into it (totk_post.h)
+    if (g_pp_sharpen || g_pp_aa >= 2) pp_ui_hook(pr);   // sharpen / AA without a game FXAA draw: the canvas before the UI (totk_post.h)
     if (!g_mfx.scene_done && g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas && pr && pr->sh[0] && mfx_ui_vs(pr->sh[0]->key) && mfx_enabled())
         mfx_snapshot_scene();   // TOTK_MFX: first UI draw into the canvas: copy the finished scene first
     if (!g_uw_ui && uw_on_canvas() && pr && pr->sh[0] && mfx_ui_vs(pr->sh[0]->key)) g_uw_ui = 1;   // key 4: the UI begins
@@ -12226,7 +12226,7 @@ static int mfx_present_frame(const tex_t *t, double period, int discard) {
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard) : -1;
     if (mfx_latch() && !mfx_enabled()) g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = 0;   // key 2 / flag mfx_interp: the next frame is fully on or off
-    if (t && !mfx_enabled() && (uw_ratio() || g_pp_sharpen)) uw_note_present(t);   // key 4 / sharpen: the canvas search (TOTK_MFX does it in mfx_present_frame)
+    if (t && !mfx_enabled() && (uw_ratio() || g_pp_sharpen || g_pp_aa >= 2)) uw_note_present(t);   // key 4 / sharpen: the canvas search (TOTK_MFX does it in mfx_present_frame)
     pp_latch();   // picture settings for the next frame (totk_post.h)
     mtl_wb_eager();
     g_uw_ui = 0;
