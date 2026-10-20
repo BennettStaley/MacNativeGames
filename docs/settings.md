@@ -58,8 +58,8 @@ Limits and why:
   barely moves.
 - **Hide the HUD**: hides everything the game draws over the picture (hearts, map, prompts, quest text) for clean
   screenshots; **F2** on a Mac keyboard toggles it and the setting follows. It hides the game's menus too (the pause
-  menu and the inventory are drawn the same way as the HUD; the inventory's 3D Link still shows), so turn it off to
-  use them. The performance readout is the port's own and stays.
+  menu and the inventory are drawn the same way as the HUD: with it on, the pause menu is a black screen), so turn it
+  off to use them. The performance readout is the port's own and stays.
 - **Shader counter** (after restart), and on iPhone / iPad the **touch controls** (when they show, opacity, size) and
   the **settings button**.
 - **Button prompts**: the button icons the game shows: *Automatic* (the last controller you connected: Xbox icons for an
