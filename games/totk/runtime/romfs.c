@@ -56,9 +56,12 @@ static uint64_t handles[NH]; /* file index + 1; 0 is free */
    after the RomFS's own files (file_count + k, k in path order, added[]), opens and reads like a replacement, and its
    folders exist for runtime_romfs_entry_type. The RomFS has no directory listing here, so nothing else needs to know.
    The player's layers (that older folder, then the mods folder of mods.h: TOTK_MODS_DIR, one folder per mod, mods.txt for
-   the order, no manifest) never stop the start over a file a build layer also changes: the build's copy is used and the
-   log says so. The mods folder's files are not hashed; their identity check at open time is the same. When player files
-   are loaded, the ResourceSizeTable is served adjusted for them (rstb_serve). */
+   the order, no manifest) never stop the start over a file a build layer also changes (build_yield, mods_build_collision):
+   the player's copy is used and the build's patch of that file is dropped, except for what the port needs (the HeapDef
+   overlay: the heap sizes for the output), where the build's copy is kept; the Common layout archive that UI mods ship
+   gets the build's quick-menu background fix applied again (capture_refix). The log says which. The mods folder's files
+   are not hashed; their identity check at open time is the same. When player files are loaded, the ResourceSizeTable is
+   served adjusted for them (rstb_serve). */
 typedef struct { uint64_t index,size; char *path; dev_t dev; ino_t ino; struct timespec mtime; char *name; } Overlay;
 static Overlay *overlays; /* sorted by RomFS index after overlay_init */
 static size_t noverlay,overlay_cap;
@@ -161,7 +164,10 @@ static void sha_range(int fd,uint64_t offset,uint64_t size,const char *expected,
 static uint64_t lower(const char *name);
 static int path_ok(const char *p);
 static size_t nbuild;   /* overlays[0..nbuild): the build's own layers (patches, HeapDef); the player's come after */
+static size_t npatch;   /* overlays[0..npatch): scripts/make_romfs_patches.py; [npatch..nbuild): the HeapDef overlay */
 static size_t build_owner(uint64_t i,const char *name);
+static int build_yield(size_t owner,const char *who,const char *name);
+static int capture_refix(const char *who,const char *name,const char *file,const struct stat *st,char *out,size_t cap);
 static void overlay_load(const char *dir,int required,int player) {
  char path[4096];need(snprintf(path,sizeof(path),"%s/manifest.tsv",dir)<(int)sizeof(path),"RomFS overlay path");FILE *m=fopen(path,"r");
  if(!m&&required){fprintf(stderr,"[totk] RomFS overlay: %s missing; build it with scripts/make_output_res_overlay.py <w>x<h>\n",path);runtime_fail("true-2K HeapDef overlay missing (make romfs-patches-out OUTPUT_RES=<w>x<h>)");}
@@ -173,13 +179,15 @@ static void overlay_load(const char *dir,int required,int player) {
   need(path_ok(name),"RomFS overlay path");uint64_t i=lower(name);int known=i<file_count&&!strcmp(entry_name(entry(i)),name),add=!strcmp(orig,"-");
   if(!known&&!add){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv names %s, which the RomFS lacks; a new file has \"-\" as its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay names a file the RomFS lacks");}
   if(known&&add){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv adds %s, which the RomFS already has; give its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay adds a file the RomFS already has");}
-  /* A player's file the build's layers also change: the build's copy is kept (it is what the port needs), the start goes on. */
-  size_t owner=player?build_owner(known?i:ADDED,name):0;
-  if(owner){fprintf(stderr,"[totk] RomFS overlay: %s/%s is also changed by the build's patches (%s); the build's copy is used\n",dir,name,overlays[owner-1].path);continue;}
+  /* A player's file the build's layers also change: build_yield decides (the build's copy where the port needs it). */
+  size_t owner=player?build_owner(known?i:ADDED,name):0;int yield=owner?build_yield(owner,dir,name):0;
+  if(owner&&!yield)continue;
+  if(owner)first--;   /* the build's slot is gone */
   Entry e={0};if(known){e=entry(i);sha_range(image_fd,e.offset,e.size,orig,"original");}else i=ADDED;
   char file[8200];need(snprintf(file,sizeof(file),"%s/%s",dir,name)<(int)sizeof(file),"RomFS overlay file path");int fd=open(file,O_RDONLY|O_CLOEXEC);struct stat st;
   need(fd>=0&&fstat(fd,&st)==0&&(uint64_t)st.st_size==size,"RomFS overlay file missing or wrong size");sha_range(fd,0,size,sha,name);close(fd);
   hashed+=e.size+size;
+  char fixed[4096];if(yield==MODS_BUILD_REFIX&&capture_refix(dir,name,file,&st,fixed,sizeof fixed)){need(stat(fixed,&st)==0,"RomFS overlay fixed copy");snprintf(file,sizeof file,"%s",fixed);size=(unsigned long long)st.st_size;}
   if(noverlay==overlay_cap){overlay_cap=overlay_cap?overlay_cap*2:16;overlays=realloc(overlays,overlay_cap*sizeof(*overlays));need(overlays!=NULL,"RomFS overlay table");}
   char *copy=strdup(file),*rel=strdup(name);need(copy&&rel,"RomFS overlay path copy");overlays[noverlay++]=(Overlay){i,size,copy,st.st_dev,st.st_ino,st.st_mtimespec,rel};
   if(noverlay-first<=16)fprintf(stderr,"[totk] RomFS overlay: %s (%llu bytes) %s\n",name,size,add?"is added":"replaces the original");
@@ -191,6 +199,17 @@ static void overlay_load(const char *dir,int required,int player) {
 /* The build layer's overlay slot + 1 that already changes RomFS file i (or adds name, i = ADDED), else 0. */
 static size_t build_owner(uint64_t i,const char *name) {
  for(size_t k=0;k<nbuild;k++)if(overlays[k].index==i&&(i!=ADDED||!strcmp(overlays[k].name,name)))return k+1;return 0;
+}
+/* A player's file at a path build slot owner-1 changes: MODS_BUILD_KEEP (0 here: the build's copy stays, the player's is
+   left out) for what the port needs, else the build's slot is removed and the player's copy is used (MODS_BUILD_MOD_WINS,
+   or MODS_BUILD_REFIX: with the build's fix applied to it again). */
+static int build_yield(size_t owner,const char *who,const char *name) {
+ size_t k=owner-1;int r=k>=npatch?MODS_BUILD_KEEP:mods_build_collision(name);
+ if(r==MODS_BUILD_KEEP){fprintf(stderr,"[totk] mods: %s: %s is also changed by the port (%s), which needs its own copy (the heap sizes for the output resolution); the mod's copy is left out\n",who,name,overlays[k].path);return 0;}
+ fprintf(stderr,"[totk] mods: %s: %s is also changed by the port's own patches (%s); the mod's copy is used%s\n",who,name,overlays[k].path,
+  r==MODS_BUILD_REFIX?", with the port's quick-menu background fix applied to it again":" and the port's patch is left out");
+ free(overlays[k].path);free(overlays[k].name);memmove(&overlays[k],&overlays[k+1],(noverlay-k-1)*sizeof(*overlays));noverlay--;nbuild--;if(k<npatch)npatch--;
+ return r;
 }
 static int overlay_order(const void *a,const void *b) {uint64_t x=((const Overlay *)a)->index,y=((const Overlay *)b)->index;return (x>y)-(x<y);}
 static int added_order(const void *a,const void *b) {const Overlay *x=*(Overlay *const *)a,*y=*(Overlay *const *)b;return strcmp(x->name,y->name);}
@@ -220,7 +239,7 @@ static int folder_exists(const char *folder) {
 static uint32_t overlay_slot(uint64_t i) {size_t lo=0,hi=noverlay;while(lo<hi){size_t m=lo+(hi-lo)/2;if(overlays[m].index<i)lo=m+1;else hi=m;}return lo<noverlay&&overlays[lo].index==i?(uint32_t)(lo+1):0;}
 /* The player's mods folder (mods.h, runtime/mods.c): each enabled mod's files in load order, the first mod's copy of a path
    only, as overlay entries; no manifest and no hashing (nothing to compare with: a mod is whatever the player put there).
-   The identity check at open time still applies. A file a build layer already changes is left to the build. */
+   The identity check at open time still applies. A file a build layer already changes: build_yield. */
 static uint32_t *folded;   /* RomFS indices in case-insensitive order, built on the first miss */
 static int folded_order(const void *a,const void *b) {return strcasecmp(entry_name(entry(*(const uint32_t *)a)),entry_name(entry(*(const uint32_t *)b)));}
 static int romfs_lookup(const char *p,char *real,size_t cap) {
@@ -242,20 +261,26 @@ static void mods_load(void) {
   for(unsigned b=MOD_HAS_CODE;b<=MOD_EMPTY;b<<=1)if(m.flags&b){
    if(b==MOD_CONFLICT)fprintf(stderr,"[totk] mods:    %u of its files are also changed by a mod higher in the list; that mod's copies are used\n",m.conflicts);
    else fprintf(stderr,"[totk] mods:    %s\n",mods_notice(b));}}
- const ModFile *f;int nf=mods_files(&f);size_t first=noverlay;unsigned replaced=0,addn=0,kept=0;
+ const ModFile *f;int nf=mods_files(&f);size_t first=noverlay;unsigned replaced=0,addn=0,kept=0,overrode=0;
  for(int k=0;k<nf;k++){
   ModInfo m;if(mods_get(f[k].mod,&m))continue;
   if(!path_ok(f[k].path)){fprintf(stderr,"[totk] mods: %s: %s is not a usable RomFS path; left out\n",m.folder,f[k].path);continue;}
   uint64_t i=f[k].replaces?lower(f[k].path):ADDED;if(i!=ADDED&&(i>=file_count||strcmp(entry_name(entry(i)),f[k].path)))i=ADDED;
   size_t owner=0;for(size_t j=0;j<first&&!owner;j++)if(overlays[j].index==i&&(i!=ADDED||!strcmp(overlays[j].name,f[k].path)))owner=j+1;
-  if(owner){fprintf(stderr,"[totk] mods: %s: %s is also changed by %s (%s); that copy is used\n",m.folder,f[k].path,owner<=nbuild?"the build's patches":"the older mods/" TOTK_GAME_DIR " folder",overlays[owner-1].path);kept++;continue;}
+  if(owner>nbuild){fprintf(stderr,"[totk] mods: %s: %s is also changed by the older mods/" TOTK_GAME_DIR " folder (%s); that copy is used\n",m.folder,f[k].path,overlays[owner-1].path);continue;}
   struct stat st;if(stat(f[k].file,&st)||!S_ISREG(st.st_mode)){fprintf(stderr,"[totk] mods: %s: %s is gone; left out\n",m.folder,f[k].file);continue;}
-  push_overlay(i,f[k].file,f[k].path,&st);if(i==ADDED)addn++;else replaced++;
+  int yield=owner?build_yield(owner,m.folder,f[k].path):0;
+  if(owner&&!yield){kept++;continue;}
+  if(owner){first--;overrode++;}   /* the build's slot is gone */
+  const char *file=f[k].file;char fixed[4096];
+  if(yield==MODS_BUILD_REFIX&&capture_refix(m.folder,f[k].path,f[k].file,&st,fixed,sizeof fixed)){need(stat(fixed,&st)==0,"mods: fixed copy stat");file=fixed;}
+  push_overlay(i,file,f[k].path,&st);if(i==ADDED)addn++;else replaced++;
   if(noverlay-first<=16)fprintf(stderr,"[totk] mods: %s: %s (%llu bytes) %s\n",m.folder,f[k].path,(unsigned long long)st.st_size,i==ADDED?"is added":"replaces the original");
  }
  if(noverlay-first>16)fprintf(stderr,"[totk] mods: %zu more files not listed\n",noverlay-first-16);
  fprintf(stderr,"[totk] mods: %s: %d installed, %d on; %u files replace the game's, %u are added",dir,n,on,replaced,addn);
- if(kept)fprintf(stderr,", %u left to the build's own copies",kept);
+ if(overrode)fprintf(stderr,", %u in place of the port's own patches",overrode);
+ if(kept)fprintf(stderr,", %u left to the port's own copies",kept);
  fprintf(stderr," (%.2f s)\n",(runtime_now_ns()-t0)/1e9);
  mods_mark_loaded();
 }
@@ -307,6 +332,44 @@ static uint8_t *zs_decompress(const uint8_t *src,size_t n,size_t *out) {
   if(o.pos==o.size){if(cap>=(1u<<30))break;uint8_t *g=realloc(b,cap*2);if(!g)break;b=g;cap*=2;o.dst=b;o.size=cap;}
   else if(in.pos==in.size)break;}   /* the frame ends early */
  free(b);ZSTD_freeDCtx(c);return NULL;
+}
+/* A player's Common layout archive (UI mods: button glyphs, HUD) with the build's quick-menu background fix applied again
+   (mods_capture_fix), served as a zstd frame of raw blocks from <mods>/.cache: capture-fix-<path digest>.blarc.zs, its
+   .key holding the player file's size, modification time and path and the verdict, so the next start with the same file
+   reads nothing. 1 = out names the file to serve; 0 = the player's file is served unchanged (its archive differs from the
+   game's where the fix goes, or it does not read), and the log says the fix is not applied. */
+static int capture_refix(const char *who,const char *name,const char *file,const struct stat *st,char *out,size_t cap) {
+ uint64_t t0=runtime_now_ns();char key[4400],cache[4096],keyfile[4400],saved[5000]={0};
+ snprintf(key,sizeof key,"totk-capture-fix-1\t%llu\t%lld.%09ld\t%s",(unsigned long long)st->st_size,(long long)st->st_mtimespec.tv_sec,(long)st->st_mtimespec.tv_nsec,file);
+ uint8_t d[32];CC_SHA256(file,(CC_LONG)strlen(file),d);
+ snprintf(cache,sizeof cache,"%s/.cache",mods_dir());
+ if(mkdir(cache,0755)&&errno!=EEXIST){const char *t=getenv("TMPDIR");snprintf(cache,sizeof cache,"%s",t&&*t?t:"/tmp");}
+ if(snprintf(out,cap,"%s/capture-fix-%02x%02x%02x%02x%02x%02x%02x%02x.blarc.zs",cache,d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7])>=(int)cap)return 0;
+ snprintf(keyfile,sizeof keyfile,"%s.key",out);
+ FILE *kf=fopen(keyfile,"r");if(kf){size_t r=fread(saved,1,sizeof saved-1,kf);saved[r]=0;fclose(kf);}
+ size_t kl=strlen(key);struct stat cs;
+ if(!strncmp(saved,key,kl)&&saved[kl]=='\n'){
+  const char *verdict=saved+kl+1;
+  if(!strncmp(verdict,"fixed\n",6)&&!stat(out,&cs)&&S_ISREG(cs.st_mode)&&cs.st_size>0){
+   fprintf(stderr,"[totk] mods: %s: %s: the quick-menu background fix is applied to the mod's copy (cached: %s)\n",who,name,out);return 1;}
+  if(!strncmp(verdict,"unchanged\t",10)){fprintf(stderr,"[totk] mods: %s: %s: %s (cached)\n",who,name,verdict+10);return 0;}
+ }
+ size_t n=0,m=0;uint8_t *raw=host_file(file,&n,256u<<20),*plain=raw?zs_decompress(raw,n,&m):NULL;free(raw);
+ char why[300]="the archive does not decompress",line[600];int moved=plain?mods_capture_fix(plain,m,why,sizeof why):-1;
+ if(moved<=0){
+  if(moved<0)snprintf(line,sizeof line,"the port's quick-menu background fix was not applied (%s); the mod's file is used unchanged, so the quick menus' background can be black at 60 fps",why);
+  else snprintf(line,sizeof line,"the mod's copy already has the quick-menu background fix; used unchanged");
+  fprintf(stderr,"[totk] mods: %s: %s: %s\n",who,name,line);free(plain);
+  kf=fopen(keyfile,"w");if(kf){fprintf(kf,"%s\nunchanged\t%s\n",key,line);fclose(kf);}
+  return 0;}
+ size_t fn=0;uint8_t *frame=mods_zstd_raw_frame(plain,m,&fn);free(plain);if(!frame)return 0;
+ char tmp[4300];snprintf(tmp,sizeof tmp,"%s.%ld.tmp",out,(long)getpid());int fd=open(tmp,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0644);
+ int ok=fd>=0&&write(fd,frame,fn)==(ssize_t)fn;if(fd>=0)ok&=!close(fd);free(frame);
+ if(!ok||rename(tmp,out)){unlink(tmp);fprintf(stderr,"[totk] mods: %s: %s: cannot write %s (%s); the mod's file is used without the quick-menu background fix\n",who,name,out,strerror(errno));return 0;}
+ kf=fopen(keyfile,"w");if(kf){fprintf(kf,"%s\nfixed\n",key);fclose(kf);}
+ fprintf(stderr,"[totk] mods: %s: %s: the port's quick-menu background fix is applied to the mod's copy (%d visibility keys moved from frame 1 to 0; %zu bytes, zstd raw blocks, %s, %.2f s)\n",
+  who,name,moved,fn,out,(runtime_now_ns()-t0)/1e9);
+ return 1;
 }
 typedef struct {char **paths;uint32_t *values;size_t n,cap;} Estimates;
 static void est_add(Estimates *e,const char *path,uint32_t v) {
@@ -387,6 +450,7 @@ static void rstb_serve(size_t from) {
    <w>x<h>[-scene-<sw>x<sh>] (the HeapDef sizes, scripts/make_output_res_overlay.py; runtime_heap_overlay names it); then the player's older folder TOTK_ROMFS_MODS (0 = none) and the mods folder (TOTK_MODS_DIR, 0 = none). */
 static void overlay_init(void) {
  const char *dir=getenv("TOTK_ROMFS_PATCHES");if(!dir||strcmp(dir,"0"))overlay_load(dir?dir:"extracted/" TOTK_GAME_DIR "/romfs-patches",0,0);
+ npatch=noverlay;
  char name[64];if(runtime_heap_overlay(name,sizeof name)){const char *out=getenv("TOTK_ROMFS_PATCHES_OUT");char d[4096];
   need(snprintf(d,sizeof(d),"%s/%s",out?out:"extracted/" TOTK_GAME_DIR "/romfs-patches-out",name)<(int)sizeof(d),"RomFS output overlay path");overlay_load(d,1,0);}
  nbuild=noverlay;
