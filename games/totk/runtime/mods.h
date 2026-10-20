@@ -1,0 +1,51 @@
+/* Player mods (runtime/mods.c): the installed mods, their order and what the game loads from them. Shared by the loader
+   (runtime/romfs.c serves the files), the Mac and iPhone / iPad menus (the Mods tab) and the mod browser
+   (runtime/mod_browser.m installs from GameBanana).
+
+   Layout, under the mods folder (Mac: ~/Library/Application Support/MacNativeGames/TOTK/mods, iPhone / iPad: the app's
+   Documents/mods, visible in Files; TOTK_MODS_DIR overrides):
+     mods.txt             the load order: one folder name per line, "-" in front = installed but off; first line wins a
+                          file two mods both change. Folders not listed are added at the end, on.
+     <Mod>/romfs/...      RomFS files at their game paths, as Yuzu / Ryujinx / Atmosphère mods ship them. A folder
+                          whose top level already is RomFS paths (Pack/, Model/, UI/, ...) counts as romfs/ itself.
+     <Mod>/exefs/...      code patches (pchtxt, ips, subsdk): detected and reported, not applied yet.
+     <Mod>/mod.json       optional: what the browser knows (name, author, version, source ids, game versions it names).
+   Every file a mod ships is checked against the game's RomFS at start (replaces a file, or adds one); a mod's own
+   ResourceSizeTable is left out and the runtime fixes the 1.4.3 table for the files mods change instead. Changes to the
+   list apply at the next start. The older single folder mods/<v143>/ with manifest.tsv keeps working. */
+#pragma once
+#include <stddef.h>
+#include <stdint.h>
+
+enum {   /* ModInfo.flags: what the menu shows next to a mod */
+    MOD_HAS_ROMFS = 1,           /* files the game loads */
+    MOD_HAS_CODE = 2,            /* exefs/ code patches: not applied (the port's code is translated ahead of time) */
+    MOD_OWN_RSTB = 4,            /* shipped its own ResourceSizeTable: left out, the runtime's fixed table is used */
+    MOD_OLD_VERSION = 8,         /* mod.json or its name says another game version (e.g. 1.2.1): may not work on 1.4.3 */
+    MOD_CONFLICT = 16,           /* changes a file an earlier mod in the list also changes: that mod's copy is used */
+    MOD_TKCL = 32,               /* a TKMM .tkcl package: not supported yet */
+    MOD_EMPTY = 64,              /* nothing the game can load */
+};
+
+typedef struct {
+    char folder[256];            /* the folder name under mods/, the mod's id */
+    char name[256];              /* mod.json name, else the folder name */
+    char author[128], version[64];
+    char game_versions[64];      /* e.g. "1.2.1, 1.4.x" from mod.json; "" = not stated */
+    int enabled;                 /* 1 = loaded at the next start */
+    unsigned flags;              /* MOD_* */
+    unsigned files, conflicts;   /* RomFS files it ships; files an earlier mod already changes */
+    uint64_t bytes;
+    int64_t gamebanana_id;       /* mod.json source: the GameBanana mod (0 = none) */
+} ModInfo;
+
+const char *mods_dir(void);                      /* the mods folder (created on first use) */
+int mods_scan(void);                             /* reads the folder and mods.txt again; returns the count */
+int mods_count(void);
+int mods_get(int i, ModInfo *out);               /* in load order; 0 on success */
+int mods_set_enabled(const char *folder, int on);
+int mods_move(const char *folder, int to_index); /* load order */
+int mods_remove(const char *folder);             /* deletes the folder */
+int mods_save(void);                             /* writes mods.txt; 0 on success */
+int mods_changed_since_start(void);              /* 1: the list differs from what the game loaded (restart to apply) */
+const char *mods_notice(unsigned flags);         /* one line for a flag, for the menu */
