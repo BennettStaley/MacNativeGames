@@ -96,7 +96,3 @@ runtime, the iOS app and `tests/test_settings.c`.
 Test runs drive the menu's own code path through `TOTK_INPUT_FILE`: `set <key> <value>` changes a setting as the menu
 does (`set display.scale 50`, `set graphics.aa smaa`), `menu` opens or closes the Mac menu, `menukey <Mac key code>`
 presses a key in it, and `settings-shot <png>` saves the Mac menu as a picture.
-
-## Credits
-
-Several settings follow features first offered on Switch and emulators by MaxLastBreath's UltraCam (https://gamebanana.com/mods/480138) and NX Optimizer (https://github.com/MaxLastBreath/nx-optimizer). This port reimplements them independently for 1.4.3 and contains none of their code.

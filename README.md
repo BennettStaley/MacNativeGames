@@ -226,6 +226,7 @@ Recorded performance experiments, remaining work and comparison methods: [Mac pe
 
 ## Acknowledgements
 
+- **[UltraCam](https://gamebanana.com/mods/480138)** and **[NX Optimizer](https://github.com/MaxLastBreath/nx-optimizer)** by **MaxLastBreath**: the ideas behind several settings (time of day speed, fog, depth of field, bloom, shadow resolution, render distance, camera speed, hiding the HUD). No UltraCam or NX Optimizer code or binaries are included; each setting is this port's own 1.4.3 implementation.
 - **[d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)** (MIT) developed this way of running Switch games natively (for Diablo II: Resurrected): the NSO rewriter, the Horizon host and the NVN-on-Metal layer here started as its generic parts.
 - **[nxnative](https://github.com/seedds/nxnative)**: the one-script packaging and NSP common-ticket import follow its approach.
 - **Ryujinx** (MIT): its shader translator (`vendor/ryujinx`) turns the game's Maxwell shaders into SPIR-V, and its system-service code is a reference. With this project's patches and service it is compiled ahead of time (.NET NativeAOT) into `games/totk/prebuilt/macos-arm64/totk_xlate`; `games/totk/tools/totk_xlate/publish_native.sh` rebuilds it (needs the .NET 10 SDK, only for developers).
