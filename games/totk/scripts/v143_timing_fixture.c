@@ -27,6 +27,7 @@ int main(int argc,char **argv){
  printf("{\"pin\":[%.9g,%.9g,%.9g]",values[0],values[1],values[2]);
  const char *ask=getenv("FIXTURE_RENDER_REQUEST");unsigned rw,rh;   /* a live scene size, latched by the next present */
  if(ask&&sscanf(ask,"%ux%u",&rw,&rh)==2&&runtime_render_request(rw,rh))return 3;
+ const char *fog=getenv("FIXTURE_FOG");if(fog)runtime_fog_set(atoi(fog));   /* the settings menu's live fog density */
  runtime_frame_step_pin(0);runtime_frame_step_update(1000000000ULL);runtime_frame_step_update(1025000000ULL);
  memcpy(values,base+data,sizeof values);printf(",\"sample\":[%.9g,%.9g,%.9g]}\n",values[0],values[1],values[2]);
  f=fopen(argv[2],"wb");if(!f||fwrite(base,1,size,f)!=size||fclose(f))return 2;
