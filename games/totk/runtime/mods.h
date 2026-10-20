@@ -49,3 +49,40 @@ int mods_remove(const char *folder);             /* deletes the folder */
 int mods_save(void);                             /* writes mods.txt; 0 on success */
 int mods_changed_since_start(void);              /* 1: the list differs from what the game loaded (restart to apply) */
 const char *mods_notice(unsigned flags);         /* one line for a flag, for the menu */
+
+/* Added for the loader (runtime/romfs.c) and tests/test_mods.c; the menus need none of this.
+
+   mod.json fields read (at any depth, the first one found): "name" / "title", "author" / "submitter", "version",
+   "game_versions" / "gameVersions" / "game_version" (a string or a list of strings), "gamebanana_id" / "gamebananaId" /
+   "gamebanana" (a number or digits). Other fields are ignored. A folder named like the older single folder (v143 ...)
+   that holds a manifest.tsv is that older layout and not listed. */
+typedef struct {
+    const char *path;            /* the RomFS path, in the RomFS's own case when the mod spelled it otherwise */
+    const char *file;            /* the file on disk */
+    uint64_t size;
+    int mod;                     /* index in load order (mods_get) */
+    int replaces;                /* 1: replaces a RomFS file, 0: adds one (only known with a RomFS lookup) */
+} ModFile;
+/* How mods.c asks the game's RomFS about a path: 0 = no such file, 1 = exact, 2 = only by case (the RomFS's spelling
+   written to real). Without one (tests, a menu outside the game) every file counts as a replacement, spelt as shipped. */
+typedef int (*ModsRomfsLookup)(const char *path, char *real, size_t cap);
+void mods_set_romfs_lookup(ModsRomfsLookup lookup);
+int mods_files(const ModFile **out);             /* the enabled mods' files from the last mods_scan: each path once, the
+                                                    first mod's copy, in load order; returns the count */
+void mods_mark_loaded(void);                     /* the loader: what mods_changed_since_start compares with */
+
+/* The ResourceSizeTable (RESTBL; 1.4.3: MODS_RSTB_PATH): the memory the game sets aside for each resource, keyed by the
+   CRC32 of its path without .zs / .mc, with a name table for paths whose CRC32 collides. */
+#define MODS_RSTB_PATH "System/Resource/ResourceSizeTable.Product.143.Nin_NX_NVN.rsizetable.zs"
+/* The size to reserve for a resource (TkSharp's calculator): size = decompressed bytes; data = the decompressed bytes
+   for the types that need them (mods_rstb_needs_data), else NULL. 0 = leave the entry alone (streams, the table). */
+uint32_t mods_rstb_estimate(const char *path, uint64_t size, const uint8_t *data, size_t len);
+int mods_rstb_needs_data(const char *path);
+typedef struct { unsigned raised, added, kept, skipped; } ModsRstbStats;
+/* Each path's entry becomes max(the table's, value); missing paths are added. Returns a malloc'd table (*out_len) or
+   NULL when table is not a RESTBL. */
+uint8_t *mods_rstb_patch(const uint8_t *table, size_t len, const char *const *paths, const uint32_t *values, size_t n,
+                         size_t *out_len, ModsRstbStats *stats);
+uint32_t mods_crc32(const char *s);
+/* A zstd frame of uncompressed ("raw") blocks: valid zstd without an encoder. Returns a malloc'd frame (*out_len). */
+uint8_t *mods_zstd_raw_frame(const uint8_t *data, size_t len, size_t *out_len);
