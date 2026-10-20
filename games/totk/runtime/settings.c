@@ -116,6 +116,7 @@ static int apply_live(const SettingDef *d, int v) {
     else if (!strcmp(d->key, "graphics.lod_bias")) dm_gfx_set_flag("lod_bias", v);
     else if (!strcmp(d->key, "framerate.cap")) nvn_fps_cap_set(v);
     else if (!strcmp(d->key, "interface.readout")) fps_overlay_set_hints(v);
+    else if (!strcmp(d->key, "interface.shader_counter")) { extern void shader_overlay_set(int on); shader_overlay_set(v); }
     else if (!strcmp(d->key, "interface.readout_detail")) fps_overlay_set_detail(v);
     else if (!strcmp(d->key, "interface.hide_hud")) dm_gfx_set_flag("hide_hud", v);
     else if (!strcmp(d->key, "graphics.dof")) dm_gfx_set_flag("dof", v);

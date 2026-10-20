@@ -43,6 +43,7 @@ int fps_overlay_line_pixel_font(const char *text);   // 0: the line has a charac
 /* TOTK automatic shader collection, bottom-left box (2026-10-16 night): "SHADER +<new>/<in the cache> PSO +<new pipelines>",
    yellow for 3 s after something new was collected. TOTK_SHADER_OVERLAY=0 hides it (default on on the Mac, off on iOS). */
 int shader_overlay_enabled(void);
+void shader_overlay_set(int on);   /* the settings menu's Shader counter, live */
 void shader_overlay_text(char *out, size_t n, uint64_t compiling, uint64_t fresh, int64_t total, uint64_t pipelines);   /* total < 0: "--" (not counted yet) */
 /* Record that the game's present number `ticket` reached the screen at now_s (seconds). The rate of game presents is
    re-measured every half second; fps_overlay_value() returns it, or -1 before the first measurement. */

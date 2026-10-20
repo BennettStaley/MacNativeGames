@@ -113,7 +113,7 @@ static const SettingDef SETTINGS[] = {
     {"interface.hide_hud", "Interface", "Hide the HUD", "Hides the game's hearts, map, prompts and menus for clean screenshots (F2 on a Mac keyboard). Turn it off to use menus.",
      NULL, SET_BOOL, SET_LIVE, SET_ALL, 0, 0, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"interface.shader_counter", "Interface", "Shader counter", "New shaders collected while you play.",
-     "TOTK_SHADER_OVERLAY", SET_BOOL, SET_RESTART, SET_ALL, 1, 0, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
+     "TOTK_SHADER_OVERLAY", SET_BOOL, SET_LIVE, SET_ALL, 1, 0, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"interface.touch_controls", "Interface", "Touch controls", "When the on-screen controller shows.",
      NULL, SET_CHOICE, SET_LIVE, SET_IOS, 1, 1, 0, 0, 0, NULL, SET_TOUCH, SET_N(SET_TOUCH), "Only on iPhone and iPad.", NULL, 0},
     {"interface.touch_opacity", "Interface", "Touch control opacity", NULL,

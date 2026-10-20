@@ -210,7 +210,14 @@ int hud_snapshot(int line, char *out, size_t n, int *highlight) {
     return set;
 }
 
+/* The settings menu's Shader counter, live: on / off now; off also takes its line out of the corner panel. */
+static _Atomic int g_shader_overlay = -1;
+void shader_overlay_set(int on) {
+    atomic_store(&g_shader_overlay, on ? 1 : 0);
+    if (!on) { pthread_mutex_lock(&g_hud_mu); g_hud_set[HUD_SHADER] = 0; pthread_mutex_unlock(&g_hud_mu); }
+}
 int shader_overlay_enabled(void) {
+    int set = atomic_load(&g_shader_overlay); if (set >= 0) return set;
     static int on = -1;
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
     const int def = 0;   // the phone translates nothing (misses go to shader-requests/)
