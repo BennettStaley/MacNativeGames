@@ -52,6 +52,11 @@ Limits and why:
   display) the limit holds each frame for whole refreshes (30 fps = 4 refreshes at 120 Hz); 40 needs a 120 Hz display.
 - **Performance readout**, **shader counter** (after restart), and on iPhone / iPad the **touch controls** (when they
   show, opacity, size) and the **settings button**.
+- **Button prompts**: the button icons the game shows: *Automatic* (the last controller you connected: Xbox icons for an
+  Xbox controller, PlayStation icons for a DualSense or DualShock, the game's own otherwise), *Switch*, *Xbox* or
+  *PlayStation*. Xbox and PlayStation use a button-icon mod installed from the Mods tab (for Xbox: "Xbox UI for
+  v1.4.3" on GameBanana); the setting turns exactly one of them on at start and the others off, so going back to the
+  game's own icons is one choice, not uninstalling. Applies after a restart (the game loads its icons once at boot).
 - **Face buttons** (PlayStation and Xbox by position or by label), **rumble** and **motion controls** (Mac).
 - **Volume**.
 

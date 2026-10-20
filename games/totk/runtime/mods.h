@@ -26,6 +26,7 @@ enum {   /* ModInfo.flags: what the menu shows next to a mod */
     MOD_CONFLICT = 16,           /* changes a file an earlier mod in the list also changes: that mod's copy is used */
     MOD_TKCL = 32,               /* a TKMM .tkcl package: not supported yet */
     MOD_EMPTY = 64,              /* nothing the game can load */
+    MOD_PROMPTS = 128,           /* button icons (Xbox / PlayStation): switched by the Controls › Button prompts setting */
 };
 
 typedef struct {
@@ -38,6 +39,7 @@ typedef struct {
     unsigned files, conflicts;   /* RomFS files it ships; files an earlier mod already changes */
     uint64_t bytes;
     int64_t gamebanana_id;       /* mod.json source: the GameBanana mod (0 = none) */
+    int prompts;                 /* MOD_PROMPTS: the style its button icons are (MODS_PROMPTS_XBOX / _PLAYSTATION), else 0 */
 } ModInfo;
 
 const char *mods_dir(void);                      /* the mods folder (created on first use) */
@@ -50,6 +52,12 @@ int mods_remove(const char *folder);             /* deletes the folder */
 int mods_save(void);                             /* writes mods.txt; 0 on success */
 int mods_changed_since_start(void);              /* 1: the list differs from what the game loaded (restart to apply) */
 const char *mods_notice(unsigned flags);         /* one line for a flag, for the menu */
+/* Button prompts (settings: controls.prompts): a mod that changes the game's button-icon archive
+   (UI/LayoutArchive/Common.Product.*.blarc.zs) and whose mod.json "prompts" or name says Xbox or PlayStation is a
+   prompts mod. mods_set_prompts picks the style before mods_scan: the first prompts mod of that style in the list is on,
+   every other prompts mod off (MODS_PROMPTS_SWITCH: all off, the game's own icons); 0 leaves mods.txt as it is. */
+enum { MODS_PROMPTS_SWITCH = 1, MODS_PROMPTS_XBOX = 2, MODS_PROMPTS_PLAYSTATION = 3 };
+void mods_set_prompts(int style);
 
 /* Added for the loader (runtime/romfs.c) and tests/test_mods.c; the menus need none of this.
 

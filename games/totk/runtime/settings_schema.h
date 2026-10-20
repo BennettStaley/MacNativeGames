@@ -56,6 +56,8 @@ static const SettingChoice SET_AA[] = {{"The game's own", "game", "0", 0}, {"Off
 static const SettingChoice SET_ANISO[] = {{"The game's", "game", "0", 0}, {"2x", "2", "2", 2}, {"4x", "4", "4", 4}, {"8x", "8", "8", 8}, {"16x", "16", "16", 16}};
 static const SettingChoice SET_TOUCH[] = {{"Always", "always", NULL, 0}, {"Hide with a controller", "controller", NULL, 1},
                                           {"Until touched", "touch", NULL, 2}, {"Off", "off", NULL, 3}};
+static const SettingChoice SET_PROMPTS[] = {{"Automatic (your controller)", "auto", NULL, 0}, {"Switch (the game's own)", "switch", NULL, 1},
+                                            {"Xbox", "xbox", NULL, 2}, {"PlayStation", "playstation", NULL, 3}};
 static const SettingChoice SET_FACE[] = {{"Automatic", "auto", NULL, 0}, {"By position", "position", "position", 1},
                                          {"By label", "label", "label", 2}};
 #define SET_N(a) (int)(sizeof a / sizeof *a)
@@ -98,6 +100,8 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_RANGE, SET_LIVE, SET_IOS, 100, 100, 75, 150, 5, "%", NULL, 0, "Only on iPhone and iPad.", NULL, 0},
     {"interface.menu_button", "Interface", "Settings button", "A small gear at the top of the screen. Three fingers also open the menu.",
      NULL, SET_BOOL, SET_LIVE, SET_IOS, 1, 1, 0, 1, 1, NULL, NULL, 0, "Only on iPhone and iPad.", NULL, 0},
+    {"controls.prompts", "Controls", "Button prompts", "The button icons the game shows. Xbox and PlayStation use a button-icon mod from the Mods tab (e.g. \"Xbox UI for v1.4.3\"). Automatic follows the last controller you connected.",
+     NULL, SET_CHOICE, SET_RESTART, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_PROMPTS, SET_N(SET_PROMPTS), NULL, NULL, 0},
     {"controls.face_buttons", "Controls", "Face buttons", "PlayStation and Xbox buttons by position (as the game's prompts show them) or by their letters.",
      "TOTK_FACE_BUTTONS", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_FACE, SET_N(SET_FACE), NULL, NULL, 0},
     {"controls.rumble", "Controls", "Rumble", NULL,

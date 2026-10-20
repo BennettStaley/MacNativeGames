@@ -83,11 +83,22 @@ static const char *json_string(const char *p, char *out, size_t cap) {   /* p at
     return *p ? p + 1 : p;
 }
 static int json_key(const char *k, const char *const *names) { for (; *names; names++) if (!strcmp(k, *names)) return 1; return 0; }
+/* A button-icon style a text names: "xbox" -> Xbox, "playstation" / "ps4" / "ps5" / "dualsense" / "dualshock" ->
+   PlayStation; both or neither -> 0 (a "Controller UI (Xbox&PS)" mod is a choice inside, not one style). */
+static int prompts_style(const char *text) {
+    char low[600]; size_t n = 0; for (; text[n] && n < sizeof low - 1; n++) low[n] = (char)tolower((unsigned char)text[n]); low[n] = 0;
+    int xbox = strstr(low, "xbox") != NULL;
+    int ps = strstr(low, "playstation") || strstr(low, "ps4") || strstr(low, "ps5") || strstr(low, "dualsense") || strstr(low, "dualshock");
+    return xbox && !ps ? MODS_PROMPTS_XBOX : ps && !xbox ? MODS_PROMPTS_PLAYSTATION : 0;
+}
+static int prompt_choice;   /* mods_set_prompts */
+void mods_set_prompts(int style) { pthread_mutex_lock(&lock); prompt_choice = style; pthread_mutex_unlock(&lock); }
 static void read_mod_json(const char *path, ModInfo *m) {
     FILE *f = fopen(path, "rb"); if (!f) return;
     char *text = malloc(1 << 20); size_t n = text ? fread(text, 1, (1 << 20) - 1, f) : 0; fclose(f); if (!text) return; text[n] = 0;
     static const char *const NAME[] = {"name","title",NULL}, *const AUTHOR[] = {"author","submitter",NULL}, *const VERSION[] = {"version",NULL},
-        *const GAMES[] = {"game_versions","gameVersions","game_version",NULL}, *const GB[] = {"gamebanana_id","gamebananaId","gamebanana",NULL};
+        *const GAMES[] = {"game_versions","gameVersions","game_version",NULL}, *const GB[] = {"gamebanana_id","gamebananaId","gamebanana",NULL},
+        *const PROMPTS[] = {"prompts",NULL};
     int have_name = 0, have_author = 0, have_version = 0, have_games = 0, have_gb = 0;
     char key[64] = "", s[512];
     for (const char *p = text; *p;) {
@@ -102,6 +113,7 @@ static void read_mod_json(const char *path, ModInfo *m) {
             else if (json_key(key, VERSION) && !have_version) { copy(m->version, sizeof m->version, s); have_version = 1; }
             else if (json_key(key, GAMES) && !have_games) { copy(m->game_versions, sizeof m->game_versions, s); have_games = 1; }
             else if (json_key(key, GB) && !have_gb && isdigit((unsigned char)*s)) { m->gamebanana_id = strtoll(s, NULL, 10); have_gb = 1; }
+            else if (json_key(key, PROMPTS)) m->prompts = prompts_style(s);
             *key = 0;
         } else if (*p == '[') {   /* a list: game versions are joined, anything else skipped */
             int games = json_key(key, GAMES) && !have_games; *key = 0; p++;
@@ -236,6 +248,12 @@ static void analyse(Mod *m, int index) {
     m->count = nrecs - m->first;
     if (i->files) i->flags |= MOD_HAS_ROMFS; else i->flags |= MOD_EMPTY;
     if (old_version(i)) i->flags |= MOD_OLD_VERSION;
+    /* Button icons: only a mod that changes the icon archive counts, named by mod.json or by its name. */
+    int icons = 0;
+    for (size_t r = m->first; r < m->first + m->count && !icons; r++) icons = !strncmp(recs[r].path, "UI/LayoutArchive/Common.Product.", 32);
+    if (!icons) i->prompts = 0;
+    else if (!i->prompts) { char both[600]; snprintf(both, sizeof both, "%s %s", i->name, i->folder); i->prompts = prompts_style(both); }
+    if (i->prompts) i->flags |= MOD_PROMPTS;
 }
 
 /* ---- the list ---- */
@@ -313,6 +331,11 @@ int mods_scan(void) {
     for (size_t k = 0; k < nnames; k++) { add_mod(names[k], 1); free(names[k]); }
     free(names);
     for (int k = 0; k < nmods; k++) analyse(&mods[k], k);
+    if (prompt_choice) {   /* the Button prompts setting: one prompts mod of that style on, the others off */
+        int chosen = -1;
+        for (int k = 0; k < nmods; k++) if (mods[k].info.prompts && mods[k].info.prompts == prompt_choice && chosen < 0) chosen = k;
+        for (int k = 0; k < nmods; k++) if (mods[k].info.prompts) mods[k].info.enabled = k == chosen;
+    }
     resolve();
     int n = nmods; pthread_mutex_unlock(&lock);
     return n;
@@ -406,6 +429,7 @@ const char *mods_notice(unsigned flags) {
     if (flags & MOD_TKCL) return "A TKMM package (.tkcl): not supported yet. Use the mod's romfs folder instead.";
     if (flags & MOD_EMPTY) return "Nothing the game can load: no romfs folder (or several side by side: keep one).";
     if (flags & MOD_OLD_VERSION) return "Made for an older game version: may not work on 1.4.3.";
+    if (flags & MOD_PROMPTS) return "Button icons: switched on or off by Controls › Button prompts (after a restart).";
     if (flags & MOD_CONFLICT) return "Changes files a mod higher in the list also changes: that mod's copies are used.";
     if (flags & MOD_HAS_CODE) return "Has code patches (exefs): not applied; only its game files are loaded.";
     if (flags & MOD_OWN_RSTB) return "Ships its own ResourceSizeTable: left out, the game's table is adjusted instead.";

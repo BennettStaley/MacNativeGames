@@ -109,3 +109,12 @@ the game's table and raises the entry of every file the mods change or add (and 
 Before the mods folder, the port loaded one folder, `mods/<v0|v112|v121|v143>`, with a `manifest.tsv` written by
 `games/totk/scripts/make_mod_manifest.py` (each file's size and SHA-256 and its original's, checked at start). It still
 loads, before the mods folder's mods; it is not listed as a mod.
+
+## Button-icon mods
+
+A mod that changes the game's button-icon archive (`UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs`) and whose
+name (or `mod.json` `"prompts": "xbox"` / `"playstation"`) says Xbox or PlayStation is a *button prompts* mod. It is not
+switched in the Mods tab: **Settings › Controls › Button prompts** picks the style at each start (Automatic follows the
+last controller connected) and turns on the first installed mod of that style and every other button-icon mod off.
+Switch (the game's own icons) turns them all off. A mod that names both (a "Controller UI (Xbox & PS)" pack with options
+inside) is an ordinary mod.

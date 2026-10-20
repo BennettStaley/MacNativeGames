@@ -119,6 +119,21 @@ static int apply_live(const SettingDef *d, int v) {
     return 0;
 }
 
+/* The last controller connected (gamepad.m, settings_note_controller), for Button prompts: Automatic. Next to settings.txt. */
+static const char *controller_path(void) {
+    static char p[1100]; const char *slash = strrchr(path, '/');
+    if (slash) snprintf(p, sizeof p, "%.*s/last-controller.txt", (int)(slash - path), path); else snprintf(p, sizeof p, "last-controller.txt");
+    return p;
+}
+void settings_note_controller(const char *kind) {
+    if (!*path) return;
+    char was[32] = ""; FILE *f = fopen(controller_path(), "r");
+    if (f) { if (fgets(was, sizeof was, f)) was[strcspn(was, "\r\n")] = 0; fclose(f); }
+    if (!strcmp(was, kind)) return;
+    if ((f = fopen(controller_path(), "w"))) { fprintf(f, "%s\n", kind); fclose(f); }
+    fprintf(stderr, "[settings] last controller: %s (Button prompts: Automatic follows it at the next start)\n", kind);
+}
+
 void settings_init(const char *file) {
     pthread_mutex_lock(&lock);
     if (loaded) { pthread_mutex_unlock(&lock); return; }
@@ -140,6 +155,16 @@ void settings_init(const char *file) {
     for (int i = 0; i < SETTINGS_COUNT; i++)
         if (!SETTINGS[i].env && SETTINGS[i].apply == SET_LIVE && strncmp(SETTINGS[i].key, "display.", 8) && start[i] != settings_default(&SETTINGS[i], settings_ios())) apply_live(&SETTINGS[i], start[i]);
     display_apply(NULL);   /* the start sizes: the patches take them when they install */
+    /* Button prompts: which button-icon mod the mods folder loads this start (mods.c). */
+    extern void mods_set_prompts(int style);
+    int prompts = settings_get("controls.prompts");
+    if (prompts == 0) {   /* Automatic: the last controller connected (settings_note_controller) */
+        char kind[32] = ""; FILE *k = fopen(controller_path(), "r");
+        if (k) { if (fgets(kind, sizeof kind, k)) kind[strcspn(kind, "\r\n")] = 0; fclose(k); }
+        prompts = !strcmp(kind, "xbox") ? 2 : !strcmp(kind, "playstation") ? 3 : 1;
+        fprintf(stderr, "[settings] button prompts: automatic, %s (last controller: %s)\n", prompts == 2 ? "Xbox" : prompts == 3 ? "PlayStation" : "Switch", *kind ? kind : "none yet");
+    }
+    mods_set_prompts(prompts);
 }
 
 int settings_get(const char *key) {

@@ -144,6 +144,11 @@ static void attach_gamepad(GCController *controller) {
             (controller.vendorName ?: @"unknown").UTF8String,
             (controller.productCategory ?: @"unknown").UTF8String, face_by_position(controller) ? "position" : "label");
     runtime_feedback_attach(controller);
+    { /* Button prompts: Automatic picks the icons of the last controller connected (settings.c). */
+      NSString *c = [NSString stringWithFormat:@"%@ %@", controller.productCategory ?: @"", controller.vendorName ?: @""].lowercaseString;
+      extern void settings_note_controller(const char *kind);
+      settings_note_controller([c containsString:@"xbox"] ? "xbox" : ([c containsString:@"dualsense"] || [c containsString:@"dualshock"] || [c containsString:@"playstation"]) ? "playstation"
+                               : ([c containsString:@"switch"] || [c containsString:@"joy-con"] || [c containsString:@"nintendo"]) ? "nintendo" : "other"); }
     refresh_gamepads();
 }
 
