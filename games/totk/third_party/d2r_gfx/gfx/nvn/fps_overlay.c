@@ -209,11 +209,14 @@ int shader_overlay_enabled(void) {
     return on;
 }
 
-void shader_overlay_text(char *out, size_t n, uint64_t fresh, int64_t total, uint64_t pipelines) {
+/* "Shaders 2 compiling / 10 new / 18074 total" (user, 2026-10-20): what Metal is building right now (pipelines, the
+   warm-up's remaining items), shaders translated for the first time this session, and every shader in the cache. */
+void shader_overlay_text(char *out, size_t n, uint64_t compiling, uint64_t fresh, int64_t total, uint64_t pipelines) {
     char t[16];
     (void)pipelines;   // user 2026-10-17: the pipeline count is not shown
     if (total < 0) snprintf(t, sizeof t, "--"); else snprintf(t, sizeof t, "%lld", (long long)(total > 999999 ? 999999 : total));
-    snprintf(out, n, TOTK_UI("新着色器 %llu / 总计 %s", "New shaders %llu / total %s"), (unsigned long long)(fresh > 99999 ? 99999 : fresh), t);
+    snprintf(out, n, TOTK_UI("着色器 编译中 %llu / 本次新增 %llu / 总计 %s", "Shaders %llu compiling / %llu new / %s total"),
+             (unsigned long long)(compiling > 99999 ? 99999 : compiling), (unsigned long long)(fresh > 99999 ? 99999 : fresh), t);
 }
 
 /* A count's rate, re-measured every half second (game presents; interpolated frames shown). stale_s > 0: a gap longer

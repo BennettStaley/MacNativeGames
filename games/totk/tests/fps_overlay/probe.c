@@ -118,28 +118,28 @@ int main(void) {
     /* The automatic shader collection box (bottom-left, user 2026-10-17: "新着色器 N / 总计 M", no pipeline count): its text,
        bounds of the longest line at every scale, and the yellow highlight. */
     char line[96];
-    shader_overlay_text(line, sizeof line, 3, 7428, 12);
-    CHECK(!strcmp(line, "新着色器 3 / 总计 7428"), "shader box text \"%s\"", line);
-    shader_overlay_text(line, sizeof line, 0, -1, 0);
-    CHECK(!strcmp(line, "新着色器 0 / 总计 --"), "shader box text before the cache is counted \"%s\"", line);
-    shader_overlay_text(line, sizeof line, 123456, 9999999, 123456);
-    CHECK(!strcmp(line, "新着色器 99999 / 总计 999999"), "shader box text clamped \"%s\"", line);
+    shader_overlay_text(line, sizeof line, 2, 3, 7428, 12);
+    CHECK(!strcmp(line, "着色器 编译中 2 / 本次新增 3 / 总计 7428"), "shader box text \"%s\"", line);
+    shader_overlay_text(line, sizeof line, 0, 0, -1, 0);
+    CHECK(!strcmp(line, "着色器 编译中 0 / 本次新增 0 / 总计 --"), "shader box text before the cache is counted \"%s\"", line);
+    shader_overlay_text(line, sizeof line, 123456, 123456, 9999999, 123456);
+    CHECK(!strcmp(line, "着色器 编译中 99999 / 本次新增 99999 / 总计 999999"), "shader box text clamped \"%s\"", line);
     /* English labels (TOTK_UI_LANG=en, or a Mac whose language is not Chinese). */
     setenv("TOTK_UI_LANG", "en", 1);
-    shader_overlay_text(line, sizeof line, 3, 7428, 12);
-    CHECK(!strcmp(line, "New shaders 3 / total 7428"), "English shader box text \"%s\"", line);
+    shader_overlay_text(line, sizeof line, 2, 3, 7428, 12);
+    CHECK(!strcmp(line, "Shaders 2 compiling / 3 new / 7428 total"), "English shader box text \"%s\"", line);
     CHECK(!fps_overlay_line_pixel_font(line), "English shader line \"%s\" drawn with the pixel font, which lacks its lower-case letters", line);
     CHECK(fps_overlay_line_pixel_font("FPS 60  2560x1440"), "the FPS line left the pixel font");
     fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 1, 0, 0}, 2, px, &grown, &h);
     CHECK(grown > base + 40, "English MetalFX on: \"  MetalFX on\" after the size (box %d, without it %d)", grown, base);
     setenv("TOTK_UI_LANG", "zh", 1);
-    shader_overlay_text(line, sizeof line, 123456, 9999999, 123456);
+    shader_overlay_text(line, sizeof line, 123456, 123456, 9999999, 123456);
     CHECK(!fps_overlay_has_glyph('Q'), "negative control: 'Q' has no glyph in the pixel font but was reported");
     for (int s = 1; s <= FPS_OVERLAY_MAX_SCALE; s++) {
         fps_overlay_raster_line(line, s & 1, s, px, &w, &h);
         CHECK(w > 0 && h > 0 && w <= FPS_OVERLAY_TEX_W && h <= FPS_OVERLAY_TEX_H, "longest shader line at scale %d: box %dx%d outside the texture", s, w, h);
     }
-    shader_overlay_text(line, sizeof line, 3, 7428, 12);
+    shader_overlay_text(line, sizeof line, 2, 3, 7428, 12);
     fps_overlay_raster_line(line, 1, 3, px, &w, &h);
     colours(w, h, &green, &yellow);
     CHECK(h == 11 * 3 && yellow > 0 && green == 0 && outside_dirty(w, h) == 0, "highlighted line: box %dx%d, %d yellow and %d green pixels", w, h, yellow, green);

@@ -6082,6 +6082,9 @@ static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // 本次提交是�
 // time draws waited for a background compile, scans and which budget ended them.
 static uint64_t g_pp_full, g_pp_reclaimed, g_pp_waits, g_pp_wait_ns, g_pp_scans, g_pp_scan_ns, g_pp_stop[3];
 static void pso_predict_rest(void);
+/* The shader counter's "compiling": pipelines Metal is building in the background right now, plus the warm-up's items
+   still to go while it runs (warm_task_done). */
+static _Atomic int64_t g_compiling_now, g_warm_left;
 static int pso_pend_find(const pso_key *k) { for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !memcmp(&g_pp[i].k, k, sizeof *k)) return i; return -1; }
 // Called only with g_pp_mu held. An in-flight worker still owns its slot:
 // completion must be published before that slot can ever be reused. Negative 25 frees every slot.
@@ -6101,9 +6104,11 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // �
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
     MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++;
+    atomic_fetch_add(&g_compiling_now, 1);   // the shader counter's "compiling"
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
         pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
+        atomic_fetch_sub(&g_compiling_now, 1);
     });
 }
 static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交线程调：表里有就等它编完并取走；没有返回 nil | Called by the submit thread: if it is in the table, wait for it to finish compiling and take it; otherwise return nil
@@ -6325,7 +6330,7 @@ static void warm_plan(NSArray<NSString *> *paths, NSArray<NSString *> *files, NS
 }
 static void warm_task_done(uint64_t *done,uint64_t total,uint64_t shader_total,uint64_t pipeline_total,
                            NSDictionary<NSString *,NvShader *> *dict) {
-    ++*done;
+    ++*done; atomic_store(&g_warm_left, (int64_t)(total - *done));
     if (!(*done % 1024) || *done == total)
         MLOG("预热进度：已处理 %llu / %llu 项，着色器 %lu / %llu，管线 %llu / %llu",
              (unsigned long long)*done,(unsigned long long)total,(unsigned long)dict.count,(unsigned long long)shader_total,
@@ -11259,7 +11264,8 @@ static int shader_overlay_prepare(int slot, MTLViewport vp, MTLViewport *ovp, fl
     uint64_t fresh = 0, last = 0; int64_t total = -1; totk_rt_counts(&fresh, &total, &last);
     uint64_t pso = atomic_load(&g_collect_new[1]) + atomic_load(&g_collect_new[2]), plast = atomic_load(&g_collect_last_ns);
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), newest = last > plast ? last : plast;
-    char text[48]; shader_overlay_text(text, sizeof text, fresh, total, pso);
+    int64_t compiling = atomic_load(&g_compiling_now) + (atomic_load(&g_warm_running) ? atomic_load(&g_warm_left) : 0);
+    char text[64]; shader_overlay_text(text, sizeof text, compiling < 0 ? 0 : (uint64_t)compiling, fresh, total, pso);
     int hl = newest && now - newest < 3000000000ull, scale = fps_overlay_scale(vp.height);
     if (hud_compact()) { hud_publish(HUD_SHADER, text, hl); return 0; }
     pthread_mutex_lock(&mu);
