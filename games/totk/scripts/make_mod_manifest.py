@@ -7,13 +7,15 @@ Each line of the manifest names a path, the replacement's size and SHA-256 and t
 all of them at start, so a mod made for another game version stops the start instead of loading. A file the RomFS lacks
 is added (its original's SHA-256 is "-"), unless a RomFS path differs from it only in case: that is a misspelt
 replacement (paths are case-sensitive), so nothing is written. The originals come
-from the RomFS the app was built with: the app's Contents/Resources/totk/extracted/<version>/romfs (romfs.bin and
-runtime-index.bin), or a build work folder's extracted/<version>/romfs.
+from the RomFS the app was built with: the game-data folder its Contents/Resources/totk/game-data.json names (romfs.bin and
+runtime-index.bin; an app built with --embed-data has them in Contents/Resources/totk/extracted/<version>/romfs), or a
+build work folder's extracted/<version>/romfs.
 
 usage: make_mod_manifest.py <mod folder> (--app <Tears of the Kingdom.app> | --romfs <folder>) [--version v143]
 """
 import argparse
 import hashlib
+import json
 from pathlib import Path
 import struct
 import sys
@@ -91,6 +93,9 @@ def main():
         if not version:
             parser.error('name the game version with --version (or name the mod folder v0, v112, v121 or v143)')
         romfs = args.app/f'Contents/Resources/totk/extracted/{version}/romfs'
+        pointer = args.app/'Contents/Resources/totk/game-data.json'
+        if pointer.is_file():   # the default Mac app: its game data is outside it (build_app.py step_store)
+            romfs = Path(json.loads(pointer.read_text())['romfs']['path'])
     for need in ('romfs.bin', 'runtime-index.bin'):
         if not (romfs/need).is_file():
             parser.error(f'{romfs/need} not found')

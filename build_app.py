@@ -20,6 +20,12 @@ signature, shared fonts by valid BFTTF structure):
      for the Mac the startup shaders are then compiled once into this Mac's Metal cache (about 2 minutes on an M4), so the
      first start does not compile them in the background (games/totk/tools/warm_metal_cache.m)
 
+The Mac app holds the code and small files only (about 120 MB): the RomFS image and the prepared shaders go once into
+content-addressed folders in ~/Library/Application Support/MacNativeGames/TOTK/game-data (APFS clones of the work
+folder's files, so no extra space on its volume), which the app's game-data.json names. A rebuild with the same game
+data and shaders then only rebuilds the code and assembles the small app (about a minute). --embed-data makes a
+self-contained app instead; --prune-data deletes the folders no app points to. The IPA always carries its data.
+
 Every intermediate file is in the work folder (default: "<game file folder>/TOTK_build"); a second run reuses
 what is already done and correct. Mac saves, shader cache and logs go to the user's Library folders; iOS keeps saves
 and the writable shader cache in the app's Documents container.
@@ -30,7 +36,7 @@ For iPhone/iPad: Xcode 26+ with iOS/Metal toolchains, plus xcodegen, CMake and N
 Optional: Xcode's Metal toolchain (xcodebuild -downloadComponent MetalToolchain) compiles the startup shaders into the
 app, so moving or rebuilding it does not repeat that work at launch.
 """
-import argparse, concurrent.futures, hashlib, json, os, platform, shutil, struct, subprocess, sys, threading, time
+import argparse, concurrent.futures, ctypes, errno, hashlib, json, os, platform, shlex, shutil, struct, subprocess, sys, threading, time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
@@ -734,17 +740,156 @@ def step_binary(tree, game, keys, env, logs, *, version="v0"):
             say(f'   no app icon, the app gets the default one ({str(e).splitlines()[0]})')
 
 
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_LIBC.clonefile.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32)
+
+
 def clone(src, dst):
-    """APFS clone when on the same volume (no extra space), else a copy."""
+    """APFS clone when on the same volume (no extra space, no copying: clonefile(2) in this process, so tens of thousands
+    of files take seconds), else a copy. Returns True when it was a clone."""
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if subprocess.run(['cp', '-c', src, dst], capture_output=True).returncode:
-        shutil.copy2(src, dst)
+    for _ in range(2):
+        if _LIBC.clonefile(os.fsencode(src), os.fsencode(dst), 0) == 0:
+            return True
+        if ctypes.get_errno() != errno.EEXIST:
+            break
+        dst.unlink()
+    shutil.copy2(src, dst)
+    return False
 
 
 def copy_tree(src, dst):
     for p in sorted(src.rglob('*')):
         if p.is_file():
             clone(p, dst / p.relative_to(src))
+
+
+# ---- the game data outside the app (the default Mac layout) ----
+# The RomFS image (17 GB) and the prepared shaders (52,000 + 17,000 files) change only with the game files, the shared
+# shader list or the Metal compiler, but made up nearly all of the bytes and files that every rebuild copied, sealed and
+# had macOS scan again. They now live in content-addressed folders, written once and cloned from the work folder:
+#   <data dir>/<version>-romfs-<id>/    romfs.bin, runtime-index.bin, store.json
+#   <data dir>/<version>-shaders-<id>/  shader-seed/, shader-libs/, store.json
+# <id> is derived from the content (the SHA-256 of the files), so another build of the same data finds its folder and
+# a changed shader list gets a new one. The app carries Contents/Resources/totk/game-data.json naming both, which the
+# launcher (app/launcher.m) checks and hands to the game; --embed-data puts everything into the app as before.
+DATA_DIR = Path.home() / 'Library/Application Support/MacNativeGames/TOTK/game-data'
+STORE_FORMAT = 1
+
+
+def _identity(path):
+    st = path.stat()
+    return [st.st_ino, st.st_size, st.st_mtime_ns]
+
+
+def _content_id(version, kind, parts):
+    text = ''.join(f'{name}\t{value}\n' for name, value in sorted(parts.items()))
+    return f'{version}-{kind}-{hashlib.sha256(text.encode()).hexdigest()[:16]}'
+
+
+def _store_ok(folder, sid):
+    """True when folder holds the files its store.json lists with their sizes and, for any file whose identity (inode,
+    size, modification time) changed since it was hashed, the same SHA-256 again; store.json then records the new
+    identity. A missing or partial folder is False."""
+    try:
+        record = json.loads((folder / 'store.json').read_text())
+        if record.get('format') != STORE_FORMAT or record.get('id') != sid:
+            return False
+        changed = False
+        for name, want in record['files'].items():
+            path = folder / name
+            got = _identity(path)
+            if got[1] != want['size']:
+                return False
+            if got != want['identity']:
+                if sha256(path) != want['sha256']:
+                    return False
+                want['identity'], changed = got, True
+        if changed:
+            (folder / 'store.json').write_text(json.dumps(record, indent=1) + '\n')
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def _store_write(root, sid, kind, version, files, logs, intact=None):
+    """Make root/sid from files {name in the store: (source, sha256 or None)} unless it is there and intact. Sources are
+    cloned (a byte copy only across volumes, then hashed and compared to the known SHA-256); store.json is written last,
+    so an interrupted build leaves no folder that looks complete."""
+    folder = root / sid
+    if intact if intact is not None else _store_ok(folder, sid):
+        return folder, False
+    root.mkdir(parents=True, exist_ok=True)
+    partial = root / f'.{sid}.partial-{os.getpid()}'
+    if partial.exists():
+        shutil.rmtree(partial)
+    record = dict(format=STORE_FORMAT, id=sid, kind=kind, version=version, created=time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                  files={})
+    try:
+        copied = 0
+        for name, (source, digest) in sorted(files.items()):
+            target = partial / name
+            if not clone(source, target):
+                copied += 1
+                got = sha256(target)
+                if digest and got != digest:
+                    raise BuildError(f'{source}: the copy in {folder} has SHA-256 {got[:16]}..., not {digest[:16]}...')
+                digest = got
+            target.chmod(0o444)   # the game only reads these; a write by mistake fails instead of changing the data
+            record['files'][name] = dict(size=target.stat().st_size, sha256=digest or sha256(target), identity=_identity(target))
+        if copied:
+            say(f'   {copied} files were copied, not cloned (the data folder is on another volume than the work folder)')
+        (partial / 'store.json').write_text(json.dumps(record, indent=1) + '\n')
+        if folder.exists():
+            shutil.rmtree(folder)   # damaged or incomplete; the game data is made again from the work folder
+        try:
+            partial.rename(folder)
+        except OSError:
+            if not _store_ok(folder, sid):   # another build made it meanwhile
+                raise
+    finally:
+        if partial.exists():
+            shutil.rmtree(partial, ignore_errors=True)
+    return folder, True
+
+
+def step_store(tree, root, logs, *, version='v0'):
+    """The RomFS and prepared-shader folders for this build (made when missing); returns the app's game-data.json."""
+    t0 = time.time()
+    romfs = tree / f'extracted/{version}/romfs'
+    expected = VERSIONS[version]['romfs']
+    # step_data / step_update_data verified the image through every IVFC level and compared its SHA-256 and size;
+    # its index.json says so (the same check that lets a rebuild skip the extraction)
+    report = json.loads((romfs / 'index.json').read_text())
+    if report.get('romfs_sha256') != expected['sha256'] or (romfs / 'romfs.bin').stat().st_size != expected['size']:
+        raise BuildError(f'{romfs}: not the verified RomFS of this version')
+    index_sha = sha256(romfs / 'runtime-index.bin')
+    rid = _content_id(version, 'romfs', {'romfs.bin': expected['sha256'], 'runtime-index.bin': index_sha})
+    rdir, made = _store_write(root, rid, 'romfs', version, {'romfs.bin': (romfs / 'romfs.bin', expected['sha256']),
+                                                            'runtime-index.bin': (romfs / 'runtime-index.bin', index_sha)}, logs)
+    say(f'4/4 app: game data {"written to" if made else "already in"} {rdir}')
+
+    seed = tree / f'build/shader-seed/{version}'
+    manifest = verify_seed(seed, version, hashes=False)
+    libs = tree / 'build/shader-libs'
+    compiler = (libs / 'compiler.txt').read_text() if (libs / 'compiler.txt').is_file() else ''
+    lib_names = sorted(f'{digest}.metallib' for name, digest in manifest['files'].items()
+                       if name.endswith('.metal') and (libs / f'{digest}.metallib').is_file())
+    sid = _content_id(version, 'shaders', {'seed-manifest.json': sha256(seed / 'seed-manifest.json'),
+                                           'compiler': hashlib.sha256(compiler.encode()).hexdigest(),
+                                           'libs': hashlib.sha256('\n'.join(lib_names).encode()).hexdigest()})
+    intact = _store_ok(root / sid, sid)
+    if not intact:
+        verify_seed(seed, version)   # every file against the seed's manifest, before it is written to the store
+    files = {f'shader-seed/{name}': (seed / name, digest) for name, digest in manifest['files'].items()}
+    files['shader-seed/seed-manifest.json'] = (seed / 'seed-manifest.json', None)
+    files.update({f'shader-libs/{name}': (libs / name, None) for name in lib_names})
+    sdir, made = _store_write(root, sid, 'shaders', version, files, logs, intact)
+    say(f'4/4 app: prepared shaders {"written to" if made else "already in"} {sdir} ({time.time() - t0:.0f} s)')
+    return dict(format=1, version=version,
+                romfs=dict(id=rid, path=str(rdir), sizes={'romfs.bin': expected['size'],
+                                                          'runtime-index.bin': (romfs / 'runtime-index.bin').stat().st_size}),
+                shaders=dict(id=sid, path=str(sdir), sizes={'shader-seed/seed-manifest.json': (seed / 'seed-manifest.json').stat().st_size}))
 
 
 def sign_app(app, logs):
@@ -754,7 +899,23 @@ def sign_app(app, logs):
     run(['codesign', '--verify', '--deep', '--strict', app], logs / 'verify-app-signature.log')
 
 
-def step_app(tree, out, logs, *, version="v0"):
+def verify_seed(seed, version, hashes=True):
+    """The prepared startup shaders' manifest, checked (with hashes: every file against its SHA-256)."""
+    if not (seed/'seed-manifest.json').is_file():
+        raise BuildError('startup shader seed was not prepared; refusing an app without first-launch warm-up data')
+    try:
+        report = json.loads((seed/'seed-manifest.json').read_text())
+        if (report['version'] != version or report['chain'] != 'totk-native-v4-unverified' or
+                report['shaders'] < 8000 or not report['files'] or any(
+                    Path(name).name != name or (hashes and sha256(seed/name) != digest) for name, digest in report['files'].items())):
+            raise ValueError('version, translation chain or file hash differs')
+    except (ValueError, KeyError, OSError, TypeError) as error:
+        raise BuildError(f'invalid prepared startup shader seed: {error}') from None
+    return report
+
+
+def step_app(tree, out, logs, *, version="v0", store=None):
+    """The app bundle; store (step_store's game-data.json): the large game data stays outside it, else it is inside."""
     expected = VERSIONS[version]
     tmp = out.with_name(out.name + '.partial')
     if tmp.exists():
@@ -763,27 +924,24 @@ def step_app(tree, out, logs, *, version="v0"):
     clone(tree / ('build/totk-native' if version == 'v0' else f'build/totk-native-{version}'), res/'build/totk-native')
     for rel in ('build/pso_manifest.tsv', 'build/pso_title.tsv', 'build/spirv-cross/spirv-cross',
                 f'rewritten/{version}/main.patched.bin', f'rewritten/{version}/sdk.patched.bin',
-                f'rewritten/{version}/subsdk0.patched.bin', f'extracted/{version}/romfs/romfs.bin', f'extracted/{version}/romfs/runtime-index.bin'):
+                f'rewritten/{version}/subsdk0.patched.bin'):
         clone(tree / rel, res / rel)
     clone(tree / 'prebuilt/macos-arm64/totk_xlate', res / 'build/shader-service/totk_xlate')   # where totk_shader_rt.m looks for it
     for rel in (f'extracted/{version}/romfs-patches', f'extracted/{version}/romfs-patches-out', 'extracted/firmware/shared-fonts'):
         copy_tree(tree / rel, res / rel)
-    seed = tree/f'build/shader-seed/{version}'
-    if not (seed/'seed-manifest.json').is_file():
-        raise BuildError('startup shader seed was not prepared; refusing an app without first-launch warm-up data')
-    try:
-        report = json.loads((seed/'seed-manifest.json').read_text())
-        if (report['version'] != version or report['chain'] != 'totk-native-v4-unverified' or
-                report['shaders'] < 8000 or not report['files'] or any(
-                    Path(name).name != name or sha256(seed/name) != digest for name, digest in report['files'].items())):
-            raise ValueError('version, translation chain or file hash differs')
-    except (ValueError, KeyError, OSError, TypeError) as error:
-        raise BuildError(f'invalid prepared startup shader seed: {error}') from None
-    copy_tree(seed, res/'build/shader-seed')
-    for src in sorted(seed.glob('*.metal')):
-        lib = tree/f'build/shader-libs/{sha256(src)}.metallib'
-        if lib.is_file():
-            clone(lib, res/'build/shader-libs'/lib.name)
+    if store:
+        # the RomFS and the prepared shaders stay in the game-data folders (step_store); the launcher finds them here
+        (res/'game-data.json').write_text(json.dumps(store, indent=1) + '\n')
+    else:
+        for rel in (f'extracted/{version}/romfs/romfs.bin', f'extracted/{version}/romfs/runtime-index.bin'):
+            clone(tree / rel, res / rel)
+        seed = tree/f'build/shader-seed/{version}'
+        verify_seed(seed, version)
+        copy_tree(seed, res/'build/shader-seed')
+        for src in sorted(seed.glob('*.metal')):
+            lib = tree/f'build/shader-libs/{sha256(src)}.metallib'
+            if lib.is_file():
+                clone(lib, res/'build/shader-libs'/lib.name)
     clone(tree / 'build/app-launcher', tmp / 'Contents/MacOS/TOTK')
     info = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable='TOTK', CFBundleIdentifier=BUNDLE_ID, CFBundleName=APP_NAME,
                 CFBundleDisplayName=APP_NAME, CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],
@@ -849,7 +1007,7 @@ def metal_cache_users():
     return sorted(users)
 
 
-def step_warm_metal(tree, out, logs):
+def step_warm_metal(tree, out, logs, store=None):
     """Compile the app's startup shaders once into this Mac's Metal cache (2026-10-18). The game compiles each of them from
     source when it first meets it, and Metal keeps the result keyed by the source text, the compile options and the length
     of the path of the compiling program's folder (only its length: another folder with a path as long finds them too);
@@ -861,11 +1019,12 @@ def step_warm_metal(tree, out, logs):
     result is checked in a new process. Nothing here can make the build fail: without it the game compiles the shaders
     itself, as before."""
     build = out / 'Contents/Resources/totk/build'
-    seed = build / 'shader-seed'
+    shaders = Path(store['shaders']['path']) if store else build   # the game-data folder (step_store), else the app
+    seed = shaders / 'shader-seed'
     tool = build / 'warm-metal-cache'   # next to the game binary: Metal matches the length of the program's folder path
     tool.unlink(missing_ok=True)        # left by an interrupted build
     sources = sorted(seed.glob('*_b.metal'))
-    if sources and all((build / 'shader-libs' / f'{sha256(src)}.metallib').is_file() for src in sources):
+    if sources and all((shaders / 'shader-libs' / f'{sha256(src)}.metallib').is_file() for src in sources):
         say('4/4 app: the startup shaders are compiled into the app (step_shader_libs), so Metal\'s cache needs no warming')
         return
     users = metal_cache_users()
@@ -903,15 +1062,98 @@ def step_warm_metal(tree, out, logs):
             f"{sample['median_ms']:.0f} ms; {why}); the first start compiles them instead")
 
 
+def tree_size(path):
+    return sum(p.lstat().st_size for p in path.rglob('*') if p.is_file() and not p.is_symlink())
+
+
+def rebuild_command(args, game, keys, update, firmware, shared_fonts, work, out):
+    """The command that makes this app again, for the launcher's message when its game data is missing (paths only)."""
+    cmd = ['python3.14', str(REPO / 'build_app.py'), str(game), '-k', str(keys)]
+    if update: cmd += ['--update', str(update)]
+    if firmware: cmd += ['--firmware', str(firmware)]
+    if shared_fonts: cmd += ['--shared-fonts', str(shared_fonts)]
+    if args.work: cmd += ['--work', str(work)]
+    if args.data_dir.expanduser().resolve() != DATA_DIR: cmd += ['--data-dir', str(args.data_dir.expanduser().resolve())]
+    return shlex.join(cmd + ['-o', str(out)])
+
+
+def register_app(data_dir, out, store):
+    """apps.json in the data folder: the apps this script built, so --prune-data knows which folders are in use."""
+    registry = data_dir / 'apps.json'
+    try:
+        apps = json.loads(registry.read_text()) if registry.is_file() else []
+    except ValueError:
+        apps = []
+    apps = [a for a in apps if a != str(out)] + ([str(out)] if store else [])
+    if store or registry.is_file():
+        data_dir.mkdir(parents=True, exist_ok=True)
+        registry.write_text(json.dumps(apps, indent=1) + '\n')
+
+
+def apps_in_use(data_dir):
+    """The apps that may point into data_dir: the ones this script built (apps.json) and every app with this bundle
+    identifier Spotlight knows (one moved or copied after the build)."""
+    found = []
+    try:
+        found += json.loads((data_dir / 'apps.json').read_text())
+    except (OSError, ValueError):
+        pass
+    try:
+        found += subprocess.run(['mdfind', f"kMDItemCFBundleIdentifier == '{BUNDLE_ID}'"], capture_output=True, text=True,
+                                timeout=60).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return sorted({str(Path(a)) for a in found if a})
+
+
+def prune_data(data_dir):
+    """Delete the game-data folders that no app points to (apps_in_use); an app on a volume that is not connected now
+    cannot be seen, and would need a rebuild afterwards."""
+    if not data_dir.is_dir():
+        say(f'no game data in {data_dir}')
+        return
+    used, apps = set(), []
+    for app in apps_in_use(data_dir):
+        pointer = Path(app) / 'Contents/Resources/totk/game-data.json'
+        try:
+            data = json.loads(pointer.read_text())
+        except (OSError, ValueError):
+            continue
+        apps.append(app)
+        used.update(Path(data[part]['path']).name for part in ('romfs', 'shaders') if part in data)
+    freed = 0
+    for folder in sorted(data_dir.iterdir()):
+        if not folder.is_dir() or folder.name in used:
+            continue
+        partial = folder.name.startswith('.') and '.partial-' in folder.name
+        if partial:   # an interrupted build's leftovers; a running build's is younger than a day
+            if time.time() - folder.stat().st_mtime < 86400:
+                continue
+        elif not (folder / 'store.json').is_file():
+            continue   # not a game-data folder
+        size = tree_size(folder)
+        say(f'deleting {folder.name} ({size / 2**30:.1f} GB on disk at most; less when it shares blocks with a work folder)')
+        shutil.rmtree(folder)
+        freed += size
+    say(f'game data in use by {len(apps)} app{"s" if len(apps) != 1 else ""}: ' + (', '.join(sorted(used)) or 'none') +
+        f'; {freed / 2**30:.1f} GB deleted')
+
+
 def parse_args(argv):
     ap = argparse.ArgumentParser(description='Build a native Mac app or unsigned iPhone/iPad IPA from TOTK base 1.0.0 (XCI/NSP), optionally with the separate 1.1.2, 1.2.1 or 1.4.3 update.',
                                  epilog='example: python3 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys')
-    ap.add_argument('game', type=Path, help='the game file (.xci or .nsp), base game 1.0.0')
+    ap.add_argument('game', type=Path, nargs='?', help='the game file (.xci or .nsp), base game 1.0.0')
     ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app')
     ap.add_argument('--platform', choices=('macos','ios'), default='macos', help='build a macOS app (default) or unsigned iPhone/iPad IPA')
-    ap.add_argument('-k', '--keys', type=Path, required=True, help='your prod.keys')
+    ap.add_argument('-k', '--keys', type=Path, help='your prod.keys (required for a build)')
     ap.add_argument('-o', '--out', type=Path, help=f'the app or IPA to write (default depends on --platform; next to the game file)')
     ap.add_argument('--work', type=Path, help='work folder (default: TOTK_build next to the game file)')
+    ap.add_argument('--embed-data', action='store_true', help='Mac: put the RomFS and the prepared shaders into the app (a '
+                    'self-contained 17 GB app to copy elsewhere) instead of the shared game-data folder')
+    ap.add_argument('--data-dir', type=Path, default=DATA_DIR, help=f'Mac: where the game data the app uses is kept (default: {DATA_DIR}); '
+                    'on the work folder\'s volume it is cloned and takes no extra space')
+    ap.add_argument('--prune-data', action='store_true', help='delete the game-data folders no app points to (alone: only that; '
+                    'with a build: after it)')
     ap.add_argument('--no-shader-reminder', action='store_true', help='iOS: do not install the Mac agent that asks, while an iPhone / iPad with the game is connected, to send the shaders the shared list lacks')
     fonts = ap.add_mutually_exclusive_group()
     fonts.add_argument('--firmware', type=Path, help='unpacked firmware NCA directory providing the six expected shared fonts (needed for NSP unless --shared-fonts or valid cached fonts are available)')
@@ -921,6 +1163,14 @@ def parse_args(argv):
 
 def main(argv):
     args = parse_args(argv)
+    data_dir = args.data_dir.expanduser().resolve()
+    if args.game is None:
+        if not args.prune_data:
+            raise BuildError('name the game file (or pass --prune-data alone to delete unused game data)')
+        prune_data(data_dir)
+        return
+    if args.keys is None:
+        raise BuildError('a build needs your prod.keys: -k <prod.keys>')
     game, keys = args.game.expanduser().resolve(), args.keys.expanduser().resolve()
     if not game.is_file():
         raise BuildError(f'no such file: {game}')
@@ -988,6 +1238,7 @@ def main(argv):
     step_shader_libs(tree, logs, version=version)
     step_binary(tree, game, keys, env, logs, version=version)
     say(f'4/4 app: assembling {out}')
+    store = None
     if args.platform=='ios':
         run([py, 'ios/tools/build_ipa.py', '--tree', tree, '--out', out, '--version', version,
              '--logs', logs, '--app-name', APP_NAME, '--bundle-id', BUNDLE_ID], logs/'build-ipa.log', cwd=tree, env=env)
@@ -1001,20 +1252,29 @@ def main(argv):
             except BuildError as e:
                 say(f'   the Mac reminder for iPhone / iPad shader contributions was not installed: {e}')
     else:
-        step_app(tree, out, logs, version=version)
+        if not args.embed_data:
+            store = step_store(tree, data_dir, logs, version=version)
+            store['rebuild'] = rebuild_command(args, game, keys, update, firmware, shared_fonts, work, out)
+        step_app(tree, out, logs, version=version, store=store)
+        register_app(data_dir, out, store)
     # Refresh an existing app's version, executable and signing identity before
     # the next Finder launch; the desktop alias keeps pointing to this bundle.
     if args.platform=='macos': run([LSREGISTER, '-f', out], logs / 'register-app.log')
-    # macOS scans a new app the first time it runs (minutes for 16 GB, with nothing on screen): run it once here, in its
-    # check-only mode, so the player's first start is immediate.
+    # macOS scans a new app the first time it runs (minutes for a 16 GB app with the data inside, with nothing on screen;
+    # seconds without it): run it once here, in its check-only mode, so the player's first start is immediate. The
+    # launcher's check also finds the game-data folders the app points to.
     if args.platform=='macos':
-        say('4/4 app: macOS checks the new app once (a few minutes for the 16 GB bundle)')
+        say('4/4 app: macOS checks the new app once' + (' (a few minutes for the 17 GB app)' if args.embed_data else ''))
         t1 = time.time()
         r = subprocess.run([out / 'Contents/MacOS/TOTK', '--check'], capture_output=True, text=True, timeout=1800)
         if r.returncode: raise BuildError(f'the app does not start: {(r.stdout + r.stderr).strip()}')
         say(f'   checked in {time.time() - t1:.0f} s')
-        step_warm_metal(tree, out, logs)
-    say(f'done in {(time.time() - t0) / 60:.0f} min: {out}')
+        step_warm_metal(tree, out, logs, store)
+    if args.prune_data and args.platform == 'macos':
+        prune_data(data_dir)
+    elapsed = time.time() - t0
+    say(f'done in {elapsed / 60:.0f} min {elapsed % 60:.0f} s: {out}' + (f' ({tree_size(out) / 2**20:.0f} MB; the game data is in '
+        f'{data_dir})' if args.platform == 'macos' and not args.embed_data else ''))
     if args.platform=='macos':
         say('Open it from Finder. Moving it afterwards (also to /Applications) keeps the macOS check when it stays on the same '
             'volume, but Metal then compiles the startup shaders again in the background on the next start (a few minutes): '
