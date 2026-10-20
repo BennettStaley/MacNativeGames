@@ -16,7 +16,7 @@ from unicorn.arm64_const import (
     UC_ARM64_REG_PC, UC_ARM64_REG_X0, UC_ARM64_REG_X2, UC_ARM64_REG_X3, UC_ARM64_REG_X4,
     UC_ARM64_REG_X8, UC_ARM64_REG_X9, UC_ARM64_REG_X10, UC_ARM64_REG_X11, UC_ARM64_REG_X19, UC_ARM64_REG_X23,
     UC_ARM64_REG_SP, UC_ARM64_REG_S0, UC_ARM64_REG_S1, UC_ARM64_REG_S2, UC_ARM64_REG_S7, UC_ARM64_REG_S8, UC_ARM64_REG_S9,
-    UC_ARM64_REG_S16, UC_ARM64_REG_S17, UC_ARM64_REG_S18, UC_ARM64_REG_D16,
+    UC_ARM64_REG_S16, UC_ARM64_REG_S17, UC_ARM64_REG_S18, UC_ARM64_REG_D16, UC_ARM64_REG_X0, UC_ARM64_REG_X17,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -115,16 +115,17 @@ def render_res_checks(out, raw, data, layout):
 
 
 FOG_SITES = {0xd3050}                 # the Env writer's fog ramp scale, fcsel s9, s18, s1, ne (aspect_patch.h fog_install)
-SHADOW_SITES = {0xf5998, 0xf59b8}     # the shadow map's width and height products (aspect_patch.h shadow_install)
-FOG_STUB, SHADOW_STUB = 400, 448      # text padding offsets from the stub base: one 48-byte stub, two 28-byte stubs (to +504)
-FOG_SLOT, SHADOW_SLOT = 80, 84        # data page floats
+SHADOW_SITES = {0x683604}             # the shadow map side's rounding, add w11, w11, #7 (aspect_patch.h shadow_install)
+FOG_STUB, SHADOW_STUB = 400, 448      # text padding offsets from the stub base: one 48-byte stub, one 32-byte stub (to +480)
+FOG_SLOT, SHADOW_SLOT = 80, 84        # data page: the fog multiplier (float), the shadow shift (int)
 
 
 def fog_shadow_checks(out, raw, data, layout):
     """Fog density (TOTK_FOG, live through runtime_fog_set) and shadow resolution (TOTK_SHADOW_RES, at the start): the
-    three sites always carry their stubs (Mac and the iOS export), the data page holds 0 for the game's own; executed,
+    two sites always carry their stubs (Mac and the iOS export), the data page holds 0 for the game's own; executed,
     the fog stub multiplies the ramp scale s9 (and so the offset the next fnmul derives from it) and the shadow stubs
-    multiply the map's side before it is rounded; the stubs keep x10 / d16 (fog) and touch only dead registers (shadow)."""
+    shifts the map's side left (2x: 1, 4x: 2) and caps it at 2048 before the game rounds it up to 8; the stubs keep x10 /
+    d16 (fog) and use only x16 (shadow)."""
     base = layout['TEXT_END'] + 15 & ~15
 
     def image(extra):
@@ -157,16 +158,14 @@ def fog_shadow_checks(out, raw, data, layout):
         f = lambda r: struct.unpack('<f', struct.pack('<I', mu.reg_read(r) & 0xffffffff))[0]
         return f(UC_ARM64_REG_S9), f(UC_ARM64_REG_S8), mu.reg_read(UC_ARM64_REG_X10), mu.reg_read(UC_ARM64_REG_D16)
 
-    def shadow_run(img, site, value_a, value_b):
-        """One product site and the fcvtzs after it: the int the game stores (before its clamp and rounding)."""
+    def shadow_run(img, side):
+        """main+0x683600..0x68360c with s18 = the side the game picked: the rounded side it stores (w19), and x17 kept."""
         mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
         mu.mem_map(0, (len(img) + 0x3fff) & ~0x3fff); mu.mem_write(0, img)
-        fl = lambda v: struct.unpack('<I', struct.pack('<f', v))[0]
-        if site == 0xf5998:
-            mu.reg_write(UC_ARM64_REG_S0, fl(value_a)); mu.reg_write(UC_ARM64_REG_S2, fl(value_b))
-            mu.emu_start(site, site + 8, count=12); return mu.reg_read(UC_ARM64_REG_X9) & 0xffffffff
-        mu.reg_write(UC_ARM64_REG_S0, fl(value_a)); mu.reg_write(UC_ARM64_REG_S1, fl(value_b))
-        mu.emu_start(site, site + 8, count=12); return mu.reg_read(UC_ARM64_REG_X10) & 0xffffffff
+        mu.reg_write(UC_ARM64_REG_S18, struct.unpack('<I', struct.pack('<f', side))[0]); mu.reg_write(UC_ARM64_REG_X17, 0x5555)
+        mu.emu_start(0x683600, 0x68360c, count=12)
+        assert mu.reg_read(UC_ARM64_REG_PC) == 0x68360c and mu.reg_read(UC_ARM64_REG_X17) == 0x5555
+        return mu.reg_read(UC_ARM64_REG_X19) & 0xffffffff
 
     code, unset = image({})
     assert code == 0, 'the fixture failed with the fog and shadow patches'
@@ -189,20 +188,23 @@ def fog_shadow_checks(out, raw, data, layout):
     assert code == 0 and slot(back, FOG_SLOT) == 0, 'live 100 % is not the game\'s own'
     code, _ = image({'TOTK_FOG': '120'})
     assert code != 0, 'TOTK_FOG=120 was accepted'
-    assert shadow_run(padded, 0xf5998, 1.0, 400.0) == 400 and shadow_run(unset, 0xf5998, 1.0, 400.0) == 400
-    assert shadow_run(padded, 0xf59b8, 0.5, 400.0) == 200 and shadow_run(unset, 0xf59b8, 0.5, 400.0) == 200
+    shift = lambda img: struct.unpack('<I', img[data + SHADOW_SLOT:data + SHADOW_SLOT + 4])[0]
+    assert shadow_run(padded, 400.0) == shadow_run(unset, 400.0) == 400, 'unset, the side differs'
+    assert shadow_run(padded, 421.3) == shadow_run(unset, 421.3) == 424
     code, x4 = image({'TOTK_SHADOW_RES': '4'})
-    assert code == 0 and slot(x4, SHADOW_SLOT) == 4.0
-    assert shadow_run(x4, 0xf5998, 1.0, 400.0) == 1600 and shadow_run(x4, 0xf59b8, 0.5, 400.0) == 800, 'TOTK_SHADOW_RES=4'
+    assert code == 0 and shift(x4) == 2
+    assert shadow_run(x4, 400.0) == 1600 and shadow_run(x4, 421.3) == 1688, 'TOTK_SHADOW_RES=4'
+    assert shadow_run(x4, 800.0) == shadow_run(x4, 1440.0) == 2048, 'the 2048 cap'
+    assert shadow_run(unset, 1440.0) == 1440, 'unset, the game\'s biggest side is capped'
     code, x2 = image({'TOTK_SHADOW_RES': '2'})
-    assert code == 0 and shadow_run(x2, 0xf5998, 1.0, 400.0) == 800
+    assert code == 0 and shift(x2) == 1 and shadow_run(x2, 400.0) == 800
     code, _ = image({'TOTK_SHADOW_RES': '3'})
     assert code != 0, 'TOTK_SHADOW_RES=3 was accepted'
     code, export = image({'TOTK_EXPORT_IOS': str(out / 'unused-export'), 'TOTK_SHADOW_RES': '4'})
     assert code == 0 and {p for p in sites if raw[p:p+4] != export[p:p+4]} == sites, 'the iOS export did not embed the stubs'
-    assert slot(export, SHADOW_SLOT) == 0, 'the iOS export carried a shadow factor'
+    assert shift(export) == 0, 'the iOS export carried a shadow factor'
     return dict(sites=[hex(p) for p in sorted(sites)], stubs=[hex(base + FOG_STUB), hex(base + SHADOW_STUB)],
-                fog_scale_half=True, fog_zero=True, fog_live_back_to_game=True, shadow_4x=[1600, 800], shadow_2x=800,
+                fog_scale_half=True, fog_zero=True, fog_live_back_to_game=True, shadow_4x=1600, shadow_2x=800,
                 ios_export_embeds=len(sites), malformed_rejected=True)
 
 
@@ -244,8 +246,8 @@ def main():
     # The 21:9 view (runtime/aspect_patch.h, always installed since c446bce): four sites and its stubs after the two veneers.
     # The field of view (aspect_patch.h fov_install): two camera sites and their 48-byte stubs after the aspect stubs.
     aspect = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0, 0x628c3c, 0xb4342c} | {p for p in changes if frame_step + 48 <= p < frame_step + 272}
-    # Fog density and shadow resolution (aspect_patch.h): three sites, their stubs at +400..+504 (fog_shadow_checks).
-    aspect |= FOG_SITES | SHADOW_SITES | {p for p in changes if frame_step + FOG_STUB <= p < frame_step + SHADOW_STUB + 56}
+    # Fog density and shadow resolution (aspect_patch.h): three sites, their stubs at +400..+480 (fog_shadow_checks).
+    aspect |= FOG_SITES | SHADOW_SITES | {p for p in changes if frame_step + FOG_STUB <= p < frame_step + SHADOW_STUB + 32}
     assert changes - aspect == want, [hex(p) for p in sorted((changes - aspect) ^ want)]
 
     def execute(w, h, scale, apply):
