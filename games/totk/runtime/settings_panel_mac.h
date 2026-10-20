@@ -3,7 +3,9 @@
    table (runtime/settings_schema.h), one tab per page. Opened with Command-comma, F1, the app menu's Settings item, or a
    controller's Home button (or Options and Menu together). Mouse, keyboard (arrows choose and change, Return toggles,
    Q / E or Tab switch tabs, Escape closes) and controller (D-pad or left stick, A, B, shoulder buttons) all work. While it
-   is open the game reads a neutral controller (runtime_input_hold). The iPhone / iPad menu is ios/Sources/settings_menu.m. */
+   is open the game reads a neutral controller (runtime_input_hold). The last tab, Mods, is runtime/mods_panel_mac.h (the
+   installed mods and the GameBanana browser); the sidebar widens while it shows. The iPhone / iPad menu is
+   ios/Sources/settings_menu.m. */
 #pragma once
 #import <Cocoa/Cocoa.h>
 #import <GameController/GameController.h>
@@ -14,6 +16,7 @@
 @implementation TOTKFlippedView
 - (BOOL)isFlipped { return YES; }
 @end
+#include "mods_panel_mac.h"
 
 @interface TOTKSettingsPanel : NSView
 + (void)toggle;
@@ -27,7 +30,9 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     NSSegmentedControl *tabs;
     NSScrollView *scroll;
     NSStackView *list;
-    NSTextField *status;
+    NSTextField *status, *hint;
+    NSButton *reset;
+    TOTKModsPane *mods;                   /* the Mods tab (page MODS_PAGE) */
     NSMutableArray<NSView *> *rows;       /* the rows of the page shown, in order */
     NSMutableArray<NSNumber *> *rowSetting;
     NSInteger page, focus;
@@ -35,7 +40,8 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     uint64_t padPrev; double padRepeatAt; int padDir;
 }
 static TOTKSettingsPanel *settingsPanel;
-enum { PANEL_WIDTH = 440, PANEL_MARGIN = 16 };
+enum { PANEL_WIDTH = 440, PANEL_MARGIN = 16, MODS_PAGE = SETTINGS_NPAGES, NPAGES = SETTINGS_NPAGES + 1 };
+static NSString *const SETTINGS_HINT = @"↑↓ choose   ←→ change   Q E tabs   Esc close\nController: D-pad, A, B, shoulder buttons";
 
 static BOOL settings_row_shown(const SettingDef *d) {
     if (!(d->platforms & SET_MAC)) return NO;
@@ -75,6 +81,7 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
 
     NSMutableArray *labels = [NSMutableArray array];
     for (int p = 0; p < SETTINGS_NPAGES; p++) [labels addObject:@(SETTINGS_PAGES[p])];
+    [labels addObject:@"Mods"];
     tabs = [NSSegmentedControl segmentedControlWithLabels:labels trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(tabClicked:)];
     tabs.segmentStyle = NSSegmentStyleAutomatic; tabs.selectedSegment = 0; tabs.refusesFirstResponder = YES;
     tabs.segmentDistribution = NSSegmentDistributionFillEqually; tabs.controlSize = NSControlSizeSmall;
@@ -87,12 +94,13 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
     NSView *doc = [TOTKFlippedView new]; doc.translatesAutoresizingMaskIntoConstraints = NO;
     [doc addSubview:list]; scroll.documentView = doc;
 
-    NSTextField *hint = [NSTextField wrappingLabelWithString:@"↑↓ choose   ←→ change   Q E tabs   Esc close\nController: D-pad, A, B, shoulder buttons"];
+    hint = [NSTextField wrappingLabelWithString:SETTINGS_HINT];
     hint.font = [NSFont systemFontOfSize:10.5]; hint.textColor = NSColor.tertiaryLabelColor;
-    NSButton *reset = [NSButton buttonWithTitle:@"Reset all" target:self action:@selector(reset)];
+    reset = [NSButton buttonWithTitle:@"Reset all" target:self action:@selector(reset)];
     reset.controlSize = NSControlSizeSmall; reset.refusesFirstResponder = YES; reset.bezelStyle = NSBezelStyleRounded;
 
-    for (NSView *v in @[title, status, tabs, scroll, hint, reset]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v]; }
+    mods = [[TOTKModsPane alloc] initWithMenu:self]; mods.hidden = YES;
+    for (NSView *v in @[title, status, tabs, scroll, mods, hint, reset]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v]; }
     [NSLayoutConstraint activateConstraints:@[
         [title.topAnchor constraintEqualToAnchor:self.topAnchor constant:18], [title.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20],
         [status.firstBaselineAnchor constraintEqualToAnchor:title.firstBaselineAnchor], [status.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-20],
@@ -102,6 +110,8 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
         [scroll.topAnchor constraintEqualToAnchor:tabs.bottomAnchor constant:10],
         [scroll.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:8], [scroll.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-8],
         [scroll.bottomAnchor constraintEqualToAnchor:hint.topAnchor constant:-10],
+        [mods.topAnchor constraintEqualToAnchor:scroll.topAnchor], [mods.bottomAnchor constraintEqualToAnchor:scroll.bottomAnchor],
+        [mods.leadingAnchor constraintEqualToAnchor:scroll.leadingAnchor], [mods.trailingAnchor constraintEqualToAnchor:scroll.trailingAnchor],
         [hint.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20], [hint.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-14],
         [hint.trailingAnchor constraintLessThanOrEqualToAnchor:reset.leadingAnchor constant:-10],
         [reset.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16], [reset.centerYAnchor constraintEqualToAnchor:hint.centerYAnchor],
@@ -163,6 +173,11 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
 }
 
 - (void)buildPage {
+    BOOL modsPage = page == MODS_PAGE;
+    scroll.hidden = modsPage; mods.hidden = !modsPage; reset.hidden = modsPage;
+    hint.stringValue = modsPage ? MODS_HINT : SETTINGS_HINT;
+    if (self.superview) [self place];
+    if (modsPage) { tabs.selectedSegment = page; [mods refresh]; [self refreshStatus]; return; }
     for (NSView *v in list.arrangedSubviews.copy) { [list removeArrangedSubview:v]; [v removeFromSuperview]; }
     [rows removeAllObjects]; [rowSetting removeAllObjects];
     for (int i = 0; i < SETTINGS_COUNT; i++) {
@@ -224,6 +239,7 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
 
 /* One step left (-1) or right (+1) on the focused row; 0 = activate (toggle, next choice). */
 - (void)step:(int)dir {
+    if (page == MODS_PAGE) { [mods step:dir]; return; }
     if (focus >= (NSInteger)rows.count) return;
     int i = rowSetting[focus].intValue; const SettingDef *d = &SETTINGS[i]; int v = settings_get(d->key);
     if (d->type == SET_BOOL) v = dir ? dir > 0 : !v;
@@ -238,10 +254,11 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
 }
 
 - (void)moveFocus:(int)dir {
+    if (page == MODS_PAGE) { [mods moveFocus:dir]; return; }
     if (!rows.count) return;
     focus = (focus + dir + (NSInteger)rows.count) % (NSInteger)rows.count; [self showFocus];
 }
-- (void)movePage:(int)dir { page = (page + dir + SETTINGS_NPAGES) % SETTINGS_NPAGES; focus = 0; [self buildPage]; }
+- (void)movePage:(int)dir { page = (page + dir + NPAGES) % NPAGES; focus = 0; [self buildPage]; }
 - (void)tabClicked:(NSSegmentedControl *)s { page = s.selectedSegment; focus = 0; [self buildPage]; [self.window makeFirstResponder:self]; }
 
 - (void)reset {
@@ -250,6 +267,7 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
 }
 
 - (void)keyDown:(NSEvent *)e {
+    if (page == MODS_PAGE && [mods key:e]) return;
     switch (e.keyCode) {
     case 126: [self moveFocus:-1]; return;   /* up */
     case 125: [self moveFocus:1]; return;    /* down */
@@ -276,6 +294,7 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
         if (p.buttonA.isPressed) now |= 16; if (p.buttonB.isPressed) now |= 32;
         if (p.leftShoulder.isPressed) now |= 64; if (p.rightShoulder.isPressed) now |= 128;
         if (p.buttonMenu.isPressed) now |= 256;
+        if (p.buttonX.isPressed) now |= 512; if (p.buttonY.isPressed) now |= 1024;
         if (fabsf(p.leftThumbstick.yAxis.value) > fabsf(ly)) ly = p.leftThumbstick.yAxis.value;
         if (fabsf(p.leftThumbstick.xAxis.value) > fabsf(lx)) lx = p.leftThumbstick.xAxis.value;
     }
@@ -294,6 +313,8 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
     if (edge & 16) [self step:0];
     if (edge & 64) [self movePage:-1];
     if (edge & 128) [self movePage:1];
+    if (page == MODS_PAGE && (edge & 512)) [mods moveMod:-1];   /* X / Y: the mod's place in the load order */
+    if (page == MODS_PAGE && (edge & 1024)) [mods moveMod:1];
     if (edge & (32 | 256)) [self hide];
 }
 
@@ -301,7 +322,8 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
 
 - (void)place {
     NSView *host = settings_window().contentView;
-    self.frame = NSMakeRect(PANEL_MARGIN, PANEL_MARGIN, PANEL_WIDTH, MAX(320, host.bounds.size.height - 2 * PANEL_MARGIN));
+    CGFloat width = page == MODS_PAGE ? MIN(MODS_PANEL_WIDTH, MAX(PANEL_WIDTH, host.bounds.size.width - 2 * PANEL_MARGIN)) : PANEL_WIDTH;
+    self.frame = NSMakeRect(PANEL_MARGIN, PANEL_MARGIN, width, MAX(320, host.bounds.size.height - 2 * PANEL_MARGIN));
     self.autoresizingMask = NSViewHeightSizable | NSViewMaxXMargin;
 }
 

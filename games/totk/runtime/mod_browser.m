@@ -516,6 +516,7 @@ static NSString *license_text(id page) {
         if (!made.count) { end(nil, nil, e ?: gb_error(@"Nothing was installed.")); return; }
         dispatch_sync(dispatch_get_main_queue(), ^{
             mods_scan();
+            for (NSString *f in made) mods_move(f.fileSystemRepresentation, mods_count() - 1);   /* at the end, in this order */
             for (NSUInteger i = 1; i < made.count; i++) mods_set_enabled([made[i] fileSystemRepresentation], 0);
             mods_set_enabled([made[0] fileSystemRepresentation], 1);
             mods_save();
@@ -826,10 +827,23 @@ NSArray<NSString *> *mod_browser_install_archive(NSString *archive, NSString *mo
             e = gb_error(@"Nothing the game can load in this archive: no romfs/ or exefs/ folder (it may be a ReShade preset, a save or a tool).");
             goto fail;
         }
-        /* Several versions in one archive (1.2.1/, 1.4.x/, or options): each becomes a mod, the best for 1.4.3 is switched on. */
-        [roots sortWithOptions:NSSortStable usingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-            int sa, sb; mod_browser_versions(a[@"rel"], &sa, NULL, NULL); mod_browser_versions(b[@"rel"], &sb, NULL, NULL);
-            return sa > sb ? NSOrderedAscending : sa < sb ? NSOrderedDescending : NSOrderedSame; }];
+        /* Several versions or options in one archive (1.2.1/ and 1.4.x/, or "Champion_Equipment/" next to "Unbreakable_Equipment/"):
+           each becomes a mod and one is switched on: the best for 1.4.3, then the one named like the mod or the file, then the
+           one with the most files (usually the full set). */
+        NSString *(^key)(NSString *) = ^NSString *(NSString *t) { return re_replace(t.lowercaseString, @"[^a-z0-9]+", @""); };
+        NSString *modKey = key(mod.name ?: @""), *fileKey = key((file.name ?: @"").stringByDeletingPathExtension);
+        NSMutableArray *ranked = [NSMutableArray array];
+        for (NSDictionary *r in roots) {
+            int score; mod_browser_versions(r[@"rel"], &score, NULL, NULL);
+            NSString *k = key([r[@"rel"] lastPathComponent] ?: @"");
+            BOOL named = k.length && ((modKey.length && ([modKey containsString:k] || [k containsString:modKey])) || (fileKey.length && [fileKey containsString:k]));
+            NSUInteger count = 0; for (NSString *rel in [fm enumeratorAtPath:r[@"path"]]) { (void)rel; count++; }
+            [ranked addObject:@{@"root": r, @"score": @(score), @"named": @(named), @"count": @(count)}];
+        }
+        [ranked sortWithOptions:NSSortStable usingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            for (NSString *k in @[@"score", @"named", @"count"]) { NSComparisonResult c = [b[k] compare:a[k]]; if (c != NSOrderedSame) return c; }
+            return NSOrderedSame; }];
+        [roots removeAllObjects]; for (NSDictionary *r in ranked) [roots addObject:r[@"root"]];
         if (!roots.count) [roots addObject:@{@"path": x, @"rel": @"", @"bare": @NO}];   /* .tkcl only */
         NSMutableSet *taken = [NSMutableSet set];
         BOOL code = NO;
