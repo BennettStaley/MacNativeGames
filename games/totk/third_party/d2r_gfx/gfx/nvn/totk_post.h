@@ -322,15 +322,15 @@ static void fx_bloom_scale(void) {
 /* 1.4.3 (other versions: these keys have to be found again). */
 static int fx_is_dof(const char *key) { return !strncmp(key, "18b730fad0eec4ba", 16); }
 static int fx_is_tonemap(const char *key) { return !strncmp(key, "0ac9a54938974396", 16); }
-/* Before the draw opens its pass: 1 = leave this draw out (settings: hide the HUD, depth of field off); the
-   tone map with a bloom strength below 100 scales the bloom first. */
+/* Before the draw opens its pass: 1 = leave this draw out (depth of field off); a UI draw with the HUD hidden is masked;
+   the tone map with a bloom strength below 100 scales the bloom first. */
 static int fx_draw(__unsafe_unretained NvProg *pr) {
     if (!pr || g_defer_replaying) return 0;
     __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
     if (g_fx_hud && vs && uw_on_canvas() && uw_ui_vs(vs->key) && (g_uw_ui || mfx_ui_vs(vs->key))) {
-        /* Drawn, with every colour write masked off (draw() puts the mask back): leaving the draws out made the game
-           stop drawing its HUD and menus for good, even after the setting was off again (2026-10-20, 1.4.3 prologue).
-           Masked, a UI draw does everything but write pixels, and the first one still ends the scene (sharpening, MetalFX). */
+        /* Drawn, with every colour write masked off (draw() puts the mask back) rather than left out: a masked UI draw
+           does everything but write pixels (occlusion queries counting over it see the same samples), and the first
+           one still ends the scene (sharpening, MetalFX). */
         if (!g_fx_masked) { g_fx_saved_mask = S.chmask.mask; g_fx_masked = 1; }
         S.chmask.mask = 0; g_pso_dirty = 1; g_postfx.hud_n++;
         return 0;

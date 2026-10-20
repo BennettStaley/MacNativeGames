@@ -4247,7 +4247,9 @@ static int uw_ui_vs(const char *vs) {
     return 0;
 }
 static double uw_ui_squeeze(const char *vs, const p_draw *dw, const p_draw_idx *di, NSUInteger tw, NSUInteger th) {
-    if (!g_uw_ui || !vs || !uw_ui_vs(vs) || (dw ? dw->count : di ? di->count : 0) != 6 || !uw_on_canvas() || !tw || !th) return 1;
+    /* No ratio (the game's 16:9): no squeeze. The canvas is also learned for the picture settings and Hide the HUD; without
+       this a 16:9 window squeezed every UI quad to nothing once it was known (the HUD and menus vanished). */
+    if (!g_uw_ui || !vs || !uw_ratio() || !uw_ui_vs(vs) || (dw ? dw->count : di ? di->count : 0) != 6 || !uw_on_canvas() || !tw || !th) return 1;
     double f = uw_ratio() * th / tw;
     return f > 1.001 || f < 0.999 ? f : 1;   /* below 1: a screen taller than 16:9 (16:10), the UI is squeezed vertically by f */
 }
