@@ -11,7 +11,8 @@
      <Mod>/exefs/...      code patches (pchtxt, ips, subsdk): detected and reported, not applied yet.
      <Mod>/mod.json       optional: what the browser knows (name, author, version, source ids, game versions it names).
    Every file a mod ships is checked against the game's RomFS at start (replaces a file, or adds one); a mod's own
-   ResourceSizeTable is left out and the runtime fixes the 1.4.3 table for the files mods change instead. Changes to the
+   ResourceSizeTable is left out and the runtime fixes the 1.4.3 table for the files mods change instead. A mod's file
+   wins over the port's own patch of it, except where the port needs its copy (mods_build_collision). Changes to the
    list apply at the next start. The older single folder mods/<v143>/ with manifest.tsv keeps working. */
 #pragma once
 #include <stddef.h>
@@ -86,3 +87,19 @@ uint8_t *mods_rstb_patch(const uint8_t *table, size_t len, const char *const *pa
 uint32_t mods_crc32(const char *s);
 /* A zstd frame of uncompressed ("raw") blocks: valid zstd without an encoder. Returns a malloc'd frame (*out_len). */
 uint8_t *mods_zstd_raw_frame(const uint8_t *data, size_t len, size_t *out_len);
+
+/* A mod file at a path the build's own RomFS patches also change (scripts/make_romfs_patches.py, the HeapDef overlay):
+   MODS_BUILD_KEEP = the port needs its copy (System/HeapSize/: the heap sizes for bigger outputs), the mod's is left out;
+   MODS_BUILD_MOD_WINS = the mod's copy is used (the game over flow fix only matters on 1.0.0);
+   MODS_BUILD_REFIX = the mod's copy is used with the build's fix applied to it again (mods_capture_fix): the Common
+   layout archive, which UI mods (button glyphs, HUD) replace. */
+enum { MODS_BUILD_MOD_WINS = 0, MODS_BUILD_KEEP = 1, MODS_BUILD_REFIX = 2 };
+int mods_build_collision(const char *path);
+/* The quick-menu background fix on a decompressed Common layout archive (UI/LayoutArchive/Common.Product.<v>.Nin_NX_NVN
+   .blarc, a SARC): in anim/ShortCutBG_00_In.bflan (C_CaptureBG_00, C_CaptureClearBG_00, P_CaptureClearBG_00) and
+   anim/AutoBuilder_00_In.bflan (C_CaptureBG_00) the visibility keys [(0.0, hidden), (1.0, shown)] become
+   [(0.0, hidden), (0.0, shown)], so the screen capture behind the menu is taken while the world still draws (at 60 fps
+   frame 1.0 comes after it stopped: a black background). All or nothing: returns the number of keys moved (4 on the
+   game's archive and on mods that keep those animations; 0 when all four already are at 0.0), or -1 with why filled
+   when the archive's shape differs (a member, pane or key list not as expected; nothing is changed). */
+int mods_capture_fix(uint8_t *sarc, size_t len, char *why, size_t cap);

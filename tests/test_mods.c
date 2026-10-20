@@ -39,6 +39,46 @@ static uint32_t entry_for(const uint8_t *t, size_t len, const char *name) {   /*
     return 0;
 }
 
+/* A minimal BFLAN: one pai1 section, one entry per pane with one FLVI step track of two keys [(0, 0), (f1, 1)]. */
+static void w16(uint8_t *p, unsigned v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static void w32(uint8_t *p, uint32_t v) { for (int k = 0; k < 4; k++) p[k] = (uint8_t)(v >> (8 * k)); }
+static size_t make_flan(uint8_t *b, const char *const *panes, const float *f1, int np) {
+    memset(b, 0, 0x14 + 20 + 4 * (size_t)np + 64 * (size_t)np);
+    memcpy(b, "FLAN", 4); b[4] = 0xFF; b[5] = 0xFE; w16(b + 0x10, 1);
+    uint8_t *s = b + 0x14; size_t size = 20 + 4 * (size_t)np;
+    memcpy(s, "pai1", 4); w16(s + 14, (unsigned)np); w32(s + 16, 20);
+    for (int e = 0; e < np; e++) {
+        uint8_t *en = s + size; w32(s + 20 + 4 * e, (uint32_t)size);
+        snprintf((char *)en, 28, "%s", panes[e]); en[28] = 1; w32(en + 32, 36);    /* one track, right after */
+        uint8_t *t = en + 36; memcpy(t, "FLVI", 4); t[4] = 1; w32(t + 8, 12);      /* one group */
+        uint8_t *g = t + 12; g[2] = 1; w16(g + 4, 2); w32(g + 8, 12);             /* step curve, 2 keys */
+        uint8_t *k = g + 12; float z = 0, f = f1[e]; memcpy(k, &z, 4); w16(k + 4, 0); memcpy(k + 8, &f, 4); w16(k + 12, 1);
+        size += 36 + 12 + 12 + 16;
+    }
+    w32(s + 4, (uint32_t)size);
+    return 0x14 + size;
+}
+/* A SARC of the given members (names sorted is not needed for the lookup). */
+static size_t make_sarc(uint8_t *out, const char *const *names, uint8_t *const *data, const size_t *lens, int n) {
+    size_t sfnt = 0x20 + 16 * (size_t)n, at = sfnt + 8, name_off[8];
+    for (int k = 0; k < n; k++) { name_off[k] = at - (sfnt + 8); size_t l = strlen(names[k]) + 1; memcpy(out + at, names[k], l); at += (l + 3) & ~(size_t)3; }
+    size_t data_start = (at + 255) & ~(size_t)255, pos = 0;
+    memset(out, 0, 0x20); memcpy(out, "SARC", 4); w16(out + 4, 0x14); out[6] = 0xFF; out[7] = 0xFE; w32(out + 0x0C, (uint32_t)data_start);
+    memcpy(out + 0x14, "SFAT", 4); w16(out + 0x18, 0xC); w16(out + 0x1A, (unsigned)n);
+    memcpy(out + sfnt, "SFNT", 4); w16(out + sfnt + 4, 8); w16(out + sfnt + 6, 0);
+    for (int k = 0; k < n; k++) {
+        uint8_t *node = out + 0x20 + 16 * k; w32(node, 0); w32(node + 4, 0x01000000u | (uint32_t)(name_off[k] / 4));
+        w32(node + 8, (uint32_t)pos); w32(node + 12, (uint32_t)(pos + lens[k]));
+        memcpy(out + data_start + pos, data[k], lens[k]); pos = (pos + lens[k] + 7) & ~(size_t)7;
+    }
+    w32(out + 8, (uint32_t)(data_start + pos));
+    return data_start + pos;
+}
+static float key_frame(uint8_t *sarc, size_t len, const char *member, int pane) {   /* the second key of pane #pane */
+    size_t n; uint8_t *m = sarc_member(sarc, len, member, &n); if (!m) return -1;
+    uint8_t *s = m + 0x14, *en = s + le32(s + 20 + 4 * pane); float f; memcpy(&f, en + 36 + 12 + 12 + 8, 4); return f;
+}
+
 int main(void) {
     const char *tmp = getenv("TMPDIR"); snprintf(root, sizeof root, "%s/test-mods-XXXXXX", tmp && *tmp ? tmp : "/tmp");
     if (!mkdtemp(root)) { perror("mkdtemp"); return 1; }
@@ -154,6 +194,37 @@ int main(void) {
     free(frame); frame = mods_zstd_raw_frame(data, 0, &fl);
     expect(ZSTD_decompress(again, big, frame, fl) == 0, "an empty frame");
     free(frame); free(data); free(again); free(p); free(t);
+
+    /* A mod file the port's own patches also change. */
+    expect(mods_build_collision("System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs") == MODS_BUILD_KEEP, "the HeapDef stays the port's");
+    expect(mods_build_collision("UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs") == MODS_BUILD_REFIX, "1.4.3 Common archive: refixed");
+    expect(mods_build_collision("UI/LayoutArchive/Common.Product.100.Nin_NX_NVN.blarc.zs") == MODS_BUILD_REFIX, "1.0.0 Common archive: refixed");
+    expect(mods_build_collision("UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc") == MODS_BUILD_MOD_WINS &&
+           mods_build_collision("UI/LayoutArchive/Common.Product.x.Nin_NX_NVN.blarc.zs") == MODS_BUILD_MOD_WINS, "only that archive");
+    expect(mods_build_collision("Event/EventFlow/DmF_SY_GameOver.bfevfl.zs") == MODS_BUILD_MOD_WINS, "the game over flow: the mod wins");
+
+    /* The quick-menu background fix on a synthetic Common archive. */
+    const char *const sc_panes[] = {"N_Other_00", "C_CaptureBG_00", "C_CaptureClearBG_00", "P_CaptureClearBG_00"}, *const ab_panes[] = {"C_CaptureBG_00"};
+    const float one4[] = {1, 1, 1, 1}, one1[] = {1}, odd1[] = {2};
+    uint8_t *sc = calloc(1, 4096), *ab = calloc(1, 4096), *ab_odd = calloc(1, 4096), *other = calloc(1, 64), *arc = calloc(1, 16384);
+    size_t sc_n = make_flan(sc, sc_panes, one4, 4), ab_n = make_flan(ab, ab_panes, one1, 1), ab_odd_n = make_flan(ab_odd, ab_panes, odd1, 1);
+    memcpy(other, "not a layout", 12);
+    const char *const arc_names[] = {"blyt/X.bflyt", "anim/ShortCutBG_00_In.bflan", "anim/AutoBuilder_00_In.bflan"};
+    uint8_t *arc_data[] = {other, sc, ab}; size_t arc_lens[] = {12, sc_n, ab_n};
+    size_t arc_n = make_sarc(arc, arc_names, arc_data, arc_lens, 3); char why[300];
+    expect(key_frame(arc, arc_n, "anim/ShortCutBG_00_In.bflan", 1) == 1.0f, "the synthetic archive reads");
+    expect(mods_capture_fix(arc, arc_n, why, sizeof why) == 4, "four keys moved");
+    expect(key_frame(arc, arc_n, "anim/ShortCutBG_00_In.bflan", 1) == 0.0f && key_frame(arc, arc_n, "anim/ShortCutBG_00_In.bflan", 3) == 0.0f &&
+           key_frame(arc, arc_n, "anim/AutoBuilder_00_In.bflan", 0) == 0.0f, "moved to frame 0");
+    expect(key_frame(arc, arc_n, "anim/ShortCutBG_00_In.bflan", 0) == 1.0f, "another pane is left alone");
+    expect(mods_capture_fix(arc, arc_n, why, sizeof why) == 0, "already fixed: nothing to move");
+    arc_data[2] = ab_odd; arc_lens[2] = ab_odd_n; arc_n = make_sarc(arc, arc_names, arc_data, arc_lens, 3);
+    uint8_t *before = malloc(arc_n); memcpy(before, arc, arc_n);
+    expect(mods_capture_fix(arc, arc_n, why, sizeof why) == -1 && strstr(why, "(2, 1)") && !memcmp(before, arc, arc_n), "other keys: refused, nothing changed");
+    arc_n = make_sarc(arc, arc_names, arc_data, arc_lens, 2);
+    expect(mods_capture_fix(arc, arc_n, why, sizeof why) == -1 && strstr(why, "AutoBuilder"), "a missing member: refused");
+    expect(mods_capture_fix(other, 12, NULL, 0) == -1, "not a SARC");
+    free(sc); free(ab); free(ab_odd); free(other); free(arc); free(before);
 
     char cmd[1200]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", root); if (system(cmd)) {}
     if (failures) { fprintf(stderr, "%d failures\n", failures); return 1; }

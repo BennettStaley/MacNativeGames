@@ -562,3 +562,94 @@ uint8_t *mods_zstd_raw_frame(const uint8_t *data, size_t len, size_t *out_len) {
     } while (done < len);
     *out_len = o; return out;
 }
+
+/* ---- the port's own patches ---- */
+int mods_build_collision(const char *path) {
+    if (!path) return MODS_BUILD_MOD_WINS;
+    if (!strncmp(path, "System/HeapSize/", 16)) return MODS_BUILD_KEEP;
+    static const char head[] = "UI/LayoutArchive/Common.Product.", tail[] = ".Nin_NX_NVN.blarc.zs";
+    size_t n = strlen(path), h = sizeof head - 1, t = sizeof tail - 1;
+    if (n > h + t && !strncmp(path, head, h) && !strcmp(path + n - t, tail)) {
+        for (size_t k = h; k < n - t; k++) if (!isdigit((unsigned char)path[k])) return MODS_BUILD_MOD_WINS;
+        return MODS_BUILD_REFIX;
+    }
+    return MODS_BUILD_MOD_WINS;
+}
+static unsigned le16(const uint8_t *p) { return (unsigned)p[0] | (unsigned)p[1] << 8; }
+static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+/* A SARC member by name (*len its size), or NULL (absent, or not a SARC). */
+static uint8_t *sarc_member(uint8_t *d, size_t n, const char *want, size_t *len) {
+    if (n < 0x20 || memcmp(d, "SARC", 4) || d[6] != 0xFF || d[7] != 0xFE) return NULL;
+    size_t hdr = le16(d + 4), data = le32(d + 0x0C);
+    if (hdr + 12 > n || memcmp(d + hdr, "SFAT", 4)) return NULL;
+    size_t count = le16(d + hdr + 6), sfnt = hdr + 12 + count * 16;
+    if (sfnt + 8 > n || memcmp(d + sfnt, "SFNT", 4)) return NULL;
+    for (size_t k = 0; k < count; k++) {
+        const uint8_t *node = d + hdr + 12 + k * 16; uint32_t attr = le32(node + 4), start = le32(node + 8), end = le32(node + 12);
+        size_t at = sfnt + 8 + (size_t)(attr & 0xFFFFFF) * 4;
+        if (!(attr >> 24) || at >= n || !memchr(d + at, 0, n - at) || strcmp((const char *)d + at, want)) continue;
+        if (start > end || data + end > n) return NULL;
+        *len = end - start; return d + data + start;
+    }
+    return NULL;
+}
+/* A BFLAN's visibility (FLVI) keys for the panes asked for (the layout scripts/make_romfs_patches.py's flvi_keys reads);
+   -1 when the animation does not read. */
+typedef struct { const char *pane; uint8_t *keys; unsigned nkeys; int tracks, step; } FlviPane;
+static int flvi_panes(uint8_t *b, size_t n, FlviPane *panes, int np) {
+    if (n < 0x14 || memcmp(b, "FLAN", 4) || b[4] != 0xFF || b[5] != 0xFE) return -1;
+    size_t pos = 0x14; unsigned sections = le16(b + 0x10);
+    for (unsigned s = 0; s < sections; s++) {
+        if (pos + 8 > n) return -1;
+        size_t size = le32(b + pos + 4); if (size < 8 || size > n - pos) return -1;
+        if (!memcmp(b + pos, "pai1", 4)) {
+            if (size < 20) return -1;
+            size_t count = le16(b + pos + 14), table = pos + le32(b + pos + 16);
+            for (size_t e = 0; e < count; e++) {
+                if (table + 4 * e + 4 > n) return -1;
+                size_t eo = pos + le32(b + table + 4 * e); if (eo + 32 > n) return -1;
+                char name[29]; memcpy(name, b + eo, 28); name[28] = 0;
+                int p = 0; while (p < np && strcmp(name, panes[p].pane)) p++;
+                if (p == np) continue;
+                for (unsigned t = 0; t < b[eo + 28]; t++) {
+                    if (eo + 32 + 4 * t + 4 > n) return -1;
+                    size_t to = eo + le32(b + eo + 32 + 4 * t); if (to + 8 > n) return -1;
+                    if (memcmp(b + to, "FLVI", 4)) continue;
+                    for (unsigned g = 0; g < b[to + 4]; g++) {
+                        if (to + 8 + 4 * g + 4 > n) return -1;
+                        size_t go = to + le32(b + to + 8 + 4 * g); if (go + 12 > n) return -1;
+                        size_t nk = le16(b + go + 4), ko = go + le32(b + go + 8); if (ko > n || nk * 8 > n - ko) return -1;
+                        panes[p].tracks++; panes[p].step = b[go + 2] == 1; panes[p].keys = b + ko; panes[p].nkeys = (unsigned)nk;
+                    }
+                }
+            }
+        }
+        pos += size;
+    }
+    return 0;
+}
+int mods_capture_fix(uint8_t *sarc, size_t len, char *why, size_t cap) {
+    static const struct { const char *member, *panes[3]; int np; } FIX[] = {
+        {"anim/ShortCutBG_00_In.bflan", {"C_CaptureBG_00", "C_CaptureClearBG_00", "P_CaptureClearBG_00"}, 3},
+        {"anim/AutoBuilder_00_In.bflan", {"C_CaptureBG_00", NULL, NULL}, 1}};
+    char scratch[8]; if (!why || !cap) { why = scratch; cap = sizeof scratch; }
+    *why = 0;
+    uint8_t *move[4]; int nmove = 0;
+    for (size_t f = 0; f < sizeof FIX / sizeof *FIX; f++) {
+        size_t n = 0; uint8_t *m = sarc ? sarc_member(sarc, len, FIX[f].member, &n) : NULL;
+        if (!m) { snprintf(why, cap, "no %s in the archive", FIX[f].member); return -1; }
+        FlviPane p[3]; memset(p, 0, sizeof p); for (int k = 0; k < FIX[f].np; k++) p[k].pane = FIX[f].panes[k];
+        if (flvi_panes(m, n, p, FIX[f].np)) { snprintf(why, cap, "%s does not read as a layout animation", FIX[f].member); return -1; }
+        for (int k = 0; k < FIX[f].np; k++) {
+            if (p[k].tracks != 1 || !p[k].step || p[k].nkeys != 2) {
+                snprintf(why, cap, "%s: %s has %d visibility tracks, %u keys (one step track of 2 expected)", FIX[f].member, p[k].pane, p[k].tracks, p[k].nkeys); return -1; }
+            float f0, f1; memcpy(&f0, p[k].keys, 4); memcpy(&f1, p[k].keys + 8, 4);
+            unsigned v0 = le16(p[k].keys + 4), v1 = le16(p[k].keys + 12);
+            if (f0 != 0.0f || v0 != 0 || v1 != 1 || (f1 != 1.0f && f1 != 0.0f)) {
+                snprintf(why, cap, "%s: %s keys are (%g, %u), (%g, %u), not (0, 0), (1, 1)", FIX[f].member, p[k].pane, (double)f0, v0, (double)f1, v1); return -1; }
+            if (f1 == 1.0f) move[nmove++] = p[k].keys + 8;
+        }
+    }
+    const float zero = 0.0f; for (int k = 0; k < nmove; k++) memcpy(move[k], &zero, 4);
+    return nmove;
+}
