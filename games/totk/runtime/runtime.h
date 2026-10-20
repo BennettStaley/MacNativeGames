@@ -115,6 +115,8 @@ int fps_overlay_toggle_hints(void);   /* shared key 1 toggle for FPS, shader and
 int runtime_aspect_toggle(void);   /* runtime/aspect_patch.h: key 4, 16:9 <-> ultrawide (Mac, 1.2.1 / 1.4.3); 0 where unavailable */
 float runtime_aspect_now(void);     /* the ratio in force, 0 = the game's own 16:9 */
 void runtime_fov_set(int percent);
+void runtime_fog_set(int percent);   /* aspect_patch.h: fog density 0..100 % live (1.4.3, Mac and iOS), 100 = the game's own */
+int runtime_shadow_res(void);        /* aspect_patch.h: the shadow map factor in force from the start (TOTK_SHADOW_RES), 0 = the game's own */
 void runtime_fov_aspect(float k);   /* aspect_patch.h: the vertical angle's factor for a screen taller than 16:9 (Vert+), with the player's */  /* runtime/aspect_patch.h: field of view 70..140 % live (1.4.3, Mac and iOS), 100 = the game's own */
 int hud_compact(void);   /* gfx/nvn/fps_overlay.c: the overlay lines go to the window's corner panel (TOTK_HUD=corners: in the picture) */
 int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line 0..2: FPS, shaders, load; 0 = not published */

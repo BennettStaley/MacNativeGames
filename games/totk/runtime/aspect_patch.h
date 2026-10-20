@@ -216,3 +216,98 @@ static inline void fov_install(Module *m, const char *version, const uint64_t *s
     fprintf(stderr, "[totk] %s field of view: %d%% (TOTK_FOV), live via runtime_fov_set; %u camera site(s), stubs +%#llx\n",
             version, start, nsite, (unsigned long long)stub_off);
 }
+
+/* Fog (1.4.3; Mac and iPhone / iPad): TOTK_FOG=<percent> 0..100 scales the distance fog's density from the start (100 or
+   unset = the game's own, 0 = none), runtime_fog_set changes it live (the settings menu). The environment uniform writer
+   (main+0xd28b4, the per-frame writer of the "Env" block, found with a write watch on that block) blends the four fog
+   objects of the two environment palettes in force and stores each as a colour, a direction and a linear ramp: scale =
+   1 / (end - start) (main+0xd3050, fcsel s9, s18, s1, ne: 1 when end = start) and offset = -start * scale (the fnmul
+   right after it). The fog amount is that ramp, clamped, times the colour's alpha. A DPF_MULTIPLY stub on the fcsel
+   scales s9 and so the offset with it: the whole ramp is multiplied, 50 % reaches the game's fog at twice the distance,
+   0 % leaves none. The multiplier is a float on the data page after main (+80; 0 = the game's own, FLT_MIN stands for
+   0 %). iOS cannot write code at run time: the iOS export always embeds the stub; the phone checks it and writes the
+   multiplier. */
+#define FOG_DATA_SLOT 80
+static _Atomic(uint32_t) *g_fog_slot;
+static int g_fog_percent = 100;
+static inline int fog_clamp(int p) { return p < 0 ? 0 : p > 100 ? 100 : p; }
+static inline uint32_t fog_bits(int percent) {
+    float v = percent >= 100 ? 0.0f : percent <= 0 ? 1.17549435e-38f : percent / 100.0f; uint32_t bits;
+    memcpy(&bits, &v, 4); return bits;
+}
+/* Live: percent 0..100 (clamped), 100 = the game's own. Ignored where the patch is not in (other game versions). */
+void runtime_fog_set(int percent) {
+    g_fog_percent = fog_clamp(percent);
+    if (!g_fog_slot) { fprintf(stderr, "[totk] fog %d%%: not available in this build\n", g_fog_percent); return; }
+    atomic_store(g_fog_slot, fog_bits(g_fog_percent)); fprintf(stderr, "[totk] fog %d%%\n", g_fog_percent);
+}
+static inline int fog_requested(void) {
+    const char *e = getenv("TOTK_FOG"); char rest; int p;
+    if (!e || !*e) return 100;
+    if (sscanf(e, "%d%c", &p, &rest) != 1 || p < 0 || p > 100) runtime_fail("TOTK_FOG must be a percentage between 0 and 100");
+    return p;
+}
+static inline void fog_install(Module *m, const char *version, const uint64_t *sites, const uint32_t *want, unsigned nsite, uint64_t stub_off, uint64_t data_off) {
+    int start = fog_requested();
+#if TARGET_OS_IPHONE
+    if (!dpf_embedded(m, "fog", sites, want, nsite, stub_off, data_off, FOG_DATA_SLOT, DPF_MULTIPLY)) {
+        fprintf(stderr, "[totk] %s fog: the game's own (not patched at build)\n", version); return;
+    }
+#else
+    dpf_install(m, "fog", sites, want, nsite, stub_off, data_off, FOG_DATA_SLOT, DPF_MULTIPLY);
+#endif
+    g_fog_slot = (_Atomic(uint32_t) *)(void *)(m->base + data_off + FOG_DATA_SLOT);
+    g_fog_percent = start; atomic_store(g_fog_slot, fog_bits(start));
+    fprintf(stderr, "[totk] %s fog: %d%% (TOTK_FOG), live via runtime_fog_set; %u site(s), stubs +%#llx\n", version, start, nsite, (unsigned long long)stub_off);
+}
+
+/* Shadow resolution (1.4.3; Mac): TOTK_SHADOW_RES=2 or 4 multiplies the side of the sun's cascaded shadow map (a square
+   2D array of 4 depth layers, "shadow_map_depth", made by main+0xfca60; 400 x 400 docked) from the start; 0 or unset is
+   the game's own. Each view's side is picked in main+0x683480..: a quality table's two sizes blended by the camera's
+   state, times a factor, converted (fcvtzs w11), rounded up to 8 (main+0x683604 add w11, w11, #7; and ~7) and stored as
+   both width (+0x3d8) and height (+0x3f8) of the view (stride 0xbb0), which the map's creation and the shadow passes
+   read. A stub on that add first shifts w11 left by the int on the data page (+84: 1 = 2x, 2 = 4x, 0 = the game's own)
+   and caps it at 2048: the game also makes maps for its other views at boot (424, 800, 848, 720 and 1440; measured
+   2026-10-20: 4x without the cap added 635 MB of GPU memory, with it the main view still gets 1600). Both paths to the
+   rounding (main+0x6835a8 jumps to it) go through the stub. x16 and the flags are free there (x16 is written next at
+   main+0x683618, the flags at main+0x683640). The iOS export embeds the stub; the phone checks it and leaves +84 at 0. */
+#define SHADOW_DATA_SLOT 84
+enum { SHADOW_STUB = 32, SHADOW_CAP = 2048 };   /* bytes; the largest side the stub makes */
+static inline void shadow_stub(uint32_t *s, uint32_t ins, uint64_t site, uint64_t stub, uint64_t data_off) {
+    int64_t pages = (int64_t)(data_off >> 12) - (int64_t)(stub >> 12);   /* the module base is page aligned */
+    if (pages < -(1 << 20) || pages >= (1 << 20)) runtime_fail("shadow stub: data page out of ADRP range");
+    uint32_t imm = (uint32_t)pages & 0x1fffff, d = (ins >> 5) & 31;
+    s[0] = 0x90000000u | ((imm & 3) << 29) | ((imm >> 2) << 5) | 16;          /* adrp x16, <data page> */
+    s[1] = 0xb9400000u | ((SHADOW_DATA_SLOT / 4) << 10) | (16 << 5) | 16;    /* ldr w16, [x16, #84] */
+    s[2] = 0x1ac02000u | (16 << 16) | (d << 5) | d;                          /* lsl w11, w11, w16 */
+    s[3] = 0x52800000u | (SHADOW_CAP << 5) | 16;                             /* mov w16, #2048 */
+    s[4] = 0x6b00001fu | (16 << 16) | (d << 5);                              /* cmp w11, w16 */
+    s[5] = 0x1a80b000u | (16 << 16) | (d << 5) | d;                          /* csel w11, w11, w16, lt */
+    s[6] = ins;                                                              /* add w11, w11, #7 (the game's rounding) */
+    s[7] = aspect_branch(stub + 28, site + 4);                               /* b <after the add> */
+}
+static int g_shadow_factor;   /* the factor in force (0 = the game's own) */
+int runtime_shadow_res(void) { return g_shadow_factor; }
+static inline void shadow_install(Module *m, const char *version, uint64_t stub_off, uint64_t data_off) {
+    const uint64_t site = 0x683604; const uint32_t want = 0x11001d6b;   /* add w11, w11, #7 */
+    uint64_t page_end = (m->text_end + 0x3fff) & ~0x3fffULL;
+    if (stub_off < m->text_end || stub_off + SHADOW_STUB > page_end) dpf_fail("shadow resolution", "no room in main's text padding");
+    if (data_off + SHADOW_DATA_SLOT + 4 > m->size) dpf_fail("shadow resolution", "no data page after main");
+    uint32_t stub[SHADOW_STUB / 4], jump = aspect_branch(site, stub_off), got;
+    shadow_stub(stub, want, site, stub_off, data_off);
+    memcpy(&got, m->base + site, 4);
+#if TARGET_OS_IPHONE
+    if (got == want) { fprintf(stderr, "[totk] %s shadow resolution: the game's own (not patched at build)\n", version); return; }
+    if (got != jump || memcmp(m->base + stub_off, stub, SHADOW_STUB)) dpf_fail("shadow resolution", "embedded code mismatch");
+#else
+    if (got != want) dpf_fail("shadow resolution", "the shadow code does not match this game version");
+    for (uint64_t i = 0; i < SHADOW_STUB; i++) if (m->base[stub_off + i]) dpf_fail("shadow resolution", "text padding in use");
+    memcpy(m->base + stub_off, stub, SHADOW_STUB); memcpy(m->base + site, &jump, 4);
+#endif
+    const char *e = getenv("TOTK_SHADOW_RES"); int k = 0; char rest;
+    if (e && *e && (sscanf(e, "%d%c", &k, &rest) != 1 || (k != 0 && k != 1 && k != 2 && k != 4))) runtime_fail("TOTK_SHADOW_RES must be 0, 2 or 4");
+    if (k == 1 || getenv("TOTK_EXPORT_IOS")) k = 0;   /* the export builds code only; the phone decides at its own launch */
+    atomic_store((_Atomic(uint32_t) *)(void *)(m->base + data_off + SHADOW_DATA_SLOT), (uint32_t)(k == 4 ? 2 : k == 2 ? 1 : 0));
+    g_shadow_factor = k;
+    fprintf(stderr, "[totk] %s shadow resolution: %s (TOTK_SHADOW_RES); main+%#llx, stub +%#llx\n", version, k == 4 ? "4x" : k == 2 ? "2x" : "the game's own", (unsigned long long)site, (unsigned long long)stub_off);
+}

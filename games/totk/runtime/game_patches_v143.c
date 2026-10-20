@@ -16,6 +16,7 @@
 #endif
 
 typedef struct { uint64_t off; uint32_t original, replacement; } Patch;
+enum { FOG_STUB_AT = 400, SHADOW_STUB_AT = 448 };   /* text padding offsets from the stub base (the fog and shadow stubs, to +480) */
 static const Patch fps60[] = {
     {0x2db204, 0x6b08015f, 0x7100055f},
     {0x2db208, 0x1a89b10a, 0x1a9fa52a},
@@ -130,6 +131,12 @@ void runtime_game_patches(Module *m) {
     { static const uint64_t sites[] = {0x628c3c, 0xb4342c};
       static const uint32_t want[] = {0xbd413e60 /* ldr s0, [x19, #0x13c] */, 0xbd4066c0 /* ldr s0, [x22, #0x64] */};
       fov_install(m, "1.4.3", sites, want, 2, ((m->text_end + 15) & ~15ULL) + 48 + 4 * DPF_REPLACE, (m->file_size + 0x3fff) & ~0x3fffULL); }
+    /* Fog density and shadow resolution (aspect_patch.h): text padding from +400 (fog, one 48-byte stub; the shadow's 32-byte
+       stub from +448, to +480), data page +80 (fog) and +84 (shadow). Always in on the Mac and in the iOS export. */
+    { static const uint64_t sites[] = {0xd3050};
+      static const uint32_t want[] = {0x1e211e49 /* fcsel s9, s18, s1, ne */};
+      fog_install(m, "1.4.3", sites, want, 1, ((m->text_end + 15) & ~15ULL) + FOG_STUB_AT, (m->file_size + 0x3fff) & ~0x3fffULL); }
+    shadow_install(m, "1.4.3", ((m->text_end + 15) & ~15ULL) + SHADOW_STUB_AT, (m->file_size + 0x3fff) & ~0x3fffULL);
     const char *enabled = getenv("TOTK_FPS60");
     if (enabled && !strcmp(enabled, "0")) {
         fprintf(stderr, "[totk] 1.4.3 shipping frame controller (TOTK_FPS60=0)\n");

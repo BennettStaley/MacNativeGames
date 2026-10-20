@@ -41,6 +41,8 @@ Limits and why:
 |---|---|
 | **Frame interpolation** | MetalFX makes a frame between two game frames: off, 30 + 30, half the refresh rate, every frame (Mac and iPad). |
 | **Field of view** | 70–140 % of the game's camera angle. Aiming, first person and cutscenes keep their own changes, scaled. |
+| **Fog** | 0–100 % of the game's distance fog (100 % is the game's own). 50 % reaches the same fog at twice the distance, 0 % has none. Live. Version 1.4.3. |
+| **Shadow resolution** | The sun's cascaded shadow map: *the game's own* (400 × 400 per cascade docked), *2x* (800) or *4x* (1600) for sharper shadow edges; the game's other views grow too, up to 2048. 4x adds about 190 MB of depth maps in all. Mac only; applies after a restart. Version 1.4.3. |
 | **Anti-aliasing** | The game's own FXAA, off, FXAA or SMAA, on the 3D scene before the game draws its text and icons. |
 | **Sharpening** | AMD FidelityFX CAS on the finished picture, under the text and icons. |
 | **Anisotropic filtering** | The game's, or 2–16×: sharper ground and walls seen at an angle. |
@@ -94,3 +96,7 @@ runtime, the iOS app and `tests/test_settings.c`.
 Test runs drive the menu's own code path through `TOTK_INPUT_FILE`: `set <key> <value>` changes a setting as the menu
 does (`set display.scale 50`, `set graphics.aa smaa`), `menu` opens or closes the Mac menu, `menukey <Mac key code>`
 presses a key in it, and `settings-shot <png>` saves the Mac menu as a picture.
+
+## Credits
+
+Several settings follow features first offered on Switch and emulators by MaxLastBreath's UltraCam (https://gamebanana.com/mods/480138) and NX Optimizer (https://github.com/MaxLastBreath/nx-optimizer). This port reimplements them independently for 1.4.3 and contains none of their code.
