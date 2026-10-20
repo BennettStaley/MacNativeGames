@@ -45,20 +45,40 @@ Limits and why:
 | **Sharpening** | AMD FidelityFX CAS on the finished picture, under the text and icons. |
 | **Anisotropic filtering** | The game's, or 2–16×: sharper ground and walls seen at an angle. |
 | **Texture detail bias** | Below 0 picks sharper texture levels; too low shimmers. |
+| **Depth of field** | On (the game's) or off. The game blurs the distance with one full-screen pass over the scene (it reads the depth and blends a blurred half-size copy of the picture over everything far away); off leaves that pass out, so far away stays as sharp as it was drawn. Version 1.4.3. |
+| **Bloom** | 0–100 % of the game's glow around bright light. The tone map adds the bloom texture to the scene; below 100 % that texture is scaled first, so 0 % is no bloom at all. Version 1.4.3. |
 
 ## Frame rate, interface, controls, audio
 
 - **Frame rate limit**: 30, 40, 60, 120 fps or the display's refresh rate. When the display paces the game (a 120 Hz
   display) the limit holds each frame for whole refreshes (30 fps = 4 refreshes at 120 Hz); 40 needs a 120 Hz display.
-- **Performance readout**, **shader counter** (after restart), and on iPhone / iPad the **touch controls** (when they
-  show, opacity, size) and the **settings button**.
+- **Performance readout**, and its **Readout detail**: *Simple* (`FPS 60  2560x1440`) or *Detailed*, which adds the
+  average and the 1 % low over the last 5 seconds (`FPS 60  avg 59  1% low 48  2560x1440`). The 1 % low is the frame
+  rate of the slowest 1 % of the game's frames in that window, so a single long hitch shows there while the average
+  barely moves.
+- **Hide the HUD**: hides everything the game draws over the picture (hearts, map, prompts, quest text) for clean
+  screenshots; **F2** on a Mac keyboard toggles it and the setting follows. It hides the game's menus too (the pause
+  menu and the inventory are drawn the same way as the HUD; the inventory's 3D Link still shows), so turn it off to
+  use them. The performance readout is the port's own and stays.
+- **Shader counter** (after restart), and on iPhone / iPad the **touch controls** (when they show, opacity, size) and
+  the **settings button**.
 - **Button prompts**: the button icons the game shows: *Automatic* (the last controller you connected: Xbox icons for an
   Xbox controller, PlayStation icons for a DualSense or DualShock, the game's own otherwise), *Switch*, *Xbox* or
   *PlayStation*. Xbox and PlayStation use a button-icon mod installed from the Mods tab (for Xbox: "Xbox UI for
   v1.4.3" on GameBanana); the setting turns exactly one of them on at start and the others off, so going back to the
   game's own icons is one choice, not uninstalling. Applies after a restart (the game loads its icons once at boot).
+- **Camera speed, horizontal / vertical**: 25–300 % of the right stick's left-right and up-down push (controller and
+  arrow keys alike), each axis on its own. The push is scaled before the game reads it and stays within the stick's
+  range, so above 100 % a partial push turns the camera like a fuller one and the game's top speed (stick all the way,
+  or an arrow key) stays the game's; below 100 % every push, the arrow keys included, turns it slower.
 - **Face buttons** (PlayStation and Xbox by position or by label), **rumble** and **motion controls** (Mac).
 - **Volume**.
+
+## Credits
+
+Several settings follow features first offered on Switch and emulators by MaxLastBreath's UltraCam
+(https://gamebanana.com/mods/480138) and NX Optimizer (https://github.com/MaxLastBreath/nx-optimizer). This port
+reimplements them independently for 1.4.3 and contains none of their code.
 
 ## The file
 
