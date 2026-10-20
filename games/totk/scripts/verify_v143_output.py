@@ -196,8 +196,8 @@ FOG_SLOT, SHADOW_SLOT = 80, 84        # data page: the fog multiplier (float), t
 
 
 def fog_shadow_checks(out, raw, data, layout):
-    """Fog density (TOTK_FOG, live through runtime_fog_set) and shadow resolution (TOTK_SHADOW_RES, at the start): the
-    two sites always carry their stubs (Mac and the iOS export), the data page holds 0 for the game's own; executed,
+    """Fog density (TOTK_FOG, live through runtime_fog_set) and shadow resolution (TOTK_SHADOW_RES, live through
+    runtime_shadow_res_set): the two sites always carry their stubs (Mac and the iOS export), the data page holds 0 for the game's own; executed,
     the fog stub multiplies the ramp scale s9 (and so the offset the next fnmul derives from it) and the shadow stubs
     shifts the map's side left (2x: 1, 4x: 2) and caps it at 2048 before the game rounds it up to 8; the stubs keep x10 /
     d16 (fog) and use only x16 (shadow)."""

@@ -261,16 +261,26 @@ static inline void fog_install(Module *m, const char *version, const uint64_t *s
     fprintf(stderr, "[totk] %s fog: %d%% (TOTK_FOG), live via runtime_fog_set; %u site(s), stubs +%#llx\n", version, start, nsite, (unsigned long long)stub_off);
 }
 
-/* Shadow resolution (1.4.3; Mac): TOTK_SHADOW_RES=2 or 4 multiplies the side of the sun's cascaded shadow map (a square
-   2D array of 4 depth layers, "shadow_map_depth", made by main+0xfca60; 400 x 400 docked) from the start; 0 or unset is
-   the game's own. Each view's side is picked in main+0x683480..: a quality table's two sizes blended by the camera's
-   state, times a factor, converted (fcvtzs w11), rounded up to 8 (main+0x683604 add w11, w11, #7; and ~7) and stored as
-   both width (+0x3d8) and height (+0x3f8) of the view (stride 0xbb0), which the map's creation and the shadow passes
-   read. A stub on that add first shifts w11 left by the int on the data page (+84: 1 = 2x, 2 = 4x, 0 = the game's own)
-   and caps it at 2048: the game also makes maps for its other views at boot (424, 800, 848, 720 and 1440; measured
-   2026-10-20: 4x without the cap added 635 MB of GPU memory, with it the main view still gets 1600). Both paths to the
-   rounding (main+0x6835a8 jumps to it) go through the stub. x16 and the flags are free there (x16 is written next at
-   main+0x683618, the flags at main+0x683640). The iOS export embeds the stub; the phone checks it and leaves +84 at 0. */
+/* Shadow resolution (1.4.3; Mac): 2x or 4x the side of the sun's cascaded shadow map (a square 2D array of 4 depth
+   layers, "shadow_map_depth"), from the start (TOTK_SHADOW_RES=2 / 4; 0 or unset is the game's own) and live
+   (runtime_shadow_res_set, the settings menu). Each view's side is picked in main+0x683480..: a quality table's two
+   sizes blended by the camera's state, times a factor, converted (fcvtzs w11), rounded up to 8 (main+0x683604 add w11,
+   w11, #7; and ~7) and stored as both width (+0x3d8) and height (+0x3f8) of the view (stride 0xbb0), which the map's
+   creation and the shadow passes read. A stub on that add first shifts w11 left by the int on the data page (+84: 1 =
+   2x, 2 = 4x, 0 = the game's own) and caps it at 2048: the game also makes maps for its other views (424, 800, 848, 720
+   and 1440; measured 2026-10-20: 4x without the cap added 635 MB of GPU memory). Both paths to the rounding
+   (main+0x6835a8 jumps to it) go through the stub. x16 and the flags are free there (x16 is written next at
+   main+0x683618, the flags at main+0x683640). The iOS export embeds the stub; the phone checks it and leaves +84 at 0.
+   Live needs nothing more than the data page: the pick is not a boot-time step. It runs every frame (main+0x682fec,
+   called only from main+0x6822f0 <- main+0x67e028, a job the graphics setup at main+0xcce420 registers), and so does the
+   map's creation: main+0xfca60 (called every frame from main+0xf5818, the render-target pass setup; also from
+   main+0x5683e0 and main+0xf6278) reads the side back from the view (+0x68 / +0x88 of the target at view +0x370) and asks
+   main+0x1c2590 for a texture: a cache of render targets keyed by a CRC of the descriptor (size, format, layers) that
+   returns a matching entry or recycles an unused one (refcount 0, the free list at +0x2238) from the game's own texture
+   heap. The game itself changes the side from frame to frame (the title screen goes through 424, 848, 800, 400 and 720),
+   so a new factor is taken at the next frame's pick the same way (measured 2026-10-20, Great Sky Island: 800 -> 2048 ->
+   800 -> 1600 -> 800 within a frame of each switch; GPU memory 3380 MB before, 3470 MB after the first 4x and flat
+   through 20 more switches). */
 #define SHADOW_DATA_SLOT 84
 enum { SHADOW_STUB = 32, SHADOW_CAP = 2048 };   /* bytes; the largest side the stub makes */
 static inline void shadow_stub(uint32_t *s, uint32_t ins, uint64_t site, uint64_t stub, uint64_t data_off) {
@@ -288,6 +298,14 @@ static inline void shadow_stub(uint32_t *s, uint32_t ins, uint64_t site, uint64_
 }
 static int g_shadow_factor;   /* the factor in force (0 = the game's own) */
 int runtime_shadow_res(void) { return g_shadow_factor; }
+static _Atomic(uint32_t) *g_shadow_slot;
+int runtime_shadow_res_set(int k) {
+    if (k != 0 && k != 2 && k != 4) return -1;
+    if (!g_shadow_slot) { fprintf(stderr, "[totk] shadow resolution %dx: not available in this build\n", k); return -1; }
+    atomic_store(g_shadow_slot, (uint32_t)(k == 4 ? 2 : k == 2 ? 1 : 0)); g_shadow_factor = k;
+    fprintf(stderr, "[totk] shadow resolution: %s (live)\n", k == 4 ? "4x" : k == 2 ? "2x" : "the game's own");
+    return 0;
+}
 static inline void shadow_install(Module *m, const char *version, uint64_t stub_off, uint64_t data_off) {
     const uint64_t site = 0x683604; const uint32_t want = 0x11001d6b;   /* add w11, w11, #7 */
     uint64_t page_end = (m->text_end + 0x3fff) & ~0x3fffULL;
@@ -303,6 +321,7 @@ static inline void shadow_install(Module *m, const char *version, uint64_t stub_
     if (got != want) dpf_fail("shadow resolution", "the shadow code does not match this game version");
     for (uint64_t i = 0; i < SHADOW_STUB; i++) if (m->base[stub_off + i]) dpf_fail("shadow resolution", "text padding in use");
     memcpy(m->base + stub_off, stub, SHADOW_STUB); memcpy(m->base + site, &jump, 4);
+    g_shadow_slot = (_Atomic(uint32_t) *)(void *)(m->base + data_off + SHADOW_DATA_SLOT);
 #endif
     const char *e = getenv("TOTK_SHADOW_RES"); int k = 0; char rest;
     if (e && *e && (sscanf(e, "%d%c", &k, &rest) != 1 || (k != 0 && k != 1 && k != 2 && k != 4))) runtime_fail("TOTK_SHADOW_RES must be 0, 2 or 4");

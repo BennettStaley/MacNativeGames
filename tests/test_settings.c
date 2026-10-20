@@ -68,7 +68,7 @@ int main(void) {
     v[settings_index("controls.face_buttons")] = 0; unsetenv("TOTK_FACE_BUTTONS"); settings_export_env(v);
     expect(!getenv("TOTK_FACE_BUTTONS"), "automatic leaves the variable unset");
 
-    /* Fog (live, every platform) and shadow resolution (restart, Mac): defaults, the file's words, the game's variables. */
+    /* Fog (live, every platform) and shadow resolution (live, Mac; TOTK_SHADOW_RES for the start): defaults, the file's words, the game's variables. */
     settings_defaults(v, 0);
     expect(value(v, "graphics.fog") == 100 && value(v, "graphics.shadow_res") == 0, "fog and shadows default to the game's own");
     settings_defaults(v, 1);
@@ -76,8 +76,8 @@ int main(void) {
     expect(settings_parse_text("graphics.fog = 55\ngraphics.shadow_res = 4\n", v) == 2 && value(v, "graphics.fog") == 50 &&
            value(v, "graphics.shadow_res") == 4, "fog rounds to its step, shadows by their word");
     expect(settings_parse_text("graphics.shadow_res = 3\n", v) == 0 && value(v, "graphics.shadow_res") == 4, "no 3x shadows");
-    expect(SETTINGS[settings_index("graphics.fog")].apply == SET_LIVE && SETTINGS[settings_index("graphics.shadow_res")].apply == SET_RESTART &&
-           SETTINGS[settings_index("graphics.shadow_res")].platforms == SET_MAC, "fog is live everywhere, shadows restart on the Mac");
+    expect(SETTINGS[settings_index("graphics.fog")].apply == SET_LIVE && SETTINGS[settings_index("graphics.shadow_res")].apply == SET_LIVE &&
+           SETTINGS[settings_index("graphics.shadow_res")].platforms == SET_MAC, "fog is live everywhere, shadows live on the Mac");
     unsetenv("TOTK_FOG"); unsetenv("TOTK_SHADOW_RES"); settings_export_env(v);
     expect(getenv("TOTK_FOG") && !strcmp(getenv("TOTK_FOG"), "50") && getenv("TOTK_SHADOW_RES") && !strcmp(getenv("TOTK_SHADOW_RES"), "4"),
            "fog and shadows go out as TOTK_FOG / TOTK_SHADOW_RES");
