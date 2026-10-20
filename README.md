@@ -192,8 +192,19 @@ Native 2K changes the game's composition canvas and UI to 2560×1440. The 3D sce
 
 Language: the game and the launcher's own text (startup screen, shader warm-up progress, overlays, keyboard prompt) follow the Mac's language. The launcher text is Chinese on a Chinese Mac and English otherwise. In a 1.4.3 build, Brazilian Portuguese selects the game's official pt-BR text. To give only this game another language, set its preferred language, for example `defaults write org.macnativegames.totk AppleLanguages -array pt-BR` (`defaults delete org.macnativegames.totk AppleLanguages` removes it). To override, launch with `TOTK_LANG` for the game (for example `open --env TOTK_LANG=en-US "Tears of the Kingdom.app"`) or `TOTK_UI_LANG=zh` / `en` for the launcher text.
 
+## Settings menu
+
+The game has an in-game settings menu on Mac, iPad and iPhone: output resolution (up to your display's native pixels or
+4K), 3D render scale (25–200 %), aspect ratio (wider and taller screens see more, nothing stretched), field of view,
+anti-aliasing (FXAA / SMAA), sharpening, anisotropic filtering, frame rate limit, frame interpolation, the HUD readouts,
+touch controls, controller face buttons and volume. Changes apply while you play. On the Mac open it with **⌘,** or
+**F1** (or a controller's Home button); it is a sidebar inside the game window, so it works in full screen. On iPad and
+iPhone use the gear at the top, a three-finger tap or a controller's Home button. See [docs/settings.md](docs/settings.md).
+
 ## Where things are
 
+- Settings: `~/Library/Application Support/MacNativeGames/TOTK/settings.txt` (the menu writes it; see [docs/settings.md](docs/settings.md))
+- Save sync between the Mac and an iPhone / iPad: [docs/save-sync.md](docs/save-sync.md)
 - Saves: `~/Library/Application Support/MacNativeGames/TOTK/profile`
 - Shader cache: `~/Library/Application Support/MacNativeGames/TOTK/shader-cache` (delete it to translate everything again)
 - Shaders the shared list does not have yet: `~/Library/Application Support/MacNativeGames/TOTK/shader-list-contribution.txt`
