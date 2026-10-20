@@ -128,7 +128,7 @@ __attribute__((constructor)) static void input_script_start(void) {
 /* Optional local integration-test command stream. Appending complete lines lets tests inspect each
    actual frame before choosing the next input, instead of guessing load/menu timings. Disabled normally.
    Commands: key <Mac keycode> <milliseconds>, down/up <Mac keycode>, shot <path>, wshot <path>, passdump <frames>, querylog <frames>, anomdump,
-   kbtest / kbtype <text> / kbenter / kbesc / kbshot <path> (the text entry bar), threads (dump every guest thread's wait), hletrace <0|1|2> (host calls the game makes), framestep <ms> (pin the frame step), close. */
+   kbtest / kbtype <text> / kbenter / kbesc / kbshot <path> (the text entry bar), threads (dump every guest thread's wait), hletrace <0|1|2> (host calls the game makes), framestep <ms> (pin the frame step), render <w>x<h> (live scene size), close. */
 extern void dm_gfx_shot_at(long frames, const char *path);
 extern void runtime_front_request_close(void);
 static void *input_file(void *arg) {
@@ -185,6 +185,9 @@ static void *input_file(void *arg) {
             runtime_frame_step_pin(ms);
         } else if (sscanf(line, "fov %u %n", &code, &used) == 1 && used && !line[used] && code >= 70 && code <= 140) {
             runtime_fov_set((int)code);   /* "fov <percent>": field of view 70..140 %, 100 = the game's own (aspect_patch.h) */
+        } else if (!strncmp(line, "render ", 7)) {   /* "render <w>x<h>": the live scene size (runtime_render_request), as the settings menu asks */
+            unsigned w, h; char rest = 0; if (sscanf(line + 7, "%ux%u%c", &w, &h, &rest) < 2 || (rest && rest != '\n' && rest != '\r')) runtime_fail("render takes <width>x<height>");
+            runtime_render_request(w, h);
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
         } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }

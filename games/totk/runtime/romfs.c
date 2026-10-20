@@ -204,12 +204,12 @@ static int folder_exists(const char *folder) {
 /* The overlay slot + 1 that replaces RomFS file i, or 0. */
 static uint32_t overlay_slot(uint64_t i) {size_t lo=0,hi=noverlay;while(lo<hi){size_t m=lo+(hi-lo)/2;if(overlays[m].index<i)lo=m+1;else hi=m;}return lo<noverlay&&overlays[lo].index==i?(uint32_t)(lo+1):0;}
 /* TOTK_ROMFS_PATCHES (default extracted/<version>/romfs-patches; 0 = none); with a true-2K output bigger than 1920x1080
-   also <TOTK_ROMFS_PATCHES_OUT, default extracted/<version>/romfs-patches-out>/<w>x<h> (the HeapDef sizes,
-   scripts/make_output_res_overlay.py); then the player's mods in TOTK_ROMFS_MODS (0 = none). */
+   or a scene reserve above 1600x900 (1.4.3) also <TOTK_ROMFS_PATCHES_OUT, default extracted/<version>/romfs-patches-out>/
+   <w>x<h>[-scene-<sw>x<sh>] (the HeapDef sizes, scripts/make_output_res_overlay.py; runtime_heap_overlay names it); then the player's mods in TOTK_ROMFS_MODS (0 = none). */
 static void overlay_init(void) {
  const char *dir=getenv("TOTK_ROMFS_PATCHES");if(!dir||strcmp(dir,"0"))overlay_load(dir?dir:"extracted/" TOTK_GAME_DIR "/romfs-patches",0);
- unsigned w,h;if(runtime_output_res(&w,&h)&&runtime_output_res_extra_bytes()){const char *out=getenv("TOTK_ROMFS_PATCHES_OUT");char d[4096];
-  need(snprintf(d,sizeof(d),"%s/%ux%u",out?out:"extracted/" TOTK_GAME_DIR "/romfs-patches-out",w,h)<(int)sizeof(d),"RomFS output overlay path");overlay_load(d,1);}
+ char name[64];if(runtime_heap_overlay(name,sizeof name)){const char *out=getenv("TOTK_ROMFS_PATCHES_OUT");char d[4096];
+  need(snprintf(d,sizeof(d),"%s/%s",out?out:"extracted/" TOTK_GAME_DIR "/romfs-patches-out",name)<(int)sizeof(d),"RomFS output overlay path");overlay_load(d,1);}
  const char *mods=getenv("TOTK_ROMFS_MODS");if(mods&&*mods&&strcmp(mods,"0"))overlay_load(mods,0);
  added_init();
  if(noverlay)qsort(overlays,noverlay,sizeof(*overlays),overlay_order);

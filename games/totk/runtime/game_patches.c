@@ -282,6 +282,18 @@ uint64_t runtime_output_res_extra_bytes(void) {
     uint64_t kib = (uint64_t)ceil(113664.0 * ratio / 1024.0) * 1024 - 113664;
     return kib << 10;
 }
+int runtime_heap_overlay(char *out, size_t n) {
+    unsigned w, h;
+    if (!runtime_output_res(&w, &h) || !runtime_output_res_extra_bytes()) return 0;
+    snprintf(out, n, "%ux%u", w, h);
+    return 1;
+}
+/* Live scene sizes are 1.4.3 only (runtime/game_patches_v143.c); here TOTK_RENDER_RES stays a boot setting. */
+int runtime_render_request(unsigned w, unsigned h) {
+    fprintf(stderr, "[totk] render request %ux%u refused: live scene sizes need 1.4.3 (TOTK_RENDER_RES applies after a restart)\n", w, h);
+    return -1;
+}
+void runtime_render_reserve(unsigned *w, unsigned *h) { *w = *h = 0; }
 enum { DP_OUTPUT_SIZE = 32, DP_RENDERER = 40 };   /* data page: the output size {w, h} the game reads; the renderer it stores */
 static _Atomic(uint8_t *) output_page;
 static unsigned output_w, output_h;   /* the largest output size (the swapchain) */
