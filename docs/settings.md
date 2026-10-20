@@ -53,6 +53,7 @@ Limits and why:
 | **Texture detail bias** | Below 0 picks sharper texture levels; too low shimmers. |
 | **Depth of field** | On (the game's) or off. The game blurs the distance with one full-screen pass over the scene (it reads the depth and blends a blurred half-size copy of the picture over everything far away); off leaves that pass out, so far away stays as sharp as it was drawn. Version 1.4.3. |
 | **Bloom** | 0–100 % of the game's glow around bright light. The tone map adds the bloom texture to the scene; below 100 % that texture is scaled first, so 0 % is no bloom at all. Version 1.4.3. |
+| **Lens flare** | On (the game's) or off. With the sun in view the game draws about a dozen rings, ghosts and a glint over the scene before its tone map; off leaves those draws out (the sun, its glow and bloom stay). Live. Version 1.4.3. |
 | **Render distance** | 50–300 % of the camera's far clip distance (the game's own is 100 %). The game's own is 25 km, more than the map is across, so below 100 % land in the far distance is cut off sooner and above 100 % mostly changes nothing you can see: it does not load more of the world or raise the detail of distant land, which the game decides separately. |
 
 ## Frame rate, interface, controls, audio

@@ -2289,8 +2289,8 @@ static int g_pp_aa, g_pp_sharpen; static _Atomic int g_pp_aniso, g_pp_lodb;
 /* Effects the settings menu turns off or scales (totk_post.h, fx_draw): "hide_hud" 1 masks the colour writes of the game's UI draws into the
    canvas, "dof" 0 skips the depth-of-field composite, "bloom" 0..100 scales the bloom the tone map adds. Latched at
    the present like the others. */
-static _Atomic int g_fx_req_hud, g_fx_req_dof = 1, g_fx_req_bloom = 100;
-static int g_fx_hud, g_fx_dof = 1, g_fx_bloom = 100;
+static _Atomic int g_fx_req_hud, g_fx_req_dof = 1, g_fx_req_bloom = 100, g_fx_req_flare = 1;
+static int g_fx_hud, g_fx_dof = 1, g_fx_bloom = 100, g_fx_flare = 1;
 static int g_fx_masked; static uint32_t g_fx_saved_mask;   // hide the HUD: this UI draw runs with its colour writes masked off
 static int pp_flag(const char *name, int v);
 /* TOTK_GAME_LOD_BIAS=0: leave out the game's own sampler LOD bias, as before it was passed to Metal (A/B; 1.4.3 sets -1 on a few

@@ -88,7 +88,14 @@ int main(void) {
     unsetenv("TOTK_FOG"); unsetenv("TOTK_SHADOW_RES");
     /* World page (runtime/world_patch.h): the time of day in percent, paused included; the render distance in 25 % steps. */
     expect(SETTINGS_NPAGES == 7 && !strcmp(SETTINGS_PAGES[SETTINGS_NPAGES - 1], "World"), "World is the last settings page (Mods follows it)");
-    expect(SETTINGS_COUNT == 33, "33 settings");
+    expect(SETTINGS_COUNT == 34, "34 settings");
+    {
+        const SettingDef *lf = &SETTINGS[settings_index("graphics.lens_flare")];
+        expect(lf->type == SET_BOOL && lf->def_mac == 1 && lf->def_ios == 1 && lf->apply == SET_LIVE && lf->platforms == SET_ALL && !lf->env,
+               "lens flare: on (the game's) by default, live everywhere, no start variable");
+        settings_defaults(v, 0);
+        expect(settings_parse_text("graphics.lens_flare = off\n", v) == 1 && value(v, "graphics.lens_flare") == 0, "lens flare off parses");
+    }
     const SettingDef *ts = &SETTINGS[settings_index("world.time_speed")], *rd = &SETTINGS[settings_index("graphics.render_distance")];
     expect(!strcmp(ts->page, "World") && ts->nchoices == 7 && ts->def_mac == 100 && ts->def_ios == 100 && ts->apply == SET_LIVE && ts->platforms == SET_ALL,
            "time of day speed: seven choices, normal by default, live everywhere");
