@@ -286,7 +286,7 @@ static uint8_t *render_page;                 /* the data page once the four site
 static unsigned render_game_w,render_game_h; /* the game's own size for this mode */
 static _Atomic uint64_t render_request;      /* pack_size of the asked size; 0 = the game's own */
 static uint64_t render_latched;static unsigned render_canvas;   /* present thread only */
-#define RENDER_VENEER 192                    /* 32 bytes after the frame-step (16), output (28) and aspect (4 x 32 at +48) veneers */
+#define RENDER_VENEER 272                    /* 32 bytes after the frame-step (16), output (28), aspect (4 x 32 at +48) and field-of-view (2 x 48 at +176) stubs */
 #define RENDER_STOCK_PIXELS (1600u*900u)     /* the scene the shipped heaps hold next to a 1080p canvas */
 static int render_size_parse(const char *e,unsigned *w,unsigned *h){
     char rest;return sscanf(e,"%ux%u%c",w,h,&rest)==2&&*w>=64&&*h>=64&&*w<=4096&&*h<=4096;

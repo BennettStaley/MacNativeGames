@@ -1,14 +1,20 @@
 /* The settings menu on the Mac (included by runtime/frontend.m only): a panel over the game window built from the shared
    settings table (runtime/settings_schema.h), one section per page, opened with Command-comma, F1 or the app menu's
-   Settings item. Rows another platform owns (touch controls) are greyed with the reason in their tooltip. While the panel
+   Settings item. Each row shows its help under its name; rows only iPhone and iPad have (touch controls) are left out. While the panel
    is open the game reads a neutral controller (runtime_input_hold). The iPhone / iPad menu is ios/Sources/settings_menu.m. */
 #pragma once
 #import <Cocoa/Cocoa.h>
 #include "runtime.h"
 #include "settings.h"
 
+@interface TOTKFlippedView : NSView @end   /* the panel's scrolling contents start at the top */
+@implementation TOTKFlippedView
+- (BOOL)isFlipped { return YES; }
+@end
+
 @interface TOTKSettingsPanel : NSObject <NSWindowDelegate>
 + (void)toggle;
++ (BOOL)snapshotTo:(NSString *)path;   /* the panel's contents as a PNG, without showing it (test runs, TOTK_INPUT_FILE "settings-shot") */
 @end
 
 @implementation TOTKSettingsPanel {
@@ -48,7 +54,7 @@ static NSString *settings_value_text(const SettingDef *d, int v) {
     else if (d->type == SET_CHOICE) {
         NSPopUpButton *p = [NSPopUpButton new];
         for (int k = 0; k < d->nchoices; k++) { [p addItemWithTitle:@(d->choices[k].label)]; if (d->choices[k].value == v) [p selectItemAtIndex:k]; }
-        c = p;
+        [p.widthAnchor constraintEqualToConstant:220].active = YES; c = p;
     } else {
         NSSlider *s = [NSSlider sliderWithValue:v minValue:d->min maxValue:d->max target:nil action:nil];
         s.numberOfTickMarks = (d->max - d->min) / d->step + 1; s.allowsTickMarkValuesOnly = YES; s.continuous = YES;
@@ -63,7 +69,39 @@ static NSString *settings_value_text(const SettingDef *d, int v) {
     return row;
 }
 
++ (BOOL)snapshotTo:(NSString *)path {
+    if (!settingsPanel) settingsPanel = [TOTKSettingsPanel new];
+    [settingsPanel build];
+    NSView *view = settingsPanel->panel.contentView; [view layoutSubtreeIfNeeded];
+    NSBitmapImageRep *rep = [view bitmapImageRepForCachingDisplayInRect:view.bounds], *out = [rep copy];
+    if (!rep) return NO;
+    __block BOOL ok = NO;
+    [settingsPanel->panel.appearance performAsCurrentDrawingAppearance:^{   /* the dark panel, on its window background */
+        [view cacheDisplayInRect:view.bounds toBitmapImageRep:rep];
+        [NSGraphicsContext saveGraphicsState];
+        NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithBitmapImageRep:out];
+        [NSColor.windowBackgroundColor setFill]; NSRectFill(view.bounds);
+        [rep drawInRect:view.bounds fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1 respectFlipped:YES hints:nil];
+        [NSGraphicsContext restoreGraphicsState];
+        ok = [[out representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:path atomically:YES];
+    }];
+    return ok;
+}
+
 - (void)show {
+    [self build];
+    runtime_input_hold(1);
+    [panel makeKeyAndOrderFront:nil];
+}
+
+- (void)reset {
+    for (int i = 0; i < SETTINGS_COUNT; i++) if (SETTINGS[i].platforms & SET_MAC) settings_set(SETTINGS[i].key, SETTINGS[i].def_mac);
+    NSRect frame = panel.frame; BOOL shown = panel.visible;
+    [panel orderOut:nil]; panel.delegate = nil; panel = nil; [self build]; [panel setFrame:frame display:NO];
+    if (shown) [panel makeKeyAndOrderFront:nil];
+}
+
+- (void)build {
     if (!panel) {
         labels = [NSMutableDictionary dictionary]; values = [NSMutableDictionary dictionary];
         NSStackView *stack = [NSStackView new]; stack.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -71,34 +109,39 @@ static NSString *settings_value_text(const SettingDef *d, int v) {
         for (int p = 0; p < SETTINGS_NPAGES; p++) {
             NSTextField *head = [NSTextField labelWithString:@(SETTINGS_PAGES[p])]; head.font = [NSFont boldSystemFontOfSize:13];
             NSGridView *grid = [NSGridView gridViewWithNumberOfColumns:2 rows:0];
-            grid.columnSpacing = 16; grid.rowSpacing = 8; [grid columnAtIndex:0].width = 220;
+            grid.columnSpacing = 20; grid.rowSpacing = 12; [grid columnAtIndex:0].width = 250; grid.yPlacement = NSGridCellPlacementCenter;
             for (int i = 0; i < SETTINGS_COUNT; i++) {
-                const SettingDef *d = &SETTINGS[i]; if (strcmp(d->page, SETTINGS_PAGES[p])) continue;
-                BOOL on = (d->platforms & SET_MAC) != 0;
-                NSTextField *label = [NSTextField labelWithString:[self labelFor:d]]; label.textColor = on ? NSColor.labelColor : NSColor.tertiaryLabelColor;
-                label.toolTip = on ? (d->help ? @(d->help) : nil) : @(d->unavailable ? d->unavailable : "Not on the Mac.");
-                labels[@(d->key)] = label;
-                NSGridRow *row = [grid addRowWithViews:@[label, [self controlFor:d index:i enabled:on]]];
-                row.rowAlignment = NSGridRowAlignmentLastBaseline;
+                const SettingDef *d = &SETTINGS[i]; if (strcmp(d->page, SETTINGS_PAGES[p]) || !(d->platforms & SET_MAC)) continue;
+                NSTextField *label = [NSTextField labelWithString:[self labelFor:d]]; labels[@(d->key)] = label;
+                NSStackView *name = [NSStackView stackViewWithViews:@[label]]; name.orientation = NSUserInterfaceLayoutOrientationVertical;
+                name.alignment = NSLayoutAttributeLeading; name.spacing = 2;
+                if (d->help) {
+                    NSTextField *help = [NSTextField wrappingLabelWithString:@(d->help)];
+                    help.font = [NSFont systemFontOfSize:11]; help.textColor = NSColor.secondaryLabelColor; help.preferredMaxLayoutWidth = 250;
+                    [name addArrangedSubview:help];
+                }
+                [grid addRowWithViews:@[name, [self controlFor:d index:i enabled:YES]]];
             }
             if (!grid.numberOfRows) continue;
+            if (stack.arrangedSubviews.count) [stack setCustomSpacing:22 afterView:stack.arrangedSubviews.lastObject];
             [stack addArrangedSubview:head]; [stack addArrangedSubview:grid];
         }
-        NSTextField *foot = [NSTextField wrappingLabelWithString:@"Saved in ~/Library/Application Support/MacNativeGames/TOTK/settings.txt. Hover a setting for what it does."];
-        foot.textColor = NSColor.secondaryLabelColor; foot.font = [NSFont systemFontOfSize:11]; [stack addArrangedSubview:foot];
+        [stack setCustomSpacing:22 afterView:stack.arrangedSubviews.lastObject];
+        NSButton *reset = [NSButton buttonWithTitle:@"Reset to defaults" target:self action:@selector(reset)];
+        NSTextField *foot = [NSTextField wrappingLabelWithString:@"Saved in ~/Library/Application Support/MacNativeGames/TOTK/settings.txt. \"(next start)\" marks a change the game takes when it starts again."];
+        foot.textColor = NSColor.secondaryLabelColor; foot.font = [NSFont systemFontOfSize:11]; foot.preferredMaxLayoutWidth = 520;
+        [stack addArrangedSubview:reset]; [stack addArrangedSubview:foot];
         NSScrollView *scroll = [NSScrollView new]; scroll.hasVerticalScroller = YES; scroll.drawsBackground = NO;
-        NSView *doc = [NSView new]; doc.translatesAutoresizingMaskIntoConstraints = NO; stack.translatesAutoresizingMaskIntoConstraints = NO;
+        NSView *doc = [TOTKFlippedView new]; doc.translatesAutoresizingMaskIntoConstraints = NO; stack.translatesAutoresizingMaskIntoConstraints = NO;
         [doc addSubview:stack]; scroll.documentView = doc;
         [NSLayoutConstraint activateConstraints:@[[stack.topAnchor constraintEqualToAnchor:doc.topAnchor], [stack.leadingAnchor constraintEqualToAnchor:doc.leadingAnchor],
             [stack.trailingAnchor constraintEqualToAnchor:doc.trailingAnchor], [stack.bottomAnchor constraintEqualToAnchor:doc.bottomAnchor],
             [doc.widthAnchor constraintEqualToAnchor:scroll.contentView.widthAnchor]]];
-        panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 560, 640) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO];
+        panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 600, 700) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO];
         panel.title = @"Settings"; panel.contentView = scroll; panel.delegate = self; panel.releasedWhenClosed = NO;
         panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
         [panel center];
     }
-    runtime_input_hold(1);
-    [panel makeKeyAndOrderFront:nil];
 }
 
 - (void)windowWillClose:(NSNotification *)note { (void)note; runtime_input_hold(0); }

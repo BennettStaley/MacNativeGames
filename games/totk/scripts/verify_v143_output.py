@@ -78,7 +78,7 @@ def render_res_checks(out, raw, data, layout):
     assert struct.unpack('<ff', unset[data + 16:data + 24]) == (1600.0, 900.0), 'unset is not the game\'s own docked size'
     code, set_ = image({'TOTK_RENDER_RES': '960x540'})
     assert code == 0 and sites_changed(set_) == RENDER_SITES, 'TOTK_RENDER_RES=960x540 did not patch the four sites'
-    veneer = (layout['TEXT_END'] + 15 & ~15) + 192
+    veneer = (layout['TEXT_END'] + 15 & ~15) + 272
     others = {p for p in range(0, data, 4) if off[p:p+4] != set_[p:p+4]}
     assert others == RENDER_SITES | RENDER_KICK | {veneer + 4 * i for i in range(8)}, [hex(p) for p in sorted(others ^ RENDER_SITES)]
     assert struct.unpack('<ff', set_[data + 16:data + 24]) == (960.0, 540.0)
@@ -146,9 +146,10 @@ def main():
         0xbdb578, 0xbdb584, 0x3dcb28,
         0x2db204, 0x2db208, 0x2db22c, 0x2db360, 0x2db36c, 0x2db340, 0x2db34c,
         0x3e5658, 0x2daa54, 0x2daa58, 0x2daa6c, 0x2daa70, 0x2daa74, 0x2daa78,
-    } | RENDER_SITES | RENDER_KICK | {frame_step + 192 + 4 * i for i in range(8)} | {frame_step + 4 * i for i in range(4)} | {stub + 4 * i for i in range(7)}
+    } | RENDER_SITES | RENDER_KICK | {frame_step + 272 + 4 * i for i in range(8)} | {frame_step + 4 * i for i in range(4)} | {stub + 4 * i for i in range(7)}
     # The 21:9 view (runtime/aspect_patch.h, always installed since c446bce): four sites and its stubs after the two veneers.
-    aspect = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0} | {p for p in changes if frame_step + 48 <= p < frame_step + 176}
+    # The field of view (aspect_patch.h fov_install): two camera sites and their 48-byte stubs after the aspect stubs.
+    aspect = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0, 0x628c3c, 0xb4342c} | {p for p in changes if frame_step + 48 <= p < frame_step + 272}
     assert changes - aspect == want, [hex(p) for p in sorted((changes - aspect) ^ want)]
 
     def execute(w, h, scale, apply):

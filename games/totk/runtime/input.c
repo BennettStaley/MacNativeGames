@@ -188,6 +188,10 @@ static void *input_file(void *arg) {
         } else if (!strncmp(line, "render ", 7)) {   /* "render <w>x<h>": the live scene size (runtime_render_request), as the settings menu asks */
             unsigned w, h; char rest = 0; if (sscanf(line + 7, "%ux%u%c", &w, &h, &rest) < 2 || (rest && rest != '\n' && rest != '\r')) runtime_fail("render takes <width>x<height>");
             runtime_render_request(w, h);
+        } else if (!strncmp(line, "settings-shot ", 14)) {   /* "settings-shot <png>": the Mac settings panel as a picture, without showing it */
+            extern void runtime_front_settings_shot(const char *) __attribute__((weak));
+            char *path = line + 14; path[strcspn(path, "\r\n")] = 0;
+            if (runtime_front_settings_shot) runtime_front_settings_shot(path); else fprintf(stderr, "[settings] settings-shot: no settings panel on this platform\n");
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
         } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }
