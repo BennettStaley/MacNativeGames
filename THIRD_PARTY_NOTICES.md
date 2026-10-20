@@ -13,6 +13,8 @@ Code in this repository that comes from other projects keeps its license; the li
 | `games/totk/prebuilt/macos-arm64/totk_xlate` (the shader translator, a native program) | built from `vendor/ryujinx` + the patches + `games/totk/tools/totk_xlate` with `publish_native.sh`; contains .NET runtime libraries compiled in by NativeAOT | MIT (Ryujinx, d2r-mobile, .NET) | `vendor/ryujinx/LICENSE.txt`, `games/totk/tools/totk_xlate/LICENSE` |
 | SMAA 1x in `games/totk/third_party/d2r_gfx/gfx/nvn/totk_post_msl.h` and its lookup tables `smaa_tables.h` (anti-aliasing setting) | [SMAA](https://github.com/iryoku/smaa), ported to Metal | MIT | `games/totk/third_party/licenses/SMAA.txt` |
 | contrast adaptive sharpening in `games/totk/third_party/d2r_gfx/gfx/nvn/totk_post_msl.h` (sharpen setting) | [AMD FidelityFX CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS), ported to Metal | MIT | `games/totk/third_party/licenses/AMD-FidelityFX-CAS.txt` |
+| ResourceSizeTable size estimates in `games/totk/runtime/mods.c` (`mods_rstb_estimate`) | ported from [TkSharp](https://github.com/TKMM-Team/TkSharp) (`TkSharp.Merging/ResourceSizeTable`) | MIT | `games/totk/third_party/licenses/TkSharp.txt` |
+| `games/totk/third_party/zstd` (decoder only, single file) | [zstd](https://github.com/facebook/zstd) 1.5.7 | BSD-3-Clause (zstd is dual BSD / GPLv2; used under BSD) | `games/totk/third_party/zstd/LICENSE` |
 | audio effects in `games/totk/runtime/audio_reverb.c`, `games/totk/runtime/audio_effects.c` (delay, reverb, compressor) and the mixer | ported from Ryujinx.Audio | MIT | `games/totk/third_party/licenses/Ryujinx-Audio.txt` |
 
 Fetched or linked at build time (not in this repository):

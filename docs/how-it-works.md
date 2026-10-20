@@ -82,11 +82,21 @@ The same game memory can be reached through two Metal buffers, each with its own
    RomFS overlays (small data patches: quick-menu capture timing at high frame rates, the game-over retry, the heap
    sizes the 1440p output needs) are made from your own files. The game-over retry patch only matters on 1.0.0:
    1.1.2 and 1.4.3 read Nintendo's own fixed flow (`DmF_SY_GameOver.110`), so there the patch of the old file is made
-   and checked but never read. At start the runtime also loads player mods from
-   `~/Library/Application Support/MacNativeGames/TOTK/mods/<version>` in the same manifest format, after the build's
-   overlays. Every listed file is hashed at start, and each one is opened only when the game opens it. A line whose
-   original SHA-256 is `-` adds a file the RomFS lacks (numbered after the RomFS's own files; its folders exist for the
-   game's entry-type queries); `scripts/make_mod_manifest.py` writes such lines for new files.
+   and checked but never read. At start the runtime then loads the player's mods, after the build's overlays
+   (`runtime/mods.c`, `runtime/romfs.c`; [docs/mods.md](mods.md)): the mods folder
+   (`~/Library/Application Support/MacNativeGames/TOTK/mods`, the iOS app's `Documents/mods`, `TOTK_MODS_DIR`) holds one
+   folder per mod with its `romfs/`, and `mods.txt` gives the order. Every file a mod ships is looked up in the RomFS
+   index: it replaces the file of that path (a path spelt in another case uses the game's spelling, with a warning) or
+   adds one; the first mod in the order wins a path two mods change, and a path a build overlay changes stays the
+   build's (logged; the start goes on). These files are not hashed: each one's identity (device, inode, size,
+   modification time) is kept and checked when the game opens it. A mod's own ResourceSizeTable is never served;
+   instead the game's table (`System/Resource/ResourceSizeTable.Product.143.Nin_NX_NVN.rsizetable.zs`, a RESTBL: CRC32
+   of each resource path without `.zs` with a size, plus a name table for colliding paths) is decompressed with zstd's
+   decoder (`third_party/zstd`), each player file's entry (and each changed member of a replaced `.pack`) is raised to
+   TkSharp's estimate, and the result is served as a zstd frame of raw blocks, cached in `<mods>/.cache` until the
+   files change. The older single folder `mods/<version>` with a `manifest.tsv` still loads first: every listed file
+   is hashed at start, and a line whose original SHA-256 is `-` adds a file the RomFS lacks (numbered after the RomFS's
+   own files; its folders exist for the game's entry-type queries); `scripts/make_mod_manifest.py` writes it.
 3. SPIRV-Cross compiled with clang; the prebuilt shader translator checked against its SHA-256. `prepare_shader_seed.py`
    reads dictionary-compressed startup packages from the selected, verified RomFS, parses supported NVN BNSH programs
    and translates default-binding variants. The version, translation chain, translator/preparer hashes and every

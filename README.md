@@ -209,7 +209,7 @@ iPhone use the gear at the top, a three-finger tap or a controller's Home button
 - Shader cache: `~/Library/Application Support/MacNativeGames/TOTK/shader-cache` (delete it to translate everything again)
 - Shaders the shared list does not have yet: `~/Library/Application Support/MacNativeGames/TOTK/shader-list-contribution.txt`
 - Log: `~/Library/Logs/MacNativeGames/totk.log` (the run before: `totk.previous.log`)
-- Mods: `~/Library/Application Support/MacNativeGames/TOTK/mods/<v0|v112|v121|v143>`. Its `manifest.tsv` lists each RomFS file the mod replaces or adds as tab-separated path, size, SHA-256 and the original's SHA-256 (`-` for a file the game does not have); the files sit under the same paths. `python3 games/totk/scripts/make_mod_manifest.py <mods folder> --app <Tears of the Kingdom.app>` writes it, adding files the game lacks; a path that differs from the game's only in upper and lower case stops it (paths are case-sensitive). Only the RomFS (data) side of a mod is loaded: ExeFS parts (extra code modules, IPS patches) are not supported. The game checks every listed file at start and stops on a mismatch, or when a mod file changes while it runs. Delete the folder to play without mods.
+- Mods: `~/Library/Application Support/MacNativeGames/TOTK/mods` (iPhone / iPad: the app's `mods` folder in Files). One folder per mod, as Yuzu / Ryujinx mods ship them: unzip the mod there so that its `romfs` folder ends up inside (`mods/<Mod>/romfs/...`; an extra wrapping folder from the archive is fine). `mods.txt` in the same folder sets the order (first line wins a file two mods both change) and turns a mod off with `-` in front; new folders are added at the end, on. Only game data (RomFS) is loaded: code patches (`exefs`), TKMM `.tkcl` packages and merging two mods that change the same file are not supported yet; a mod's own ResourceSizeTable is left out and the game's is adjusted for the mods' files instead. The log lists every mod, what it replaces or adds and what was left out. See [docs/mods.md](docs/mods.md). The older single folder `mods/<v0|v112|v121|v143>` with a `manifest.tsv` (`games/totk/scripts/make_mod_manifest.py`) still loads; its files are checked against their SHA-256 at start.
 
 ## Known issues
 
@@ -437,7 +437,7 @@ west = y
 - 着色器缓存：`~/Library/Application Support/MacNativeGames/TOTK/shader-cache`（删掉会全部重新翻译）
 - 公共清单里还没有的着色器：`~/Library/Application Support/MacNativeGames/TOTK/shader-list-contribution.txt`
 - 日志：`~/Library/Logs/MacNativeGames/totk.log`（上一次运行：`totk.previous.log`）
-- 模组：`~/Library/Application Support/MacNativeGames/TOTK/mods/<v0|v112|v121|v143>`。其中的 `manifest.tsv` 以制表符分隔列出模组替换或新增的每个 RomFS 文件：路径、大小、SHA-256 和原文件的 SHA-256（游戏里没有的新文件写 `-`）；文件按相同路径存放。可用 `python3 games/totk/scripts/make_mod_manifest.py <模组文件夹> --app <Tears of the Kingdom.app>` 生成，游戏里没有的文件会作为新增文件写入；只是大小写和游戏里的路径不同的会报错（路径区分大小写）。只加载模组的 RomFS（数据）部分，ExeFS 部分（额外的代码模块、IPS 补丁）不支持。游戏启动时校验所有列出的文件，不一致即停止；游戏运行中模组文件被改动也会停止。删除该文件夹即可不带模组运行。
+- 模组：`~/Library/Application Support/MacNativeGames/TOTK/mods`（iPhone / iPad：“文件”App 里本应用的 `mods` 文件夹）。每个模组一个文件夹，与 Yuzu / Ryujinx 模组的结构相同：解压后其 `romfs` 文件夹位于 `mods/<模组>/romfs/...`（压缩包多套一层文件夹也可以）。同一文件夹里的 `mods.txt` 决定加载顺序（两个模组改同一个文件时第一行的优先），行首写 `-` 表示停用；未列出的新文件夹排在最后并启用。只加载游戏数据（RomFS）：代码补丁（`exefs`）、TKMM 的 `.tkcl` 包以及合并两个修改同一文件的模组暂不支持；模组自带的 ResourceSizeTable 不使用，而是按模组的文件调整游戏自己的表。日志会列出每个模组、它替换或新增的文件以及被略过的内容。详见 [docs/mods.md](docs/mods.md)。旧的单一文件夹 `mods/<v0|v112|v121|v143>`（带 `manifest.tsv`，由 `games/totk/scripts/make_mod_manifest.py` 生成）仍可使用，启动时按 SHA-256 校验。
 
 ## 已知问题
 
