@@ -29,13 +29,15 @@ typedef struct {
     const char *unavailable;         /* why the row is greyed on a platform outside `platforms` */
 } SettingDef;
 
-static const char *const SETTINGS_PAGES[] = {"Graphics", "Frame rate", "Interface", "Controls", "Audio"};
+static const char *const SETTINGS_PAGES[] = {"Display", "Graphics", "Frame rate", "Interface", "Controls", "Audio"};
 enum { SETTINGS_NPAGES = sizeof SETTINGS_PAGES / sizeof *SETTINGS_PAGES };
 
 static const SettingChoice SET_CAP[] = {{"30 fps", "30", "30", 30}, {"40 fps", "40", "40", 40}, {"60 fps", "60", "60", 60},
                                         {"120 fps", "120", "120", 120}, {"Display refresh rate", "display", "display", 0}};
 static const SettingChoice SET_INTERP[] = {{"Off", "off", "0", 0}, {"30 + 30", "interp30", "interp30", 1},
                                            {"Half the refresh rate", "half", "interp", 2}, {"Every frame", "max", "interpmax", 3}};
+static const SettingChoice SET_RES[] = {{"The game's own", "game", NULL, 0}, {"720p", "720", "1280x720", 720}, {"900p", "900", "1600x900", 900},
+                                        {"1080p", "1080", "1920x1080", 1080}, {"1440p", "1440", "2560x1440", 1440}};
 static const SettingChoice SET_AA[] = {{"The game's FXAA", "game", "0", 0}, {"Off", "off", "1", 1}, {"FXAA", "fxaa", "2", 2}, {"SMAA", "smaa", "3", 3}};
 static const SettingChoice SET_ANISO[] = {{"The game's", "game", "0", 0}, {"2x", "2", "2", 2}, {"4x", "4", "4", 4}, {"8x", "8", "8", 8}, {"16x", "16", "16", 16}};
 static const SettingChoice SET_TOUCH[] = {{"Always", "always", NULL, 0}, {"Hide with a controller", "controller", NULL, 1},
@@ -48,6 +50,8 @@ static const SettingDef SETTINGS[] = {
     {"graphics.interpolation", "Graphics", "Frame interpolation", "MetalFX makes a frame between two game frames.",
      "TOTK_MFX", SET_CHOICE, SET_LIVE, SET_MAC | SET_IPAD, 0, 0, 0, 0, 0, NULL, SET_INTERP, SET_N(SET_INTERP),
      "Not tested on iPhone yet."},
+    {"display.resolution", "Display", "3D resolution", "The size the game draws its 3D scene at (version 1.4.3). Above what was set aside at start, it applies at the next start.",
+     "TOTK_RENDER_RES", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_RES, SET_N(SET_RES), NULL},
     {"graphics.fov", "Graphics", "Field of view", "How wide the camera sees, against the game's own (version 1.4.3).",
      "TOTK_FOV", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 70, 140, 5, "%", NULL, 0, NULL},
     {"graphics.aa", "Graphics", "Anti-aliasing", "Smooths the 3D scene's edges before the game draws its text and icons on top (version 1.4.3).",

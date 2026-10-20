@@ -18,8 +18,8 @@ static void (*observer)(const char *key, int value);
 int settings_ios(void) { return TARGET_OS_IPHONE ? 1 : 0; }
 
 /* Live settings go to the code that owns them; the touch controls and the menu button are the iOS app's own views, which
-   follow through settings_observe. */
-static void apply_live(const SettingDef *d, int v) {
+   follow through settings_observe. Returns -1 when the game cannot take the value now (it applies at the next start). */
+static int apply_live(const SettingDef *d, int v) {
     extern void dm_gfx_set_flag(const char *name, int value);
     extern void nvn_fps_cap_set(int hz);
     extern void fps_overlay_set_hints(int visible);
@@ -27,6 +27,11 @@ static void apply_live(const SettingDef *d, int v) {
     extern int runtime_hid_feedback_flag(const char *name, int v);
     extern void runtime_gamepad_relayout(void);
     extern void runtime_fov_set(int percent);
+    extern int runtime_render_request(unsigned w, unsigned h);
+    if (!strcmp(d->key, "display.resolution")) {   /* the game's own: handheld 720p (iOS), docked 900p (Mac) */
+        unsigned h = v ? (unsigned)v : settings_ios() ? 720u : 900u;
+        return runtime_render_request(h * 16 / 9, h);
+    }
     if (!strcmp(d->key, "graphics.interpolation")) dm_gfx_set_flag("mfx_interp", v);
     else if (!strcmp(d->key, "graphics.fov")) runtime_fov_set(v);
     else if (!strcmp(d->key, "graphics.aa")) dm_gfx_set_flag("aa_mode", v);
@@ -43,6 +48,7 @@ static void apply_live(const SettingDef *d, int v) {
         if (c && c->env) setenv("TOTK_FACE_BUTTONS", c->env, 1); else unsetenv("TOTK_FACE_BUTTONS");
         runtime_gamepad_relayout();
     }
+    return 0;
 }
 
 void settings_init(const char *file) {
@@ -75,7 +81,7 @@ int settings_get(const char *key) {
 
 int settings_pending_restart(const char *key) {
     int i = settings_index(key); if (i < 0) return 0;
-    pthread_mutex_lock(&lock); int r = changed_since_start[i] && SETTINGS[i].apply == SET_RESTART; pthread_mutex_unlock(&lock);
+    pthread_mutex_lock(&lock); int r = changed_since_start[i]; pthread_mutex_unlock(&lock);
     return r;
 }
 
@@ -96,14 +102,15 @@ int settings_set(const char *key, int value) {
     const SettingDef *d = &SETTINGS[i];
     if (!settings_valid(d, value)) return SETTINGS_INVALID;
     pthread_mutex_lock(&lock);
-    int was = values[i]; values[i] = value; if (was != value) changed_since_start[i] = 1;
+    int was = values[i]; values[i] = value; if (was != value && d->apply == SET_RESTART) changed_since_start[i] = 1;
     pthread_mutex_unlock(&lock);
     if (was == value) return d->apply == SET_LIVE ? SETTINGS_APPLIED : SETTINGS_RESTART;
     fprintf(stderr, "[settings] %s = %d (was %d)\n", key, value, was);
-    if (d->apply == SET_LIVE) apply_live(d, value);
+    int live = d->apply == SET_LIVE && apply_live(d, value) == 0;
+    pthread_mutex_lock(&lock); changed_since_start[i] = !live; pthread_mutex_unlock(&lock);   /* a live value the game took clears an earlier refusal */
     if (settings_save()) fprintf(stderr, "[settings] could not write %s\n", *path ? path : "(no settings file)");
     if (observer) observer(key, value);
-    return d->apply == SET_LIVE ? SETTINGS_APPLIED : SETTINGS_RESTART;
+    return live ? SETTINGS_APPLIED : SETTINGS_RESTART;
 }
 
 void settings_observe(void (*fn)(const char *key, int value)) { observer = fn; }
