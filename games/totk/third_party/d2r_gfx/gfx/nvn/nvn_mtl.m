@@ -2286,6 +2286,12 @@ static int diag_shader_prefix_matches(const char *key, uint64_t value) {
    decides), the values latched for the frame being drawn (replay thread; aniso / LOD bias are read by samp_by_id). */
 static _Atomic int g_pp_req_aa = -1, g_pp_req_sharpen = -1, g_pp_req_aniso = -1, g_pp_req_lodb = -1000;
 static int g_pp_aa, g_pp_sharpen; static _Atomic int g_pp_aniso, g_pp_lodb;
+/* Effects the settings menu turns off or scales (totk_post.h, fx_draw): "hide_hud" 1 masks the colour writes of the game's UI draws into the
+   canvas, "dof" 0 skips the depth-of-field composite, "bloom" 0..100 scales the bloom the tone map adds. Latched at
+   the present like the others. */
+static _Atomic int g_fx_req_hud, g_fx_req_dof = 1, g_fx_req_bloom = 100;
+static int g_fx_hud, g_fx_dof = 1, g_fx_bloom = 100;
+static int g_fx_masked; static uint32_t g_fx_saved_mask;   // hide the HUD: this UI draw runs with its colour writes masked off
 static int pp_flag(const char *name, int v);
 /* TOTK_GAME_LOD_BIAS=0: leave out the game's own sampler LOD bias, as before it was passed to Metal (A/B; 1.4.3 sets -1 on a few
    linear-mip-nearest repeating samplers). */
@@ -4429,7 +4435,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
       void ts_note(id pd, NSUInteger nc); ts_note(pd, (NSUInteger)R.rt.n); }
     ser_gate();
     if (mfx_enabled()) mfx_pass_setup(pd);   // TOTK: MetalFX scene / UI attachments, G-buffer depth
-    else if (uw_ratio() || g_pp_sharpen || g_pp_aa >= 2) canvas_learn(pd);   // key 4: the canvas the UI is squeezed in; picture settings: the canvas they process
+    else if (uw_ratio() || g_pp_sharpen || g_pp_aa >= 2 || g_fx_hud) canvas_learn(pd);   // key 4: the canvas the UI is squeezed in; picture settings: the canvas they process; hide the HUD: the canvas its draws go to
     g_enc = enc_r_begin(pd);
     args_dirty_all();
     g_stat_pass++;
@@ -9143,7 +9149,9 @@ static void skv_done(skv_item *l, int n, uint32_t frame) {   /* submission compl
     for (int j = 0; j < n; j++) { skv_ent *e = &g_skv[l[j].idx]; if (e->last_frame != frame) { e->last_frame = frame; if (e->nonzero_frame == frame) { if (e->streak >= SKV_STREAK) { g_skv_revived++; e->stable_after = frame + SKV_HOLD; } e->streak = 0; } else if (e->streak < 1000) e->streak++; } CFRelease(l[j].buf); }
     free(l);
 }
-static void draw(const p_draw *dw, const p_draw_idx *di) { g_draw_depth++; draw_inner(dw, di); if (g_draw_depth == 1) nan_draw_probe(dw, di); g_draw_depth--; }
+static void draw(const p_draw *dw, const p_draw_idx *di) { g_draw_depth++; draw_inner(dw, di);
+    if (g_fx_masked) { S.chmask.mask = g_fx_saved_mask; g_fx_masked = 0; g_pso_dirty = 1; }   // hide the HUD: the UI draw's own colour mask again (totk_post.h fx_draw)
+    if (g_draw_depth == 1) nan_draw_probe(dw, di); g_draw_depth--; }
 // TOTK: an update makes the argument buffers of the stages whose bound uniform ranges overlap it stale.
 static void upd_dirty_stages(uint64_t lo, uint64_t hi) {
     for (int st = 0; st < 6; st++) for (int r = 0; r < 16; r++) {
@@ -9604,6 +9612,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
             if (h) { fx_from = R.rt.color[0]->serial; fx_to = h; PD("N %llu 跳过 FXAA：ser=%llu 的读者改读 ser=%llu", g_stat_pass, (unsigned long long)fx_from, (unsigned long long)h_ser(h)); return; } }
         else if (fx_from && !strncmp(f->key, "52aac1f2306b8fc5", 16)) { for (int r = 0; r < 128; r++) if (S.tex[1][r] && h_ser(S.tex[1][r]) == fx_from) S.tex[1][r] = fx_to; fx_from = 0; } } }
     if (pp_aa_draw(pr)) return;   // aa_mode 1-3: the game's FXAA draw replaced by ours (totk_post.h)
+    if (fx_draw(pr)) return;   // hide the HUD, depth of field off: the draw is left out; bloom strength (totk_post.h)
     { static uint64_t bloomq_frame; if (bloomq_frame != atomic_load(&g_cur_frame)) { bloomq_frame = atomic_load(&g_cur_frame); bloomq_reset(); }
       if (bloomq_enabled() && tbdr_on() && !g_defer_replaying && pr->sh[1]) {
         NvShader *f = pr->sh[1]; uint64_t tgt = 0; int lv, sl;
@@ -11238,7 +11247,9 @@ static int fps_overlay_prepare(int slot, MTLViewport vp, MTLViewport *ovp, float
     int scale = fps_overlay_scale(vp.height);
     uint64_t mfx_at = atomic_load(&g_mfxup_last), gen_at = atomic_load(&g_mfxi_last), cur = atomic_load(&g_cur_frame);   // the last game frame MetalFX did the upscale (" MFX") / an interpolated frame was shown ("+50")
     int gen = gen_at && cur - gen_at < 30 ? fps_overlay_gen_value() : 0;
-    fps_overlay_info info = {fps_overlay_value(), (int)lround(vp.width), (int)lround(vp.height), mfx_at && cur - mfx_at < 30, gen > 0 ? gen : 0, atomic_load(&g_pic_big)};
+    int detail = fps_overlay_detail();
+    fps_overlay_info info = {fps_overlay_value(), (int)lround(vp.width), (int)lround(vp.height), mfx_at && cur - mfx_at < 30, gen > 0 ? gen : 0, atomic_load(&g_pic_big),
+                             detail, detail ? fps_overlay_avg_value() : 0, detail ? fps_overlay_low_value() : 0};
     if (hud_compact()) { char text[96]; fps_overlay_text(&info, text, sizeof text); hud_publish(HUD_FPS, text, 0); return 0; }   // shown in the window's corner panel
     pthread_mutex_lock(&mu);
     if (g_fps_key[slot].scale != scale || memcmp(&g_fps_key[slot].info, &info, sizeof info)) {
@@ -12251,7 +12262,7 @@ static int mfx_present_frame(const tex_t *t, double period, int discard) {
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard) : -1;
     if (mfx_latch() && !mfx_enabled()) g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = 0;   // key 2 / flag mfx_interp: the next frame is fully on or off
-    if (t && !mfx_enabled() && (uw_ratio() || g_pp_sharpen || g_pp_aa >= 2)) uw_note_present(t);   // key 4 / sharpen: the canvas search (TOTK_MFX does it in mfx_present_frame)
+    if (t && !mfx_enabled() && (uw_ratio() || g_pp_sharpen || g_pp_aa >= 2 || g_fx_hud)) uw_note_present(t);   // key 4 / sharpen: the canvas search (TOTK_MFX does it in mfx_present_frame)
     pp_latch();   // picture settings for the next frame (totk_post.h)
     mtl_wb_eager();
     g_uw_ui = 0;

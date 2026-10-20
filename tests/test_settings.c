@@ -33,6 +33,20 @@ int main(void) {
     expect(value(v, "graphics.interpolation") == 0, "a bad word keeps the default");
     expect(value(v, "interface.touch_opacity") == 100, "a range is clamped");
 
+    settings_defaults(v, 0);
+    expect(value(v, "controls.camera_speed_x") == 100 && value(v, "controls.camera_speed_y") == 100 && value(v, "graphics.bloom") == 100 &&
+           value(v, "graphics.dof") == 1 && value(v, "interface.hide_hud") == 0 &&
+           value(v, "interface.readout_detail") == 0, "the effects and the camera start as the game's own");
+    expect(settings_parse_text("controls.camera_speed_x = 999\ncontrols.camera_speed_y = 12\ngraphics.bloom = 55\ninterface.readout_detail = detailed\n", v) == 4,
+           "camera speed, bloom and readout detail read");
+    expect(value(v, "controls.camera_speed_x") == 300 && value(v, "controls.camera_speed_y") == 25 && value(v, "graphics.bloom") == 50 &&
+           value(v, "interface.readout_detail") == 1, "camera speed clamped to 25..300, bloom in steps of 10");
+    {
+        const SettingDef *d = &SETTINGS[settings_index("interface.readout_detail")];
+        expect(d->shown_key && !strcmp(d->shown_key, "interface.readout") && d->shown_value == 1, "readout detail shows only with the readout on");
+    }
+    settings_parse_text("framerate.cap = 60\naudio.volume=47\ninterface.readout = off\ninterface.touch_opacity = 500\n", v);
+
     char text[4096]; int len = settings_format_text(v, text, sizeof text);
     expect(len > 0 && len < (int)sizeof text, "the file fits");
     settings_defaults(again, 1);   /* other defaults underneath: everything must come from the text */

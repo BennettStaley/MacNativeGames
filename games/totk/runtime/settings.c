@@ -98,6 +98,8 @@ static int apply_live(const SettingDef *d, int v) {
     extern void runtime_gamepad_relayout(void);
     extern void runtime_fov_set(int percent);
     extern int runtime_render_request(unsigned w, unsigned h);
+    extern void runtime_camera_speed_set(int axis, int percent);
+    extern void fps_overlay_set_detail(int detailed);
     (void)runtime_render_request;
     if (!strncmp(d->key, "display.", 8)) return d->apply == SET_LIVE ? display_apply(d->key) : 0;
     if (!strcmp(d->key, "graphics.interpolation")) dm_gfx_set_flag("mfx_interp", v);
@@ -108,6 +110,12 @@ static int apply_live(const SettingDef *d, int v) {
     else if (!strcmp(d->key, "graphics.lod_bias")) dm_gfx_set_flag("lod_bias", v);
     else if (!strcmp(d->key, "framerate.cap")) nvn_fps_cap_set(v);
     else if (!strcmp(d->key, "interface.readout")) fps_overlay_set_hints(v);
+    else if (!strcmp(d->key, "interface.readout_detail")) fps_overlay_set_detail(v);
+    else if (!strcmp(d->key, "interface.hide_hud")) dm_gfx_set_flag("hide_hud", v);
+    else if (!strcmp(d->key, "graphics.dof")) dm_gfx_set_flag("dof", v);
+    else if (!strcmp(d->key, "graphics.bloom")) dm_gfx_set_flag("bloom", v);
+    else if (!strcmp(d->key, "controls.camera_speed_x")) runtime_camera_speed_set(0, v);
+    else if (!strcmp(d->key, "controls.camera_speed_y")) runtime_camera_speed_set(1, v);
     else if (!strcmp(d->key, "audio.volume")) audio_master_volume_set(v);
     else if (!strcmp(d->key, "controls.rumble")) runtime_hid_feedback_flag("rumble", v);
     else if (!strcmp(d->key, "controls.gyro")) runtime_hid_feedback_flag("gyro", v);

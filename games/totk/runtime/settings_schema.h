@@ -58,6 +58,7 @@ static const SettingChoice SET_TOUCH[] = {{"Always", "always", NULL, 0}, {"Hide 
                                           {"Until touched", "touch", NULL, 2}, {"Off", "off", NULL, 3}};
 static const SettingChoice SET_PROMPTS[] = {{"Automatic (your controller)", "auto", NULL, 0}, {"Switch (the game's own)", "switch", NULL, 1},
                                             {"Xbox", "xbox", NULL, 2}, {"PlayStation", "playstation", NULL, 3}};
+static const SettingChoice SET_DETAIL[] = {{"Simple", "simple", NULL, 0}, {"Detailed (average, 1% low)", "detailed", NULL, 1}};
 static const SettingChoice SET_FACE[] = {{"Automatic", "auto", NULL, 0}, {"By position", "position", "position", 1},
                                          {"By label", "label", "label", 2}};
 #define SET_N(a) (int)(sizeof a / sizeof *a)
@@ -84,12 +85,20 @@ static const SettingDef SETTINGS[] = {
      "TOTK_SHARPEN", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, 0, 100, 5, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.aniso", "Graphics", "Anisotropic filtering", "Sharper ground and walls seen at an angle.",
      "TOTK_ANISO", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_ANISO, SET_N(SET_ANISO), NULL, NULL, 0},
+    {"graphics.dof", "Graphics", "Depth of field", "The game's blur of the distance. Off keeps far away sharp (version 1.4.3).",
+     NULL, SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
+    {"graphics.bloom", "Graphics", "Bloom", "The glow around bright light, against the game's own (version 1.4.3).",
+     NULL, SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 0, 100, 10, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.lod_bias", "Graphics", "Texture detail bias", "Below 0 picks sharper texture levels, in hundredths of a level; too low shimmers.",
      "TOTK_LOD_BIAS", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, -100, 0, 25, NULL, NULL, 0, NULL, NULL, 0},
     {"framerate.cap", "Frame rate", "Frame rate limit", "The most frames a second the game draws. 40 needs a 120 Hz display.",
      "TOTK_UNCAPPED_HZ", SET_CHOICE, SET_LIVE, SET_ALL, 120, 0, 0, 0, 0, NULL, SET_CAP, SET_N(SET_CAP), NULL, NULL, 0},
     {"interface.readout", "Interface", "Performance readout", "Frames per second and the game picture's size.",
      "TOTK_HINTS", SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
+    {"interface.readout_detail", "Interface", "Readout detail", "Detailed adds the average and the 1% low frame rate over the last 5 seconds.",
+     NULL, SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_DETAIL, SET_N(SET_DETAIL), NULL, "interface.readout", 1},
+    {"interface.hide_hud", "Interface", "Hide the HUD", "Hides the game's hearts, map, prompts and menus for clean screenshots (F2 on a Mac keyboard). Turn it off to use menus.",
+     NULL, SET_BOOL, SET_LIVE, SET_ALL, 0, 0, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"interface.shader_counter", "Interface", "Shader counter", "New shaders collected while you play.",
      "TOTK_SHADER_OVERLAY", SET_BOOL, SET_RESTART, SET_ALL, 1, 0, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"interface.touch_controls", "Interface", "Touch controls", "When the on-screen controller shows.",
@@ -104,6 +113,10 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_CHOICE, SET_RESTART, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_PROMPTS, SET_N(SET_PROMPTS), NULL, NULL, 0},
     {"controls.face_buttons", "Controls", "Face buttons", "PlayStation and Xbox buttons by position (as the game's prompts show them) or by their letters.",
      "TOTK_FACE_BUTTONS", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_FACE, SET_N(SET_FACE), NULL, NULL, 0},
+    {"controls.camera_speed_x", "Controls", "Camera speed, horizontal", "The right stick's left and right (and the arrow keys) against the game's own.",
+     NULL, SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 25, 300, 5, "%", NULL, 0, NULL, NULL, 0},
+    {"controls.camera_speed_y", "Controls", "Camera speed, vertical", "The right stick's up and down against the game's own.",
+     NULL, SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 25, 300, 5, "%", NULL, 0, NULL, NULL, 0},
     {"controls.rumble", "Controls", "Rumble", NULL,
      "TOTK_RUMBLE", SET_BOOL, SET_LIVE, SET_MAC, 1, 1, 0, 1, 1, NULL, NULL, 0, "Not on iPhone and iPad yet.", NULL, 0},
     {"controls.gyro", "Controls", "Motion controls", "Gyro aiming with a controller that has a gyroscope.",

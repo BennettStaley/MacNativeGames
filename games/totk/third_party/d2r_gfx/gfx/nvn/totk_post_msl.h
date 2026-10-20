@@ -13,6 +13,8 @@ static const char k_post_msl[] =
     "static float4 tap(texture2d<float> t, float2 px, constant K &k) { return t.sample(pnt, uvc(px, k), level(0)); }\n"
     "\n"
     "fragment float4 pp_copy(V in [[stage_in]], texture2d<float> c [[texture(0)]], constant K &k [[buffer(0)]]) { return tap(c, in.pos.xy, k); }\n"
+    "/* Bloom strength: drawn with blending zero + target * blend colour, so the target is scaled in place. */\n"
+    "fragment float4 pp_zero(V in [[stage_in]]) { return float4(0); }\n"
     "\n"
     "/* Our FXAA: luma contrast test on the 3x3 neighbourhood, the edge's orientation from second differences, a walk along\n"
     "   the edge in both directions to its ends, and one bilinear tap shifted across the edge by the coverage estimate\n"

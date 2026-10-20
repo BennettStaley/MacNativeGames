@@ -15,6 +15,16 @@
      bias. The game's own LOD bias is passed to Metal now as well (it was dropped; TOTK_GAME_LOD_BIAS=0 leaves it out).
      Changing either drops every built sampler object (released after the GPU is done with it) and the next use builds
      it again (samp_by_id).
+   - "hide_hud" (Interface: Hide the HUD, F2 on the Mac): every draw into the canvas with one of the UI vertex shaders
+     (uw_ui_vs) from the frame's first UI draw on runs with its colour writes masked off: hearts, map, prompts, and the
+     menus too (the inventory's 3D scene, drawn with the tone map 0ac9a549, stays).
+   - "dof" (Depth of field): 0 leaves out the game's depth-of-field composite 18b730fa: a full-screen draw that reads the
+     depth, picks a level of the half-resolution blurred copy of the scene (34070de6) by distance and blends it over the
+     scene (source alpha); without it the scene stays as drawn, sharp.
+   - "bloom" (Bloom): 0..100, the bloom's share. The tone map 0ac9a549 adds its texture 1 (the bloom chain's result,
+     bright pass 79b89ff1, blurred downsamples and the upsamples 327ae8bb) to the scene; below 100 that texture is
+     multiplied in place first, every level, by a blend-only pass of ours (pp_zero, zero + target * strength). The chain
+     rewrites it every frame.
    dm_gfx_set_flag only records a request (any thread); pp_latch takes it at the game's present on the replay thread, so
    a frame is drawn with one setting throughout. */
 #include "totk_post_msl.h"
@@ -31,6 +41,8 @@ static struct {
     __weak id<MTLTexture> canvas;   // this frame's canvas, once drawn into (CAS fallback for a frame without UI)
     int ui_done, fxaa_seen; MTLClearColor cc;   // cc: a clear the game had pending for the FXAA target (pp_pass clear 2)
     uint64_t aa_n, aa_kept[6], cas_n, canvas_aa_n, frames, last_aa_n;
+    id<MTLRenderPipelineState> scale_ps[4]; MTLPixelFormat scale_pf[4];   // pp_zero with the multiplying blend (bloom strength)
+    uint64_t hud_n, dof_n, bloom_n, bloom_kept;
 } g_postfx;
 
 static int pp_flag(const char *name, int v) {
@@ -46,6 +58,14 @@ static int pp_flag(const char *name, int v) {
         if (v == 1) v = 0;
         if (v != 0 && v != 2 && v != 4 && v != 8 && v != 16) { MLOG("[flag] aniso requires 0, 2, 4, 8 or 16"); return 1; }
         atomic_store(&g_pp_req_aniso, v); MLOG("[flag] aniso = %d (samplers rebuilt at the next frame)", v); return 1;
+    }
+    if (!strcmp(name, "hide_hud") || !strcmp(name, "dof")) {
+        _Atomic int *r = name[0] == 'h' ? &g_fx_req_hud : &g_fx_req_dof;
+        atomic_store(r, v < 0 ? !atomic_load(r) : v != 0); MLOG("[flag] %s = %d (from the next frame)", name, atomic_load(r)); return 1;
+    }
+    if (!strcmp(name, "bloom")) {
+        if (v < 0 || v > 100) { MLOG("[flag] bloom requires 0..100 (percent of the game's)"); return 1; }
+        atomic_store(&g_fx_req_bloom, v); MLOG("[flag] bloom = %d%% (from the next frame)", v); return 1;
     }
     if (!strcmp(name, "lod_bias")) {
         if (v < -100 || v > 0) { MLOG("[flag] lod_bias requires -100..0 (hundredths)"); return 1; }
@@ -78,6 +98,14 @@ static void pp_latch(void) {
     if (aa != g_pp_aa || sh != g_pp_sharpen) MLOG("[pp] anti-aliasing %s, sharpen %d from frame %llu", k_pp_aa_name[aa], sh, (unsigned long long)atomic_load(&g_cur_frame) + 1);
     if (aa != g_pp_aa) g_postfx.last_aa_n = g_postfx.aa_n, g_postfx.frames = 0;
     g_pp_aa = aa; g_pp_sharpen = sh;
+    {
+        int hud = atomic_load(&g_fx_req_hud), dof = atomic_load(&g_fx_req_dof), bloom = atomic_load(&g_fx_req_bloom);
+        if (hud != g_fx_hud || dof != g_fx_dof || bloom != g_fx_bloom)
+            MLOG("[pp] HUD %s, depth of field %s, bloom %d%% from frame %llu (so far: UI draws left out %llu, depth of field composites %llu, bloom scaled %llu / kept %llu)",
+                 hud ? "hidden" : "shown", dof ? "on" : "off", bloom, (unsigned long long)atomic_load(&g_cur_frame) + 1,
+                 (unsigned long long)g_postfx.hud_n, (unsigned long long)g_postfx.dof_n, (unsigned long long)g_postfx.bloom_n, (unsigned long long)g_postfx.bloom_kept);
+        g_fx_hud = hud; g_fx_dof = dof; g_fx_bloom = bloom;
+    }
     if (an != atomic_load(&g_pp_aniso) || lb != atomic_load(&g_pp_lodb)) {
         int n = 0;
         registry_lock();
@@ -243,4 +271,72 @@ static void pp_ui_hook(__unsafe_unretained NvProg *pr) {
         return;
     }
     if (g_postfx.canvas) for (int i = 0; i < g_mfx.nswap; i++) if (g_mfx.swap[i] == ser) { pp_canvas(g_postfx.canvas); return; }
+}
+
+/* Bloom strength: the tone map's bloom texture (its texture 1), every level, multiplied by g_fx_bloom / 100 in place. */
+static id<MTLRenderPipelineState> fx_scale_pso(MTLPixelFormat pf) {
+    for (int i = 0; i < 4; i++) if (g_postfx.scale_ps[i] && g_postfx.scale_pf[i] == pf) return g_postfx.scale_ps[i];
+    if (!pp_pso(PP_COPY, MTLPixelFormatRGBA16Float)) return nil;   // builds the library
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [g_postfx.lib newFunctionWithName:@"pp_vs"]; d.fragmentFunction = [g_postfx.lib newFunctionWithName:@"pp_zero"];
+    MTLRenderPipelineColorAttachmentDescriptor *a = d.colorAttachments[0];
+    a.pixelFormat = pf; a.blendingEnabled = YES;
+    a.sourceRGBBlendFactor = a.sourceAlphaBlendFactor = MTLBlendFactorZero;
+    a.destinationRGBBlendFactor = a.destinationAlphaBlendFactor = MTLBlendFactorBlendColor;
+    NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+    if (!ps) { MLOG("【红】[pp] bloom pipeline (format %lu): %s", (unsigned long)pf, e.localizedDescription.UTF8String); return nil; }
+    int i = 0; while (i < 3 && g_postfx.scale_ps[i]) i++;
+    g_postfx.scale_ps[i] = ps; g_postfx.scale_pf[i] = pf; return ps;
+}
+static void fx_bloom_scale(void) {
+    int tid = (int)(S.tex[1][1] & 0xfffff);
+    id<MTLTexture> b = tid > 0 ? (__bridge id<MTLTexture>)tex_fast(tid) : nil, rt = R.rt.n > 0 && R.rt.color[0] ? tex_mtl(R.rt.color[0]) : nil;
+    /* The handle is a sampling view of the texture (shader read only): the passes draw into its parent, the view's levels. */
+    NSUInteger lv0 = 0, nlv = b ? b.mipmapLevelCount : 0, slice = 0;
+    if (b && !(b.usage & MTLTextureUsageRenderTarget) && b.parentTexture) {
+        lv0 = b.parentRelativeLevel; slice = b.parentRelativeSlice; b = b.parentTexture;
+    }
+    id<MTLRenderPipelineState> ps = b ? fx_scale_pso(b.pixelFormat) : nil;
+    if (!b || !ps || b == rt || b.textureType != MTLTextureType2D || slice || !(b.usage & MTLTextureUsageRenderTarget) || b.width > 1024 || lv0 + nlv > b.mipmapLevelCount) {
+        static int told; if (!told++) MLOG("[pp] bloom strength: the tone map's texture 1 is not the bloom texture expected (%lux%lu format %lu usage %#lx); the game's bloom stays",
+                                           (unsigned long)b.width, (unsigned long)b.height, (unsigned long)b.pixelFormat, (unsigned long)b.usage);
+        g_postfx.bloom_kept++; return;
+    }
+    { static int once; if (!once++) MLOG("[pp] bloom strength %d%%: the tone map's bloom %lux%lu (levels %lu-%lu of %lu, format %lu) scaled in place", g_fx_bloom,
+                                         (unsigned long)b.width, (unsigned long)b.height, (unsigned long)lv0, (unsigned long)(lv0 + nlv - 1), (unsigned long)b.mipmapLevelCount, (unsigned long)b.pixelFormat); }
+    rp_end(); blit_close(); rs_sync();
+    float k = g_fx_bloom / 100.f;
+    for (NSUInteger lv = lv0; lv < lv0 + nlv; lv++) {
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+        rp.colorAttachments[0].texture = b; rp.colorAttachments[0].level = lv;
+        rp.colorAttachments[0].loadAction = MTLLoadActionLoad; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pt_mark(g_cb, 'R', rp); id<MTL4RenderCommandEncoder> en = [g_cb renderCommandEncoderWithDescriptor:rp]; es_reset(); if (!en) break;
+        [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+        NSUInteger w = MAX(b.width >> lv, 1u), h = MAX(b.height >> lv, 1u);
+        [en setViewport:(MTLViewport){0, 0, w, h, 0, 1}]; [en setScissorRect:(MTLScissorRect){0, 0, w, h}];
+        [en setRenderPipelineState:ps]; [en setBlendColorRed:k green:k blue:k alpha:k];
+        [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; m4_end(en);
+    }
+    pp_done_encoding(); g_postfx.bloom_n++;
+}
+/* 1.4.3 (other versions: these keys have to be found again). */
+static int fx_is_dof(const char *key) { return !strncmp(key, "18b730fad0eec4ba", 16); }
+static int fx_is_tonemap(const char *key) { return !strncmp(key, "0ac9a54938974396", 16); }
+/* Before the draw opens its pass: 1 = leave this draw out (settings: hide the HUD, depth of field off); the
+   tone map with a bloom strength below 100 scales the bloom first. */
+static int fx_draw(__unsafe_unretained NvProg *pr) {
+    if (!pr || g_defer_replaying) return 0;
+    __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
+    if (g_fx_hud && vs && uw_on_canvas() && uw_ui_vs(vs->key) && (g_uw_ui || mfx_ui_vs(vs->key))) {
+        /* Drawn, with every colour write masked off (draw() puts the mask back): leaving the draws out made the game
+           stop drawing its HUD and menus for good, even after the setting was off again (2026-10-20, 1.4.3 prologue).
+           Masked, a UI draw does everything but write pixels, and the first one still ends the scene (sharpening, MetalFX). */
+        if (!g_fx_masked) { g_fx_saved_mask = S.chmask.mask; g_fx_masked = 1; }
+        S.chmask.mask = 0; g_pso_dirty = 1; g_postfx.hud_n++;
+        return 0;
+    }
+    if (!fs) return 0;
+    if (!g_fx_dof && fx_is_dof(fs->key)) { g_postfx.dof_n++; return 1; }
+    if (g_fx_bloom < 100 && fx_is_tonemap(fs->key)) fx_bloom_scale();
+    return 0;
 }

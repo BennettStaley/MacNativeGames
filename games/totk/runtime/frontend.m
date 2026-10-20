@@ -113,7 +113,8 @@ void runtime_front_settings_shot(const char *path){NSString *p=@(path);dispatch_
 @end
 @implementation TOTKInputView
 -(BOOL)acceptsFirstResponder{return YES;}
--(void)keyDown:(NSEvent *)e{if(e.keyCode==122&&!e.isARepeat){[TOTKSettingsPanel toggle];return;}runtime_input_key(e.keyCode,1);}   /* F1: settings */
+-(void)keyDown:(NSEvent *)e{if(e.keyCode==122&&!e.isARepeat){[TOTKSettingsPanel toggle];return;}
+ if(e.keyCode==120){if(!e.isARepeat)settings_set("interface.hide_hud",!settings_get("interface.hide_hud"));return;}runtime_input_key(e.keyCode,1);}   /* F1: settings; F2: hide the HUD (the setting follows) */
 -(void)keyUp:(NSEvent *)e{runtime_input_key(e.keyCode,0);}
 -(void)flagsChanged:(NSEvent *)e{if(e.keyCode==56)runtime_input_key(56,!!(e.modifierFlags&NSEventModifierFlagShift));if(e.keyCode==58)runtime_input_key(58,!!(e.modifierFlags&NSEventModifierFlagOption));}
 @end
