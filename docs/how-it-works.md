@@ -101,9 +101,62 @@ The same game memory can be reached through two Metal buffers, each with its own
    reads dictionary-compressed startup packages from the selected, verified RomFS, parses supported NVN BNSH programs
    and translates default-binding variants. The version, translation chain, translator/preparer hashes and every
    output file are checked before cache reuse and packaging. No prior user shader cache is read.
-4. The game binary built against your extracted files (it checks their hashes at every start) and everything put into
-   an app bundle; the app's launcher points the game at your profile, cache and log folders. The builder seals and
-   strictly verifies the complete bundle before replacing the previous app, then refreshes its LaunchServices record.
+4. The game binary built against your extracted files (it checks their hashes at every start) and the app bundle: the
+   code and small files inside it, the large game data in the game-data folders next to it (see below); the app's
+   launcher points the game at your profile, cache, log and game-data folders. The builder seals and strictly verifies
+   the bundle before replacing the previous app, then refreshes its LaunchServices record.
+
+## Where the game data lives
+
+The RomFS image (17 GB) and the prepared startup shaders (about 52,000 seed files and 17,000 compiled Metal libraries,
+1 GB) change only when the game files, the shared shader list or the Metal compiler change. Inside the app they made up
+nearly all of what every rebuild cloned file by file, sealed with `codesign` (which reads all 17 GB) and had macOS scan
+again on the first run, so a one-line code change took 10 to 15 minutes. They now live outside the app, in
+content-addressed folders:
+
+```
+~/Library/Application Support/MacNativeGames/TOTK/game-data/
+  v143-romfs-<id>/     romfs.bin, runtime-index.bin, store.json (+ the game's RomFS verification record)
+  v143-shaders-<id>/   shader-seed/, shader-libs/, store.json
+  apps.json            the apps build_app.py made, for --prune-data
+```
+
+`<id>` is derived from the content (the image's pinned SHA-256 and the index's; the seed manifest's SHA-256, the Metal
+compiler's identity and the list of compiled libraries), so a rebuild of the same data finds its folder and a new shader
+list gets a new one next to it. `build_app.py` (`step_store`) writes a folder only when it is missing or damaged: its
+files are APFS clones of the work folder's (`clonefile`, no extra space on the same volume; across volumes a byte copy,
+hashed and compared), made read-only, with `store.json` written last. On a later build each file must still have its
+size, and a file whose identity (inode, size, modification time) changed since it was hashed is hashed again. The
+shader seed is checked file by file against its manifest before it is written. `--data-dir` puts the folders elsewhere
+(they are cloned only on the work folder's volume).
+
+The app carries `Contents/Resources/totk/game-data.json` with the two folders' paths, ids and file sizes and the build
+command. The launcher checks them before it starts the game (and in `--check`, so the build fails when they are wrong); a
+missing or different folder shows a dialog naming the folder and that command. It hands the folders to the game with
+`TOTK_ROMFS`, `TOTK_SHADER_SEED_DIR` and `TOTK_SHADER_LIBS`, and sets `TOTK_ROMFS_PROOF_DIR` to the RomFS folder. The game's
+checks are unchanged: it hashes the index at every start and the whole 17 GB image (SHA-256) when no verification record
+matches the image's device, inode, size and times; the record now lives next to the image, and since a rebuild no longer
+makes a new copy of the image, the image is hashed once per data folder rather than after every rebuild. The prepared
+shaders are checked against the seed's manifest when they are imported, as before.
+
+A rebuild whose game data and shaders are unchanged therefore only rebuilds the code (`make`), finds both folders, and
+assembles and seals an app of about 150 MB, which macOS checks in seconds. Measured on an M4 Mac mini (2026-10-20, 1.4.3,
+work folder already complete): the app with the data inside took 739 s to rebuild (8.5 minutes cloning 69,516 files one
+`cp` at a time and sealing 17 GB, 123 s for the macOS check) and was 17 GB; the first build in this layout, which also
+wrote both data folders, took 76 s, and a rebuild after touching `runtime/settings.c` 45 s (code 17 s, the data and
+shader steps' checks and overlays 24 s, data folders 1 s, assembling and sealing 2 s, the macOS check 1 s), for an app
+of 149 MB in 36 files.
+
+`--embed-data` builds the self-contained app as before (the data inside it, no `game-data.json`), for copying the app to
+another Mac. The iPhone/iPad IPA always carries its data. Moving the default app is fine (the folders are found by their
+absolute paths); copying it to another Mac needs `--embed-data` or a rebuild there.
+
+Disk use: on the work folder's volume the folders share their blocks with the work folder's files, so they take no extra
+space until the work folder is deleted; then they hold the 17 GB of the RomFS and about 1 GB of shaders per shader list.
+Old shader folders stay when the shader list changes. `python3.14 build_app.py --prune-data` deletes every folder no app
+points to (the apps in `apps.json` and every app with the bundle identifier Spotlight finds); an app on a disconnected
+volume is not seen, and would need a rebuild. Deleting the whole `game-data` folder is also safe: the next build makes it
+again (in a minute or two while the work folder has the data), and until then the app says what to run.
 
 The optional `games/totk/tools/install_desktop_entry.py` installer keeps one desktop link to that bundle. When replacing
 the older development launcher, it verifies a copy of its profile in the standard user-data folder, keeps an upgrade

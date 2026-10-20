@@ -20,7 +20,7 @@ signature, shared fonts by valid BFTTF structure):
      for the Mac the startup shaders are then compiled once into this Mac's Metal cache (about 2 minutes on an M4), so the
      first start does not compile them in the background (games/totk/tools/warm_metal_cache.m)
 
-The Mac app holds the code and small files only (about 120 MB): the RomFS image and the prepared shaders go once into
+The Mac app holds the code and small files only (about 150 MB): the RomFS image and the prepared shaders go once into
 content-addressed folders in ~/Library/Application Support/MacNativeGames/TOTK/game-data (APFS clones of the work
 folder's files, so no extra space on its volume), which the app's game-data.json names. A rebuild with the same game
 data and shaders then only rebuilds the code and assembles the small app (about a minute). --embed-data makes a
@@ -1024,7 +1024,9 @@ def step_warm_metal(tree, out, logs, store=None):
     tool = build / 'warm-metal-cache'   # next to the game binary: Metal matches the length of the program's folder path
     tool.unlink(missing_ok=True)        # left by an interrupted build
     sources = sorted(seed.glob('*_b.metal'))
-    if sources and all((shaders / 'shader-libs' / f'{sha256(src)}.metallib').is_file() for src in sources):
+    # the game-data folder's seed was checked against its manifest when it was written: its digests name the libraries
+    digest = (lambda src, files=json.loads((seed / 'seed-manifest.json').read_text())['files']: files[src.name]) if store else sha256
+    if sources and all((shaders / 'shader-libs' / f'{digest(src)}.metallib').is_file() for src in sources):
         say('4/4 app: the startup shaders are compiled into the app (step_shader_libs), so Metal\'s cache needs no warming')
         return
     users = metal_cache_users()
@@ -1273,7 +1275,7 @@ def main(argv):
     if args.prune_data and args.platform == 'macos':
         prune_data(data_dir)
     elapsed = time.time() - t0
-    say(f'done in {elapsed / 60:.0f} min {elapsed % 60:.0f} s: {out}' + (f' ({tree_size(out) / 2**20:.0f} MB; the game data is in '
+    say(f'done in {int(elapsed // 60)} min {int(elapsed % 60)} s: {out}' + (f' ({tree_size(out) / 2**20:.0f} MB; the game data is in '
         f'{data_dir})' if args.platform == 'macos' and not args.embed_data else ''))
     if args.platform=='macos':
         say('Open it from Finder. Moving it afterwards (also to /Applications) keeps the macOS check when it stays on the same '
