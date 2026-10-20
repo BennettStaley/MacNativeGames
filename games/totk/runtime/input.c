@@ -200,6 +200,8 @@ static void *input_file(void *arg) {
             if (sscanf(line + 4, "%63s %63s", key, word) != 2 || runtime_setting_test(key, word, &v)) runtime_fail("set takes <settings key> <value as settings.txt writes it>");
         } else if (sscanf(line, "menukey %u %n", &code, &used) == 1 && used && !line[used] && code < 128) {
             runtime_front_settings_key(code);   /* "menukey <Mac keycode>": a key pressed in the open settings menu */
+        } else if (!strcmp(line, "restart\n")) {   /* "restart": the menu's Restart now (closes the game, opens TOTK_APP_BUNDLE again) */
+            runtime_front_restart();
         } else if (!strcmp(line, "menu\n")) {   /* "menu": open or close the settings menu, as Command-comma does */
             runtime_front_settings_toggle();
         } else if (!strncmp(line, "settings-shot ", 14)) {   /* "settings-shot <png>": the Mac settings panel as a picture, without showing it */

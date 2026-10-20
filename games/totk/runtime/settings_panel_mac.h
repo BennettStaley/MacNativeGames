@@ -31,7 +31,7 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     NSScrollView *scroll;
     NSStackView *list;
     NSTextField *status, *hint;
-    NSButton *reset;
+    NSButton *reset, *restartNow;   /* restartNow: shown while a setting or the mods wait for a restart */
     TOTKModsPane *mods;                   /* the Mods tab (page MODS_PAGE) */
     NSMutableArray<NSView *> *rows;       /* the rows of the page shown, in order */
     NSMutableArray<NSNumber *> *rowSetting;
@@ -97,10 +97,13 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
     hint = [NSTextField wrappingLabelWithString:SETTINGS_HINT];
     hint.font = [NSFont systemFontOfSize:10.5]; hint.textColor = NSColor.tertiaryLabelColor;
     reset = [NSButton buttonWithTitle:@"Reset all" target:self action:@selector(reset)];
+    restartNow = [NSButton buttonWithTitle:@"Restart now" target:self action:@selector(restartGame)];
+    restartNow.controlSize = NSControlSizeSmall; restartNow.refusesFirstResponder = YES; restartNow.hidden = YES;
+    restartNow.bezelColor = NSColor.systemOrangeColor; restartNow.translatesAutoresizingMaskIntoConstraints = NO;
     reset.controlSize = NSControlSizeSmall; reset.refusesFirstResponder = YES; reset.bezelStyle = NSBezelStyleRounded;
 
     mods = [[TOTKModsPane alloc] initWithMenu:self]; mods.hidden = YES;
-    for (NSView *v in @[title, status, tabs, scroll, mods, hint, reset]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v]; }
+    for (NSView *v in @[title, status, tabs, scroll, mods, hint, reset, restartNow]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v]; }
     [NSLayoutConstraint activateConstraints:@[
         [title.topAnchor constraintEqualToAnchor:self.topAnchor constant:18], [title.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20],
         [status.firstBaselineAnchor constraintEqualToAnchor:title.firstBaselineAnchor], [status.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-20],
@@ -113,8 +116,9 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
         [mods.topAnchor constraintEqualToAnchor:scroll.topAnchor], [mods.bottomAnchor constraintEqualToAnchor:scroll.bottomAnchor],
         [mods.leadingAnchor constraintEqualToAnchor:scroll.leadingAnchor], [mods.trailingAnchor constraintEqualToAnchor:scroll.trailingAnchor],
         [hint.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20], [hint.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-14],
-        [hint.trailingAnchor constraintLessThanOrEqualToAnchor:reset.leadingAnchor constant:-10],
+        [hint.trailingAnchor constraintLessThanOrEqualToAnchor:restartNow.leadingAnchor constant:-10],
         [reset.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16], [reset.centerYAnchor constraintEqualToAnchor:hint.centerYAnchor],
+        [restartNow.trailingAnchor constraintEqualToAnchor:reset.leadingAnchor constant:-6], [restartNow.centerYAnchor constraintEqualToAnchor:hint.centerYAnchor],
         [list.topAnchor constraintEqualToAnchor:doc.topAnchor], [list.leadingAnchor constraintEqualToAnchor:doc.leadingAnchor],
         [list.trailingAnchor constraintEqualToAnchor:doc.trailingAnchor], [list.bottomAnchor constraintEqualToAnchor:doc.bottomAnchor],
         [doc.widthAnchor constraintEqualToAnchor:scroll.contentView.widthAnchor]]];
@@ -198,7 +202,11 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
 - (void)refreshStatus {
     const char *s = settings_display_status();
     status.stringValue = s && *s ? @(s) : @"";
+    int pending = mods_changed_since_start();   /* Restart now: a setting marked (after restart), or mod changes */
+    for (int i = 0; i < SETTINGS_COUNT && !pending; i++) pending = settings_pending_restart(SETTINGS[i].key);
+    restartNow.hidden = !pending || !runtime_front_can_restart();
 }
+- (void)restartGame { [self hide]; runtime_front_restart(); }
 
 - (void)showFocus {
     for (NSUInteger k = 0; k < rows.count; k++)

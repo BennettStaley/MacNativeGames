@@ -225,6 +225,20 @@ static void note_occlusion(const char *when){int v=(window.occlusionState&NSWind
 static TOTKWindowDelegate *windowDelegate;
 int runtime_front_window_visible(void){return atomic_load(&windowVisible);}
 void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(), ^{[window performClose:nil];});}
+/* The menu's Restart now (mods and after-restart settings): a detached shell waits for this process to end, then opens the
+   app again (TOTK_APP_BUNDLE, set by the launcher); the window closes the usual way, so a save in progress finishes first.
+   0 when there is no app to reopen (a test run of the bare binary). */
+#include <spawn.h>
+extern char **environ;
+int runtime_front_can_restart(void){const char *a=getenv("TOTK_APP_BUNDLE");return a&&*a;}
+void runtime_front_restart(void){
+ const char *app=getenv("TOTK_APP_BUNDLE");if(!app||!*app){fprintf(stderr,"[totk] restart: no app to reopen (TOTK_APP_BUNDLE unset)\n");return;}
+ char script[4600];snprintf(script,sizeof script,"while kill -0 %d 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open \"$0\"",(int)getpid());
+ char *const argv[]={"/bin/sh","-c",script,(char *)app,NULL};pid_t pid;posix_spawnattr_t at;posix_spawnattr_init(&at);posix_spawnattr_setflags(&at,POSIX_SPAWN_SETSID);
+ int err=posix_spawn(&pid,"/bin/sh",NULL,&at,argv,environ);posix_spawnattr_destroy(&at);
+ if(err){fprintf(stderr,"[totk] restart: could not start the helper (%d)\n",err);return;}
+ fprintf(stderr,"[totk] restart: the app opens again once this game has closed\n");runtime_front_request_close();
+}
 /* Use the window-close path, not terminate:, so Command-Q also waits for active saves. */
 static void front_install_menu(void){
  NSMenu *menu=[NSMenu new],*appMenu=[NSMenu new];

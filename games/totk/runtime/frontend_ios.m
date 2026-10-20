@@ -78,6 +78,8 @@ static void app_active_changed(int active){
  fprintf(stderr,"[totk] app %s\n",active?"became active":"resigned active: GPU submission paused");
 }
 void runtime_front_settings_toggle(void) {}
+void runtime_front_restart(void) {}   /* iOS apps cannot reopen themselves: the menus hide Restart now */
+int runtime_front_can_restart(void) { return 0; }
 void runtime_front_settings_key(unsigned code) { (void)code; }   /* the iOS app opens its own menu (ios/Sources/main.m) */
 void runtime_front_settings_shot(const char *path){fprintf(stderr,"[settings] settings-shot %s: the iPhone / iPad menu is not drawn offscreen\n",path);}
 void runtime_front_request_close(void){fprintf(stderr,"[totk] close requested; iOS apps are closed by the user\n");}

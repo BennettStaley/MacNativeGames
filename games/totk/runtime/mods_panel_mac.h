@@ -101,6 +101,7 @@ static NSArray<NSString *> *mods_notices(const ModInfo *m) {
     __weak NSView *menu;
     NSSegmentedControl *sub;
     NSTextField *banner, *footer;
+    NSButton *restartNow;   /* on the banner: close the game and open it again (runtime_front_restart) */
     NSView *body;
     /* installed */
     NSScrollView *installedScroll; NSStackView *installedList;
@@ -146,7 +147,12 @@ static NSArray<NSString *> *mods_notices(const ModInfo *m) {
             [v.leadingAnchor constraintEqualToAnchor:body.leadingAnchor], [v.trailingAnchor constraintEqualToAnchor:body.trailingAnchor]]];
     }
     browseView.hidden = YES;
-    for (NSView *v in @[sub, folder, banner, body, footer]) [self addSubview:v];
+    restartNow = [NSButton buttonWithTitle:@"Restart now" target:self action:@selector(restart)];
+    restartNow.controlSize = NSControlSizeSmall; restartNow.font = [NSFont systemFontOfSize:11]; restartNow.refusesFirstResponder = YES;
+    restartNow.translatesAutoresizingMaskIntoConstraints = NO; restartNow.hidden = YES;
+    for (NSView *v in @[sub, folder, banner, body, footer, restartNow]) [self addSubview:v];
+    [NSLayoutConstraint activateConstraints:@[[restartNow.centerYAnchor constraintEqualToAnchor:banner.centerYAnchor],
+        [restartNow.trailingAnchor constraintEqualToAnchor:banner.trailingAnchor constant:-4]]];
     [NSLayoutConstraint activateConstraints:@[
         [sub.topAnchor constraintEqualToAnchor:self.topAnchor], [sub.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:8],
         [folder.centerYAnchor constraintEqualToAnchor:sub.centerYAnchor], [folder.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-8],
@@ -168,9 +174,10 @@ static NSArray<NSString *> *mods_notices(const ModInfo *m) {
 
 - (void)updateBanner {
     BOOL show = mods_changed_since_start() != 0;
-    banner.hidden = !show;
+    banner.hidden = !show; restartNow.hidden = !show || !runtime_front_can_restart();
     for (NSLayoutConstraint *c in banner.constraints) if (c.firstAttribute == NSLayoutAttributeHeight) c.constant = show ? 22 : 0;
 }
+- (void)restart { runtime_front_restart(); }
 
 - (void)showBrowse:(BOOL)browse {
     sub.selectedSegment = browse ? 1 : 0;

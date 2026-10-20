@@ -197,6 +197,7 @@ int main(int argc, char **argv) {
         setenv("TOTK_SHADER_CONTRIB", contrib.fileSystemRepresentation, 1);
         contrib_reminder(contrib);
         unsetenv("TOTK_AUTOLOAD");   // the game starts at its title screen, as on the console
+        setenv("TOTK_APP_BUNDLE", NSBundle.mainBundle.bundlePath.fileSystemRepresentation, 1);   // the menu's Restart now opens it again
         /* runtime command channel (runtime/input.c): echo "shot ~/Desktop/shot.png" >> "<data>/input.txt" */
         { NSString *cmds = env_or("TOTK_INPUT_FILE", [data stringByAppendingPathComponent:@"input.txt"]);
           FILE *cf = fopen(cmds.fileSystemRepresentation, "w"); if (cf) fclose(cf);

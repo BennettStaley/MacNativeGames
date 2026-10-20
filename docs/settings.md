@@ -15,6 +15,10 @@ it while you change things. Navigate with the mouse, the keyboard (↑ ↓ choos
 switch tabs, Esc closes) or a controller (D-pad or left stick, A, B, the shoulder buttons switch tabs). While the menu is
 open the game receives no input.
 
+A setting marked *(after restart)*, or a change in the Mods tab, shows **Restart now** at the bottom of the menu (and on
+the Mods tab's banner): the game closes the usual way (a save in progress finishes first) and the app opens again. Mac only;
+on iPhone and iPad close the app from the app switcher and open it again.
+
 ## Display
 
 | Setting | What it does |

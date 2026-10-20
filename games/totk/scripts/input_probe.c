@@ -178,5 +178,6 @@ void runtime_fov_set(int percent) { (void)percent; }
 int runtime_render_request(unsigned w, unsigned h) { (void)w; (void)h; return -1; }
 void runtime_front_settings_shot(const char *path) { (void)path; }
 void runtime_front_settings_toggle(void) {}
+void runtime_front_restart(void) {}
 void runtime_front_settings_key(unsigned code) { (void)code; }
 int runtime_setting_test(const char *key, const char *word, int *value) { (void)key; (void)word; (void)value; return -1; }

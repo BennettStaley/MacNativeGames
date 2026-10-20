@@ -135,6 +135,8 @@ void runtime_input_clear(void);
 void runtime_input_hold(int on);
 int runtime_setting_test(const char *key, const char *word, int *value);   /* settings.c: TOTK_INPUT_FILE "set <key> <value>", the menu's path */
 void runtime_front_settings_key(unsigned code);   /* frontend.m: a key pressed in the open settings menu (TOTK_INPUT_FILE "menukey") */
+void runtime_front_restart(void);       /* frontend.m: close the game and open the app again (the menu's Restart now) */
+int runtime_front_can_restart(void);   /* 1 when launched from the app (TOTK_APP_BUNDLE) */
 void runtime_front_settings_toggle(void);   /* frontend.m: open or close the Mac settings menu (gamepad.m: Home, or Options + Menu) */
 void runtime_front_settings_shot(const char *path);   /* frontend.m: the Mac settings panel as a PNG (TOTK_INPUT_FILE "settings-shot") */   /* 1 while the settings menu is open: the game reads a neutral controller */
 int runtime_handheld_mode(void);   /* TOTK_OPERATION_MODE=handheld (runtime/services.c) */
