@@ -191,6 +191,12 @@ probe-fps-overlay:
 	@mkdir -p build/tests
 	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn tests/fps_overlay/probe.c third_party/d2r_gfx/gfx/nvn/fps_overlay.c third_party/d2r_gfx/gfx/nvn/totk_sysload.c -framework IOKit -framework CoreFoundation -framework CoreGraphics -framework CoreText -o build/tests/fps_overlay_probe
 	build/tests/fps_overlay_probe
+# Mod browser (runtime/mod_browser.m): version guesses, the zip extractor and how archives become mod folders, offline;
+# LIVE=1 also lists GameBanana and installs a small mod into build/tests/mods (never the player's folder).
+probe-mod-browser:
+	@mkdir -p build/tests/mods
+	xcrun clang -fobjc-arc -O1 -g -Wall -Wextra -Werror -Iruntime tests/mod_browser/probe.m runtime/mod_browser.m runtime/mods.c -framework Foundation -lz -o build/tests/mod_browser_probe
+	TOTK_MODS_DIR=$(CURDIR)/build/tests/mods build/tests/mod_browser_probe $(if $(LIVE),--live)
 .PHONY: probe-audio
 probe-audio: runtime
 	build/totk-native rewritten/v0 probe-audio > analysis/native-audio-probe.json
