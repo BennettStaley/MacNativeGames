@@ -1,6 +1,7 @@
 /* 1.4.3 has a new compiler and frame-controller layout. Every adapted game-code
    site below is checked before any write; older versions use game_patches.c. */
 #include "aspect_patch.h"
+#include "world_patch.h"
 #include "game_patches.h"
 #include "game_version.h"
 #include "world_survey.h"
@@ -113,6 +114,7 @@ static void patch_realtime(Module *m){
     frame_interval_data=(_Atomic uint32_t *)(void *)(m->base+data+8);frame_step_store(1.0f/60.0f);
     fprintf(stderr,"[totk] 1.4.3 real-time frame step: 7 guarded sites, producer veneer +%#llx; original half-step selector and ratio/inverse/seconds/FPS calculations retained\n",(unsigned long long)stub);
 }
+#define WORLD_STUBS 304                      /* world_patch.h: time of day (32) and render distance (2 x 32), after the render veneers */
 static void patch_output_res(Module *m);
 static void patch_render_res(Module *m);
 void runtime_game_patches(Module *m) {
@@ -137,6 +139,9 @@ void runtime_game_patches(Module *m) {
       static const uint32_t want[] = {0x1e211e49 /* fcsel s9, s18, s1, ne */};
       fog_install(m, "1.4.3", sites, want, 1, ((m->text_end + 15) & ~15ULL) + FOG_STUB_AT, (m->file_size + 0x3fff) & ~0x3fffULL); }
     shadow_install(m, "1.4.3", ((m->text_end + 15) & ~15ULL) + SHADOW_STUB_AT, (m->file_size + 0x3fff) & ~0x3fffULL);
+    /* Time of day speed and render distance (world_patch.h): three 32-byte stubs after the render-resolution veneers
+       (+304..+400), factors at the data page +72 / +76. Always in on the Mac and in the iOS export. */
+    world_patches_install(m, "1.4.3", ((m->text_end + 15) & ~15ULL) + WORLD_STUBS, (m->file_size + 0x3fff) & ~0x3fffULL);
     const char *enabled = getenv("TOTK_FPS60");
     if (enabled && !strcmp(enabled, "0")) {
         fprintf(stderr, "[totk] 1.4.3 shipping frame controller (TOTK_FPS60=0)\n");

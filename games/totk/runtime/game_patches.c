@@ -1,5 +1,6 @@
 #include "game_patches.h"
 #include "aspect_patch.h"
+#include "world_patch.h"   /* the setters only: time of day and render distance are 1.4.3 patches */
 #include "game_version.h"
 #include "world_survey.h"
 #include <TargetConditionals.h>

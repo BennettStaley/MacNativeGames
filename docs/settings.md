@@ -49,6 +49,7 @@ Limits and why:
 | **Texture detail bias** | Below 0 picks sharper texture levels; too low shimmers. |
 | **Depth of field** | On (the game's) or off. The game blurs the distance with one full-screen pass over the scene (it reads the depth and blends a blurred half-size copy of the picture over everything far away); off leaves that pass out, so far away stays as sharp as it was drawn. Version 1.4.3. |
 | **Bloom** | 0–100 % of the game's glow around bright light. The tone map adds the bloom texture to the scene; below 100 % that texture is scaled first, so 0 % is no bloom at all. Version 1.4.3. |
+| **Render distance** | 50–300 % of the camera's far clip distance (the game's own is 100 %). The game's own is 25 km, more than the map is across, so below 100 % land in the far distance is cut off sooner and above 100 % mostly changes nothing you can see: it does not load more of the world or raise the detail of distant land, which the game decides separately. |
 
 ## Frame rate, interface, controls, audio
 
@@ -81,6 +82,11 @@ Limits and why:
 Several settings follow features first offered on Switch and emulators by MaxLastBreath's UltraCam
 (https://gamebanana.com/mods/480138) and NX Optimizer (https://github.com/MaxLastBreath/nx-optimizer). This port
 reimplements them independently for 1.4.3 and contains none of their code.
+## World
+
+| Setting | What it does |
+|---|---|
+| **Time of day speed** | *Paused*, 0.25×, 0.5×, *Normal* (the game's own), 2×, 4× or 8×: how fast the day passes, the clock, the sun, the sky and the shadows with it. *Paused* stops the time of day where it is. Events that set the time (sleeping, cutscenes) still do, and where the game holds the clock itself (the opening beneath Hyrule Castle stays at 7:00) the setting has nothing to speed up. |
 
 ## The file
 
