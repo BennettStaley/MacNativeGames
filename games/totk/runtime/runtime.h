@@ -97,6 +97,11 @@ int runtime_heap_overlay(char *out,size_t n);   /* the HeapDef overlay folder in
    fits when w*h is at most its pixels); TOTK_RENDER_RESERVE=<w>x<h> sets it. Older versions refuse and report 0x0. */
 int runtime_render_request(unsigned w,unsigned h);
 void runtime_render_reserve(unsigned *w,unsigned *h);
+/* The game's output (its 16:9 canvas, text and icons included), live up to the swapchain sized at start (1.4.3, Mac):
+   runtime_output_request asks for w x h (0, or -1 when outside 640x360 .. runtime_output_max). */
+int runtime_output_request(unsigned w,unsigned h);
+void runtime_output_max(unsigned *w,unsigned *h);
+void runtime_aspect_set(float ratio);   /* aspect_patch.h: the picture's shape, 0 = the game's own 16:9 (Mac) */
 int runtime_output_res_toggle(void);                    /* legacy two-state output size switch */
 int runtime_output_mode_cycle(void);                    /* key 3: MetalFX 2K -> native 2K -> off */
 uint64_t runtime_output_size_current(void);              /* configured canvas: width in low 32 bits, height in high 32 bits */
@@ -123,6 +128,9 @@ void runtime_memory_probe(void);
 void runtime_input_key(unsigned code,int down);
 void runtime_input_clear(void);
 void runtime_input_hold(int on);
+int runtime_setting_test(const char *key, const char *word, int *value);   /* settings.c: TOTK_INPUT_FILE "set <key> <value>", the menu's path */
+void runtime_front_settings_key(unsigned code);   /* frontend.m: a key pressed in the open settings menu (TOTK_INPUT_FILE "menukey") */
+void runtime_front_settings_toggle(void);   /* frontend.m: open or close the Mac settings menu (gamepad.m: Home, or Options + Menu) */
 void runtime_front_settings_shot(const char *path);   /* frontend.m: the Mac settings panel as a PNG (TOTK_INPUT_FILE "settings-shot") */   /* 1 while the settings menu is open: the game reads a neutral controller */
 int runtime_handheld_mode(void);   /* TOTK_OPERATION_MODE=handheld (runtime/services.c) */
 void *runtime_input_override(const char *name);

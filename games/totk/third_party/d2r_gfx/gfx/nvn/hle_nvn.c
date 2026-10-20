@@ -2140,6 +2140,7 @@ NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
 static void trow(uint64_t f, const char *name, double v);
 static void set_time_constraint(uint64_t period_ns);
 static void rt_comp_tick(uint64_t period_ns);
+static _Atomic int g_fps_limit;   // the settings menu's frame rate limit (TOTK_UNCAPPED_HZ as a number; 0 = none), present_ticks
 static int g_uncapped;   // TOTK_UNCAPPED configured, see present_cfg; suspended while frame interpolation paces the game (uncapped_now)
 static int g_paced_hz;   // the display-following rate, used instead of UNCAPPED_HZ while interpolation paces the game
 #include "totk_mfx_mode.h"   /* totk_mfx.m: frame interpolation mode of this game frame (TOTK_MFX, key 2) */
@@ -2471,8 +2472,9 @@ void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_di
 void nvn_fps_cap_set(int hz) {
     char text[16]; if (hz > 0) snprintf(text, sizeof text, "%d", hz); else snprintf(text, sizeof text, "display");
     setenv("TOTK_UNCAPPED_HZ", text, 1);
+    atomic_store(&g_fps_limit, hz > 0 ? hz : 0);
     if (g_hz < 0) return;
-    if (!g_uncapped) { LOG("[nvn] frame rate limit %s: applies at the next start (pacing is not uncapped now)", text); return; }
+    if (!g_uncapped) { LOG("[nvn] frame rate limit %s: by display refreshes (%d Hz)", text, g_paced_hz); return; }
     g_hz = uncapped_cap(mtl_display_hz());
     LOG("[nvn] frame rate limit: %d fps (TOTK_UNCAPPED_HZ=%s)", g_hz, text);
 }
@@ -2484,6 +2486,7 @@ static void present_cfg(const win_t *o) {
     const char *e = getenv("DM_PRESENT_HZ"), *rt = getenv("TOTK_REALTIME");
     int realtime = !(rt && !strcmp(rt, "0"));
     g_hz = g_paced_hz = e ? atoi(e) : (realtime && scr > 0 ? scr : 60);
+    { const char *l = getenv("TOTK_UNCAPPED_HZ"); atomic_store(&g_fps_limit, l && atoi(l) > 0 ? atoi(l) : 0); }
     { const char *u = getenv("TOTK_UNCAPPED"), *f60 = getenv("TOTK_FPS60");   // the original 30-frame mode needs fixed pacing; MetalFX interpolation suspends it while on (uncapped_now)
       g_uncapped = !e && realtime && !(u && !strcmp(u, "0")) && !(f60 && !strcmp(f60, "0")) && g_hz < UNCAPPED_HZ; }
     if (g_uncapped) { g_hz = uncapped_cap(scr); LOG("[nvn] 不限帧率（TOTK_UNCAPPED，默认开；=0 关）：不等显示器刷新，自己的时钟上限 %d 帧（TOTK_UNCAPPED_HZ）；显示器 %d Hz 每次刷新显示最新一帧%s", g_hz, scr,
@@ -2513,7 +2516,13 @@ static unsigned present_ticks(const win_t *o) {   /* display ticks per game fram
     int m = mfx_enabled();
     if (m == MFX_HALF) return 2;
     if (m == MFX_30) { int hz = g_paced_hz > 0 ? g_paced_hz : 60; return (unsigned)(hz >= 45 ? (hz + 15) / 30 : 1); }
-    return g_display_mode || (uncapped_now() && !dm_detclock_enabled() && uncapped_interval_on()) || o->interval <= 0 ? 1u : (unsigned)o->interval;
+    unsigned t = g_display_mode || (uncapped_now() && !dm_detclock_enabled() && uncapped_interval_on()) || o->interval <= 0 ? 1u : (unsigned)o->interval;
+    /* The settings menu's frame rate limit when the display paces the game (a 120 Hz display is never uncapped): at least
+       as many refreshes per frame as keep it at or below the limit (120 Hz: 30 -> 4, 40 -> 3, 60 -> 2). The real-time
+       frame step keeps the game's speed. */
+    int lim = atomic_load(&g_fps_limit);
+    if (lim > 0 && g_paced_hz > lim && !uncapped_now() && !dm_detclock_enabled()) { unsigned c = (unsigned)((g_paced_hz + lim - 1) / lim); if (c > t) t = c; }
+    return t;
 }
 static uint64_t present_period(const win_t *o) {
     unsigned itv = present_ticks(o); int m = mfx_enabled(), hz = g_uncapped && !uncapped_now() ? g_paced_hz : g_hz;
@@ -2529,7 +2538,7 @@ static uint64_t present_period(const win_t *o) {
    legacy 30 FPS path. No sleep, present or GPU allocation is involved. */
 void dm_nvn_probe_present_interval(void) {
     int saved_hz = g_hz, saved_display = g_display_mode, saved_uncapped = g_uncapped;
-    int saved_flag = atomic_load(&g_uncapped_interval), checked = 0;
+    int saved_flag = atomic_load(&g_uncapped_interval), checked = 0, saved_limit = atomic_exchange(&g_fps_limit, 0);
     const char *neg = getenv("TOTK_PROBE_NEGATIVE");
     for (int hz = 60; hz <= 120; hz += 60) for (int uncapped = 0; uncapped < 2; uncapped++)
     for (int display = 0; display < 2; display++) for (int on = 0; on < 2; on++)
@@ -2575,6 +2584,11 @@ void dm_nvn_probe_present_interval(void) {
     mfx_set(saved_mfx); mfx_latch();
     g_hz = saved_hz; g_paced_hz = saved_paced; g_display_mode = saved_display; g_uncapped = saved_uncapped;
     atomic_store(&g_uncapped_interval, saved_flag);
+    { win_t w = {.interval = 1}; g_paced_hz = 120; g_hz = 120; g_display_mode = 1; g_uncapped = 0; atomic_store(&g_fps_limit, 40);
+      if (present_ticks(&w) != 3) die("present interval probe: a 40 fps limit at 120 Hz must hold each frame for 3 refreshes");
+      atomic_store(&g_fps_limit, 30); if (present_ticks(&w) != 4) die("present interval probe: a 30 fps limit at 120 Hz must hold each frame for 4 refreshes");
+      g_hz = saved_hz; g_paced_hz = saved_paced; g_display_mode = saved_display; g_uncapped = saved_uncapped; checked += 2; }
+    atomic_store(&g_fps_limit, saved_limit);
     LOG("[present-interval] %d pacing cases passed", checked);
 }
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)

@@ -188,6 +188,13 @@ static void *input_file(void *arg) {
         } else if (!strncmp(line, "render ", 7)) {   /* "render <w>x<h>": the live scene size (runtime_render_request), as the settings menu asks */
             unsigned w, h; char rest = 0; if (sscanf(line + 7, "%ux%u%c", &w, &h, &rest) < 2 || (rest && rest != '\n' && rest != '\r')) runtime_fail("render takes <width>x<height>");
             runtime_render_request(w, h);
+        } else if (!strncmp(line, "set ", 4)) {   /* "set <key> <value>": a setting changed the way the settings menu changes it (settings_set) */
+            char key[64], word[64]; int v;
+            if (sscanf(line + 4, "%63s %63s", key, word) != 2 || runtime_setting_test(key, word, &v)) runtime_fail("set takes <settings key> <value as settings.txt writes it>");
+        } else if (sscanf(line, "menukey %u %n", &code, &used) == 1 && used && !line[used] && code < 128) {
+            runtime_front_settings_key(code);   /* "menukey <Mac keycode>": a key pressed in the open settings menu */
+        } else if (!strcmp(line, "menu\n")) {   /* "menu": open or close the settings menu, as Command-comma does */
+            runtime_front_settings_toggle();
         } else if (!strncmp(line, "settings-shot ", 14)) {   /* "settings-shot <png>": the Mac settings panel as a picture, without showing it */
             char *path = line + 14; path[strcspn(path, "\r\n")] = 0;
             runtime_front_settings_shot(path);

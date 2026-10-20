@@ -596,6 +596,7 @@ def step_update_data(tree, game, update, keys, logs, *, version='v112'):
     if version == 'v143':   # the heaps for live scene sizes (runtime_render_reserve): 2K canvas on the Mac, 1080p canvas (iOS, TOTK_OUTPUT_RES=0)
         jobs += [('make_output_res_overlay.py', [canvas, '--scene', scene]) for canvas in ('2560x1440', '1920x1080')
                  for scene in ('1920x1080', '2560x1440')]
+        jobs += [('make_output_res_overlay.py', ['3840x2160', '--scene', '2560x1440'])]   # the settings' 4K headroom (Mac, 16 GB+)
     for n, (script, arguments) in enumerate(jobs):
         run([tree/'.venv/bin/python', 'scripts/'+script, *arguments, '--version', version],
             logs/(version+'-'+script+(f'-{n}' if n > 1 else '')+'.log'), cwd=tree)

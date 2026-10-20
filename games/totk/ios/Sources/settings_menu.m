@@ -43,7 +43,12 @@ static unsigned device_mask(void) { return UIDevice.currentDevice.userInterfaceI
     NSMutableArray *rows = [NSMutableArray array], *names = [NSMutableArray array];
     for (int p = 0; p < SETTINGS_NPAGES; p++) {
         NSMutableArray *page = [NSMutableArray array];
-        for (int i = 0; i < SETTINGS_COUNT; i++) if (!strcmp(SETTINGS[i].page, SETTINGS_PAGES[p])) [page addObject:@(i)];
+        for (int i = 0; i < SETTINGS_COUNT; i++) {
+            const SettingDef *d = &SETTINGS[i];
+            if (strcmp(d->page, SETTINGS_PAGES[p]) || (d->shown_key && settings_get(d->shown_key) != d->shown_value)) continue;
+            if (!(d->platforms & device_mask()) && !strncmp(d->key, "display.", 8)) continue;   /* the Mac's output sizes: iOS shows 720p */
+            [page addObject:@(i)];
+        }
         if (page.count) { [rows addObject:page]; [names addObject:@(SETTINGS_PAGES[p])]; }
     }
     sections = rows; titles = names;

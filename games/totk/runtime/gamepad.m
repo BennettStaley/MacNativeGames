@@ -78,11 +78,12 @@ static uint64_t gamepad_buttons(GCExtendedGamepad *pad, int by_position) {
 
 static void refresh_gamepads(void) {
     RuntimeGamepadState next = {0};
-    uint64_t physical = 0;
+    uint64_t physical = 0; int menu = 0;
     for (GCController *controller in GCController.controllers) {
         GCExtendedGamepad *pad = controller.extendedGamepad;
         if (!pad) continue;
         next.connected = 1;
+        if (controller.physicalInputProfile.buttons[GCInputButtonHome].isPressed || (pad.buttonOptions.isPressed && pad.buttonMenu.isPressed)) menu = 1;
         physical |= gamepad_buttons(pad, face_by_position(controller));
         next.lx = stronger_axis(next.lx, stick_axis(pad.leftThumbstick.xAxis.value));
         next.ly = stronger_axis(next.ly, stick_axis(pad.leftThumbstick.yAxis.value));
@@ -94,6 +95,8 @@ static void refresh_gamepads(void) {
     uint64_t now = runtime_now_ns(), edges = physical & ~physicalPrev, synthetic = 0, suppressed = 0;
     int moving = next.lx || next.ly;
     physicalPrev = physical;
+    /* The settings menu: Home, or Options and Menu together (the frontend; on iPhone / iPad the app's own). */
+    static int menuPrev; if (menu && !menuPrev) runtime_front_settings_toggle(); menuPrev = menu;
     for (int i = 0; i < CONTROLLER_BUTTONS; i++) {
         uint64_t bit = 1ULL << i;
         int kind = controller_mode_kind(controllerModes[i]);
@@ -131,6 +134,8 @@ static void refresh_gamepads(void) {
 static void attach_gamepad(GCController *controller) {
     GCExtendedGamepad *pad = controller.extendedGamepad;
     if (!pad) return;
+    GCControllerButtonInput *home = controller.physicalInputProfile.buttons[GCInputButtonHome];
+    if (home) home.preferredSystemGestureState = GCSystemGestureStateDisabled;   /* Home opens the settings menu, not the system's */
     pad.valueChangedHandler = ^(GCExtendedGamepad *changed, GCControllerElement *element) {
         (void)changed; (void)element;
         refresh_gamepads();

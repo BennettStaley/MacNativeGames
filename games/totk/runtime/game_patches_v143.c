@@ -183,6 +183,11 @@ int runtime_output_res(unsigned *w,unsigned *h){
             const char *dir=getenv("TOTK_ROMFS_PATCHES_OUT");char path[4096];
             snprintf(path,sizeof path,"%s/2560x1440/manifest.tsv",dir?dir:"extracted/v143/romfs-patches-out");
             FILE *f=fopen(path,"r");if(f){fclose(f);on=1;cw=2560;ch=1440;}
+            /* Headroom (settings): a 4K output on a Mac with 16 GB or more when its overlay was built, with a 2560x1440 scene
+               reserve (a 4K scene too would need a 1.5 GiB texture heap, above the 1 GiB a zero-copy GPU buffer may take). */
+            uint64_t mem=0;size_t len=sizeof mem;sysctlbyname("hw.memsize",&mem,&len,NULL,0);
+            snprintf(path,sizeof path,"%s/3840x2160-scene-2560x1440/manifest.tsv",dir?dir:"extracted/v143/romfs-patches-out");
+            if(mem>=(16ULL<<30)&&(f=fopen(path,"r"))){fclose(f);on=1;cw=3840;ch=2160;}
             output_full_at_start=0;
         }else{
             char tail;
@@ -192,6 +197,23 @@ int runtime_output_res(unsigned *w,unsigned *h){
         decided=1;
     }
     if(on){*w=cw;*h=ch;}return on;
+}
+/* The settings menu's output size (settings.c display_apply): any 16:9 size up to the swapchain, live through the game's own
+   display-config rebuild (as key 3). Asked before the patch installs, it is the size the game starts at. */
+static _Atomic uint64_t output_pending;
+void runtime_output_max(unsigned *w,unsigned *h){if(!runtime_output_res(w,h)){*w=1920;*h=1080;}}
+int runtime_output_request(unsigned w,unsigned h){
+    unsigned mw,mh;if(!runtime_output_res(&mw,&mh))return w==1920&&h==1080?0:-1;
+    if(w<640||h<360||w>mw||h>mh)return -1;
+    uint8_t *page=atomic_load(&output_page);
+    if(!page){atomic_store(&output_pending,pack_size(w,h));return 0;}
+    _Atomic uint64_t *size=(_Atomic uint64_t *)(void *)(page+32);
+    if(atomic_load(size)==pack_size(w,h))return 0;
+    atomic_store(size,pack_size(w,h));
+    uint64_t config=atomic_load((_Atomic uint64_t *)(void *)(page+40));
+    if(config){__atomic_fetch_or((uint32_t *)(uintptr_t)(config+8),1u<<21,__ATOMIC_SEQ_CST);runtime_oe_push_message(30);}
+    fprintf(stderr,"[totk] 1.4.3 output %ux%u (settings; display config %s)\n",w,h,config?"ready":"not published yet");
+    return 0;
 }
 /* What the HeapDef overlay adds to DynamicTextureAllocatorMem and Graphics (and runtime/services.c to the application
  * pool): the canvas and the scene each grow the heap by their pixel ratio above the shipped 1920x1080 / 1600x900, the
@@ -242,7 +264,8 @@ static void patch_output_res(Module *m){
     for(unsigned i=0;i<3;i++)memcpy(m->base+guards[i].off,words+i,4);
  #endif
     uint8_t *page=m->base+data;output_w=w;output_h=h;
-    atomic_store((_Atomic uint64_t *)(void *)(page+32),output_full_at_start?pack_size(w,h):pack_size(1920,1080));
+    uint64_t pending=atomic_load(&output_pending);
+    atomic_store((_Atomic uint64_t *)(void *)(page+32),pending?pending:output_full_at_start?pack_size(w,h):pack_size(1920,1080));
     atomic_store((_Atomic uint64_t *)(void *)(page+40),0);
     atomic_store(&output_page,page);   /* Publish initialized state to the HUD on the main thread. */
     fprintf(stderr,"[totk] 1.4.3 output: %ux%u swapchain; starts %s, key 3 cycles MetalFX / native / off; display-config veneer +%#llx\n",w,h,output_full_at_start?"at requested resolution":"at 1920x1080",(unsigned long long)stub);
@@ -378,12 +401,14 @@ static void render_latch(void){
     atomic_store((_Atomic uint32_t *)(void *)(render_page+48),0x80);   /* the per-frame update takes its mode-change path */
 }
 int runtime_render_request(unsigned w,unsigned h){
+    if(!w&&!h){if(atomic_exchange(&render_request,0))fprintf(stderr,"[totk] render request: the game's own size\n");return 0;}
     unsigned rw,rh;runtime_render_reserve(&rw,&rh);
     int range=w>=64&&h>=64&&w<=4096&&h<=4096;
-    if(!render_page||!range||(uint64_t)w*h>(uint64_t)rw*rh){
-        fprintf(stderr,"[totk] render request %ux%u refused: %s\n",w,h,!render_page?"the scene size is not patched":!range?"out of range":"above the boot reserve, applies after a restart");
+    if(!range||(uint64_t)w*h>(uint64_t)rw*rh){
+        fprintf(stderr,"[totk] render request %ux%u refused: %s\n",w,h,!range?"out of range":"above the boot reserve, applies after a restart");
         return -1;
     }
+    if(atomic_load(&render_request)==pack_size(w,h))return 0;
     atomic_store_explicit(&render_request,pack_size(w,h),memory_order_release);
     fprintf(stderr,"[totk] render request %ux%u (reserve %ux%u): latched at the next present\n",w,h,rw,rh);return 0;
 }

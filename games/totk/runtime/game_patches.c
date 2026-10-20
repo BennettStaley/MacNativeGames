@@ -290,10 +290,14 @@ int runtime_heap_overlay(char *out, size_t n) {
 }
 /* Live scene sizes are 1.4.3 only (runtime/game_patches_v143.c); here TOTK_RENDER_RES stays a boot setting. */
 int runtime_render_request(unsigned w, unsigned h) {
+    if (!w && !h) return 0;   /* the game's own */
     fprintf(stderr, "[totk] render request %ux%u refused: live scene sizes need 1.4.3 (TOTK_RENDER_RES applies after a restart)\n", w, h);
     return -1;
 }
 void runtime_render_reserve(unsigned *w, unsigned *h) { *w = *h = 0; }
+/* The settings menu's output size is 1.4.3 only too: here the game's own 1080p (key 3 still switches a 2K start). */
+void runtime_output_max(unsigned *w, unsigned *h) { *w = 1920; *h = 1080; }
+int runtime_output_request(unsigned w, unsigned h) { return w == 1920 && h == 1080 ? 0 : -1; }
 enum { DP_OUTPUT_SIZE = 32, DP_RENDERER = 40 };   /* data page: the output size {w, h} the game reads; the renderer it stores */
 static _Atomic(uint8_t *) output_page;
 static unsigned output_w, output_h;   /* the largest output size (the swapchain) */

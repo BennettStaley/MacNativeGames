@@ -41,6 +41,16 @@ float runtime_aspect_now(void) {
     uint32_t bits = atomic_load(g_aspect_slot); float v; memcpy(&v, &bits, 4); return v;
 }
 
+/* The settings menu's aspect ratio (settings.c display_apply): ratio 0 = the game's own 16:9. Before the stubs are in it
+   is the start ratio. Ignored where the patch is not (iPhone / iPad, other game versions). */
+static float g_aspect_pending = -1;
+void runtime_aspect_set(float ratio) {
+    if (!g_aspect_slot) { g_aspect_pending = ratio; return; }
+    uint32_t bits; memcpy(&bits, &ratio, 4); atomic_store(g_aspect_slot, bits);
+    if (ratio) g_aspect_wide = ratio;
+    fprintf(stderr, "[totk] aspect ratio %s%.4f (settings)\n", ratio ? "" : "16:9, the game's own: ", ratio ? ratio : 16.0f / 9);
+}
+
 /* Key 4 (runtime/input.c). Returns 0 where it is not available (iPhone / iPad, other game versions). */
 int runtime_aspect_toggle(void) {
     if (!g_aspect_slot) return 0;
@@ -135,6 +145,7 @@ static inline void aspect_install(Module *m, const char *version, const uint64_t
     (void)m; (void)version; (void)sites; (void)nsite; (void)stub_off; (void)data_off;
 #else
     float start = aspect_requested();
+    if (!start && g_aspect_pending > 0) start = g_aspect_pending;   /* the settings' start ratio; TOTK_ASPECT wins */
     g_aspect_wide = start ? start : 21.0f / 9.0f;
     dpf_install(m, "aspect", sites, NULL, nsite, stub_off, data_off, ASPECT_DATA_SLOT, DPF_REPLACE);
     g_aspect_slot = (_Atomic(uint32_t) *)(void *)(m->base + data_off + ASPECT_DATA_SLOT);

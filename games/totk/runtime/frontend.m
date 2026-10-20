@@ -101,6 +101,12 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
  pthread_mutex_lock(&vsyncLock);for(unsigned i=0;i<vsyncCount;i++)hle_signal_system_event(vsyncEvents[i]);pthread_mutex_unlock(&vsyncLock);return kCVReturnSuccess;
 }
 #include "settings_panel_mac.h"
+static NSWindow *settings_window(void){return window;}
+/* gamepad.m: a controller's Home button, or Options and Menu pressed together. */
+void runtime_front_settings_toggle(void){dispatch_async(dispatch_get_main_queue(),^{[TOTKSettingsPanel toggle];});}
+void runtime_front_settings_key(unsigned code){dispatch_async(dispatch_get_main_queue(),^{
+ NSEvent *e=[NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:window.windowNumber context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:(unsigned short)code];
+ [TOTKSettingsPanel key:e];});}
 void runtime_front_settings_shot(const char *path){NSString *p=@(path);dispatch_async(dispatch_get_main_queue(),^{
  fprintf(stderr,"[settings] panel snapshot %s: %s\n",p.fileSystemRepresentation,[TOTKSettingsPanel snapshotTo:p]?"written":"FAILED");});}
 @interface TOTKInputView:NSView
@@ -175,6 +181,21 @@ static void front_sync_drawable(void){
  CGFloat s=window.backingScaleFactor>0?window.backingScaleFactor:1,ts=drawable_scale();CGSize px=CGSizeMake(round(v.bounds.size.width*s*ts),round(v.bounds.size.height*s*ts));
  if(px.width<1||px.height<1||CGSizeEqualToSize(metalLayer.drawableSize,px))return;
  metalLayer.contentsScale=s;metalLayer.drawableSize=px;fprintf(stderr,"[totk] window drawable %.0fx%.0f (scale %.0f)\n",px.width,px.height,s);
+ /* The settings' window-following sizes (settings_display_size), once the size has settled: each output change rebuilds
+    the game's canvas, which a live resize must not do every frame. */
+ static unsigned generation;unsigned mine=++generation;
+ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,400*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
+  if(mine!=generation)return;
+  NSScreen *screen=window.screen?:NSScreen.mainScreen;unsigned native=0;
+  CGDirectDisplayID display=[screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+  /* The panel's own pixels (3456 on a 16" MacBook Pro), not the current mode's backing size ("More Space" is bigger):
+     the widest mode drawn one pixel per point. */
+  NSArray *modes=display?CFBridgingRelease(CGDisplayCopyAllDisplayModes(display,(__bridge CFDictionaryRef)@{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes:@YES})):nil;
+  for(id m in modes){CGDisplayModeRef mode=(__bridge CGDisplayModeRef)m;size_t pw=CGDisplayModeGetPixelWidth(mode);
+   if(pw==CGDisplayModeGetWidth(mode)&&pw>native)native=(unsigned)pw;}
+  if(!native)native=(unsigned)(screen.frame.size.width*screen.backingScaleFactor);
+  settings_display_size((unsigned)metalLayer.drawableSize.width,(unsigned)metalLayer.drawableSize.height,native);
+ });
 }
 @interface TOTKWindowDelegate:NSObject<NSWindowDelegate>
 @end

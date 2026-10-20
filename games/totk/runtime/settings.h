@@ -11,3 +11,7 @@ int settings_set(const char *key, int value);   /* SETTINGS_APPLIED (live), SETT
 int settings_pending_restart(const char *key);  /* 1: changed since the game started and only applies at the next start */
 int settings_save(void);
 void settings_observe(void (*fn)(const char *key, int value));   /* called after every change, on the caller's thread */
+/* The window's drawable and the screen's native width in pixels (the Mac frontend, on resize): "Match the window", "Display
+   native" and "Fill the screen" follow them. */
+void settings_display_size(unsigned drawable_w, unsigned drawable_h, unsigned screen_w);
+const char *settings_display_status(void);      /* "Output 2560 x 1440, 3D scene 1280 x 720": what the game was last asked for */

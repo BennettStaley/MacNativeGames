@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <TargetConditionals.h>
+#include <math.h>
+#include <stdint.h>
 #include "settings.h"
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -16,6 +18,67 @@ static char path[1024];
 static void (*observer)(const char *key, int value);
 
 int settings_ios(void) { return TARGET_OS_IPHONE ? 1 : 0; }
+
+/* Display (settings_schema.h): the output (the game's 16:9 canvas, Mac: live up to the swapchain the headroom set at start),
+   the 3D scene as a share of it (up to the scene reserve), and the shape the picture is shown at. The frontend reports the
+   window's drawable and the screen's native pixels (settings_display_size), which "Match the window", "Display native"
+   and "Fill the screen" follow. Returns -1 when the game cannot take a size now. */
+static unsigned disp_w, disp_h, native_w;
+static char display_status[160];
+static int display_apply(const char *changed) {
+    extern int runtime_output_request(unsigned w, unsigned h);
+    extern void runtime_output_max(unsigned *w, unsigned *h);
+    extern int runtime_render_request(unsigned w, unsigned h);
+    extern void runtime_render_reserve(unsigned *w, unsigned *h);
+    extern void runtime_aspect_set(float ratio);
+    pthread_mutex_lock(&lock);
+    int out = values[settings_index("display.output")], custom = values[settings_index("display.custom_width")];
+    int scale = values[settings_index("display.scale")], aspect = values[settings_index("display.aspect")];
+    unsigned dw = disp_w, dh = disp_h, nw = native_w;
+    pthread_mutex_unlock(&lock);
+    int r = 0; unsigned cw = 1280, ch = 720;
+    if (!settings_ios()) {
+        unsigned mw, mh; runtime_output_max(&mw, &mh);
+        unsigned want = out == SET_OUT_WINDOW ? dw : out == SET_OUT_NATIVE ? nw : out == SET_OUT_CUSTOM ? (unsigned)custom : (unsigned)out * 16 / 9;
+        if (!want) want = 1920;   /* the window is not up yet */
+        if (want > mw) want = mw;
+        want &= ~15u; if (want < 640) want = 640;
+        cw = want; ch = want * 9 / 16;
+        if (runtime_output_request(cw, ch)) r = -1;
+    }
+    unsigned sw = 0, sh = 0, rw, rh; runtime_render_reserve(&rw, &rh);
+    /* The game's own scene grows with the output (1600 x 900 for each 1920 of width); above the reserve it is asked for
+       explicitly, at the most the reserve holds. */
+    int own_fits = !rw || cw <= 1920 || (uint64_t)(1600 * cw / 1920) * (900 * cw / 1920) <= (uint64_t)rw * rh;
+    if (scale || !own_fits) {
+        unsigned pct = scale ? (unsigned)scale : 83;
+        sw = cw * pct / 100; sh = ch * pct / 100;
+        if ((uint64_t)sw * sh > (uint64_t)rw * rh) { double f = sqrt((double)rw * rh / ((double)sw * sh)); sw = (unsigned)(sw * f); sh = (unsigned)(sh * f); }
+        sw &= ~7u; sh &= ~7u; if (sw < 64) sw = 64; if (sh < 64) sh = 64;
+    }
+    if (runtime_render_request(sw, sh)) r = -1;
+    if (!settings_ios() && (!changed || !strcmp(changed, "display.aspect") || aspect == 0)) {
+        static const float ratios[] = {0, 16.0f / 9, 16.0f / 10, 21.0f / 9, 32.0f / 9};
+        float a = aspect == 0 ? (dw && dh ? (float)dw / dh : 0) : ratios[aspect < 5 ? aspect : 1];
+        if (a && fabsf(a / (16.0f / 9) - 1) < 0.01f) a = 0;   /* 16:9 is the game's own: no stretch */
+        if (changed || a) runtime_aspect_set(a);
+    }
+    pthread_mutex_lock(&lock);
+    if (sw) snprintf(display_status, sizeof display_status, "Output %u x %u, 3D scene %u x %u", cw, ch, sw, sh);
+    else snprintf(display_status, sizeof display_status, "Output %u x %u, 3D scene the game's own", cw, ch);
+    pthread_mutex_unlock(&lock);
+    fprintf(stderr, "[settings] display: %s%s\n", display_status, r ? " (a size waits for the next start)" : "");
+    return r;
+}
+const char *settings_display_status(void) { return display_status; }
+void settings_display_size(unsigned drawable_w, unsigned drawable_h, unsigned screen_w) {
+    pthread_mutex_lock(&lock);
+    int same = drawable_w == disp_w && drawable_h == disp_h && screen_w == native_w, ready = loaded;
+    disp_w = drawable_w; disp_h = drawable_h; native_w = screen_w;
+    int out = loaded ? values[settings_index("display.output")] : -1, aspect = loaded ? values[settings_index("display.aspect")] : -1;
+    pthread_mutex_unlock(&lock);
+    if (!same && ready && (out == SET_OUT_WINDOW || out == SET_OUT_NATIVE || aspect == 0)) display_apply("window");
+}
 
 /* Live settings go to the code that owns them; the touch controls and the menu button are the iOS app's own views, which
    follow through settings_observe. Returns -1 when the game cannot take the value now (it applies at the next start). */
@@ -28,10 +91,8 @@ static int apply_live(const SettingDef *d, int v) {
     extern void runtime_gamepad_relayout(void);
     extern void runtime_fov_set(int percent);
     extern int runtime_render_request(unsigned w, unsigned h);
-    if (!strcmp(d->key, "display.resolution")) {   /* the game's own: handheld 720p (iOS), docked 900p (Mac) */
-        unsigned h = v ? (unsigned)v : settings_ios() ? 720u : 900u;
-        return runtime_render_request(h * 16 / 9, h);
-    }
+    (void)runtime_render_request;
+    if (!strncmp(d->key, "display.", 8)) return d->apply == SET_LIVE ? display_apply(d->key) : 0;
     if (!strcmp(d->key, "graphics.interpolation")) dm_gfx_set_flag("mfx_interp", v);
     else if (!strcmp(d->key, "graphics.fov")) runtime_fov_set(v);
     else if (!strcmp(d->key, "graphics.aa")) dm_gfx_set_flag("aa_mode", v);
@@ -70,7 +131,8 @@ void settings_init(const char *file) {
     pthread_mutex_unlock(&lock);
     /* Live-only settings (no variable for the game to read at start) are applied now. */
     for (int i = 0; i < SETTINGS_COUNT; i++)
-        if (!SETTINGS[i].env && SETTINGS[i].apply == SET_LIVE && start[i] != settings_default(&SETTINGS[i], settings_ios())) apply_live(&SETTINGS[i], start[i]);
+        if (!SETTINGS[i].env && SETTINGS[i].apply == SET_LIVE && strncmp(SETTINGS[i].key, "display.", 8) && start[i] != settings_default(&SETTINGS[i], settings_ios())) apply_live(&SETTINGS[i], start[i]);
+    display_apply(NULL);   /* the start sizes: the patches take them when they install */
 }
 
 int settings_get(const char *key) {
@@ -114,3 +176,12 @@ int settings_set(const char *key, int value) {
 }
 
 void settings_observe(void (*fn)(const char *key, int value)) { observer = fn; }
+
+/* TOTK_INPUT_FILE "set <key> <value>" (runtime/input.c): the menu's own path, for test runs. Nonzero = unknown key or value. */
+int runtime_setting_test(const char *key, const char *word, int *v) {
+    int i = settings_index(key);
+    if (i < 0 || settings_parse_value(&SETTINGS[i], word, v)) return -1;
+    int r = settings_set(key, *v);
+    fprintf(stderr, "[settings] test: %s = %s -> %s\n", key, word, r == SETTINGS_APPLIED ? "applied" : r == SETTINGS_RESTART ? "next start" : "invalid");
+    return r == SETTINGS_INVALID;
+}

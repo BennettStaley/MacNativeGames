@@ -27,6 +27,7 @@ typedef struct {
     const char *unit;                /* SET_RANGE: shown after the value ("%", " fps") */
     const SettingChoice *choices; int nchoices;
     const char *unavailable;         /* why the row is greyed on a platform outside `platforms` */
+    const char *shown_key; int shown_value;   /* shown only while that setting has that value (NULL: always) */
 } SettingDef;
 
 static const char *const SETTINGS_PAGES[] = {"Display", "Graphics", "Frame rate", "Interface", "Controls", "Audio"};
@@ -36,8 +37,21 @@ static const SettingChoice SET_CAP[] = {{"30 fps", "30", "30", 30}, {"40 fps", "
                                         {"120 fps", "120", "120", 120}, {"Display refresh rate", "display", "display", 0}};
 static const SettingChoice SET_INTERP[] = {{"Off", "off", "0", 0}, {"30 + 30", "interp30", "interp30", 1},
                                            {"Half the refresh rate", "half", "interp", 2}, {"Every frame", "max", "interpmax", 3}};
-static const SettingChoice SET_RES[] = {{"The game's own", "game", NULL, 0}, {"720p", "720", "1280x720", 720}, {"900p", "900", "1600x900", 900},
-                                        {"1080p", "1080", "1920x1080", 1080}, {"1440p", "1440", "2560x1440", 1440}};
+/* Display (settings.c display_apply): the output is the 16:9 picture the game composes, text and icons included (live up to
+   the headroom); the render scale sizes the 3D scene against it; the aspect ratio is the shape it is shown at. */
+enum { SET_OUT_WINDOW = 0, SET_OUT_NATIVE = 1, SET_OUT_CUSTOM = 2 };
+static const SettingChoice SET_OUTPUT[] = {{"Match the window", "window", NULL, SET_OUT_WINDOW}, {"Display native", "native", NULL, SET_OUT_NATIVE},
+                                           {"4K (3840 x 2160)", "2160", NULL, 2160}, {"1440p (2560 x 1440)", "1440", NULL, 1440},
+                                           {"1080p (game's own)", "1080", NULL, 1080}, {"900p (1600 x 900)", "900", NULL, 900},
+                                           {"720p (1280 x 720)", "720", NULL, 720}, {"Custom width", "custom", NULL, SET_OUT_CUSTOM}};
+static const SettingChoice SET_SCALE[] = {{"The game's own", "game", NULL, 0}, {"25%", "25", NULL, 25}, {"33%", "33", NULL, 33},
+                                          {"50%", "50", NULL, 50}, {"67%", "67", NULL, 67}, {"75%", "75", NULL, 75}, {"85%", "85", NULL, 85},
+                                          {"100%", "100", NULL, 100}, {"125%", "125", NULL, 125}, {"150%", "150", NULL, 150},
+                                          {"175%", "175", NULL, 175}, {"200%", "200", NULL, 200}};
+static const SettingChoice SET_ASPECT[] = {{"Fill the screen", "auto", NULL, 0}, {"16:9 (game's own)", "16:9", NULL, 1},
+                                           {"16:10", "16:10", NULL, 2}, {"21:9", "21:9", NULL, 3}, {"32:9", "32:9", NULL, 4}};
+static const SettingChoice SET_HEADROOM[] = {{"Automatic", "auto", NULL, 0}, {"Up to 1440p", "1440", "2560x1440", 1440},
+                                             {"Up to 4K", "2160", "3840x2160", 2160}};
 static const SettingChoice SET_AA[] = {{"The game's own", "game", "0", 0}, {"Off", "off", "1", 1}, {"FXAA", "fxaa", "2", 2}, {"SMAA", "smaa", "3", 3}};
 static const SettingChoice SET_ANISO[] = {{"The game's", "game", "0", 0}, {"2x", "2", "2", 2}, {"4x", "4", "4", 4}, {"8x", "8", "8", 8}, {"16x", "16", "16", 16}};
 static const SettingChoice SET_TOUCH[] = {{"Always", "always", NULL, 0}, {"Hide with a controller", "controller", NULL, 1},
@@ -49,41 +63,49 @@ static const SettingChoice SET_FACE[] = {{"Automatic", "auto", NULL, 0}, {"By po
 static const SettingDef SETTINGS[] = {
     {"graphics.interpolation", "Graphics", "Frame interpolation", "MetalFX makes a frame between two game frames.",
      "TOTK_MFX", SET_CHOICE, SET_LIVE, SET_MAC | SET_IPAD, 0, 0, 0, 0, 0, NULL, SET_INTERP, SET_N(SET_INTERP),
-     "Not tested on iPhone yet."},
-    {"display.resolution", "Display", "3D resolution", "The size the game draws its 3D scene at (version 1.4.3). Above what was set aside at start, it applies at the next start.",
-     "TOTK_RENDER_RES", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_RES, SET_N(SET_RES), NULL},
+     "Not tested on iPhone yet.", NULL, 0},
+    {"display.output", "Display", "Output resolution", "The picture the game composes, text and icons included. Display native is your screen's pixels.",
+     NULL, SET_CHOICE, SET_LIVE, SET_MAC, 1080, 1080, 0, 0, 0, NULL, SET_OUTPUT, SET_N(SET_OUTPUT), "iPhone and iPad show 720p.", NULL, 0},
+    {"display.custom_width", "Display", "Custom width", "The output's width in pixels; the height follows at 16:9.",
+     NULL, SET_RANGE, SET_LIVE, SET_MAC, 2560, 2560, 640, 3840, 64, " px", NULL, 0, "iPhone and iPad show 720p.", "display.output", SET_OUT_CUSTOM},
+    {"display.scale", "Display", "3D render scale", "The 3D scene against the output: 50% is half the width and height (four times fewer pixels), above 100% supersamples.",
+     NULL, SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_SCALE, SET_N(SET_SCALE), NULL, NULL, 0},
+    {"display.aspect", "Display", "Aspect ratio", "Fill the screen shows more of the world on a wider or taller screen; text and icons stretch to it.",
+     NULL, SET_CHOICE, SET_LIVE, SET_MAC, 1, 1, 0, 0, 0, NULL, SET_ASPECT, SET_N(SET_ASPECT), "Not on iPhone and iPad yet.", NULL, 0},
+    {"display.headroom", "Display", "Resolution headroom", "The largest output and 3D scene the game sets memory aside for at start. Automatic: 4K with 16 GB of memory or more.",
+     "TOTK_OUTPUT_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_HEADROOM, SET_N(SET_HEADROOM), "Fixed on iPhone and iPad.", NULL, 0},
     {"graphics.fov", "Graphics", "Field of view", "How wide the camera sees, against the game's own (version 1.4.3).",
-     "TOTK_FOV", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 70, 140, 5, "%", NULL, 0, NULL},
+     "TOTK_FOV", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 70, 140, 5, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.aa", "Graphics", "Anti-aliasing", "Smooths the 3D scene's edges before the game draws its text and icons on top (version 1.4.3).",
-     "TOTK_AA", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_AA, SET_N(SET_AA), NULL},
+     "TOTK_AA", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_AA, SET_N(SET_AA), NULL, NULL, 0},
     {"graphics.sharpen", "Graphics", "Sharpening", "AMD FidelityFX CAS on the finished picture, under the text and icons.",
-     "TOTK_SHARPEN", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, 0, 100, 5, "%", NULL, 0, NULL},
+     "TOTK_SHARPEN", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, 0, 100, 5, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.aniso", "Graphics", "Anisotropic filtering", "Sharper ground and walls seen at an angle.",
-     "TOTK_ANISO", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_ANISO, SET_N(SET_ANISO), NULL},
+     "TOTK_ANISO", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_ANISO, SET_N(SET_ANISO), NULL, NULL, 0},
     {"graphics.lod_bias", "Graphics", "Texture detail bias", "Below 0 picks sharper texture levels, in hundredths of a level; too low shimmers.",
-     "TOTK_LOD_BIAS", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, -100, 0, 25, NULL, NULL, 0, NULL},
+     "TOTK_LOD_BIAS", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, -100, 0, 25, NULL, NULL, 0, NULL, NULL, 0},
     {"framerate.cap", "Frame rate", "Frame rate limit", "The most frames a second the game draws. 40 needs a 120 Hz display.",
-     "TOTK_UNCAPPED_HZ", SET_CHOICE, SET_LIVE, SET_ALL, 120, 0, 0, 0, 0, NULL, SET_CAP, SET_N(SET_CAP), NULL},
+     "TOTK_UNCAPPED_HZ", SET_CHOICE, SET_LIVE, SET_ALL, 120, 0, 0, 0, 0, NULL, SET_CAP, SET_N(SET_CAP), NULL, NULL, 0},
     {"interface.readout", "Interface", "Performance readout", "Frames per second and the game picture's size.",
-     "TOTK_HINTS", SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL},
+     "TOTK_HINTS", SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"interface.shader_counter", "Interface", "Shader counter", "New shaders collected while you play.",
-     "TOTK_SHADER_OVERLAY", SET_BOOL, SET_RESTART, SET_ALL, 1, 0, 0, 1, 1, NULL, NULL, 0, NULL},
+     "TOTK_SHADER_OVERLAY", SET_BOOL, SET_RESTART, SET_ALL, 1, 0, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"interface.touch_controls", "Interface", "Touch controls", "When the on-screen controller shows.",
-     NULL, SET_CHOICE, SET_LIVE, SET_IOS, 1, 1, 0, 0, 0, NULL, SET_TOUCH, SET_N(SET_TOUCH), "Only on iPhone and iPad."},
+     NULL, SET_CHOICE, SET_LIVE, SET_IOS, 1, 1, 0, 0, 0, NULL, SET_TOUCH, SET_N(SET_TOUCH), "Only on iPhone and iPad.", NULL, 0},
     {"interface.touch_opacity", "Interface", "Touch control opacity", NULL,
-     NULL, SET_RANGE, SET_LIVE, SET_IOS, 32, 32, 10, 100, 5, "%", NULL, 0, "Only on iPhone and iPad."},
+     NULL, SET_RANGE, SET_LIVE, SET_IOS, 32, 32, 10, 100, 5, "%", NULL, 0, "Only on iPhone and iPad.", NULL, 0},
     {"interface.touch_size", "Interface", "Touch control size", NULL,
-     NULL, SET_RANGE, SET_LIVE, SET_IOS, 100, 100, 75, 150, 5, "%", NULL, 0, "Only on iPhone and iPad."},
+     NULL, SET_RANGE, SET_LIVE, SET_IOS, 100, 100, 75, 150, 5, "%", NULL, 0, "Only on iPhone and iPad.", NULL, 0},
     {"interface.menu_button", "Interface", "Settings button", "A small gear at the top of the screen. Three fingers also open the menu.",
-     NULL, SET_BOOL, SET_LIVE, SET_IOS, 1, 1, 0, 1, 1, NULL, NULL, 0, "Only on iPhone and iPad."},
+     NULL, SET_BOOL, SET_LIVE, SET_IOS, 1, 1, 0, 1, 1, NULL, NULL, 0, "Only on iPhone and iPad.", NULL, 0},
     {"controls.face_buttons", "Controls", "Face buttons", "PlayStation and Xbox buttons by position (as the game's prompts show them) or by their letters.",
-     "TOTK_FACE_BUTTONS", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_FACE, SET_N(SET_FACE), NULL},
+     "TOTK_FACE_BUTTONS", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_FACE, SET_N(SET_FACE), NULL, NULL, 0},
     {"controls.rumble", "Controls", "Rumble", NULL,
-     "TOTK_RUMBLE", SET_BOOL, SET_LIVE, SET_MAC, 1, 1, 0, 1, 1, NULL, NULL, 0, "Not on iPhone and iPad yet."},
+     "TOTK_RUMBLE", SET_BOOL, SET_LIVE, SET_MAC, 1, 1, 0, 1, 1, NULL, NULL, 0, "Not on iPhone and iPad yet.", NULL, 0},
     {"controls.gyro", "Controls", "Motion controls", "Gyro aiming with a controller that has a gyroscope.",
-     "TOTK_GYRO", SET_BOOL, SET_LIVE, SET_MAC, 1, 1, 0, 1, 1, NULL, NULL, 0, "Not on iPhone and iPad yet."},
+     "TOTK_GYRO", SET_BOOL, SET_LIVE, SET_MAC, 1, 1, 0, 1, 1, NULL, NULL, 0, "Not on iPhone and iPad yet.", NULL, 0},
     {"audio.volume", "Audio", "Volume", NULL,
-     NULL, SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 0, 100, 5, "%", NULL, 0, NULL},
+     NULL, SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 0, 100, 5, "%", NULL, 0, NULL, NULL, 0},
 };
 enum { SETTINGS_COUNT = sizeof SETTINGS / sizeof *SETTINGS };
 
