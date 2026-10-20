@@ -45,7 +45,7 @@ Limits and why:
 |---|---|
 | **Frame interpolation** | MetalFX makes a frame between two game frames: off, 30 + 30, half the refresh rate, every frame (Mac and iPad). |
 | **Field of view** | 70–140 % of the game's camera angle. Aiming, first person and cutscenes keep their own changes, scaled. |
-| **Fog** | 0–100 % of the game's distance fog (100 % is the game's own). 50 % reaches the same fog at twice the distance, 0 % has none. Live. Version 1.4.3. |
+| **Cave fog** | 0–100 % of the game's fog in caves and other enclosed places (the fog ramp the Env update writes from the area's palette): 50 % reaches it at twice the distance, 0 % has none. Outdoors on Great Sky Island it made no visible difference: the outdoor haze comes from the sky / atmosphere and is not adjustable yet. Version 1.4.3. |
 | **Shadow resolution** | The sun's cascaded shadow map: *the game's own* (400 × 400 per cascade docked), *2x* (800) or *4x* (1600) for sharper shadow edges; the game's other views grow too, up to 2048. 4x adds about 190 MB of depth maps in all. Mac only; applies after a restart. Version 1.4.3. |
 | **Anti-aliasing** | The game's own FXAA, off, FXAA or SMAA, on the 3D scene before the game draws its text and icons. |
 | **Sharpening** | AMD FidelityFX CAS on the finished picture, under the text and icons. |

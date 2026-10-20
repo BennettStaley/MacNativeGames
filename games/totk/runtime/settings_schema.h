@@ -84,7 +84,7 @@ static const SettingDef SETTINGS[] = {
      "TOTK_OUTPUT_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_HEADROOM, SET_N(SET_HEADROOM), "Fixed on iPhone and iPad.", NULL, 0},
     {"graphics.fov", "Graphics", "Field of view", "How wide the camera sees, against the game's own (version 1.4.3).",
      "TOTK_FOV", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 70, 140, 5, "%", NULL, 0, NULL, NULL, 0},
-    {"graphics.fog", "Graphics", "Fog", "How dense the distance fog is, against the game's own: 50% reaches it at twice the distance, 0% has none (version 1.4.3).",
+    {"graphics.fog", "Graphics", "Cave fog", "The fog in caves and other enclosed places, against the game's own: 50% reaches it at twice the distance, 0% has none. The outdoor haze is separate and not changed yet (version 1.4.3).",
      "TOTK_FOG", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 0, 100, 10, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.shadow_res", "Graphics", "Shadow resolution", "The sun's shadow map: 2x and 4x give sharper shadow edges and use more memory; takes effect after a restart (version 1.4.3).",
      "TOTK_SHADOW_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_SHADOW, SET_N(SET_SHADOW), "Not on iPhone and iPad yet.", NULL, 0},
