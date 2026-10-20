@@ -177,6 +177,7 @@ static UILabel *banner_label(void) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"GameBanana";
+    mods_scan();   /* the "Installed" marks */
     results = [NSMutableArray array];
     searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
     searchController.obscuresBackgroundDuringPresentation = NO; searchController.searchBar.delegate = self;
@@ -292,6 +293,7 @@ enum { SEC_TOP, SEC_ABOUT, SEC_LICENSE, SEC_FILES, NSEC };
                                                                              target:self action:@selector(openPage)];
     [TOTKModBrowser.shared details:modId completion:^(TOTKModDetails *d, NSError *e) {
         self->mod = d; self->error = e.localizedDescription;
+        if (d.name.length) self.title = d.name;
         [self buildGallery]; [self.tableView reloadData];
     }];
 }
