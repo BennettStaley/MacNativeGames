@@ -11,14 +11,18 @@
    main+0x68c15c, loads it into s9 and adds s9 to its three time-of-day accumulators (+0x28, +0x78, +0x90; each wrapped
    at the day length 86400.0, main+0x2d011a0, the day counters at +0x2c / +0x7c / +0x94), or, when the game moves the
    clock towards a set time (main+0x68c888), hands s9 to that step (main+0x21bdbf8, which takes at most the time left).
-   Scaling s9 there scales the time of day only: the game-minute counter at +0x10 / +0xc reloads +0x3c itself and keeps
-   the game's own pace. Paused is the factor -0.0 (its bits are non-zero, so the stub multiplies; the product is -0.0 and
+   The game holds the clock itself in places (the opening beneath Hyrule Castle: the update runs every frame with the
+   time at 25200.0, 7:00, and a zero step, through its own stopped-clock path that skips this load), so there the
+   setting has nothing to scale. Scaling s9 scales the time of day only: the game-minute counter at +0x10 / +0xc
+   reloads +0x3c itself and keeps the game's own pace. Paused is the factor -0.0 (its bits are non-zero, so the stub multiplies; the product is -0.0 and
    adding it leaves every accumulator as it is).
      main+0x68c15c  ldr s9, [x19, #0x3c]  (bd403e69)   x8 and s1 dead: the fall-through writes s1 at +0x68c16c and w8 at
                                                        +0x68c184 before reading them; the 0x68c888 path calls first.
    Render distance. Both functions that write the whole sead PerspectiveProjection (aspect_patch.h: fovy +0xa0, aspect
    +0xb0) store the far clip plane at +0x9c (the near one at +0x98) from the camera's own value; the stub scales it there,
-   so the projection, its frustum and everything culled against it follow.
+   so the projection, its frustum and everything culled against it follow. The game's own far plane is 25000 (25 km;
+   measured in game, the projection's +0x9c then read 12500 at 50 % and 75000 at 300 %), more than the map is across:
+   below 100 % distant land is cut off sooner, above it little changes, since level of detail and streaming are separate.
      main+0x628c30  ldr s0, [x19, #0x138] (bd413a60)   per-frame camera update; x8 and s2 dead: the next uses are a write
                                                        (+0x628c6c) or after the sin / cos / tan calls.
      main+0xb43420  ldr s0, [x22, #0x60]  (bd4062c0)   camera setup; x8 and s2 dead: the next use of x8 is the adrp at

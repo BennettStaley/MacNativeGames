@@ -45,6 +45,7 @@ Limits and why:
 | **Sharpening** | AMD FidelityFX CAS on the finished picture, under the text and icons. |
 | **Anisotropic filtering** | The game's, or 2–16×: sharper ground and walls seen at an angle. |
 | **Texture detail bias** | Below 0 picks sharper texture levels; too low shimmers. |
+| **Render distance** | 50–300 % of the camera's far clip distance (the game's own is 100 %). The game's own is 25 km, more than the map is across, so below 100 % land in the far distance is cut off sooner and above 100 % mostly changes nothing you can see: it does not load more of the world or raise the detail of distant land, which the game decides separately. |
 
 ## Frame rate, interface, controls, audio
 
@@ -60,6 +61,12 @@ Limits and why:
 - **Face buttons** (PlayStation and Xbox by position or by label), **rumble** and **motion controls** (Mac).
 - **Volume**.
 
+## World
+
+| Setting | What it does |
+|---|---|
+| **Time of day speed** | *Paused*, 0.25×, 0.5×, *Normal* (the game's own), 2×, 4× or 8×: how fast the day passes, the clock, the sun, the sky and the shadows with it. *Paused* stops the time of day where it is. Events that set the time (sleeping, cutscenes) still do, and where the game holds the clock itself (the opening beneath Hyrule Castle stays at 7:00) the setting has nothing to speed up. |
+
 ## The file
 
 `settings.txt` — Mac: `~/Library/Application Support/MacNativeGames/TOTK/settings.txt`; iPhone / iPad: the app's
@@ -74,3 +81,9 @@ runtime, the iOS app and `tests/test_settings.c`.
 Test runs drive the menu's own code path through `TOTK_INPUT_FILE`: `set <key> <value>` changes a setting as the menu
 does (`set display.scale 50`, `set graphics.aa smaa`), `menu` opens or closes the Mac menu, `menukey <Mac key code>`
 presses a key in it, and `settings-shot <png>` saves the Mac menu as a picture.
+
+## Credits
+
+Several settings follow features first offered on Switch and emulators by MaxLastBreath's UltraCam
+(https://gamebanana.com/mods/480138) and NX Optimizer (https://github.com/MaxLastBreath/nx-optimizer). This port
+reimplements them independently for 1.4.3 and contains none of their code.
