@@ -5,6 +5,8 @@
 #include "game_version.h"
 #include "fs_host.h"
 #include "romfs_path.h"
+#include "mods.h"
+#include "../third_party/zstd/zstd.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -52,7 +54,11 @@ static uint64_t handles[NH]; /* file index + 1; 0 is free */
    file there stops the game instead of serving bytes nobody checked. scripts/make_mod_manifest.py writes a mod's manifest.
    A line whose original SHA-256 is "-" adds a file the RomFS lacks (issue #48: The Second Quest adds 874): it is numbered
    after the RomFS's own files (file_count + k, k in path order, added[]), opens and reads like a replacement, and its
-   folders exist for runtime_romfs_entry_type. The RomFS has no directory listing here, so nothing else needs to know. */
+   folders exist for runtime_romfs_entry_type. The RomFS has no directory listing here, so nothing else needs to know.
+   The player's layers (that older folder, then the mods folder of mods.h: TOTK_MODS_DIR, one folder per mod, mods.txt for
+   the order, no manifest) never stop the start over a file a build layer also changes: the build's copy is used and the
+   log says so. The mods folder's files are not hashed; their identity check at open time is the same. When player files
+   are loaded, the ResourceSizeTable is served adjusted for them (rstb_serve). */
 typedef struct { uint64_t index,size; char *path; dev_t dev; ino_t ino; struct timespec mtime; char *name; } Overlay;
 static Overlay *overlays; /* sorted by RomFS index after overlay_init */
 static size_t noverlay,overlay_cap;
@@ -154,7 +160,9 @@ static void sha_range(int fd,uint64_t offset,uint64_t size,const char *expected,
 }
 static uint64_t lower(const char *name);
 static int path_ok(const char *p);
-static void overlay_load(const char *dir,int required) {
+static size_t nbuild;   /* overlays[0..nbuild): the build's own layers (patches, HeapDef); the player's come after */
+static size_t build_owner(uint64_t i,const char *name);
+static void overlay_load(const char *dir,int required,int player) {
  char path[4096];need(snprintf(path,sizeof(path),"%s/manifest.tsv",dir)<(int)sizeof(path),"RomFS overlay path");FILE *m=fopen(path,"r");
  if(!m&&required){fprintf(stderr,"[totk] RomFS overlay: %s missing; build it with scripts/make_output_res_overlay.py <w>x<h>\n",path);runtime_fail("true-2K HeapDef overlay missing (make romfs-patches-out OUTPUT_RES=<w>x<h>)");}
  if(!m){fprintf(stderr,"[totk] RomFS overlay: none (%s)\n",path);return;}
@@ -165,6 +173,9 @@ static void overlay_load(const char *dir,int required) {
   need(path_ok(name),"RomFS overlay path");uint64_t i=lower(name);int known=i<file_count&&!strcmp(entry_name(entry(i)),name),add=!strcmp(orig,"-");
   if(!known&&!add){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv names %s, which the RomFS lacks; a new file has \"-\" as its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay names a file the RomFS lacks");}
   if(known&&add){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv adds %s, which the RomFS already has; give its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay adds a file the RomFS already has");}
+  /* A player's file the build's layers also change: the build's copy is kept (it is what the port needs), the start goes on. */
+  size_t owner=player?build_owner(known?i:ADDED,name):0;
+  if(owner){fprintf(stderr,"[totk] RomFS overlay: %s/%s is also changed by the build's patches (%s); the build's copy is used\n",dir,name,overlays[owner-1].path);continue;}
   Entry e={0};if(known){e=entry(i);sha_range(image_fd,e.offset,e.size,orig,"original");}else i=ADDED;
   char file[8200];need(snprintf(file,sizeof(file),"%s/%s",dir,name)<(int)sizeof(file),"RomFS overlay file path");int fd=open(file,O_RDONLY|O_CLOEXEC);struct stat st;
   need(fd>=0&&fstat(fd,&st)==0&&(uint64_t)st.st_size==size,"RomFS overlay file missing or wrong size");sha_range(fd,0,size,sha,name);close(fd);
@@ -176,6 +187,10 @@ static void overlay_load(const char *dir,int required) {
  fclose(m);
  if(noverlay-first>16)fprintf(stderr,"[totk] RomFS overlay: %zu files from %s (%zu more not listed)\n",noverlay-first,dir,noverlay-first-16);
  if(noverlay>first)fprintf(stderr,"[totk] RomFS overlay: %s checked, %zu files, %.1f MB hashed in %.2f s\n",dir,noverlay-first,hashed/1048576.0,(runtime_now_ns()-t0)/1e9);
+}
+/* The build layer's overlay slot + 1 that already changes RomFS file i (or adds name, i = ADDED), else 0. */
+static size_t build_owner(uint64_t i,const char *name) {
+ for(size_t k=0;k<nbuild;k++)if(overlays[k].index==i&&(i!=ADDED||!strcmp(overlays[k].name,name)))return k+1;return 0;
 }
 static int overlay_order(const void *a,const void *b) {uint64_t x=((const Overlay *)a)->index,y=((const Overlay *)b)->index;return (x>y)-(x<y);}
 static int added_order(const void *a,const void *b) {const Overlay *x=*(Overlay *const *)a,*y=*(Overlay *const *)b;return strcmp(x->name,y->name);}
@@ -203,14 +218,181 @@ static int folder_exists(const char *folder) {
 }
 /* The overlay slot + 1 that replaces RomFS file i, or 0. */
 static uint32_t overlay_slot(uint64_t i) {size_t lo=0,hi=noverlay;while(lo<hi){size_t m=lo+(hi-lo)/2;if(overlays[m].index<i)lo=m+1;else hi=m;}return lo<noverlay&&overlays[lo].index==i?(uint32_t)(lo+1):0;}
+/* The player's mods folder (mods.h, runtime/mods.c): each enabled mod's files in load order, the first mod's copy of a path
+   only, as overlay entries; no manifest and no hashing (nothing to compare with: a mod is whatever the player put there).
+   The identity check at open time still applies. A file a build layer already changes is left to the build. */
+static uint32_t *folded;   /* RomFS indices in case-insensitive order, built on the first miss */
+static int folded_order(const void *a,const void *b) {return strcasecmp(entry_name(entry(*(const uint32_t *)a)),entry_name(entry(*(const uint32_t *)b)));}
+static int romfs_lookup(const char *p,char *real,size_t cap) {
+ uint64_t i=lower(p);if(i<file_count&&!strcmp(entry_name(entry(i)),p))return 1;
+ if(!folded){folded=malloc(file_count*sizeof(*folded));need(folded!=NULL,"RomFS case index");for(uint64_t k=0;k<file_count;k++)folded[k]=(uint32_t)k;qsort(folded,file_count,sizeof(*folded),folded_order);}
+ size_t lo=0,hi=file_count;while(lo<hi){size_t m=lo+(hi-lo)/2;if(strcasecmp(entry_name(entry(folded[m])),p)<0)lo=m+1;else hi=m;}
+ if(lo<file_count&&!strcasecmp(entry_name(entry(folded[lo])),p)){snprintf(real,cap,"%s",entry_name(entry(folded[lo])));return 2;}
+ return 0;
+}
+static void push_overlay(uint64_t i,const char *file,const char *name,const struct stat *st) {
+ if(noverlay==overlay_cap){overlay_cap=overlay_cap?overlay_cap*2:16;overlays=realloc(overlays,overlay_cap*sizeof(*overlays));need(overlays!=NULL,"RomFS overlay table");}
+ char *copy=strdup(file),*rel=strdup(name);need(copy&&rel,"RomFS overlay path copy");overlays[noverlay++]=(Overlay){i,(uint64_t)st->st_size,copy,st->st_dev,st->st_ino,st->st_mtimespec,rel};
+}
+static void mods_load(void) {
+ const char *dir=mods_dir();if(!strcmp(dir,"0")){fprintf(stderr,"[totk] mods: off (TOTK_MODS_DIR=0)\n");return;}
+ uint64_t t0=runtime_now_ns();mods_set_romfs_lookup(romfs_lookup);int n=mods_scan(),on=0;
+ for(int k=0;k<n;k++){ModInfo m;if(mods_get(k,&m))continue;on+=m.enabled;
+  fprintf(stderr,"[totk] mods: %d. %s%s: %u files, %.1f MB%s%s\n",k+1,m.folder,m.enabled?"":" (off)",m.files,m.bytes/1048576.0,strcmp(m.name,m.folder)?" - ":"",strcmp(m.name,m.folder)?m.name:"");
+  for(unsigned b=MOD_HAS_CODE;b<=MOD_EMPTY;b<<=1)if(m.flags&b){
+   if(b==MOD_CONFLICT)fprintf(stderr,"[totk] mods:    %u of its files are also changed by a mod higher in the list; that mod's copies are used\n",m.conflicts);
+   else fprintf(stderr,"[totk] mods:    %s\n",mods_notice(b));}}
+ const ModFile *f;int nf=mods_files(&f);size_t first=noverlay;unsigned replaced=0,addn=0,kept=0;
+ for(int k=0;k<nf;k++){
+  ModInfo m;if(mods_get(f[k].mod,&m))continue;
+  if(!path_ok(f[k].path)){fprintf(stderr,"[totk] mods: %s: %s is not a usable RomFS path; left out\n",m.folder,f[k].path);continue;}
+  uint64_t i=f[k].replaces?lower(f[k].path):ADDED;if(i!=ADDED&&(i>=file_count||strcmp(entry_name(entry(i)),f[k].path)))i=ADDED;
+  size_t owner=0;for(size_t j=0;j<first&&!owner;j++)if(overlays[j].index==i&&(i!=ADDED||!strcmp(overlays[j].name,f[k].path)))owner=j+1;
+  if(owner){fprintf(stderr,"[totk] mods: %s: %s is also changed by %s (%s); that copy is used\n",m.folder,f[k].path,owner<=nbuild?"the build's patches":"the older mods/" TOTK_GAME_DIR " folder",overlays[owner-1].path);kept++;continue;}
+  struct stat st;if(stat(f[k].file,&st)||!S_ISREG(st.st_mode)){fprintf(stderr,"[totk] mods: %s: %s is gone; left out\n",m.folder,f[k].file);continue;}
+  push_overlay(i,f[k].file,f[k].path,&st);if(i==ADDED)addn++;else replaced++;
+  if(noverlay-first<=16)fprintf(stderr,"[totk] mods: %s: %s (%llu bytes) %s\n",m.folder,f[k].path,(unsigned long long)st.st_size,i==ADDED?"is added":"replaces the original");
+ }
+ if(noverlay-first>16)fprintf(stderr,"[totk] mods: %zu more files not listed\n",noverlay-first-16);
+ fprintf(stderr,"[totk] mods: %s: %d installed, %d on; %u files replace the game's, %u are added",dir,n,on,replaced,addn);
+ if(kept)fprintf(stderr,", %u left to the build's own copies",kept);
+ fprintf(stderr," (%.2f s)\n",(runtime_now_ns()-t0)/1e9);
+ mods_mark_loaded();
+}
+
+/* The ResourceSizeTable for the player's files (mods.h): the original table with each changed or added resource's entry
+   raised to TkSharp's estimate, served as a zstd frame of raw blocks. A mod's own table is never served (they are made
+   for one game version and one set of mods). The result is kept in <mods>/.cache with a key of the files' names, sizes
+   and identities, so a start with the same mods reads nothing but that. */
+static uint8_t *image_file(uint64_t i,size_t *n) {
+ Entry e=entry(i);uint8_t *b=malloc(e.size?e.size:1);need(b!=NULL,"RomFS file buffer");
+ for(uint64_t done=0;done<e.size;){ssize_t r=src_pread(image_fd,b+done,(size_t)(e.size-done),(off_t)(e.offset+done));need(r>0,"RomFS read");done+=(uint64_t)r;}
+ *n=(size_t)e.size;return b;
+}
+static uint8_t *host_file(const char *path,size_t *n,size_t limit) {
+ int fd=open(path,O_RDONLY|O_CLOEXEC);struct stat st;if(fd<0)return NULL;
+ if(fstat(fd,&st)||(uint64_t)st.st_size>limit){close(fd);return NULL;}
+ uint8_t *b=malloc(st.st_size?(size_t)st.st_size:1);size_t done=0;
+ while(b&&done<(size_t)st.st_size){ssize_t r=pread(fd,b+done,(size_t)st.st_size-done,(off_t)done);if(r<=0)break;done+=(size_t)r;}
+ close(fd);if(b&&done!=(size_t)st.st_size){free(b);b=NULL;}*n=done;return b;
+}
+static ZSTD_DDict *ddicts[8];static unsigned ndicts;static int dicts_tried;
+static uint8_t *zs_decompress(const uint8_t *src,size_t n,size_t *out);
+static uint32_t le32(const uint8_t *p) {return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
+/* A SARC archive's members (little-endian, as the game's): calls fn for each; 0 if it is not one. */
+typedef void (*SarcFn)(void *ctx,const char *name,const uint8_t *data,size_t n);
+static int sarc_each(const uint8_t *d,size_t n,SarcFn fn,void *ctx) {
+ if(n<0x20||memcmp(d,"SARC",4)||d[6]!=0xFF||d[7]!=0xFE||memcmp(d+0x14,"SFAT",4))return 0;
+ uint32_t data=le32(d+0x0C);unsigned count=(unsigned)d[0x1A]|(unsigned)d[0x1B]<<8;size_t sfnt=0x20+(size_t)count*16;
+ if(sfnt+8>n||memcmp(d+sfnt,"SFNT",4))return 0;
+ for(unsigned k=0;k<count;k++){const uint8_t *node=d+0x20+(size_t)k*16;uint32_t attr=le32(node+4),start=le32(node+8),end=le32(node+12);
+  const char *name="";if(attr>>24){size_t at=sfnt+8+(size_t)(attr&0xFFFF)*4;if(at>=n||!memchr(d+at,0,n-at))return 0;name=(const char *)d+at;}
+  if(start>end||(uint64_t)data+end>n)return 0;fn(ctx,name,d+data+start,end-start);}
+ return 1;
+}
+static void add_dict(void *ctx,const char *name,const uint8_t *data,size_t n) {(void)ctx;(void)name;if(ndicts<8&&(ddicts[ndicts]=ZSTD_createDDict(data,n)))ndicts++;}
+/* The game's zstd dictionaries (Pack/ZsDic.pack.zs), for mod files compressed with one. */
+static void load_dicts(void) {
+ if(dicts_tried)return;dicts_tried=1;uint64_t i=lower("Pack/ZsDic.pack.zs");if(i>=file_count||strcmp(entry_name(entry(i)),"Pack/ZsDic.pack.zs"))return;
+ size_t n,m;uint8_t *z=image_file(i,&n),*pack=zs_decompress(z,n,&m);free(z);if(pack)sarc_each(pack,m,add_dict,NULL);free(pack);
+}
+static uint8_t *zs_decompress(const uint8_t *src,size_t n,size_t *out) {
+ unsigned id=ZSTD_getDictID_fromFrame(src,n);const ZSTD_DDict *dict=NULL;
+ if(id){load_dicts();for(unsigned k=0;k<ndicts;k++)if(ZSTD_getDictID_fromDDict(ddicts[k])==id)dict=ddicts[k];if(!dict)return NULL;}
+ unsigned long long want=ZSTD_getFrameContentSize(src,n);if(want==ZSTD_CONTENTSIZE_ERROR||(want!=ZSTD_CONTENTSIZE_UNKNOWN&&want>(1ull<<30)))return NULL;
+ size_t cap=want==ZSTD_CONTENTSIZE_UNKNOWN?n*4+65536:(size_t)want+1;uint8_t *b=malloc(cap);ZSTD_DCtx *c=ZSTD_createDCtx();
+ if(!b||!c||(dict&&ZSTD_isError(ZSTD_DCtx_refDDict(c,dict)))){free(b);ZSTD_freeDCtx(c);return NULL;}
+ ZSTD_inBuffer in={src,n,0};ZSTD_outBuffer o={b,cap,0};
+ for(;;){size_t r=ZSTD_decompressStream(c,&o,&in);if(ZSTD_isError(r))break;if(!r){ZSTD_freeDCtx(c);*out=o.pos;return b;}
+  if(o.pos==o.size){if(cap>=(1u<<30))break;uint8_t *g=realloc(b,cap*2);if(!g)break;b=g;cap*=2;o.dst=b;o.size=cap;}
+  else if(in.pos==in.size)break;}   /* the frame ends early */
+ free(b);ZSTD_freeDCtx(c);return NULL;
+}
+typedef struct {char **paths;uint32_t *values;size_t n,cap;} Estimates;
+static void est_add(Estimates *e,const char *path,uint32_t v) {
+ if(!v)return;
+ if(e->n==e->cap){e->cap=e->cap?e->cap*2:256;e->paths=realloc(e->paths,e->cap*sizeof(*e->paths));e->values=realloc(e->values,e->cap*sizeof(*e->values));need(e->paths&&e->values,"RSTB estimates");}
+ e->paths[e->n]=strdup(path);need(e->paths[e->n]!=NULL,"RSTB estimates");e->values[e->n++]=v;
+}
+typedef struct {const char *name;const uint8_t *data;size_t n;} Member;
+typedef struct {Member *m;size_t n,cap;} Members;
+static void member_add(void *ctx,const char *name,const uint8_t *data,size_t n) {
+ Members *ms=ctx;if(ms->n==ms->cap){ms->cap=ms->cap?ms->cap*2:64;ms->m=realloc(ms->m,ms->cap*sizeof(*ms->m));need(ms->m!=NULL,"SARC members");}
+ ms->m[ms->n++]=(Member){name,data,n};
+}
+static int ends(const char *s,const char *t) {size_t a=strlen(s),b=strlen(t);return a>=b&&!strcmp(s+a-b,t);}
+/* One player file's entries: the file itself, and for an archive (.pack / .sarc) each member that differs from the game's. */
+static void estimate_file(Estimates *e,const Overlay *o,uint64_t vanilla,unsigned *unread) {
+ const char *p=o->name;if(!mods_rstb_estimate(p,1,NULL,0))return;   /* streams, the table itself */
+ int zs=ends(p,".zs"),pack=ends(p,".pack.zs")||ends(p,".pack")||ends(p,".sarc.zs")||ends(p,".sarc"),data=mods_rstb_needs_data(p);
+ if(!zs&&!data&&!pack){est_add(e,p,mods_rstb_estimate(p,o->size,NULL,0));return;}
+ if(ends(p,".mc")){uint8_t h[16]={0};int fd=open(o->path,O_RDONLY|O_CLOEXEC);ssize_t r=fd>=0?pread(fd,h,sizeof h,0):-1;if(fd>=0)close(fd);
+  est_add(e,p,mods_rstb_estimate(p,o->size,r==16?h:NULL,r==16?16:0));return;}
+ if(zs&&!data&&!pack){uint8_t h[32];int fd=open(o->path,O_RDONLY|O_CLOEXEC);ssize_t r=fd>=0?pread(fd,h,sizeof h,0):-1;if(fd>=0)close(fd);
+  unsigned long long size=r>0?ZSTD_getFrameContentSize(h,(size_t)r):ZSTD_CONTENTSIZE_ERROR;
+  if(size!=ZSTD_CONTENTSIZE_ERROR&&size!=ZSTD_CONTENTSIZE_UNKNOWN){est_add(e,p,mods_rstb_estimate(p,size,NULL,0));return;}}
+ size_t n=0,m=0;uint8_t *raw=host_file(o->path,&n,512u<<20),*plain=raw;
+ if(raw&&zs){plain=zs_decompress(raw,n,&m);free(raw);raw=NULL;n=m;}
+ if(!plain){(*unread)++;est_add(e,p,mods_rstb_estimate(p,o->size*4,NULL,0));return;}   /* unreadable: a generous guess from the size */
+ est_add(e,p,mods_rstb_estimate(p,n,plain,n));
+ if(pack){Members mine={0},orig={0};uint8_t *vz=NULL,*vp=NULL;size_t vn=0,vm=0;
+  if(vanilla!=ADDED){vz=image_file(vanilla,&vn);vp=zs?zs_decompress(vz,vn,&vm):vz;if(zs){free(vz);vz=NULL;}else vm=vn;if(vp)sarc_each(vp,vm,member_add,&orig);}
+  if(sarc_each(plain,n,member_add,&mine))
+   for(size_t k=0;k<mine.n;k++){int same=0;for(size_t j=0;j<orig.n&&!same;j++)same=!strcmp(orig.m[j].name,mine.m[k].name)&&orig.m[j].n==mine.m[k].n&&!memcmp(orig.m[j].data,mine.m[k].data,mine.m[k].n);
+    if(!same&&*mine.m[k].name)est_add(e,mine.m[k].name,mods_rstb_estimate(mine.m[k].name,mine.m[k].n,mine.m[k].data,mine.m[k].n));}
+  free(mine.m);free(orig.m);free(vp);}
+ free(plain);
+}
+static void rstb_serve(size_t from) {
+ /* The table's RomFS path: System/Resource/ResourceSizeTable.Product.<v>[.Nin_NX_NVN].rsizetable.zs */
+ const char *prefix="System/Resource/ResourceSizeTable.Product.";uint64_t ri=lower(prefix);
+ if(ri>=file_count||strncmp(entry_name(entry(ri)),prefix,strlen(prefix))||!ends(entry_name(entry(ri)),".rsizetable.zs"))return;
+ const char *rname=entry_name(entry(ri));
+ for(size_t k=from;k<noverlay;)if(overlays[k].index==ri){fprintf(stderr,"[totk] mods: %s from %s left out: the game's table is adjusted instead\n",rname,overlays[k].path);free(overlays[k].path);free(overlays[k].name);overlays[k]=overlays[--noverlay];}else k++;
+ if(noverlay==from)return;
+ for(size_t k=0;k<from;k++)if(overlays[k].index==ri){fprintf(stderr,"[totk] mods: the build replaces %s; not adjusted for mods\n",rname);return;}
+ uint64_t t0=runtime_now_ns();
+ /* The key: what the table depends on. */
+ CC_SHA256_CTX c;CC_SHA256_Init(&c);const char *tag="totk-mods-rstb-1\n" ROMFS_IMAGE_SHA256 "\n";CC_SHA256_Update(&c,tag,(CC_LONG)strlen(tag));
+ for(size_t k=from;k<noverlay;k++){const Overlay *o=&overlays[k];int64_t id[5]={(int64_t)o->size,(int64_t)o->dev,(int64_t)o->ino,(int64_t)o->mtime.tv_sec,(int64_t)o->mtime.tv_nsec};
+  CC_SHA256_Update(&c,o->name,(CC_LONG)strlen(o->name)+1);CC_SHA256_Update(&c,id,sizeof id);}
+ uint8_t digest[32];char key[65];CC_SHA256_Final(digest,&c);for(unsigned k=0;k<32;k++)snprintf(key+k*2,3,"%02x",digest[k]);
+ char cache[4096],file[4200],keyfile[4200];snprintf(cache,sizeof cache,"%s/.cache",mods_dir());
+ if(mkdir(cache,0755)&&errno!=EEXIST){const char *t=getenv("TMPDIR");snprintf(cache,sizeof cache,"%s",t&&*t?t:"/tmp");}
+ snprintf(file,sizeof file,"%s/ResourceSizeTable-" TOTK_GAME_DIR ".rsizetable.zs",cache);snprintf(keyfile,sizeof keyfile,"%s.key",file);
+ char saved[80]={0};FILE *kf=fopen(keyfile,"r");if(kf){if(!fgets(saved,sizeof saved,kf))*saved=0;fclose(kf);}
+ struct stat st;int reuse=!strncmp(saved,key,64)&&!stat(file,&st)&&S_ISREG(st.st_mode)&&st.st_size>0;
+ if(!reuse){
+  size_t zn,tn=0;uint8_t *z=image_file(ri,&zn),*table=zs_decompress(z,zn,&tn);free(z);
+  if(!table){fprintf(stderr,"[totk] mods: cannot read %s; the game's table is used unchanged\n",rname);return;}
+  Estimates e={0};unsigned unread=0;
+  for(size_t k=from;k<noverlay;k++){uint64_t v=overlays[k].index;estimate_file(&e,&overlays[k],v,&unread);}
+  size_t pn=0;ModsRstbStats s;uint8_t *patched=mods_rstb_patch(table,tn,(const char *const *)e.paths,e.values,e.n,&pn,&s);free(table);
+  for(size_t k=0;k<e.n;k++)free(e.paths[k]);free(e.paths);free(e.values);
+  if(!patched){fprintf(stderr,"[totk] mods: %s is not a RESTBL table; the game's table is used unchanged\n",rname);return;}
+  size_t fn;uint8_t *frame=mods_zstd_raw_frame(patched,pn,&fn);free(patched);need(frame!=NULL,"RSTB frame");
+  char tmp[4300];snprintf(tmp,sizeof tmp,"%s.%ld.tmp",file,(long)getpid());int fd=open(tmp,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0644);
+  int ok=fd>=0&&write(fd,frame,fn)==(ssize_t)fn;if(fd>=0)ok&=!close(fd);free(frame);
+  if(!ok||rename(tmp,file)){unlink(tmp);fprintf(stderr,"[totk] mods: cannot write %s (%s); the game's table is used unchanged\n",file,strerror(errno));return;}
+  kf=fopen(keyfile,"w");if(kf){fprintf(kf,"%s\n",key);fclose(kf);}
+  fprintf(stderr,"[totk] mods: ResourceSizeTable: %zu entries from %zu player files: %u raised, %u added, %u already large enough%s (%.2f s)\n",
+   (size_t)(s.raised+s.added+s.kept),noverlay-from,s.raised,s.added,s.kept,unread?", some files unreadable (guessed from their size)":"",(runtime_now_ns()-t0)/1e9);
+  need(stat(file,&st)==0,"RSTB cache stat");
+ } else fprintf(stderr,"[totk] mods: ResourceSizeTable: the adjusted table for these files is cached (%s)\n",file);
+ push_overlay(ri,file,rname,&st);
+ fprintf(stderr,"[totk] mods: %s is served adjusted (%lld bytes, zstd raw blocks)\n",rname,(long long)st.st_size);
+}
 /* TOTK_ROMFS_PATCHES (default extracted/<version>/romfs-patches; 0 = none); with a true-2K output bigger than 1920x1080
    or a scene reserve above 1600x900 (1.4.3) also <TOTK_ROMFS_PATCHES_OUT, default extracted/<version>/romfs-patches-out>/
-   <w>x<h>[-scene-<sw>x<sh>] (the HeapDef sizes, scripts/make_output_res_overlay.py; runtime_heap_overlay names it); then the player's mods in TOTK_ROMFS_MODS (0 = none). */
+   <w>x<h>[-scene-<sw>x<sh>] (the HeapDef sizes, scripts/make_output_res_overlay.py; runtime_heap_overlay names it); then the player's older folder TOTK_ROMFS_MODS (0 = none) and the mods folder (TOTK_MODS_DIR, 0 = none). */
 static void overlay_init(void) {
- const char *dir=getenv("TOTK_ROMFS_PATCHES");if(!dir||strcmp(dir,"0"))overlay_load(dir?dir:"extracted/" TOTK_GAME_DIR "/romfs-patches",0);
+ const char *dir=getenv("TOTK_ROMFS_PATCHES");if(!dir||strcmp(dir,"0"))overlay_load(dir?dir:"extracted/" TOTK_GAME_DIR "/romfs-patches",0,0);
  char name[64];if(runtime_heap_overlay(name,sizeof name)){const char *out=getenv("TOTK_ROMFS_PATCHES_OUT");char d[4096];
-  need(snprintf(d,sizeof(d),"%s/%s",out?out:"extracted/" TOTK_GAME_DIR "/romfs-patches-out",name)<(int)sizeof(d),"RomFS output overlay path");overlay_load(d,1);}
- const char *mods=getenv("TOTK_ROMFS_MODS");if(mods&&*mods&&strcmp(mods,"0"))overlay_load(mods,0);
+  need(snprintf(d,sizeof(d),"%s/%s",out?out:"extracted/" TOTK_GAME_DIR "/romfs-patches-out",name)<(int)sizeof(d),"RomFS output overlay path");overlay_load(d,1,0);}
+ nbuild=noverlay;
+ const char *mods=getenv("TOTK_ROMFS_MODS");if(mods&&*mods&&strcmp(mods,"0"))overlay_load(mods,0,1);
+ mods_load();
+ rstb_serve(nbuild);
  added_init();
  if(noverlay)qsort(overlays,noverlay,sizeof(*overlays),overlay_order);
  for(size_t k=1;k<noverlay;k++)if(overlays[k].index==overlays[k-1].index){

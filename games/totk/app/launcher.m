@@ -170,7 +170,9 @@ int main(int argc, char **argv) {
         setenv("TOTK_GAME_SLOT_DIR", slot.fileSystemRepresentation, 1);
         setenv("TOTK_ROMFS_PROOF_DIR", data.fileSystemRepresentation, 1);   // the app bundle stays read-only
         setenv("TOTK_SHARED_FONTS", "extracted/firmware/shared-fonts", 1);
-        /* Player mods (runtime/romfs.c): <data>/mods/<version>/manifest.tsv, when present. */
+        /* Player mods (runtime/mods.h): one folder per mod in <data>/mods, mods.txt for the order; a TOTK_MODS_DIR already
+           set wins (a test's own folder). The older single folder <data>/mods/<version> with its manifest.tsv still loads. */
+        setenv("TOTK_MODS_DIR", [data stringByAppendingPathComponent:@"mods"].fileSystemRepresentation, 0);
         setenv("TOTK_ROMFS_MODS", [data stringByAppendingPathComponent:@"mods/" TOTK_GAME_DIR].fileSystemRepresentation, 0);
         /* The game's language (runtime/services.c): the app's first preferred language, which also follows a per-app
            language (defaults write org.macnativegames.totk AppleLanguages -array pt-BR). TOTK_LANG still overrides it. */
