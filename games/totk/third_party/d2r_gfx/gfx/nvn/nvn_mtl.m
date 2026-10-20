@@ -2282,7 +2282,16 @@ static int diag_shader_prefix_matches(const char *key, uint64_t value) {
     char prefix[17]; snprintf(prefix, sizeof prefix, "%016llx", (unsigned long long)value);
     return key && !strncmp(key, prefix, 16);
 }
+/* TOTK picture settings (totk_post.h): requests from dm_gfx_set_flag (any thread; -1 / -1000 = not set, the environment
+   decides), the values latched for the frame being drawn (replay thread; aniso / LOD bias are read by samp_by_id). */
+static _Atomic int g_pp_req_aa = -1, g_pp_req_sharpen = -1, g_pp_req_aniso = -1, g_pp_req_lodb = -1000;
+static int g_pp_aa, g_pp_sharpen; static _Atomic int g_pp_aniso, g_pp_lodb;
+static int pp_flag(const char *name, int v);
+/* TOTK_GAME_LOD_BIAS=0: leave out the game's own sampler LOD bias, as before it was passed to Metal (A/B; 1.4.3 sets -1 on a few
+   linear-mip-nearest repeating samplers). */
+static int pp_game_lod_bias(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_GAME_LOD_BIAS"); v = !(e && !strcmp(e, "0")); } return v; }
 void dm_gfx_set_flag(const char *name, int v) {
+    if (pp_flag(name, v)) return;   // aa_mode / sharpen / aniso / lod_bias
     if (!strcmp(name, "arg_epoch")) { (void)arg_epoch_on(); atomic_store(&g_arg_epoch_on, v != 0); MLOG("[flag] arg_epoch = %d", v != 0); return; }
     if (!strcmp(name, "arg_epoch_check")) { (void)arg_epoch_on(); atomic_store(&g_arg_epoch_check, v != 0); MLOG("[flag] arg_epoch_check = %d verified=%llu extra=%llu", v != 0, (unsigned long long)atomic_load(&g_arg_epoch_verified), (unsigned long long)atomic_load(&g_arg_epoch_extra)); return; }
     if (!strcmp(name, "tex_slots")) { (void)tex_slots_on(); atomic_store(&g_tex_slots_on, v != 0); MLOG("[flag] tex_slots = %d", v != 0); return; }
@@ -4420,7 +4429,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
       void ts_note(id pd, NSUInteger nc); ts_note(pd, (NSUInteger)R.rt.n); }
     ser_gate();
     if (mfx_enabled()) mfx_pass_setup(pd);   // TOTK: MetalFX scene / UI attachments, G-buffer depth
-    else if (uw_ratio()) canvas_learn(pd);   // key 4: the canvas the UI is squeezed in
+    else if (uw_ratio() || g_pp_sharpen) canvas_learn(pd);   // key 4: the canvas the UI is squeezed in; sharpen: the canvas it sharpens
     g_enc = enc_r_begin(pd);
     args_dirty_all();
     g_stat_pass++;
@@ -5357,6 +5366,14 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // 调用方持 g_rmu | Calle
     }
     d.lodMinClamp = p.lod_min < 0 ? 0 : p.lod_min; d.lodMaxClamp = p.lod_max;
     d.maxAnisotropy = p.aniso < 1 ? 1 : p.aniso > 16 ? 16 : (NSUInteger)p.aniso;
+    /* TOTK: the game's LOD bias (dropped before) plus the user's offset ("lod_bias", hundredths); the user's anisotropy
+       ("aniso") as a minimum for mipmapped linear samplers that repeat, never for compare or min / max reduction ones. */
+    { float bias = (pp_game_lod_bias() ? p.lod_bias : 0) + atomic_load_explicit(&g_pp_lodb, memory_order_relaxed) * 0.01f;
+      if (bias != 0) { if (@available(macOS 26.0, iOS 26.0, *)) d.lodBias = fminf(fmaxf(bias, -16.f), 15.99f); } }
+    { int an = atomic_load_explicit(&g_pp_aniso, memory_order_relaxed);
+      int rep_s = d.sAddressMode == MTLSamplerAddressModeRepeat || d.sAddressMode == MTLSamplerAddressModeMirrorRepeat;
+      int rep_t = d.tAddressMode == MTLSamplerAddressModeRepeat || d.tAddressMode == MTLSamplerAddressModeMirrorRepeat;
+      if (an > (int)d.maxAnisotropy && !p.cmp_mode && !p.reduction && p.magf && (p.minf == 3 || p.minf == 5) && rep_s && rep_t) d.maxAnisotropy = (NSUInteger)an; }
     if (p.cmp_mode) d.compareFunction = (MTLCompareFunction)(p.cmp_func - 1);
     d.borderColor = p.border[3] > 0.5f ? (p.border[0] > 0.5f ? MTLSamplerBorderColorOpaqueWhite : MTLSamplerBorderColorOpaqueBlack) : MTLSamplerBorderColorTransparentBlack;
     if (p.reduction > 2) die("sampler reduction filter %u unsupported", p.reduction);
@@ -9485,6 +9502,7 @@ static int mfxup_draw(NvProg *pr) {
     static unsigned n; if (++n % 1800 == 1) { char b[200]; mfxup_stats(MFXUP_SCENE, b, sizeof b); MLOG("[mfx-up] 至帧 %llu：%s", (unsigned long long)atomic_load(&g_cur_frame), b); }
     return 0;
 }
+#include "totk_post.h"
 #include "nvn_cube_group.h"
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
@@ -9565,6 +9583,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
             uint64_t h = 0; for (int i = 0; i < f->rf.nb && !h; i++) if (f->rf.b[i].kind == NVN_RB_TEX && f->rf.b[i].reg < 128) h = S.tex[1][f->rf.b[i].reg];
             if (h) { fx_from = R.rt.color[0]->serial; fx_to = h; PD("N %llu 跳过 FXAA：ser=%llu 的读者改读 ser=%llu", g_stat_pass, (unsigned long long)fx_from, (unsigned long long)h_ser(h)); return; } }
         else if (fx_from && !strncmp(f->key, "52aac1f2306b8fc5", 16)) { for (int r = 0; r < 128; r++) if (S.tex[1][r] && h_ser(S.tex[1][r]) == fx_from) S.tex[1][r] = fx_to; fx_from = 0; } } }
+    if (pp_aa_draw(pr)) return;   // aa_mode 1-3: the game's FXAA draw replaced by ours (totk_post.h)
     { static uint64_t bloomq_frame; if (bloomq_frame != atomic_load(&g_cur_frame)) { bloomq_frame = atomic_load(&g_cur_frame); bloomq_reset(); }
       if (bloomq_enabled() && tbdr_on() && !g_defer_replaying && pr->sh[1]) {
         NvShader *f = pr->sh[1]; uint64_t tgt = 0; int lv, sl;
@@ -9656,6 +9675,7 @@ frz_plain:;
     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
     if (g_enc && g_lay.active && !lay_draw_ok(pr, dw, di)) {   // TOTK: this draw cannot write its layer: end the layered pass, draw in a plain one
         PD("L %llu 分层通道内的绘制不能写层号，在此切开", g_stat_pass); rp_end(); g_lay.refuse = 1; g_lay.refused++; }
+    if (g_pp_sharpen) pp_ui_hook(pr);   // sharpen: the canvas before the UI is drawn into it (totk_post.h)
     if (!g_mfx.scene_done && g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas && pr && pr->sh[0] && mfx_ui_vs(pr->sh[0]->key) && mfx_enabled())
         mfx_snapshot_scene();   // TOTK_MFX: first UI draw into the canvas: copy the finished scene first
     if (!g_uw_ui && uw_on_canvas() && pr && pr->sh[0] && mfx_ui_vs(pr->sh[0]->key)) g_uw_ui = 1;   // key 4: the UI begins
@@ -12206,7 +12226,8 @@ static int mfx_present_frame(const tex_t *t, double period, int discard) {
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard) : -1;
     if (mfx_latch() && !mfx_enabled()) g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = 0;   // key 2 / flag mfx_interp: the next frame is fully on or off
-    if (t && !mfx_enabled() && uw_ratio()) uw_note_present(t);   // key 4: the canvas search (TOTK_MFX does it in mfx_present_frame)
+    if (t && !mfx_enabled() && (uw_ratio() || g_pp_sharpen)) uw_note_present(t);   // key 4 / sharpen: the canvas search (TOTK_MFX does it in mfx_present_frame)
+    pp_latch();   // picture settings for the next frame (totk_post.h)
     mtl_wb_eager();
     g_uw_ui = 0;
     if (atomic_load(&g_uw_log) > 0) atomic_fetch_sub(&g_uw_log, 1);
