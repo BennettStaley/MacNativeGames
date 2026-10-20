@@ -26,7 +26,9 @@ static void apply_live(const SettingDef *d, int v) {
     extern void audio_master_volume_set(int percent);
     extern int runtime_hid_feedback_flag(const char *name, int v);
     extern void runtime_gamepad_relayout(void);
+    extern void runtime_fov_set(int percent);
     if (!strcmp(d->key, "graphics.interpolation")) dm_gfx_set_flag("mfx_interp", v);
+    else if (!strcmp(d->key, "graphics.fov")) runtime_fov_set(v);
     else if (!strcmp(d->key, "framerate.cap")) nvn_fps_cap_set(v);
     else if (!strcmp(d->key, "interface.readout")) fps_overlay_set_hints(v);
     else if (!strcmp(d->key, "audio.volume")) audio_master_volume_set(v);

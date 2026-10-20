@@ -88,7 +88,10 @@ uint64_t front_game_res(int docked){(void)docked;return (720ULL<<32)|1280;}
 /* TOTK_ASSUME_FOCUS=1: unattended test runs. macOS refuses to activate an app launched from the background while the user is working in
    another one; the window then never becomes key, GetCurrentFocusState stays 0 and the game waits before its first frame. In this mode the
    game is told it is focused, and the window is shown without taking the keyboard from the user (scripted input does not need it). */
-static int assume_focus(void){static int v=-1;if(v<0){const char *e=getenv("TOTK_ASSUME_FOCUS");v=e&&atoi(e);}return v;}
+/* TOTK_BACKGROUND=1: a test run that stays out of the user's way: the window opens behind every other window, never takes
+   focus, has no Dock icon or app-switcher entry, and the game is muted (TOTK_AUDIO_OFF). Implies TOTK_ASSUME_FOCUS. */
+static int background_run(void){static int v=-1;if(v<0){const char *e=getenv("TOTK_BACKGROUND");v=e&&atoi(e);if(v)setenv("TOTK_AUDIO_OFF","1",1);}return v;}
+static int assume_focus(void){static int v=-1;if(v<0){const char *e=getenv("TOTK_ASSUME_FOCUS");v=(e&&atoi(e))||background_run();}return v;}
 /* Keep the guest active when the macOS window loses key status. Native input is still cleared
    in windowDidResignKey so a held key cannot remain stuck while another app has focus. */
 int runtime_front_focus(void){return 1;}
@@ -208,7 +211,7 @@ static void *guest_main(void *callback){@autoreleasepool{((void(*)(void))callbac
 void runtime_front_run(void(*callback)(void)){
  @autoreleasepool{
   bootStartNS=runtime_now_ns();
-  [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+  [NSApplication sharedApplication];[NSApp setActivationPolicy:background_run()?NSApplicationActivationPolicyAccessory:NSApplicationActivationPolicyRegular];
   runtime_gamepad_start();
   /* Default window: the docked output size, 1920x1080, scaled down (16:9 kept) when the screen's visible area is smaller. */
   /* TOTK_WINDOW_SIZE=<w>x<h> (test scripts only, e.g. the 2K output test; the desktop launcher never sets it): another starting size. */
@@ -245,7 +248,7 @@ void runtime_front_run(void(*callback)(void)){
   [(TOTKShortcutHelp *)shortcutHelp position];
   /* The FPS, shader and load lines: in the corner panel above (compact HUD), or with TOTK_HUD=corners drawn into the game picture's corners by the present encoder (gfx/nvn/fps_overlay.c). */
   [window makeFirstResponder:window.contentView];[window center];front_sync_drawable();
-  if(assume_focus()){[window orderFrontRegardless];}else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
+  if(background_run()){[window orderBack:nil];}else if(assume_focus()){[window orderFrontRegardless];}else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{note_occlusion(" 3 s after opening");});
   atomic_store(&focused,1);
   if(CVDisplayLinkCreateWithActiveCGDisplays(&displayLink)||CVDisplayLinkSetOutputCallback(displayLink,vsync_callback,NULL)||CVDisplayLinkStart(displayLink))runtime_fail("native display link initialization");
