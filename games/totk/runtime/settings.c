@@ -29,6 +29,10 @@ static void apply_live(const SettingDef *d, int v) {
     extern void runtime_fov_set(int percent);
     if (!strcmp(d->key, "graphics.interpolation")) dm_gfx_set_flag("mfx_interp", v);
     else if (!strcmp(d->key, "graphics.fov")) runtime_fov_set(v);
+    else if (!strcmp(d->key, "graphics.aa")) dm_gfx_set_flag("aa_mode", v);
+    else if (!strcmp(d->key, "graphics.sharpen")) dm_gfx_set_flag("sharpen", v);
+    else if (!strcmp(d->key, "graphics.aniso")) dm_gfx_set_flag("aniso", v);
+    else if (!strcmp(d->key, "graphics.lod_bias")) dm_gfx_set_flag("lod_bias", v);
     else if (!strcmp(d->key, "framerate.cap")) nvn_fps_cap_set(v);
     else if (!strcmp(d->key, "interface.readout")) fps_overlay_set_hints(v);
     else if (!strcmp(d->key, "audio.volume")) audio_master_volume_set(v);

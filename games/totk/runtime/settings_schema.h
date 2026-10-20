@@ -36,6 +36,8 @@ static const SettingChoice SET_CAP[] = {{"30 fps", "30", "30", 30}, {"40 fps", "
                                         {"120 fps", "120", "120", 120}, {"Display refresh rate", "display", "display", 0}};
 static const SettingChoice SET_INTERP[] = {{"Off", "off", "0", 0}, {"30 + 30", "interp30", "interp30", 1},
                                            {"Half the refresh rate", "half", "interp", 2}, {"Every frame", "max", "interpmax", 3}};
+static const SettingChoice SET_AA[] = {{"The game's FXAA", "game", "0", 0}, {"Off", "off", "1", 1}, {"FXAA", "fxaa", "2", 2}, {"SMAA", "smaa", "3", 3}};
+static const SettingChoice SET_ANISO[] = {{"The game's", "game", "0", 0}, {"2x", "2", "2", 2}, {"4x", "4", "4", 4}, {"8x", "8", "8", 8}, {"16x", "16", "16", 16}};
 static const SettingChoice SET_TOUCH[] = {{"Always", "always", NULL, 0}, {"Hide with a controller", "controller", NULL, 1},
                                           {"Until touched", "touch", NULL, 2}, {"Off", "off", NULL, 3}};
 static const SettingChoice SET_FACE[] = {{"Automatic", "auto", NULL, 0}, {"By position", "position", "position", 1},
@@ -48,6 +50,14 @@ static const SettingDef SETTINGS[] = {
      "Not tested on iPhone yet."},
     {"graphics.fov", "Graphics", "Field of view", "How wide the camera sees, against the game's own (version 1.4.3).",
      "TOTK_FOV", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 70, 140, 5, "%", NULL, 0, NULL},
+    {"graphics.aa", "Graphics", "Anti-aliasing", "Smooths the 3D scene's edges before the game draws its text and icons on top (version 1.4.3).",
+     "TOTK_AA", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_AA, SET_N(SET_AA), NULL},
+    {"graphics.sharpen", "Graphics", "Sharpening", "AMD FidelityFX CAS on the finished picture, under the text and icons.",
+     "TOTK_SHARPEN", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, 0, 100, 5, "%", NULL, 0, NULL},
+    {"graphics.aniso", "Graphics", "Anisotropic filtering", "Sharper ground and walls seen at an angle.",
+     "TOTK_ANISO", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_ANISO, SET_N(SET_ANISO), NULL},
+    {"graphics.lod_bias", "Graphics", "Texture detail bias", "Below 0 picks sharper texture levels, in hundredths of a level; too low shimmers.",
+     "TOTK_LOD_BIAS", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, -100, 0, 25, NULL, NULL, 0, NULL},
     {"framerate.cap", "Frame rate", "Frame rate limit", "The most frames a second the game draws. 40 needs a 120 Hz display.",
      "TOTK_UNCAPPED_HZ", SET_CHOICE, SET_LIVE, SET_ALL, 120, 0, 0, 0, 0, NULL, SET_CAP, SET_N(SET_CAP), NULL},
     {"interface.readout", "Interface", "Performance readout", "Frames per second and the game picture's size.",
