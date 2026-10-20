@@ -265,11 +265,11 @@ static void resolve(void) {
     for (int k = 0; k < nmods; k++) { mods[k].info.conflicts = 0; mods[k].info.flags &= ~(unsigned)MOD_CONFLICT; }
     for (int k = 0; k < nmods; k++) {
         Mod *m = &mods[k];
+        if (!m->info.enabled) continue;   /* a mod that is off conflicts with nothing (an archive's other options) */
         for (size_t r = m->first; r < m->first + m->count; r++) {
             size_t h = (size_t)hash_str(recs[r].path) & (cap - 1); int seen = 0;
             for (; set[h]; h = (h + 1) & (cap - 1)) if (!strcmp(recs[set[h] - 1].path, recs[r].path)) { seen = 1; break; }
             if (seen) { if (recs[set[h] - 1].mod != k) { m->info.conflicts++; m->info.flags |= MOD_CONFLICT; } continue; }
-            if (!m->info.enabled) continue;
             set[h] = r + 1;
             winners[nwinners++] = (ModFile){recs[r].path, recs[r].file, recs[r].size, k, recs[r].replaces};
         }
