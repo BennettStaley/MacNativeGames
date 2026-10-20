@@ -54,9 +54,30 @@ The log (`~/Library/Logs/MacNativeGames/totk.log`, iOS `Documents/log.txt`) list
 
 - each mod, whether it is on, its file count and notes (code patches not applied, its own ResourceSizeTable left out,
   made for an older game version, files a mod higher in the list already changes);
-- the files it replaces or adds (the first 16), and files left to the port's own data patches (the port needs its own
-  copy of a few files, such as the heap sizes for 1440p and 4K output; a mod's copy of those is skipped, the game starts);
+- the files it replaces or adds (the first 16), and what happened to files the port's own data patches also change (see
+  below);
 - the ResourceSizeTable: the game's memory table is adjusted for the mods' files.
+
+### Files the port also patches
+
+The port ships a few fixed game files of its own (`games/totk/scripts/make_romfs_patches.py` and the heap sizes for
+1440p / 4K output). When a mod changes one of them:
+
+| File | What is used | Log line |
+|---|---|---|
+| `UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs` (the HUD and menu layouts: button glyph mods such as Xbox UI or PlayStation UI replace it) | the mod's copy, with the port's quick-menu background fix applied to it again | `... the mod's copy is used, with the port's quick-menu background fix applied to it again`, then `... fix is applied to the mod's copy (4 visibility keys moved ...)` |
+| `Event/EventFlow/DmF_SY_GameOver.bfevfl.zs` (a game over fix only 1.0.0 runs) | the mod's copy | `... the mod's copy is used and the port's patch is left out` |
+| `System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs` (only with 1440p / 4K output) | the port's copy: the game needs the bigger heaps for that output | `... which needs its own copy (the heap sizes for the output resolution); the mod's copy is left out` |
+
+The quick-menu background fix: the weapon / shield / material quick menus (hold a d-pad direction) and the Autobuild
+screen show a capture of the game picture behind them. The game takes it when the capture panes become visible at
+animation frame 1.0; at 60 fps that comes after the world has stopped drawing, so the background is black. The fix moves
+those four visibility keys to frame 0.0 (in `anim/ShortCutBG_00_In.bflan` and `anim/AutoBuilder_00_In.bflan`). For a
+mod's archive the runtime decompresses it with the game's zstd dictionaries, moves the keys only where they are exactly
+the game's (hidden at 0.0, shown at 1.0) and serves the result uncompressed (zstd raw blocks), cached in
+`mods/.cache/capture-fix-*.blarc.zs` until the mod's file changes. If the mod changed those animations, its archive is
+used as it is and the log says `the port's quick-menu background fix was not applied (...)`: the quick menus can then
+show a black background at 60 fps.
 
 Mod files are not hashed at start, so a start with mods is about as fast as one without. If a mod file changes or is
 deleted while the game runs, the game stops when it next opens that file instead of reading something unchecked.
@@ -76,6 +97,7 @@ the game's table and raises the entry of every file the mods change or add (and 
 | RomFS files (replace and add), any number of mods, load order, turning mods off | works |
 | Archives with an extra top folder, folders without `romfs/` whose top level is RomFS folders | works |
 | A mod's own ResourceSizeTable | left out; the game's table is adjusted instead |
+| Files the port also patches (UI layouts, the game over flow) | the mod's copy; the port's quick-menu fix is applied to the UI layouts again |
 | Code patches (`exefs/`: `.pchtxt`, `.ips`, `subsdk`) | not applied: the port's code is translated ahead of time; coming later |
 | TKMM packages (`.tkcl`) | listed but not loaded; coming later |
 | Two mods changing the same file (merging packs, text, parameters) | the first in the order wins; merging is coming later |
