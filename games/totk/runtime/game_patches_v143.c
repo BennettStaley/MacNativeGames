@@ -44,8 +44,9 @@ void runtime_frame_step_pin(double ms){
     if(frame_step_data&&us)frame_step_store((float)(us/1e6));
     fprintf(stderr,"[totk] 1.4.3 frame step %s (pin %.3f ms)\n",us?"pinned":"real time",us/1000.0);
 }
-static void render_latch(void);
+static void render_latch(void);static void output_latch(uint64_t now_ns);
 void runtime_frame_step_update(uint64_t now_ns){
+    output_latch(now_ns);
     render_latch();   /* the present boundary: a live scene size takes effect between two frames */
     if(!frame_step_data||!now_ns)return;
     if(atomic_load_explicit(&pinned_step_us,memory_order_relaxed)){last_present_ns=now_ns;return;}
@@ -200,20 +201,32 @@ int runtime_output_res(unsigned *w,unsigned *h){
 }
 /* The settings menu's output size (settings.c display_apply): any 16:9 size up to the swapchain, live through the game's own
    display-config rebuild (as key 3). Asked before the patch installs, it is the size the game starts at. */
-static _Atomic uint64_t output_pending;
+static _Atomic uint64_t output_pending,output_want,output_want_ns;
 void runtime_output_max(unsigned *w,unsigned *h){if(!runtime_output_res(w,h)){*w=1920;*h=1080;}}
 int runtime_output_request(unsigned w,unsigned h){
     unsigned mw,mh;if(!runtime_output_res(&mw,&mh))return w==1920&&h==1080?0:-1;
     if(w<640||h<360||w>mw||h>mh)return -1;
     uint8_t *page=atomic_load(&output_page);
     if(!page){atomic_store(&output_pending,pack_size(w,h));return 0;}
+    /* Each size rebuilds the game's canvas targets, and old and new are both held for a moment: a size clicked through
+       on the way to another (several in a row ran past the GPU memory budget, 2026-10-20) is never applied. The present
+       thread takes the asked size once it has stayed the same for 0.4 s (output_latch). */
+    atomic_store(&output_want,pack_size(w,h));atomic_store(&output_want_ns,0);
+    return 0;
+}
+static void output_latch(uint64_t now_ns){
+    uint8_t *page=atomic_load(&output_page);uint64_t want=atomic_load(&output_want);
+    if(!page||!want||!now_ns)return;
     _Atomic uint64_t *size=(_Atomic uint64_t *)(void *)(page+32);
-    if(atomic_load(size)==pack_size(w,h))return 0;
-    atomic_store(size,pack_size(w,h));
+    if(atomic_load(size)==want){atomic_store(&output_want,0);return;}
+    uint64_t since=atomic_load(&output_want_ns);
+    if(!since){atomic_store(&output_want_ns,now_ns);return;}
+    if(now_ns-since<400000000ULL)return;
+    if(!atomic_compare_exchange_strong(&output_want,&want,0))return;   /* asked again meanwhile: wait for that one */
+    atomic_store(size,want);
     uint64_t config=atomic_load((_Atomic uint64_t *)(void *)(page+40));
     if(config){__atomic_fetch_or((uint32_t *)(uintptr_t)(config+8),1u<<21,__ATOMIC_SEQ_CST);runtime_oe_push_message(30);}
-    fprintf(stderr,"[totk] 1.4.3 output %ux%u (settings; display config %s)\n",w,h,config?"ready":"not published yet");
-    return 0;
+    fprintf(stderr,"[totk] 1.4.3 output %ux%u (settings; display config %s)\n",(unsigned)want,(unsigned)(want>>32),config?"ready":"not published yet");
 }
 /* What the HeapDef overlay adds to DynamicTextureAllocatorMem and Graphics (and runtime/services.c to the application
  * pool): the canvas and the scene each grow the heap by their pixel ratio above the shipped 1920x1080 / 1600x900, the

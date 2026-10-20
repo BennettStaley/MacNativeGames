@@ -123,7 +123,7 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
     else if (d->type == SET_CHOICE) {
         NSPopUpButton *p = [NSPopUpButton new];
         for (int k = 0; k < d->nchoices; k++) { [p addItemWithTitle:@(d->choices[k].label)]; if (d->choices[k].value == v) [p selectItemAtIndex:k]; }
-        [p.widthAnchor constraintEqualToConstant:176].active = YES; c = p;
+        [p.widthAnchor constraintEqualToConstant:190].active = YES; c = p;
     } else {
         NSSlider *s = [NSSlider sliderWithValue:v minValue:d->min maxValue:d->max target:nil action:nil];
         s.continuous = YES; [s.widthAnchor constraintEqualToConstant:118].active = YES; c = s;
@@ -139,14 +139,14 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
 
 - (NSView *)rowFor:(const SettingDef *)d index:(int)i {
     NSView *row = [NSView new]; row.wantsLayer = YES; row.layer.cornerRadius = 8; row.translatesAutoresizingMaskIntoConstraints = NO;
-    NSString *name = settings_pending_restart(d->key) ? [NSString stringWithFormat:@"%s  · next start", d->label] : @(d->label);
+    NSString *name = settings_pending_restart(d->key) ? [NSString stringWithFormat:@"%s (after restart)", d->label] : @(d->label);
     NSTextField *label = [NSTextField labelWithString:name];
     label.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium]; label.textColor = NSColor.labelColor;
     NSStackView *text = [NSStackView stackViewWithViews:@[label]]; text.orientation = NSUserInterfaceLayoutOrientationVertical;
     text.alignment = NSLayoutAttributeLeading; text.spacing = 2;
     if (d->help) {
         NSTextField *help = [NSTextField wrappingLabelWithString:@(d->help)];
-        help.font = [NSFont systemFontOfSize:11]; help.textColor = NSColor.secondaryLabelColor; help.preferredMaxLayoutWidth = 190;
+        help.font = [NSFont systemFontOfSize:11]; help.textColor = NSColor.secondaryLabelColor; help.preferredMaxLayoutWidth = 176;
         [text addArrangedSubview:help];
     }
     NSView *control = [self controlFor:d index:i];
@@ -154,7 +154,7 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
     [NSLayoutConstraint activateConstraints:@[
         [row.widthAnchor constraintEqualToConstant:PANEL_WIDTH - 2 * 8 - 14],
         [text.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:12], [text.topAnchor constraintEqualToAnchor:row.topAnchor constant:9],
-        [text.bottomAnchor constraintLessThanOrEqualToAnchor:row.bottomAnchor constant:-9], [text.widthAnchor constraintLessThanOrEqualToConstant:196],
+        [text.bottomAnchor constraintLessThanOrEqualToAnchor:row.bottomAnchor constant:-9], [text.widthAnchor constraintLessThanOrEqualToConstant:180],
         [control.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-10], [control.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
         [row.heightAnchor constraintGreaterThanOrEqualToAnchor:control.heightAnchor constant:18],
         [control.leadingAnchor constraintGreaterThanOrEqualToAnchor:text.trailingAnchor constant:8]]];

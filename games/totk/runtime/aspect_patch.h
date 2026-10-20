@@ -14,6 +14,7 @@
 #pragma once
 #include "runtime.h"
 #include <TargetConditionals.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -171,11 +172,26 @@ static inline int fov_clamp(int percent) { return percent < 70 ? 70 : percent > 
 static inline uint32_t fov_bits(int percent) {
     float v = fov_clamp(percent) == 100 ? 0.0f : fov_clamp(percent) / 100.0f; uint32_t bits; memcpy(&bits, &v, 4); return bits;
 }
+/* The player's percentage and the aspect ratio's own factor (Vert+: a screen taller than 16:9 sees more above and below,
+   runtime_fov_aspect), multiplied into the one multiplier on the data page. */
+static int g_fov_user = 100; static float g_fov_aspect = 1;
+static void fov_write(void) {
+    if (!g_fov_slot) return;
+    float v = fov_clamp(g_fov_user) / 100.0f * g_fov_aspect; uint32_t bits;
+    if (fabsf(v - 1) < 0.001f) v = 0;
+    memcpy(&bits, &v, 4); atomic_store(g_fov_slot, bits);
+}
 /* Live: percent 70..140 (clamped), 100 = the game's own. Ignored where the patch is not in (other game versions). */
 void runtime_fov_set(int percent) {
+    g_fov_user = fov_clamp(percent);
     if (!g_fov_slot) { fprintf(stderr, "[totk] field of view %d%%: not available in this build\n", percent); return; }
-    atomic_store(g_fov_slot, fov_bits(percent));
-    fprintf(stderr, "[totk] field of view %d%%\n", fov_clamp(percent));
+    fov_write();
+    fprintf(stderr, "[totk] field of view %d%%\n", g_fov_user);
+}
+/* settings.c display_apply: the vertical angle's factor for the picture's shape (1 = none). */
+void runtime_fov_aspect(float k) {
+    g_fov_aspect = k > 0.5f && k < 2 ? k : 1; fov_write();
+    fprintf(stderr, "[totk] field of view: x%.3f for the screen's shape\n", g_fov_aspect);
 }
 /* TOTK_FOV as a percentage; 100 when unset. A malformed or out-of-range value stops the start. */
 static inline int fov_requested(void) {
@@ -196,7 +212,7 @@ static inline void fov_install(Module *m, const char *version, const uint64_t *s
     dpf_install(m, "field of view", sites, want, nsite, stub_off, data_off, FOV_DATA_SLOT, DPF_MULTIPLY);
 #endif
     g_fov_slot = (_Atomic(uint32_t) *)(void *)(m->base + data_off + FOV_DATA_SLOT);
-    atomic_store(g_fov_slot, fov_bits(start));
+    g_fov_user = start; fov_write();
     fprintf(stderr, "[totk] %s field of view: %d%% (TOTK_FOV), live via runtime_fov_set; %u camera site(s), stubs +%#llx\n",
             version, start, nsite, (unsigned long long)stub_off);
 }

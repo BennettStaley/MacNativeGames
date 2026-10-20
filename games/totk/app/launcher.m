@@ -4,6 +4,7 @@
 //   ~/Library/Logs/MacNativeGames/totk.log             this run (totk.previous.log: the one before)
 // If the game is already running, the launcher only brings it to the front.
 #import <AppKit/AppKit.h>
+#include <sys/sysctl.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <libproc.h>
@@ -179,7 +180,15 @@ int main(int argc, char **argv) {
         setenv("TOTK_GPU_WIDEN", "1", 1);
         setenv("TOTK_GPU_BLOCKRT", "1", 1);
         setenv("TOTK_GPU_MIDCLEAR", "1", 1);
-        setenv("TOTK_GPU_BUDGET_MB", "5000", 1);
+        /* 5000 MB, more with the 4K maximum output (settings: display.headroom 4K, or Auto on 16 GB): a 4K canvas alone runs
+           at 4.5-4.9 GB and a size switch holds old and new targets for a moment (stopped at 5023 MB, 2026-10-20). Never
+           above the runtime's own default, 40% of the memory. */
+        { uint64_t mem = 0; size_t len = sizeof mem; sysctlbyname("hw.memsize", &mem, &len, NULL, 0);
+          const char *out = getenv("TOTK_OUTPUT_RES");
+          int big = out ? !strncmp(out, "3840", 4) : mem >= (16ULL << 30);
+          unsigned budget = big ? 6500 : 5000, cap = (unsigned)((mem / 5 * 2) >> 20);
+          if (cap && budget > cap) budget = cap;
+          setenv("TOTK_GPU_BUDGET_MB", [NSString stringWithFormat:@"%u", budget].UTF8String, 1); }
         setenv("TOTK_SLOT_OWNER", "user", 0);
         setenv("TOTK_SLOT_PURPOSE", "player", 0);
         NSString *contrib = env_or("TOTK_SHADER_CONTRIB", [data stringByAppendingPathComponent:@"shader-list-contribution.txt"]);

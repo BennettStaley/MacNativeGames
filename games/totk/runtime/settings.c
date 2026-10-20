@@ -62,6 +62,13 @@ static int display_apply(const char *changed) {
         float a = aspect == 0 ? (dw && dh ? (float)dw / dh : 0) : ratios[aspect < 5 ? aspect : 1];
         if (a && fabsf(a / (16.0f / 9) - 1) < 0.01f) a = 0;   /* 16:9 is the game's own: no stretch */
         if (changed || a) runtime_aspect_set(a);
+        /* Vert+: on a screen taller than 16:9 the game keeps its horizontal view and sees more above and below (the
+           vertical angle widened by the shapes' ratio, tan-corrected for the game's usual ~50 degrees), instead of
+           losing the sides. */
+        extern void runtime_fov_aspect(float k);
+        float k = 1;
+        if (a && a < 16.0f / 9) { const float half = 0.436f; k = atanf(tanf(half) * (16.0f / 9) / a) / half; }
+        if (changed || k != 1) runtime_fov_aspect(k);
     }
     pthread_mutex_lock(&lock);
     if (sw) snprintf(display_status, sizeof display_status, "Output %u x %u, 3D scene %u x %u", cw, ch, sw, sh);

@@ -50,8 +50,8 @@ static const SettingChoice SET_SCALE[] = {{"The game's own", "game", NULL, 0}, {
                                           {"175%", "175", NULL, 175}, {"200%", "200", NULL, 200}};
 static const SettingChoice SET_ASPECT[] = {{"Fill the screen", "auto", NULL, 0}, {"16:9 (game's own)", "16:9", NULL, 1},
                                            {"16:10", "16:10", NULL, 2}, {"21:9", "21:9", NULL, 3}, {"32:9", "32:9", NULL, 4}};
-static const SettingChoice SET_HEADROOM[] = {{"Automatic", "auto", NULL, 0}, {"Up to 1440p", "1440", "2560x1440", 1440},
-                                             {"Up to 4K", "2160", "3840x2160", 2160}};
+static const SettingChoice SET_HEADROOM[] = {{"Auto (4K on 16 GB)", "auto", NULL, 0}, {"1440p", "1440", "2560x1440", 1440},
+                                             {"4K", "2160", "3840x2160", 2160}};
 static const SettingChoice SET_AA[] = {{"The game's own", "game", "0", 0}, {"Off", "off", "1", 1}, {"FXAA", "fxaa", "2", 2}, {"SMAA", "smaa", "3", 3}};
 static const SettingChoice SET_ANISO[] = {{"The game's", "game", "0", 0}, {"2x", "2", "2", 2}, {"4x", "4", "4", 4}, {"8x", "8", "8", 8}, {"16x", "16", "16", 16}};
 static const SettingChoice SET_TOUCH[] = {{"Always", "always", NULL, 0}, {"Hide with a controller", "controller", NULL, 1},
@@ -72,7 +72,7 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_SCALE, SET_N(SET_SCALE), NULL, NULL, 0},
     {"display.aspect", "Display", "Aspect ratio", "Fill the screen shows more of the world on a wider or taller screen; text and icons stretch to it.",
      NULL, SET_CHOICE, SET_LIVE, SET_MAC, 1, 1, 0, 0, 0, NULL, SET_ASPECT, SET_N(SET_ASPECT), "Not on iPhone and iPad yet.", NULL, 0},
-    {"display.headroom", "Display", "Resolution headroom", "The largest output and 3D scene the game sets memory aside for at start. Automatic: 4K with 16 GB of memory or more.",
+    {"display.headroom", "Display", "Maximum output", "The biggest output resolution you can switch to while playing. Higher sets more memory aside; takes effect after a restart.",
      "TOTK_OUTPUT_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_HEADROOM, SET_N(SET_HEADROOM), "Fixed on iPhone and iPad.", NULL, 0},
     {"graphics.fov", "Graphics", "Field of view", "How wide the camera sees, against the game's own (version 1.4.3).",
      "TOTK_FOV", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 70, 140, 5, "%", NULL, 0, NULL, NULL, 0},
