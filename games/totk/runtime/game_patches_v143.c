@@ -116,6 +116,13 @@ void runtime_game_patches(Module *m) {
     { static const uint64_t sites[] = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0};   /* camera update and setup, viewport x2 */
       aspect_install(m, "1.4.3", sites, 4, ((m->text_end + 15) & ~15ULL) + 48,   /* after the two veneers above */
                      (m->file_size + 0x3fff) & ~0x3fffULL); }
+    /* Field of view (aspect_patch.h): the projection writers' fovy loads, 0x628c3c in the camera update (beside 0x628c74)
+       and 0xb4342c in the camera setup (beside 0xb43460); each is followed by fmul s8, s0, s1 (the half angle), the fovy
+       store at +0xa0 and the sin / cos / tan calls. Stubs after the four aspect ones; always in on the Mac and in the iOS
+       export, the multiplier switching them on. */
+    { static const uint64_t sites[] = {0x628c3c, 0xb4342c};
+      static const uint32_t want[] = {0xbd413e60 /* ldr s0, [x19, #0x13c] */, 0xbd4066c0 /* ldr s0, [x22, #0x64] */};
+      fov_install(m, "1.4.3", sites, want, 2, ((m->text_end + 15) & ~15ULL) + 48 + 4 * DPF_REPLACE, (m->file_size + 0x3fff) & ~0x3fffULL); }
     const char *enabled = getenv("TOTK_FPS60");
     if (enabled && !strcmp(enabled, "0")) {
         fprintf(stderr, "[totk] 1.4.3 shipping frame controller (TOTK_FPS60=0)\n");

@@ -183,6 +183,8 @@ static void *input_file(void *arg) {
         } else if (!strncmp(line, "framestep ", 10)) {   /* "framestep <ms>": pin the real-time frame step, 0 = back to real time */
             char *end; double ms = strtod(line + 10, &end); if (end == line + 10 || ms < 0 || ms > 100) runtime_fail("framestep takes milliseconds (0 = real time)");
             runtime_frame_step_pin(ms);
+        } else if (sscanf(line, "fov %u %n", &code, &used) == 1 && used && !line[used] && code >= 70 && code <= 140) {
+            runtime_fov_set((int)code);   /* "fov <percent>": field of view 70..140 %, 100 = the game's own (aspect_patch.h) */
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
         } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }
