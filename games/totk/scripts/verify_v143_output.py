@@ -20,13 +20,16 @@ from unicorn.arm64_const import (
 ROOT = Path(__file__).resolve().parents[1]
 RENDER_SITES = {0x585e48, 0x585e50, 0x585e54, 0x585e60}
 RENDER_KICK = {0x580920}   # the per-frame update's display-state load, ORed with the data page +48 (a live pick)
+# runtime/world_patch.h: the time of day's step (s9) and the two far-plane loads, each a 32-byte stub from +304.
+WORLD_SITES = {0x68c15c: (0xbd403e69, 304, 72), 0x628c30: (0xbd413a60, 336, 76), 0xb43420: (0xbd4062c0, 368, 76)}
 
 
 def clean_env():
     """The fixture runs the production patches with this environment: a size or export switch left in the shell
     would change words the checks below count."""
     return {k: v for k, v in os.environ.items()
-            if k not in ('TOTK_RENDER_RES', 'TOTK_RENDER_RESERVE', 'TOTK_EXPORT_IOS', 'TOTK_OUTPUT_RES')}
+            if k not in ('TOTK_RENDER_RES', 'TOTK_RENDER_RESERVE', 'TOTK_EXPORT_IOS', 'TOTK_OUTPUT_RES',
+                          'TOTK_TIME_SPEED', 'TOTK_RENDER_DISTANCE')}
 
 
 def render_res_checks(out, raw, data, layout):
@@ -112,6 +115,78 @@ def render_res_checks(out, raw, data, layout):
                 malformed_rejected=True)
 
 
+def world_checks(out, raw, data, layout):
+    """Time of day speed and render distance (runtime/world_patch.h): the three 1.4.3 sites hold their original words,
+    the padding they use is empty, and the production code always installs them (Mac and the iOS export). Each stub
+    is executed: with the data page factor 0 it leaves the game's value, with a factor it multiplies it, and paused
+    (-0.0) gives a zero step; x0 (the time site's live return value), x10 and sp come through, and it returns right
+    after the site."""
+    from unicorn.arm64_const import UC_ARM64_REG_S0, UC_ARM64_REG_S9, UC_ARM64_REG_X22, UC_ARM64_REG_SP
+    base = (layout['TEXT_END'] + 15) & ~15
+    for site, (word, off, _) in WORLD_SITES.items():
+        assert struct.unpack('<I', raw[site:site + 4])[0] == word, f'world site {site:#x} is not the verified 1.4.3 word'
+        assert raw[base + off:base + off + 32] == bytes(32), f'world stub padding +{off} not empty'
+    assert base + 400 <= layout['RO_OFF'], 'world stubs would overlap read-only data'
+
+    def image(extra):
+        path = out / 'main-world.bin'
+        env = clean_env() | {'TOTK_REALTIME': '1', 'TOTK_FPS60': '1', 'TOTK_OUTPUT_RES': '0',
+                             'TOTK_ROMFS_PATCHES_OUT': str(out / 'no-overlays')} | extra
+        run = subprocess.run(['build/v143-output-fixture', 'rewritten/v143/main.patched.bin', str(path),
+                              str(layout['TEXT_END'])], capture_output=True, text=True, env=env)
+        got = path.read_bytes() if run.returncode == 0 else None
+        path.unlink(missing_ok=True)
+        return run.returncode, got
+
+    def run_site(img, site, factor_bits):
+        word, off, slot = WORLD_SITES[site]
+        img = bytearray(img); img[data + slot:data + slot + 4] = struct.pack('<I', factor_bits)
+        mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
+        mu.mem_map(0, (len(img) + 0x3fff) & ~0x3fff); mu.mem_write(0, bytes(img))
+        obj, stack = 0x30000000, 0x31000000
+        mu.mem_map(obj, 0x4000); mu.mem_map(stack, 0x4000)
+        mu.mem_write(obj + 0x3c, struct.pack('<f', 2.0))      # the clock's step
+        mu.mem_write(obj + 0x138, struct.pack('<f', 1000.0))  # the camera's far plane (update)
+        mu.mem_write(obj + 0x60, struct.pack('<f', 1000.0))   # the camera's far plane (setup)
+        for r in (UC_ARM64_REG_X19, UC_ARM64_REG_X22): mu.reg_write(r, obj)
+        mu.reg_write(UC_ARM64_REG_X0, 0x1111); mu.reg_write(UC_ARM64_REG_X10, 0x2222); mu.reg_write(UC_ARM64_REG_SP, stack + 0x2000)
+        mu.emu_start(site, site + 4, count=12)
+        assert mu.reg_read(UC_ARM64_REG_PC) == site + 4
+        assert (mu.reg_read(UC_ARM64_REG_X0), mu.reg_read(UC_ARM64_REG_X10)) == (0x1111, 0x2222), 'a live register changed'
+        assert mu.reg_read(UC_ARM64_REG_SP) == stack + 0x2000
+        reg = UC_ARM64_REG_S9 if site == 0x68c15c else UC_ARM64_REG_S0
+        return struct.unpack('<f', struct.pack('<I', mu.reg_read(reg) & 0xffffffff))[0]
+
+    code, img = image({})
+    assert code == 0
+    changed = {p for p in WORLD_SITES if raw[p:p + 4] != img[p:p + 4]}
+    assert changed == set(WORLD_SITES), 'the world sites are not all patched'
+    assert img[data + 72:data + 80] == bytes(8), 'the game\'s own time and distance are not 0 on the data page'
+    bits = lambda f: struct.unpack('<I', struct.pack('<f', f))[0]
+    results = {}
+    for site in WORLD_SITES:
+        own = run_site(img, site, 0)
+        want_own = run_site(raw + bytes(data + 0x4000 - len(raw)), site, 0)
+        assert own == want_own, f'{site:#x}: factor 0 is not the game\'s own value'
+        scaled = run_site(img, site, bits(2.5))
+        assert scaled == own * 2.5, (hex(site), own, scaled)
+        results[hex(site)] = [own, scaled]
+    paused = run_site(img, 0x68c15c, 0x80000000)
+    assert paused == 0.0, 'paused (-0.0) did not give a zero step'
+    code, start = image({'TOTK_TIME_SPEED': '0', 'TOTK_RENDER_DISTANCE': '250'})
+    assert code == 0 and struct.unpack('<If', start[data + 72:data + 80]) == (0x80000000, 2.5), 'the start values are not on the data page'
+    code, start = image({'TOTK_TIME_SPEED': '800', 'TOTK_RENDER_DISTANCE': '100'})
+    assert code == 0 and struct.unpack('<fI', start[data + 72:data + 80]) == (8.0, 0)
+    code, _ = image({'TOTK_TIME_SPEED': '300'})
+    assert code != 0, 'a time speed outside the choices was accepted'
+    code, _ = image({'TOTK_RENDER_DISTANCE': '20'})
+    assert code != 0, 'a render distance below 50 was accepted'
+    code, export = image({'TOTK_EXPORT_IOS': str(out / 'unused-export')})
+    assert code == 0 and export[:data] == img[:data], 'the iOS export does not embed the same world stubs'
+    return dict(sites={hex(p): hex(w) for p, (w, _, _) in WORLD_SITES.items()}, stubs=[hex(base + 304), hex(base + 400)],
+                game_own_and_x2_5=results, paused_step=paused, ios_export_embedded=True)
+
+
 def main():
     os.chdir(ROOT)
     out = ROOT / 'analysis/v143-port'
@@ -146,7 +221,7 @@ def main():
         0xbdb578, 0xbdb584, 0x3dcb28,
         0x2db204, 0x2db208, 0x2db22c, 0x2db360, 0x2db36c, 0x2db340, 0x2db34c,
         0x3e5658, 0x2daa54, 0x2daa58, 0x2daa6c, 0x2daa70, 0x2daa74, 0x2daa78,
-    } | RENDER_SITES | RENDER_KICK | {frame_step + 272 + 4 * i for i in range(8)} | {frame_step + 4 * i for i in range(4)} | {stub + 4 * i for i in range(7)}
+    } | RENDER_SITES | RENDER_KICK | set(WORLD_SITES) | {frame_step + 304 + 4 * i for i in range(24)} | {frame_step + 272 + 4 * i for i in range(8)} | {frame_step + 4 * i for i in range(4)} | {stub + 4 * i for i in range(7)}
     # The 21:9 view (runtime/aspect_patch.h, always installed since c446bce): four sites and its stubs after the two veneers.
     # The field of view (aspect_patch.h fov_install): two camera sites and their 48-byte stubs after the aspect stubs.
     aspect = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0, 0x628c3c, 0xb4342c} | {p for p in changes if frame_step + 48 <= p < frame_step + 272}
@@ -212,10 +287,12 @@ def main():
     assert auto_export == set(), ('the iOS export took the 2560x1440 swapchain in auto', auto_export)
     assert explicit_export == set(), ('the iOS export took an explicit output size', explicit_export)
     render = render_res_checks(out, raw, data, layout)
+    world = world_checks(out, raw, data, layout)
     report = dict(status='pass', version='v143', cases=cases,
                   negative_control=negative, veneer_offset=hex(stub),
                   auto={'mac_changed_output_words': len(auto_mac), 'ios_export_auto_changed': len(auto_export), 'ios_export_explicit_changed': len(explicit_export)},
                   render_res=render,
+                  world=world,
                   changed_original_words=len(changes),
                   scope='production C patch, original scale selection, canvas/crop publication; GPU allocations tested separately')
     (out / 'output-validation.json').write_text(json.dumps(report, indent=2) + '\n')

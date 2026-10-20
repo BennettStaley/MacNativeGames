@@ -97,11 +97,15 @@ static int apply_live(const SettingDef *d, int v) {
     extern int runtime_hid_feedback_flag(const char *name, int v);
     extern void runtime_gamepad_relayout(void);
     extern void runtime_fov_set(int percent);
+    extern void runtime_time_speed_set(int percent);
+    extern void runtime_render_distance_set(int percent);
     extern int runtime_render_request(unsigned w, unsigned h);
     (void)runtime_render_request;
     if (!strncmp(d->key, "display.", 8)) return d->apply == SET_LIVE ? display_apply(d->key) : 0;
     if (!strcmp(d->key, "graphics.interpolation")) dm_gfx_set_flag("mfx_interp", v);
     else if (!strcmp(d->key, "graphics.fov")) runtime_fov_set(v);
+    else if (!strcmp(d->key, "graphics.render_distance")) runtime_render_distance_set(v);
+    else if (!strcmp(d->key, "world.time_speed")) runtime_time_speed_set(v);
     else if (!strcmp(d->key, "graphics.aa")) dm_gfx_set_flag("aa_mode", v);
     else if (!strcmp(d->key, "graphics.sharpen")) dm_gfx_set_flag("sharpen", v);
     else if (!strcmp(d->key, "graphics.aniso")) dm_gfx_set_flag("aniso", v);

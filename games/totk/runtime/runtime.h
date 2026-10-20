@@ -116,6 +116,8 @@ int runtime_aspect_toggle(void);   /* runtime/aspect_patch.h: key 4, 16:9 <-> ul
 float runtime_aspect_now(void);     /* the ratio in force, 0 = the game's own 16:9 */
 void runtime_fov_set(int percent);
 void runtime_fov_aspect(float k);   /* aspect_patch.h: the vertical angle's factor for a screen taller than 16:9 (Vert+), with the player's */  /* runtime/aspect_patch.h: field of view 70..140 % live (1.4.3, Mac and iOS), 100 = the game's own */
+void runtime_time_speed_set(int percent);       /* runtime/world_patch.h: time of day 0 (paused) .. 800 % live (1.4.3), 100 = the game's own */
+void runtime_render_distance_set(int percent);   /* runtime/world_patch.h: the camera's far clip 50..300 % live (1.4.3), 100 = the game's own */
 int hud_compact(void);   /* gfx/nvn/fps_overlay.c: the overlay lines go to the window's corner panel (TOTK_HUD=corners: in the picture) */
 int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line 0..2: FPS, shaders, load; 0 = not published */
 

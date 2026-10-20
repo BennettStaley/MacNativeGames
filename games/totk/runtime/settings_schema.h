@@ -30,7 +30,7 @@ typedef struct {
     const char *shown_key; int shown_value;   /* shown only while that setting has that value (NULL: always) */
 } SettingDef;
 
-static const char *const SETTINGS_PAGES[] = {"Display", "Graphics", "Frame rate", "Interface", "Controls", "Audio"};
+static const char *const SETTINGS_PAGES[] = {"Display", "Graphics", "Frame rate", "Interface", "Controls", "Audio", "World"};
 enum { SETTINGS_NPAGES = sizeof SETTINGS_PAGES / sizeof *SETTINGS_PAGES };
 
 static const SettingChoice SET_CAP[] = {{"30 fps", "30", "30", 30}, {"40 fps", "40", "40", 40}, {"60 fps", "60", "60", 60},
@@ -60,6 +60,10 @@ static const SettingChoice SET_PROMPTS[] = {{"Automatic (your controller)", "aut
                                             {"Xbox", "xbox", NULL, 2}, {"PlayStation", "playstation", NULL, 3}};
 static const SettingChoice SET_FACE[] = {{"Automatic", "auto", NULL, 0}, {"By position", "position", "position", 1},
                                          {"By label", "label", "label", 2}};
+/* World (runtime/world_patch.h): the time of day's speed, in percent of the game's own (0 = the clock stands still). */
+static const SettingChoice SET_TIME_SPEED[] = {{"Paused", "paused", "0", 0}, {"0.25x", "0.25", "25", 25}, {"0.5x", "0.5", "50", 50},
+                                               {"Normal (1x)", "1", "100", 100}, {"2x", "2", "200", 200}, {"4x", "4", "400", 400},
+                                               {"8x", "8", "800", 800}};
 #define SET_N(a) (int)(sizeof a / sizeof *a)
 
 static const SettingDef SETTINGS[] = {
@@ -84,6 +88,8 @@ static const SettingDef SETTINGS[] = {
      "TOTK_SHARPEN", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, 0, 100, 5, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.aniso", "Graphics", "Anisotropic filtering", "Sharper ground and walls seen at an angle.",
      "TOTK_ANISO", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_ANISO, SET_N(SET_ANISO), NULL, NULL, 0},
+    {"graphics.render_distance", "Graphics", "Render distance", "How far the camera draws before the world is cut off, against the game's own (version 1.4.3).",
+     "TOTK_RENDER_DISTANCE", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 50, 300, 25, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.lod_bias", "Graphics", "Texture detail bias", "Below 0 picks sharper texture levels, in hundredths of a level; too low shimmers.",
      "TOTK_LOD_BIAS", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, -100, 0, 25, NULL, NULL, 0, NULL, NULL, 0},
     {"framerate.cap", "Frame rate", "Frame rate limit", "The most frames a second the game draws. 40 needs a 120 Hz display.",
@@ -110,6 +116,8 @@ static const SettingDef SETTINGS[] = {
      "TOTK_GYRO", SET_BOOL, SET_LIVE, SET_MAC, 1, 1, 0, 1, 1, NULL, NULL, 0, "Not on iPhone and iPad yet.", NULL, 0},
     {"audio.volume", "Audio", "Volume", NULL,
      NULL, SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 0, 100, 5, "%", NULL, 0, NULL, NULL, 0},
+    {"world.time_speed", "World", "Time of day speed", "How fast the day passes: the clock, the sun and the sky (version 1.4.3). Paused stops the time of day.",
+     "TOTK_TIME_SPEED", SET_CHOICE, SET_LIVE, SET_ALL, 100, 100, 0, 0, 0, NULL, SET_TIME_SPEED, SET_N(SET_TIME_SPEED), NULL, NULL, 0},
 };
 enum { SETTINGS_COUNT = sizeof SETTINGS / sizeof *SETTINGS };
 

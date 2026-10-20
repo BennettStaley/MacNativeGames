@@ -54,6 +54,20 @@ int main(void) {
     v[settings_index("controls.face_buttons")] = 0; unsetenv("TOTK_FACE_BUTTONS"); settings_export_env(v);
     expect(!getenv("TOTK_FACE_BUTTONS"), "automatic leaves the variable unset");
 
+    /* World page (runtime/world_patch.h): the time of day in percent, paused included; the render distance in 25 % steps. */
+    expect(SETTINGS_NPAGES == 7 && !strcmp(SETTINGS_PAGES[SETTINGS_NPAGES - 1], "World"), "World is the last settings page (Mods follows it)");
+    expect(SETTINGS_COUNT == 25, "25 settings");
+    const SettingDef *ts = &SETTINGS[settings_index("world.time_speed")], *rd = &SETTINGS[settings_index("graphics.render_distance")];
+    expect(!strcmp(ts->page, "World") && ts->nchoices == 7 && ts->def_mac == 100 && ts->def_ios == 100 && ts->apply == SET_LIVE && ts->platforms == SET_ALL,
+           "time of day speed: seven choices, normal by default, live everywhere");
+    expect(rd->min == 50 && rd->max == 300 && rd->step == 25 && rd->def_mac == 100 && rd->apply == SET_LIVE && rd->platforms == SET_ALL,
+           "render distance: 50..300 % in 25 % steps, live everywhere");
+    settings_defaults(v, 0);
+    expect(settings_parse_text("world.time_speed = paused\ngraphics.render_distance = 260\n", v) == 2, "the world settings parse");
+    expect(value(v, "world.time_speed") == 0 && value(v, "graphics.render_distance") == 250, "paused is 0 %, a distance rounds to its step");
+    setenv("TOTK_TIME_SPEED", "800", 1); settings_take_env(v); unsetenv("TOTK_TIME_SPEED");
+    expect(value(v, "world.time_speed") == 800, "TOTK_TIME_SPEED in percent");
+
     if (failures) { fprintf(stderr, "%d failures\n", failures); return 1; }
     printf("settings: all checks passed (%d settings)\n", SETTINGS_COUNT);
     return 0;
