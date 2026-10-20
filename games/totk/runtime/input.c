@@ -56,6 +56,12 @@ static void supported_ids(const uint32_t *ids,uint64_t n){if(n>10||(!ids&&n))run
  if(getenv("TOTK_INPUT_LOG")){char b[128];size_t o=0;for(uint64_t i=0;i<n&&o<100;i++)o+=(size_t)snprintf(b+o,sizeof b-o," %#x",ids[i]);b[o]=0;fprintf(stderr,"[totk-input] game supports controller ids:%s\n",b);}pthread_mutex_lock(&inputLock);allowed=false;for(uint64_t i=0;i<n;i++)if(ids[i]==pad_id())allowed=true;pthread_mutex_unlock(&inputLock);}
 static void supported_styles(uint32_t value){pthread_mutex_lock(&inputLock);styles=value;pthread_mutex_unlock(&inputLock);}
 static uint32_t style(const uint32_t *id){if(!id)runtime_fail("controller id pointer");input_log("style set",*id);pthread_mutex_lock(&inputLock);uint32_t v=enabled&&allowed&&*id==pad_id()?(styles&pad_style()):0;pthread_mutex_unlock(&inputLock);return v;}
+/* Camera speed (settings controls.camera_speed_x / _y, percent): the right stick as the game reads it, keyboard arrows and
+   controller alike, scaled and kept within the stick's range. Above 100 % a half push turns the camera as a fuller one
+   would; the game's own top speed (the stick all the way) stays. */
+static _Atomic int cameraX=100,cameraY=100;
+void runtime_camera_speed_set(int axis,int percent){if(percent<25)percent=25;if(percent>300)percent=300;atomic_store(axis?&cameraY:&cameraX,percent);}
+static int32_t camera_scale(int32_t v,int percent){if(percent==100)return v;int64_t s=(int64_t)v*percent/100;return (int32_t)(s>32767?32767:s<-32767?-32767:s);}
 static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_style);
 static int full_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,1);}
 static int handheld_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,2);}
@@ -66,6 +72,7 @@ static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_st
  if(pad.buttons&~padSeen||abs(pad.lx)>16384||abs(pad.ly)>16384||abs(pad.rx)>16384||abs(pad.ry)>16384)user_input("controller");padSeen=pad.buttons;
  if(abs(pad.lx)>abs(state.lx))state.lx=pad.lx;if(abs(pad.ly)>abs(state.ly))state.ly=pad.ly;
  if(abs(pad.rx)>abs(state.rx))state.rx=pad.rx;if(abs(pad.ry)>abs(state.ry))state.ry=pad.ry;
+ state.rx=camera_scale(state.rx,atomic_load(&cameraX));state.ry=camera_scale(state.ry,atomic_load(&cameraY));
  }*out=state;pthread_mutex_unlock(&inputLock);return 1;}
 static int disconnected_states(NpadState *out,int max,const uint32_t *id){if(id)input_log("joy-con state",*id);if(max<=0)return 0;if(!out)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);*out=(NpadState){.sampling=++sample};pthread_mutex_unlock(&inputLock);return 1;}
 static void hold_type(int type){if(type<0||type>1)runtime_fail("invalid joy hold type");holdType=type;(void)holdType;}
