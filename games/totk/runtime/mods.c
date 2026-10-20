@@ -21,7 +21,7 @@
 #define MAX_FILES 400000
 
 typedef struct { char *path, *file; uint64_t size; int mod, replaces; } Rec;
-typedef struct { ModInfo info; char root[4096]; size_t first, count; } Mod;   /* root: the RomFS folder, "" = none */
+typedef struct { ModInfo info; char root[4096]; size_t first, count; int listed; } Mod;   /* root: the RomFS folder, "" = none; listed: named in mods.txt */
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static char dir_path[4096];
@@ -228,6 +228,29 @@ static void walk(Mod *m, int index, const char *base, const char *rel, int depth
     closedir(d);
 }
 
+/* A file the mod adds whose name carries another game version's number where the game has the same file under its own
+   (UI/LayoutArchive/Common.Product.110... beside the game's .140): the mod was made for that other version, whatever
+   its name says (balinwon's "Xbox UI v2" for 1.2.x added the 1.1/1.2 icon archive and replaced the fonts with 1.2's). */
+static int other_version_files(const Mod *m) {
+    static const char *const nums[] = {"100", "110", "112", "120", "121", "130", "140", "141", "142", "143"};
+    if (!romfs_lookup) return 0;
+    for (size_t r = m->first; r < m->first + m->count; r++) {
+        if (recs[r].replaces) continue;
+        const char *at = strstr(recs[r].path, ".Product."); if (!at) continue;
+        const char *d = at + 9;
+        if (!isdigit((unsigned char)d[0]) || !isdigit((unsigned char)d[1]) || !isdigit((unsigned char)d[2]) || d[3] != '.') continue;
+        for (size_t k = 0; k < sizeof nums / sizeof *nums; k++) {
+            if (!strncmp(d, nums[k], 3)) continue;
+            char alt[1024], real[1024]; if (snprintf(alt, sizeof alt, "%s", recs[r].path) >= (int)sizeof alt) break;
+            memcpy(alt + (d - recs[r].path), nums[k], 3);
+            if (romfs_lookup(alt, real, sizeof real)) {
+                fprintf(stderr, "[totk] mods: %s: %s is for another game version (this game has %s)\n", m->info.name, recs[r].path, alt);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
 static void analyse(Mod *m, int index) {
     char p[4096]; ModInfo *i = &m->info;
     if (snprintf(p, sizeof p, "%s/%s", dir_path, i->folder) >= (int)sizeof p) return;
@@ -247,10 +270,10 @@ static void analyse(Mod *m, int index) {
     if (*m->root) walk(m, index, m->root, "", 0);
     m->count = nrecs - m->first;
     if (i->files) i->flags |= MOD_HAS_ROMFS; else i->flags |= MOD_EMPTY;
-    if (old_version(i)) i->flags |= MOD_OLD_VERSION;
+    if (old_version(i) || other_version_files(m)) i->flags |= MOD_OLD_VERSION;
     /* Button icons: only a mod that changes the icon archive counts, named by mod.json or by its name. */
     int icons = 0;
-    for (size_t r = m->first; r < m->first + m->count && !icons; r++) icons = !strncmp(recs[r].path, "UI/LayoutArchive/Common.Product.", 32);
+    for (size_t r = m->first; r < m->first + m->count && !icons; r++) icons = recs[r].replaces && !strncmp(recs[r].path, "UI/LayoutArchive/Common.Product.", 32);   /* this game's archive, not another version's */
     if (!icons) i->prompts = 0;
     else if (!i->prompts) { char both[600]; snprintf(both, sizeof both, "%s %s", i->name, i->folder); i->prompts = prompts_style(both); }
     if (i->prompts) i->flags |= MOD_PROMPTS;
@@ -324,13 +347,15 @@ int mods_scan(void) {
             end = s + strlen(s); while (end > s && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
             if (!*s || *s == '#') continue;
             int on = 1; if (*s == '-') { on = 0; s++; } else if (*s == '+') s++;
-            for (size_t k = 0; k < nnames; k++) if (!strcmp(names[k], s)) { add_mod(s, on); break; }
+            for (size_t k = 0; k < nnames; k++) if (!strcmp(names[k], s)) { int at = add_mod(s, on); if (at >= 0) mods[at].listed = 1; break; }
         }
         fclose(f);
     }
     for (size_t k = 0; k < nnames; k++) { add_mod(names[k], 1); free(names[k]); }
     free(names);
     for (int k = 0; k < nmods; k++) analyse(&mods[k], k);
+    /* A new mod made for another game version starts off: turning it on is the player's choice. */
+    for (int k = 0; k < nmods; k++) if (!mods[k].listed && (mods[k].info.flags & MOD_OLD_VERSION)) mods[k].info.enabled = 0;
     if (prompt_choice) {   /* the Button prompts setting: one prompts mod of that style on, the others off */
         int chosen = -1;
         for (int k = 0; k < nmods; k++) if (mods[k].info.prompts && mods[k].info.prompts == prompt_choice && chosen < 0) chosen = k;

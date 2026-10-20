@@ -21,8 +21,8 @@ static int index_of(const char *folder) {
 static ModInfo get(const char *folder) { ModInfo m; memset(&m, 0, sizeof m); mods_get(index_of(folder), &m); return m; }
 /* The game's RomFS as the test sees it: two files, one of them asked for in another case. */
 static int lookup(const char *path, char *real, size_t cap) {
-    static const char *const known[] = {"UI/Foo.txt", "Pack/Actor/X.pack.zs", "Sound/a.bwav"};
-    for (size_t k = 0; k < 3; k++) {
+    static const char *const known[] = {"UI/Foo.txt", "Pack/Actor/X.pack.zs", "Sound/a.bwav", "UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs"};
+    for (size_t k = 0; k < 4; k++) {
         if (!strcmp(path, known[k])) return 1;
         if (!strcasecmp(path, known[k])) { snprintf(real, cap, "%s", known[k]); return 2; }
     }
@@ -103,6 +103,12 @@ int main(void) {
 
     mods_set_romfs_lookup(lookup);
     expect(!strcmp(mods_dir(), root), "TOTK_MODS_DIR names the folder");
+    /* Another version's file (the 1.1/1.2 icon archive beside the game's .140): flagged, starts off, not a prompts mod. */
+    put("H Xbox UI v2/romfs/UI/LayoutArchive/Common.Product.110.Nin_NX_NVN.blarc.zs", "old icons");
+    mods_scan();
+    { ModInfo h = get("H Xbox UI v2");
+      expect((h.flags & MOD_OLD_VERSION) && !h.enabled && !(h.flags & MOD_PROMPTS), "another version's file: old, off, no prompts role"); }
+    expect(!mods_remove("H Xbox UI v2"), "removed again");
     expect(mods_scan() == 7, "seven mods; the older v143 folder is not one");
     ModInfo a = get("A Standard"), b = get("B Wrapped"), c = get("C Bare"), d = get("D Old v1.2.1"), e = get("E Empty"), f = get("F Package.tkcl"), g = get("G Options");
     expect(index_of("A Standard") == 0 && index_of("G Options") == 6, "without mods.txt: by name");
@@ -113,17 +119,18 @@ int main(void) {
     expect((c.flags & MOD_HAS_ROMFS) && c.files == 2, "RomFS folders at the top level");
     expect((c.flags & MOD_CONFLICT) && c.conflicts == 1, "C changes UI/Foo.txt after A");
     expect(d.flags == (MOD_HAS_ROMFS | MOD_OWN_RSTB | MOD_OLD_VERSION) && d.files == 1, "own table left out; 1.2.1 in the name");
+    expect(!d.enabled, "a new mod made for another game version starts off");
     expect(e.flags == MOD_EMPTY && e.files == 0, "nothing to load");
     expect(f.flags & MOD_TKCL, "a .tkcl package");
     expect((g.flags & MOD_EMPTY) && g.files == 0, "two romfs folders side by side: none chosen");
     const ModFile *files; int n = mods_files(&files);
-    expect(n == 5, "winners: A 2, B 1, C 1 (UI/Foo.txt stays A), D 1");
+    expect(n == 4, "winners: A 2, B 1, C 1 (UI/Foo.txt stays A); D is off");
     int foo = 0;
     for (int k = 0; k < n; k++) if (!strcmp(files[k].path, "UI/Foo.txt")) { foo++; expect(files[k].mod == 0 && strstr(files[k].file, "A Standard/romfs/ui/foo.txt"), "first mod wins, in the game's spelling"); }
     expect(foo == 1, "a path once");
     for (int k = 0; k < n; k++) if (!strcmp(files[k].path, "Model/New.bfres.mc")) expect(!files[k].replaces, "a file the game lacks is added");
     for (int k = 0; k < n; k++) if (!strcmp(files[k].path, "Sound/a.bwav")) expect(files[k].replaces, "a file the game has is replaced");
-    for (unsigned bit = 1; bit <= MOD_EMPTY; bit <<= 1) expect(*mods_notice(bit) != 0, "every flag has a notice");
+    for (unsigned bit = 1; bit <= MOD_PROMPTS; bit <<= 1) expect(*mods_notice(bit) != 0, "every flag has a notice");
 
     /* mods.txt: order, off, unknown names dropped, the rest appended by name and on. */
     put("mods.txt", "# order\n-C Bare\n  B Wrapped  \nMissing\n\n");
