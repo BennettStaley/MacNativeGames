@@ -62,7 +62,7 @@ Shaders are automatically collected, compiled and cached as you play. Returning 
 ## What you need
 
 - A Mac with Apple silicon and **macOS 26** or later (the graphics use Metal 4); macOS 27 is supported. 16 GB of memory or more is recommended.
-- About **25 GB** of free disk space for the work folder, in addition to your game file. Keep the output app on the **same APFS volume** to share the large data files through cloning. If cloning is unavailable or the app is on another volume, allow roughly **17 GB more** for the app copy.
+- About **25 GB** of free disk space for the work folder, in addition to your game file. The large game data goes to `~/Library/Application Support/MacNativeGames/TOTK/game-data` as APFS clones of the work folder's files; if the work folder is on another volume (or you build with `--embed-data` to another volume), allow roughly **17 GB more** for that copy.
 - Your Tears of the Kingdom **base game 1.0.0** (`0100F2C0115B6000`) as an **XCI or NSP**, and your `prod.keys`. To build **1.1.2, 1.2.1 or 1.4.3**, supply its separate cumulative update as NSP or NSZ with `--update`; no intermediate update is required. NSZ is decompressed and its NCA hashes are verified before extraction. DLC and combined packages are unsupported.
 - For NSP: its common ticket must be included unless the NCAs are rights-free. NSPs do not contain system shared fonts: supply an unpacked firmware NCA directory with `--firmware`, or previously extracted fonts with `--shared-fonts`. The six fonts are checked against this project’s reference dump; a valid BFTTF font from another firmware version is accepted and bound by its own bytes. Valid fonts already in the work folder are reused.
 
@@ -111,7 +111,9 @@ Without `-o`, the selected output appears next to the game file (`Tears of the K
 
 The extracted code modules, rewritten modules, RomFS and shared fonts are checked against the selected version's `games/totk/assets/expected-v1.0.0.json`, `expected-v1.1.2.json`, `expected-v1.2.1.json` or `expected-v1.4.3.json`; the prebuilt shader translator has its own SHA-256 check. A mismatch stops the build, with one exception: a different genuine retail dump of the same version is accepted — its `main.npdm` is checked by Nintendo’s ACID signature (`npdm_signed()`) instead of the pinned hash, and its firmware’s shared fonts are checked for a valid BFTTF structure and bound by their actual SHA-256. Key values are never printed.
 
-Signing and verifying a large updated app can add several minutes. Keep the build running while it continues to report progress.
+**Where the game data goes, and fast rebuilds.** The Mac app holds only the code and small files (about 150 MB). The 17 GB RomFS image and the prepared shaders go once into `~/Library/Application Support/MacNativeGames/TOTK/game-data`, in folders named by their content (`v143-romfs-<id>`, `v143-shaders-<id>`); on the work folder's volume they are APFS clones and take no extra space. The app finds them through its `Contents/Resources/totk/game-data.json`; if they are missing it says so and shows the command that makes them again. A rebuild whose game data and shaders did not change (after a code change, for example) only rebuilds the game binary and assembles the small app: about 45 seconds instead of about 12 minutes on an M4, and the macOS check of the new app takes seconds. The first game start after the data is written verifies it once (about 20 seconds); later rebuilds keep that verification. To copy the app to another Mac, build a self-contained app with `--embed-data` (the data inside it, as before). `python3.14 build_app.py --prune-data` deletes the game-data folders no app points to (shader folders of older shader lists, for example); see [where the game data lives](docs/how-it-works.md#where-the-game-data-lives).
+
+To change an app built before this into the new layout, build it again with the same command and `-o` (the data moves out of the app into the game-data folder; with the work folder in place this takes a few minutes, and the first start verifies the data once).
 
 **3. Play:** open the app from Finder. The build starts the launcher in `--check` mode, which checks that the game executable exists and allows macOS to perform its first-launch checks; it does not run a gameplay test. You can keep the app where it was built or move it to `/Applications`; the first start after a move compiles the shaders again in the background (macOS's Metal cache does not follow the app to its new place), so to keep it in `/Applications`, build it there with `-o`. Copying it to a different volume can use additional disk space and trigger another macOS check, during which no window may appear. The first game launch verifies the game data (about 20 seconds in local testing). Newly encountered shaders can cause stutters; cached shaders reduce this work on later visits.
 
@@ -207,6 +209,7 @@ iPhone use the gear at the top, a three-finger tap or a controller's Home button
 - Save sync between the Mac and an iPhone / iPad: [docs/save-sync.md](docs/save-sync.md)
 - Saves: `~/Library/Application Support/MacNativeGames/TOTK/profile`
 - Shader cache: `~/Library/Application Support/MacNativeGames/TOTK/shader-cache` (delete it to translate everything again)
+- Game data the app uses (RomFS image, prepared shaders): `~/Library/Application Support/MacNativeGames/TOTK/game-data` (`python3.14 build_app.py --prune-data` deletes what no app uses)
 - Shaders the shared list does not have yet: `~/Library/Application Support/MacNativeGames/TOTK/shader-list-contribution.txt`
 - Log: `~/Library/Logs/MacNativeGames/totk.log` (the run before: `totk.previous.log`)
 - Mods: `~/Library/Application Support/MacNativeGames/TOTK/mods` (iPhone / iPad: the app's `mods` folder in Files). One folder per mod, as Yuzu / Ryujinx mods ship them: unzip the mod there so that its `romfs` folder ends up inside (`mods/<Mod>/romfs/...`; an extra wrapping folder from the archive is fine). `mods.txt` in the same folder sets the order (first line wins a file two mods both change) and turns a mod off with `-` in front; new folders are added at the end, on. Only game data (RomFS) is loaded: code patches (`exefs`), TKMM `.tkcl` packages and merging two mods that change the same file are not supported yet; a mod's own ResourceSizeTable is left out and the game's is adjusted for the mods' files instead. The log lists every mod, what it replaces or adds and what was left out. See [docs/mods.md](docs/mods.md). The settings menu's **Mods** tab switches mods on and off, orders and removes them, and browses and installs mods from GameBanana (Mac: zip, 7z and RAR; iPhone / iPad: zip): see [docs/mod-browser.md](docs/mod-browser.md). The older single folder `mods/<v0|v112|v121|v143>` with a `manifest.tsv` (`games/totk/scripts/make_mod_manifest.py`) still loads; its files are checked against their SHA-256 at start.
@@ -303,7 +306,7 @@ MIT (see [LICENSE](LICENSE)). Third-party code keeps its own license: [THIRD_PAR
 ## 需要准备
 
 - Apple 芯片的 Mac，**macOS 26** 或更高（图形用 Metal 4），支持 macOS 27。建议使用 16 GB 或更多内存。
-- 除游戏文件外，为工作目录预留约 **25 GB** 空闲空间。成品 App 与工作目录放在**同一个 APFS 卷**上时，大型数据文件可通过克隆共享磁盘空间；无法克隆或输出到其他卷时，还需为 App 副本另留约 **17 GB**。
+- 除游戏文件外，为工作目录预留约 **25 GB** 空闲空间。大型游戏数据以工作目录文件的 APFS 克隆放在 `~/Library/Application Support/MacNativeGames/TOTK/game-data`；工作目录在其他卷上（或用 `--embed-data` 输出到其他卷）时，还需为这份副本另留约 **17 GB**。
 - 你的《王国之泪》**本体 1.0.0**（`0100F2C0115B6000`），格式为 **XCI 或 NSP**，以及你的 `prod.keys`。构建 **1.1.2、1.2.1 或 1.4.3** 时，通过 `--update` 提供单独的累计更新 NSP 或 NSZ；无需先安装中间版本。NSZ 会先解压并校验其中的 NCA 哈希。DLC 和合并包不支持。
 - 使用 NSP 时：除不依赖票据的 NCA 外，包内必须包含通用票据。NSP 不含系统共享字体，需要通过 `--firmware` 指定已解包的固件 NCA 目录，或通过 `--shared-fonts` 提供以前提取的字体。六个字体会与本项目的参考转储核对；来自其他固件版本的有效 BFTTF 字体会按它自身的字节接受并绑定。工作目录中已有且校验通过的字体会自动复用。
 
@@ -352,7 +355,9 @@ python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys --platform ios -o ~
 
 提取的程序模块、改写后的模块、RomFS 和共享字体会与所选版本的 `games/totk/assets/expected-v1.0.0.json`、`expected-v1.1.2.json`、`expected-v1.2.1.json` 或 `expected-v1.4.3.json` 中的哈希核对；预编译着色器翻译器另有 SHA-256 校验。不匹配时停止构建，但有一个例外：同一版本的另一份真实零售转储会被接受——它的 `main.npdm` 改用任天堂的 ACID 签名校验（`npdm_signed()`），而不是固定的哈希；其固件的共享字体则检查是否为有效的 BFTTF 结构，并按实际 SHA-256 绑定。密钥的值不会被打印。
 
-大型更新版 App 的完整签名和校验还可能多用几分钟；日志持续报告进度时，请等待构建完成。
+**游戏数据放在哪里，以及快速重建。** Mac App 里只有代码和小文件（约 150 MB）。17 GB 的 RomFS 镜像和预置着色器只写入一次，放在 `~/Library/Application Support/MacNativeGames/TOTK/game-data` 里按内容命名的文件夹（`v143-romfs-<id>`、`v143-shaders-<id>`）；与工作目录在同一卷上时是 APFS 克隆，不额外占空间。App 通过 `Contents/Resources/totk/game-data.json` 找到它们；缺失时会提示，并给出重新生成的命令。游戏数据和着色器没变时（例如只改了代码），重建只重新编译游戏程序并组装小 App：在 M4 上 约 45 秒，而不是 约 12 分钟，macOS 检查新 App 也只要几秒。数据写入后的第一次启动会校验一次（约 20 秒），以后的重建沿用这次校验。要把 App 拷到另一台 Mac，用 `--embed-data` 构建自带数据的 App（与以前相同）。`python3.14 build_app.py --prune-data` 删除没有 App 使用的游戏数据文件夹（例如旧着色器清单的着色器）；详见[游戏数据的位置](docs/how-it-works.md#where-the-game-data-lives)。
+
+以前构建的 App 改用新布局：用相同命令和 `-o` 重新构建一次即可（数据从 App 移到 game-data 文件夹；工作目录还在时只需几分钟，之后第一次启动校验一次数据）。
 
 **3. 游玩：** 在访达里打开 App。构建结束时会以 `--check` 模式启动启动器，检查游戏可执行文件是否存在，并让 macOS 执行首次启动检查；这一步不进行游戏游玩测试。App 可以留在原位置，也可以移到 `/Applications`；挪动之后的第一次启动要在后台重新编着色器（Metal 的缓存不跟着 App 走），想放在 `/Applications` 就用 `-o` 直接打包到那里。拷贝到另一个卷可能额外占用磁盘空间，并触发 macOS 再次检查，期间可能没有窗口。第一次进入游戏会校验游戏数据（本地测试约 20 秒）。首次遇到的着色器可能造成编译卡顿，缓存可减少后续访问时的重复工作。
 
@@ -436,6 +441,7 @@ west = y
 
 - 存档：`~/Library/Application Support/MacNativeGames/TOTK/profile`
 - 着色器缓存：`~/Library/Application Support/MacNativeGames/TOTK/shader-cache`（删掉会全部重新翻译）
+- App 使用的游戏数据（RomFS 镜像、预置着色器）：`~/Library/Application Support/MacNativeGames/TOTK/game-data`（`python3.14 build_app.py --prune-data` 删除没有 App 使用的部分）
 - 公共清单里还没有的着色器：`~/Library/Application Support/MacNativeGames/TOTK/shader-list-contribution.txt`
 - 日志：`~/Library/Logs/MacNativeGames/totk.log`（上一次运行：`totk.previous.log`）
 - 模组：`~/Library/Application Support/MacNativeGames/TOTK/mods`（iPhone / iPad：“文件”App 里本应用的 `mods` 文件夹）。每个模组一个文件夹，与 Yuzu / Ryujinx 模组的结构相同：解压后其 `romfs` 文件夹位于 `mods/<模组>/romfs/...`（压缩包多套一层文件夹也可以）。同一文件夹里的 `mods.txt` 决定加载顺序（两个模组改同一个文件时第一行的优先），行首写 `-` 表示停用；未列出的新文件夹排在最后并启用。只加载游戏数据（RomFS）：代码补丁（`exefs`）、TKMM 的 `.tkcl` 包以及合并两个修改同一文件的模组暂不支持；模组自带的 ResourceSizeTable 不使用，而是按模组的文件调整游戏自己的表。日志会列出每个模组、它替换或新增的文件以及被略过的内容。详见 [docs/mods.md](docs/mods.md)。设置菜单的 **Mods** 标签页可以启用、停用、排序和删除模组，并能浏览和安装 GameBanana 上的模组（Mac：zip、7z 和 RAR；iPhone / iPad：zip），见 [docs/mod-browser.md](docs/mod-browser.md)。旧的单一文件夹 `mods/<v0|v112|v121|v143>`（带 `manifest.tsv`，由 `games/totk/scripts/make_mod_manifest.py` 生成）仍可使用，启动时按 SHA-256 校验。
