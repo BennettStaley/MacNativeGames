@@ -1123,6 +1123,13 @@ def prune_data(data_dir):
             continue
         apps.append(app)
         used.update(Path(data[part]['path']).name for part in ('romfs', 'shaders') if part in data)
+    registry = data_dir / 'apps.json'
+    if registry.is_file():   # forget the apps that are gone
+        try:
+            known = json.loads(registry.read_text())
+            registry.write_text(json.dumps([a for a in known if a in apps], indent=1) + '\n')
+        except (OSError, ValueError):
+            pass
     freed = 0
     for folder in sorted(data_dir.iterdir()):
         if not folder.is_dir() or folder.name in used:
