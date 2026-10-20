@@ -592,9 +592,13 @@ def step_update_data(tree, game, update, keys, logs, *, version='v112'):
         report = json.loads(index.read_text())
         check(f'{expected["display_version"]} RomFS', report['romfs_sha256'], expected['romfs']['sha256'])
         check(f'{expected["display_version"]} RomFS size', report['romfs_size'], expected['romfs']['size'])
-    for script, arguments in [('make_romfs_patches.py', []), ('make_output_res_overlay.py', ['2560x1440'])]:
+    jobs = [('make_romfs_patches.py', []), ('make_output_res_overlay.py', ['2560x1440'])]
+    if version == 'v143':   # the heaps for live scene sizes (runtime_render_reserve): 2K canvas on the Mac, 1080p canvas (iOS, TOTK_OUTPUT_RES=0)
+        jobs += [('make_output_res_overlay.py', [canvas, '--scene', scene]) for canvas in ('2560x1440', '1920x1080')
+                 for scene in ('1920x1080', '2560x1440')]
+    for n, (script, arguments) in enumerate(jobs):
         run([tree/'.venv/bin/python', 'scripts/'+script, *arguments, '--version', version],
-            logs/(version+'-'+script+'.log'), cwd=tree)
+            logs/(version+'-'+script+(f'-{n}' if n > 1 else '')+'.log'), cwd=tree)
 
 
 def build_spirv_cross(tree, logs):

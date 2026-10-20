@@ -90,6 +90,13 @@ void runtime_boot_count(const char *stage,uint64_t done,uint64_t total);   /* a 
    adds to the texture heap and to Graphics, and so to the application pool (runtime/services.c). */
 int runtime_output_res(unsigned *w,unsigned *h);
 uint64_t runtime_output_res_extra_bytes(void);
+int runtime_heap_overlay(char *out,size_t n);   /* the HeapDef overlay folder in TOTK_ROMFS_PATCHES_OUT the heaps need ("<w>x<h>[-scene-<sw>x<sh>]"), 0 = none */
+/* Live scene (3D) render size (1.4.3, runtime/game_patches_v143.c; Mac and iOS). runtime_render_request asks for w x h,
+   latched at the next present: 0, or -1 when it is above the boot reserve (applies after a restart: TOTK_RENDER_RES) or
+   the scene size is not patched. runtime_render_reserve gives the biggest size the heaps sized at boot hold (a request
+   fits when w*h is at most its pixels); TOTK_RENDER_RESERVE=<w>x<h> sets it. Older versions refuse and report 0x0. */
+int runtime_render_request(unsigned w,unsigned h);
+void runtime_render_reserve(unsigned *w,unsigned *h);
 int runtime_output_res_toggle(void);                    /* legacy two-state output size switch */
 int runtime_output_mode_cycle(void);                    /* key 3: MetalFX 2K -> native 2K -> off */
 uint64_t runtime_output_size_current(void);              /* configured canvas: width in low 32 bits, height in high 32 bits */

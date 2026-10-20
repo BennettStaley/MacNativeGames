@@ -9458,7 +9458,22 @@ static int mfxup_dock(__unsafe_unretained NvShader *fs) {
    texture slot 0; when that scene is smaller than the canvas (TOTK_RENDER_RES below the canvas size), upscale it with
    MetalFX first and let encode_args bind the result. Runs before the draw opens its render encoder. Docked: mfxup_dock.
    Returns 1 when the draw was replaced (not to be encoded). */
+/* The scene size the game really renders (live scene sizes, runtime_render_request): its upscale shaders (the two
+   mfxup_dock replaces) carry con0 = scene / canvas and the canvas size at +64; logged when it changes and once a minute
+   (after ly05010419/MacNativeGames#42). Only drawn while the scene is smaller than the canvas. */
+static void render_note_observed(NvProg *pr) {
+    NvShader *f = pr ? pr->sh[1] : nil; if (!f || (f->key[0] != 'a')) return;
+    if (strncmp(f->key, "a3a570eb159202f14bc86479b0d3a012ecd830b8550505536eb70bf82372e4bb-", 65) &&
+        strncmp(f->key, "ac58fc18eda5f3878b16074dc28cd441644a66710f1b73954d39e57ac357561b-", 65)) return;
+    const p_bind_buf *u = &S.ubo[1][0]; if (!u->addr || u->size < 80) return;
+    float k[20]; pend_materialize(u->addr, (uint8_t *)k, sizeof k, 0); uint32_t w, h; memcpy(&w, k + 16, 4); memcpy(&h, k + 17, 4);
+    if (!w || !h || w > 8192 || h > 8192 || !isfinite(k[0]) || !isfinite(k[1])) return;
+    long rw = lround((double)k[0] * w), rh = lround((double)k[1] * h); if (rw <= 0 || rh <= 0 || rw > 8192 || rh > 8192) return;
+    static _Atomic uint64_t seen; static uint64_t told; uint64_t v = w | (uint64_t)h << 16 | (uint64_t)rw << 32 | (uint64_t)rh << 48, now = atomic_load(&g_cur_frame);
+    if (atomic_exchange(&seen, v) != v || now - told >= 3600) { told = now; MLOG("[render] frame %llu: the game renders the scene at %ldx%ld for a %ux%u canvas (its upscale constants)", (unsigned long long)atomic_load(&g_cur_frame), rw, rh, w, h); }
+}
 static int mfxup_draw(NvProg *pr) {
+    render_note_observed(pr);
     g_mfxup_src = nil; g_mfxup_out = nil; g_mfxup_sh = nil;
     if (!pr || !mfxup_enabled()) return 0;
     __unsafe_unretained NvShader *fs = pr->sh[1];
