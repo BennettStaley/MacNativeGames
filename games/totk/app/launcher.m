@@ -1,6 +1,8 @@
 // The launcher inside the packaged app (build_app.py compiles it as Contents/MacOS/TOTK).
 // The game itself is Contents/Resources/totk/build/totk-native; everything it writes goes to the player's own folders:
 //   ~/Library/Application Support/MacNativeGames/TOTK/   profile (account, saves), shader cache, game slot, RomFS proof
+//                                                       and game-data/: the RomFS image and prepared shaders the app
+//                                                       points at (game-data.json; read-only for the game)
 //   ~/Library/Logs/MacNativeGames/totk.log             this run (totk.previous.log: the one before)
 // If the game is already running, the launcher only brings it to the front.
 #import <AppKit/AppKit.h>
@@ -86,6 +88,59 @@ static void contrib_reminder(NSString *path) {
     [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[[NSURL fileURLWithPath:path]]];
 }
 
+/* The game data outside the app (build_app.py's default Mac layout, docs/how-it-works.md "Where the game data lives"):
+   Contents/Resources/totk/game-data.json names two content-addressed folders in
+   ~/Library/Application Support/MacNativeGames/TOTK/game-data: <version>-romfs-<id> (romfs.bin, runtime-index.bin) and
+   <version>-shaders-<id> (shader-seed/, shader-libs/). Each folder's store.json carries the same id, and the files the
+   pointer lists must have their sizes; the game itself still checks the RomFS's SHA-256 (romfs.c: once per file
+   identity, the record kept in that folder) and every prepared shader against the seed's manifest. An app built with
+   --embed-data has no pointer and carries the data inside, as before. Returns nil when the data is there (and with
+   apply, points the game at it), else what is wrong for the error dialog. */
+static NSDictionary *json_read(NSString *path) {
+    NSData *raw = [NSData dataWithContentsOfFile:path];
+    id value = raw ? [NSJSONSerialization JSONObjectWithData:raw options:0 error:nil] : nil;
+    return [value isKindOfClass:NSDictionary.class] ? value : nil;
+}
+static NSString *game_data(NSString *root, BOOL apply) {
+    NSString *pointerPath = [root stringByAppendingPathComponent:@"game-data.json"];
+    if (![NSFileManager.defaultManager fileExistsAtPath:pointerPath]) return nil;   // self-contained app (--embed-data)
+    NSDictionary *pointer = json_read(pointerPath);
+    NSString *rebuild = [pointer[@"rebuild"] isKindOfClass:NSString.class] ? pointer[@"rebuild"]
+        : @"python3.14 build_app.py <game> -k <prod.keys> [--update <update>] -o <this app>";
+    if (!pointer || [pointer[@"format"] intValue] != 1)
+        return [NSString stringWithFormat:@"%@ is unreadable. Build the app again:\n\n%@", pointerPath, rebuild];
+    NSMutableDictionary<NSString *, NSString *> *dirs = [NSMutableDictionary dictionary];
+    for (NSString *part in @[@"romfs", @"shaders"]) {
+        NSDictionary *want = pointer[part];
+        NSString *dir = [want isKindOfClass:NSDictionary.class] && [want[@"path"] isKindOfClass:NSString.class] ? want[@"path"] : nil;
+        NSString *problem = nil;
+        if (!dir) problem = @"the app's game-data.json names no folder";
+        else {
+            NSDictionary *have = json_read([dir stringByAppendingPathComponent:@"store.json"]);
+            if (!have) problem = @"the folder is missing (deleted, or the app came from another Mac)";
+            else if (![have[@"id"] isEqual:want[@"id"]]) problem = @"the folder holds other data than this app was built with";
+            NSDictionary *sizes = [want[@"sizes"] isKindOfClass:NSDictionary.class] ? want[@"sizes"] : @{};
+            for (NSString *name in sizes) {
+                if (problem) break;
+                NSDictionary *a = [NSFileManager.defaultManager attributesOfItemAtPath:[dir stringByAppendingPathComponent:name] error:nil];
+                if (!a || a.fileSize != [sizes[name] unsignedLongLongValue])
+                    problem = [NSString stringWithFormat:@"%@ is missing or has another size", name];
+            }
+        }
+        if (problem)
+            return [NSString stringWithFormat:@"The game data this app uses is not there: %@.\n\n%@\n\nBuild the app again; it writes the data "
+                    @"there (in a minute or two when the build's work folder still has it):\n\n%@", problem, dir ?: pointerPath, rebuild];
+        dirs[part] = dir;
+    }
+    if (apply) {
+        setenv("TOTK_ROMFS", dirs[@"romfs"].fileSystemRepresentation, 1);
+        setenv("TOTK_ROMFS_PROOF_DIR", dirs[@"romfs"].fileSystemRepresentation, 1);   // the verification record goes with the image
+        setenv("TOTK_SHADER_SEED_DIR", [dirs[@"shaders"] stringByAppendingPathComponent:@"shader-seed"].fileSystemRepresentation, 1);
+        setenv("TOTK_SHADER_LIBS", [dirs[@"shaders"] stringByAppendingPathComponent:@"shader-libs"].fileSystemRepresentation, 1);
+    }
+    return nil;
+}
+
 static BOOL make_dir(NSString *path) {
     return [NSFileManager.defaultManager createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
 }
@@ -101,16 +156,20 @@ int main(int argc, char **argv) {
             int ok = access(binary.fileSystemRepresentation, X_OK) == 0;
             NSString *declared = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
             ok = ok && [declared isEqualToString:@TOTK_GAME_VERSION];
-            printf("%s: game version %s\n", ok ? "ok" : "missing binary or version mismatch", TOTK_GAME_VERSION);
-            return ok ? 0 : 1;
+            NSString *data = ok ? game_data(root, NO) : nil;
+            printf("%s: game version %s\n", !ok ? "missing binary or version mismatch" : data ? data.UTF8String : "ok", TOTK_GAME_VERSION);
+            return ok && !data ? 0 : 1;
         }
         if (access(binary.fileSystemRepresentation, X_OK) != 0) {
             show_error(@"The game files are missing from this app. Build it again with build_app.py.");
             return 1;
         }
+        NSString *missing = game_data(root, NO);
+        if (missing) { show_error(missing); return 1; }
         NSString *home = NSHomeDirectory();
         NSString *data = [home stringByAppendingPathComponent:@"Library/Application Support/MacNativeGames/TOTK"];
         NSString *logs = [home stringByAppendingPathComponent:@"Library/Logs/MacNativeGames"];
+        { const char *v = getenv("TOTK_LOG_DIR"); if (v && *v) logs = @(v); }   // a test's own log folder
         /* Folders the environment already names are kept (open --env TOTK_PROFILE_DIR=... runs a test on a save copy,
            TOTK_GAME_SLOT_DIR shares one game slot with another build of the game: one game at a time on the Mac). */
         NSString *(^env_or)(const char *, NSString *) = ^NSString *(const char *name, NSString *fallback) {
@@ -169,6 +228,7 @@ int main(int argc, char **argv) {
         setenv("TOTK_SHADER_CACHE", cache.fileSystemRepresentation, 1);
         setenv("TOTK_GAME_SLOT_DIR", slot.fileSystemRepresentation, 1);
         setenv("TOTK_ROMFS_PROOF_DIR", data.fileSystemRepresentation, 1);   // the app bundle stays read-only
+        game_data(root, YES);   // the game data outside the app: its folders (and the RomFS record next to the image)
         setenv("TOTK_SHARED_FONTS", "extracted/firmware/shared-fonts", 1);
         /* Player mods (runtime/mods.h): one folder per mod in <data>/mods, mods.txt for the order; a TOTK_MODS_DIR already
            set wins (a test's own folder). The older single folder <data>/mods/<version> with its manifest.tsv still loads. */

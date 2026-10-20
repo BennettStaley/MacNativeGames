@@ -4850,7 +4850,8 @@ static _Atomic uint64_t g_rt_prebuilt, g_rt_compiled;   // TOTK: translated vari
    whose path has another length (measured: a full 4.5-minute warm-up again); these files move with the app. */
 static NSString *shader_lib_prebuilt_path(NSData *src) {
     if (getenv("TOTK_FAST_MATH") && atoi(getenv("TOTK_FAST_MATH"))) return nil;   // built with safe math (totk_precise_opts)
-    static NSString *dir; static dispatch_once_t once; dispatch_once(&once, ^{ dir = exe_rel("shader-libs"); });
+    static NSString *dir; static dispatch_once_t once; dispatch_once(&once, ^{   // TOTK_SHADER_LIBS: the app's game-data store (launcher.m)
+        const char *libs = getenv("TOTK_SHADER_LIBS"); dir = libs && *libs ? @(libs) : exe_rel("shader-libs"); });
     unsigned char md[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(src.bytes, (CC_LONG)src.length, md);
     char hex[2 * sizeof md + 1]; for (size_t i = 0; i < sizeof md; i++) snprintf(hex + 2 * i, 3, "%02x", md[i]);
     NSString *path = [NSString stringWithFormat:@"%@/%s.metallib", dir, hex];
@@ -6582,7 +6583,13 @@ static void warm_start(void) {
         // The selected version's prepared shaders (real MSL, also on a fresh install) come last: they are shader libraries
         // only, while the lists above also build the pipelines the first scenes need.
         const char *seedMode = getenv("TOTK_SHADER_SEED");
-        NSString *prepared = [dir stringByAppendingPathComponent:@"shader-seed/pso_manifest.tsv"];
+#if TARGET_OS_IPHONE
+        const char *seedDir = NULL;   // iOS: the seed folder is the shader map's own (DM_NVN_SHMAP), listed above
+#else
+        const char *seedDir = getenv("TOTK_SHADER_SEED_DIR");   // the Mac app's game-data store (launcher.m), else next to the binary
+#endif
+        NSString *prepared = seedDir && *seedDir ? [@(seedDir) stringByAppendingPathComponent:@"pso_manifest.tsv"]
+                                                 : [dir stringByAppendingPathComponent:@"shader-seed/pso_manifest.tsv"];
         if (!(seedMode && !strcmp(seedMode, "off")) && [fm fileExistsAtPath:prepared]) [all addObject:prepared];
         paths = all;
         NSMutableString *desc = [NSMutableString string];
