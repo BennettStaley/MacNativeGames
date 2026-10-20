@@ -172,3 +172,8 @@ int main(void){
  feedback_checks();
  puts("{\"status\":\"pass\",\"scope\":\"input service state ABI, rumble and six-axis hid answers (on by default, off with =0 and in agent test sessions, left/right handles, batches, mute flags, newest-first states, orientation in the controller frame, gravity pull, axis remap), short tap latch, keyboard axes, four D-pad directions, focus clear of keyboard and controller, key 1 overlays / key 2 frame interpolation / key 3 picture mode / key 4 ultrawide (once per press), unattached controller, handheld mode controller; no game control flow\"}");
 }
+
+/* Test-command targets input.c calls (game_patches*.c, frontend.m), not linked into this probe. */
+void runtime_fov_set(int percent) { (void)percent; }
+int runtime_render_request(unsigned w, unsigned h) { (void)w; (void)h; return -1; }
+void runtime_front_settings_shot(const char *path) { (void)path; }
