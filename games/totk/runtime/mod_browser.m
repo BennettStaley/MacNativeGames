@@ -878,7 +878,7 @@ NSArray<NSString *> *mod_browser_install_archive(NSString *archive, NSString *mo
             [made addObject:name];
         }
         if (roots.count > 1)
-            [notes addObject:[NSString stringWithFormat:@"The archive holds %lu versions: all are installed, only “%@” is on. Switch in Installed.",
+            [notes addObject:[NSString stringWithFormat:@"The archive holds %lu variants: all are installed, only “%@” is on. Switch in Installed.",
                               (unsigned long)roots.count, made[0]]];
         if (code) [notes addObject:@"Code patches (exefs) aren't applied yet — coming in a later update"];
         if (tkcl.count) [notes addObject:@"TKMM .tkcl packages aren't supported yet — coming later"];

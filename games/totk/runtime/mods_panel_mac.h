@@ -69,23 +69,19 @@ static NSString *mods_when(NSDate *d) {
     return [f localizedStringForDate:d relativeToDate:NSDate.date];
 }
 
-/* The lines the menu shows under an installed mod: one per flag (mods_notice), the version line with the version named. */
+/* The lines the menu shows under an installed mod. Code, TKCL, conflicts and other versions in the words the player was
+   promised (later updates); the rest from mods_notice. */
 static NSArray<NSString *> *mods_notices(const ModInfo *m) {
     static const unsigned order[] = {MOD_HAS_CODE, MOD_TKCL, MOD_CONFLICT, MOD_OLD_VERSION, MOD_OWN_RSTB, MOD_EMPTY};
     NSMutableArray *out = [NSMutableArray array];
     for (size_t i = 0; i < sizeof order / sizeof *order; i++) {
         unsigned f = order[i]; if (!(m->flags & f)) continue;
-        const char *s = mods_notice(f); NSString *line = s && *s ? @(s) : nil;
-        if (f == MOD_OLD_VERSION && m->game_versions[0]) line = [NSString stringWithFormat:@"Made for %s: may not work on 1.4.3", m->game_versions];
-        if (f == MOD_CONFLICT) {
-            line = line ?: MODS_CONFLICT_TEXT;
-            if (m->conflicts) line = [line stringByAppendingFormat:@" (%u file%s)", m->conflicts, m->conflicts == 1 ? "" : "s"];
-        }
-        if (!line) line = f == MOD_HAS_CODE ? @"Code patches (exefs) aren't applied yet — coming in a later update" :
-                          f == MOD_TKCL ? @"TKMM .tkcl packages aren't supported yet — coming later" :
-                          f == MOD_OLD_VERSION ? @"Made for another game version: may not work on 1.4.3" :
-                          f == MOD_EMPTY ? @"Nothing the game can load in this folder" : @"Its own ResourceSizeTable is left out";
-        [out addObject:line];
+        const char *s = mods_notice(f); NSString *line = s && *s ? @(s) : @"";
+        if (f == MOD_HAS_CODE) line = @"Code patches (exefs) aren't applied yet — coming in a later update";
+        if (f == MOD_TKCL) line = @"TKMM .tkcl packages aren't supported yet — coming later";
+        if (f == MOD_CONFLICT) line = m->conflicts ? [MODS_CONFLICT_TEXT stringByAppendingFormat:@" (%u file%s)", m->conflicts, m->conflicts == 1 ? "" : "s"] : MODS_CONFLICT_TEXT;
+        if (f == MOD_OLD_VERSION) line = [NSString stringWithFormat:@"Made for %s: may not work on 1.4.3", m->game_versions[0] ? m->game_versions : "an older game version"];
+        if (line.length) [out addObject:line];
     }
     return out;
 }
@@ -210,7 +206,7 @@ static NSArray<NSString *> *mods_notices(const ModInfo *m) {
         if (strcmp(m.folder, m.name)) [meta addObject:[NSString stringWithFormat:@"folder “%s”", m.folder]];
         NSStackView *text = mods_stack(@[name, mods_label([meta componentsJoinedByString:@" · "], 11, NSFontWeightRegular, NSColor.secondaryLabelColor, 0)], YES, 2);
         for (NSString *line in mods_notices(&m)) {
-            BOOL info = [line hasPrefix:@"Its own"];
+            BOOL info = [line containsString:@"ResourceSizeTable"];
             [text addArrangedSubview:mods_label([@"⚠︎ " stringByAppendingString:line], 11, NSFontWeightRegular,
                                                 info ? NSColor.secondaryLabelColor : NSColor.systemOrangeColor, width - 200)];
         }
