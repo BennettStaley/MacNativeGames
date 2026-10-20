@@ -98,6 +98,8 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"graphics.bloom", "Graphics", "Bloom", "The glow around bright light, against the game's own (version 1.4.3).",
      NULL, SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 0, 100, 10, "%", NULL, 0, NULL, NULL, 0},
+    {"graphics.lens_flare", "Graphics", "Lens flare", "The game's rings and glints across the picture when the sun is in view (version 1.4.3).",
+     NULL, SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"graphics.render_distance", "Graphics", "Render distance", "How far the camera draws before distant land is cut off, against the game's own 25 km (version 1.4.3). It does not change the detail of distant land.",
      "TOTK_RENDER_DISTANCE", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 50, 300, 25, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.lod_bias", "Graphics", "Texture detail bias", "Below 0 picks sharper texture levels, in hundredths of a level; too low shimmers.",

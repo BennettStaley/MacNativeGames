@@ -25,6 +25,12 @@
      bright pass 79b89ff1, blurred downsamples and the upsamples 327ae8bb) to the scene; below 100 that texture is
      multiplied in place first, every level, by a blend-only pass of ours (pp_zero, zero + target * strength). The chain
      rewrites it every frame.
+   - "lens_flare" (Lens flare): 0 leaves out the game's lens flare. With the sun in view (and only then) the game first
+     adds 25 points into a 1x1 target (4c207255 / 85305c25: how much of the sun is visible), then draws about 11 sprites
+     additively (src alpha, one) into the scene at the render size, after the bloom chain and before the tone map
+     0ac9a549: d9793c43 / 675a28d1, 1509a8d8 / 452f4360 and 9e8525f6 / 452f4360 (the rings and ghosts), 1509a8d8 /
+     30bf73e3 (the glint). Those draws are not encoded; the visibility count and the exposure dispatches in the same pass
+     are kept. Found 2026-10-20 with the draw log: looking at the sun on Great Sky Island against looking away.
    dm_gfx_set_flag only records a request (any thread); pp_latch takes it at the game's present on the replay thread, so
    a frame is drawn with one setting throughout. */
 #include "totk_post_msl.h"
@@ -42,7 +48,7 @@ static struct {
     int ui_done, fxaa_seen; MTLClearColor cc;   // cc: a clear the game had pending for the FXAA target (pp_pass clear 2)
     uint64_t aa_n, aa_kept[6], cas_n, canvas_aa_n, frames, last_aa_n;
     id<MTLRenderPipelineState> scale_ps[4]; MTLPixelFormat scale_pf[4];   // pp_zero with the multiplying blend (bloom strength)
-    uint64_t hud_n, dof_n, bloom_n, bloom_kept;
+    uint64_t hud_n, dof_n, bloom_n, bloom_kept, flare_n;
 } g_postfx;
 
 static int pp_flag(const char *name, int v) {
@@ -59,8 +65,8 @@ static int pp_flag(const char *name, int v) {
         if (v != 0 && v != 2 && v != 4 && v != 8 && v != 16) { MLOG("[flag] aniso requires 0, 2, 4, 8 or 16"); return 1; }
         atomic_store(&g_pp_req_aniso, v); MLOG("[flag] aniso = %d (samplers rebuilt at the next frame)", v); return 1;
     }
-    if (!strcmp(name, "hide_hud") || !strcmp(name, "dof")) {
-        _Atomic int *r = name[0] == 'h' ? &g_fx_req_hud : &g_fx_req_dof;
+    if (!strcmp(name, "hide_hud") || !strcmp(name, "dof") || !strcmp(name, "lens_flare")) {
+        _Atomic int *r = name[0] == 'h' ? &g_fx_req_hud : name[0] == 'd' ? &g_fx_req_dof : &g_fx_req_flare;
         atomic_store(r, v < 0 ? !atomic_load(r) : v != 0); MLOG("[flag] %s = %d (from the next frame)", name, atomic_load(r)); return 1;
     }
     if (!strcmp(name, "bloom")) {
@@ -99,12 +105,13 @@ static void pp_latch(void) {
     if (aa != g_pp_aa) g_postfx.last_aa_n = g_postfx.aa_n, g_postfx.frames = 0;
     g_pp_aa = aa; g_pp_sharpen = sh;
     {
-        int hud = atomic_load(&g_fx_req_hud), dof = atomic_load(&g_fx_req_dof), bloom = atomic_load(&g_fx_req_bloom);
-        if (hud != g_fx_hud || dof != g_fx_dof || bloom != g_fx_bloom)
-            MLOG("[pp] HUD %s, depth of field %s, bloom %d%% from frame %llu (so far: UI draws left out %llu, depth of field composites %llu, bloom scaled %llu / kept %llu)",
-                 hud ? "hidden" : "shown", dof ? "on" : "off", bloom, (unsigned long long)atomic_load(&g_cur_frame) + 1,
-                 (unsigned long long)g_postfx.hud_n, (unsigned long long)g_postfx.dof_n, (unsigned long long)g_postfx.bloom_n, (unsigned long long)g_postfx.bloom_kept);
-        g_fx_hud = hud; g_fx_dof = dof; g_fx_bloom = bloom;
+        int hud = atomic_load(&g_fx_req_hud), dof = atomic_load(&g_fx_req_dof), bloom = atomic_load(&g_fx_req_bloom), flare = atomic_load(&g_fx_req_flare);
+        if (hud != g_fx_hud || dof != g_fx_dof || bloom != g_fx_bloom || flare != g_fx_flare)
+            MLOG("[pp] HUD %s, depth of field %s, bloom %d%%, lens flare %s from frame %llu (so far: UI draws left out %llu, depth of field composites %llu, bloom scaled %llu / kept %llu, lens flare draws %llu)",
+                 hud ? "hidden" : "shown", dof ? "on" : "off", bloom, flare ? "on" : "off", (unsigned long long)atomic_load(&g_cur_frame) + 1,
+                 (unsigned long long)g_postfx.hud_n, (unsigned long long)g_postfx.dof_n, (unsigned long long)g_postfx.bloom_n,
+                 (unsigned long long)g_postfx.bloom_kept, (unsigned long long)g_postfx.flare_n);
+        g_fx_hud = hud; g_fx_dof = dof; g_fx_bloom = bloom; g_fx_flare = flare;
     }
     if (an != atomic_load(&g_pp_aniso) || lb != atomic_load(&g_pp_lodb)) {
         int n = 0;
@@ -322,7 +329,14 @@ static void fx_bloom_scale(void) {
 /* 1.4.3 (other versions: these keys have to be found again). */
 static int fx_is_dof(const char *key) { return !strncmp(key, "18b730fad0eec4ba", 16); }
 static int fx_is_tonemap(const char *key) { return !strncmp(key, "0ac9a54938974396", 16); }
-/* Before the draw opens its pass: 1 = leave this draw out (depth of field off); a UI draw with the HUD hidden is masked;
+/* The lens flare's sprites, by vertex and fragment shader together (452f4360 alone might be a shared sprite shader). */
+static int fx_is_flare(const char *vs, const char *fs) {
+    static const char *const k[][2] = {{"d9793c43f9f3f91b", "675a28d16bbd6513"}, {"1509a8d88b9b1c47", "452f436094c74162"},
+                                       {"9e8525f6255f4193", "452f436094c74162"}, {"1509a8d88b9b1c47", "30bf73e31acb5890"}};
+    for (unsigned i = 0; i < sizeof k / sizeof *k; i++) if (!strncmp(vs, k[i][0], 16) && !strncmp(fs, k[i][1], 16)) return 1;
+    return 0;
+}
+/* Before the draw opens its pass: 1 = leave this draw out (depth of field or lens flare off); a UI draw with the HUD hidden is masked;
    the tone map with a bloom strength below 100 scales the bloom first. */
 static int fx_draw(__unsafe_unretained NvProg *pr) {
     if (!pr || g_defer_replaying) return 0;
@@ -337,6 +351,7 @@ static int fx_draw(__unsafe_unretained NvProg *pr) {
     }
     if (!fs) return 0;
     if (!g_fx_dof && fx_is_dof(fs->key)) { g_postfx.dof_n++; return 1; }
+    if (!g_fx_flare && vs && fx_is_flare(vs->key, fs->key)) { g_postfx.flare_n++; return 1; }
     if (g_fx_bloom < 100 && fx_is_tonemap(fs->key)) fx_bloom_scale();
     return 0;
 }

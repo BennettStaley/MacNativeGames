@@ -120,6 +120,7 @@ static int apply_live(const SettingDef *d, int v) {
     else if (!strcmp(d->key, "interface.hide_hud")) dm_gfx_set_flag("hide_hud", v);
     else if (!strcmp(d->key, "graphics.dof")) dm_gfx_set_flag("dof", v);
     else if (!strcmp(d->key, "graphics.bloom")) dm_gfx_set_flag("bloom", v);
+    else if (!strcmp(d->key, "graphics.lens_flare")) dm_gfx_set_flag("lens_flare", v);
     else if (!strcmp(d->key, "controls.camera_speed_x")) runtime_camera_speed_set(0, v);
     else if (!strcmp(d->key, "controls.camera_speed_y")) runtime_camera_speed_set(1, v);
     else if (!strcmp(d->key, "audio.volume")) audio_master_volume_set(v);
