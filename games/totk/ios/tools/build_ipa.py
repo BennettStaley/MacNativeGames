@@ -55,6 +55,9 @@ def main():
     if a.version=='v143': project=project.replace('          - loader.c','          - loader.c\n          - game_patches.c')
     else: project=project.replace('          - loader.c','          - loader.c\n          - game_patches_v143.c')
     if a.version!='v0': project=project.replace('-I../build\n','-I../build -DTOTK_GAME_'+a.version.upper()+'=1\n')
+    # The game version as the app's version, as on the Mac: save_sync.py reads it from the device (devicectl info apps).
+    game_version={'v0':'1.0.0','v112':'1.1.2','v121':'1.2.1','v143':'1.4.3'}[a.version]
+    project=project.replace('CFBundleShortVersionString: "1.0"',f'CFBundleShortVersionString: "{game_version}"')
     (ios/'project.generated.yml').write_text(project)
     # Build device dependencies separately: Homebrew's Mac archives cannot be linked into an iOS application.
     deps=tree/'build/ios-deps'

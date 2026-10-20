@@ -3,10 +3,14 @@
    the profile directory. Application save data is created on first start, as the system launcher does
    for titles that declare save data. Writes reach the host file immediately; Commit flushes them.
    Because of that, quitting in the middle of a save (the game writes several files, then commits) would leave a slot half
-   written: runtime_fs_save_busy tells the window close to wait until the save is done (runtime/frontend.m). */
+   written: runtime_fs_save_busy tells the window close to wait until the save is done (runtime/frontend.m).
+   Tools outside the game see the same state on disk (ios/tools/save_sync.py, docs/save-sync.md): <profile>/save/.busy exists
+   from the first change of a save until its commit (a crash leaves it behind: the next start removes it, the tool ignores
+   one older than 10 minutes), and <profile>/save/.version names the game version that committed the save last. */
 #include "autoload.h"
 #include "runtime.h"
 #include "fs_host.h"
+#include "game_version.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -41,16 +45,29 @@ static Mount mounts[16];
 static File files[NFILES];
 static Dir dirs[NDIRS];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static char profile[1024], save_root[1024];
+static char profile[1024], save_root[1024], busy_path[1100], version_path[1100];
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 
 static void need(int c, const char *m) { if (!c) runtime_fail(m); }
 
 /* Save in progress: a save-data file open for writing, or save data changed in the last 3 s and not committed yet (TOTK
    writes a slot's files back to back and then commits; between the files nothing is open for a moment). */
-static _Atomic int save_writers, save_dirty;
+static _Atomic int save_writers, save_dirty, busy_marked;
 static _Atomic uint64_t save_changed_ns;
-static void save_touched(void) { atomic_store(&save_changed_ns, runtime_now_ns()); atomic_store(&save_dirty, 1); }
+static void small_file(const char *path, const char *text) {   /* best effort: a missing marker only makes a sync tool less careful */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return;
+    if (write(fd, text, strlen(text)) < 0) fprintf(stderr, "[totk] cannot write %s\n", path);
+    close(fd);
+}
+static void save_touched(void) {
+    atomic_store(&save_changed_ns, runtime_now_ns()); atomic_store(&save_dirty, 1);
+    if (!atomic_exchange(&busy_marked, 1)) { char line[64]; snprintf(line, sizeof line, "%d %s\n", (int)getpid(), TOTK_GAME_VERSION); small_file(busy_path, line); }
+}
+static void save_committed(void) {
+    small_file(version_path, TOTK_GAME_VERSION "\n");
+    unlink(busy_path); atomic_store(&busy_marked, 0); atomic_store(&save_dirty, 0);
+}
 int runtime_fs_save_busy(void) {
     if (atomic_load(&save_writers) > 0) return 1;
     return atomic_load(&save_dirty) && runtime_now_ns() - atomic_load(&save_changed_ns) < 3000000000ull;
@@ -73,6 +90,8 @@ static void init(void) {
     uint64_t uid[2]; runtime_account_uid(uid);
     char p[1100]; make_dir(profile);
     snprintf(p, sizeof p, "%s/save", profile); make_dir(p);
+    snprintf(busy_path, sizeof busy_path, "%s/.busy", p); snprintf(version_path, sizeof version_path, "%s/.version", p);
+    unlink(busy_path);                                     /* left behind by a run that ended in the middle of a save */
     need(snprintf(save_root, sizeof save_root, "%s/save/%016llx%016llx", profile, (unsigned long long)uid[1], (unsigned long long)uid[0]) < (int)sizeof save_root, "save path");
     make_dir(save_root);                                   /* launcher-style EnsureSaveData */
     snprintf(p, sizeof p, "%s/temp", profile); remove_tree(p); make_dir(p);
@@ -180,7 +199,7 @@ static unsigned commit(const char *name) {
     pthread_mutex_unlock(&lock);
     if (!found) return R_PATH_NOT_FOUND;
     for (int i = 0; i < NFILES; i++) { pthread_mutex_lock(&lock); int fd = files[i].fd; pthread_mutex_unlock(&lock); if (fd > 0) fcntl(fd, F_FULLFSYNC); }
-    if (save && !(getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 23)) atomic_store(&save_dirty, 0);   /* 23: probe-save's negative control */
+    if (save && !(getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 23)) save_committed();   /* 23: probe-save's negative control */
     return 0;
 }
 
@@ -313,8 +332,14 @@ void runtime_save_probe(void) {
 #define CHECK(c, what) do { checks++; if (!(c)) { fprintf(stderr, "save probe: %s\n", what); runtime_fail("save probe failed"); } } while (0)
     CHECK(mount_save("save", uid) == 0 && mount_temp("temp") == 0, "mount save and temporary storage");
     CHECK(!runtime_fs_save_busy(), "idle at start");
+    struct stat st; char version[32] = {0}; FILE *vf;
+    CHECK(stat(busy_path, &st) != 0, "no .busy marker at start");
     CHECK(create_file("save:/a.sav", 16) == 0 && runtime_fs_save_busy(), "creating a save file starts a save");
+    CHECK(stat(busy_path, &st) == 0, "a save in progress writes save/.busy");
     CHECK(commit("save") == 0 && !runtime_fs_save_busy(), "commit ends it");
+    CHECK(stat(busy_path, &st) != 0, "commit removes save/.busy");
+    CHECK((vf = fopen(version_path, "r")) && fgets(version, sizeof version, vf) && !strcmp(version, TOTK_GAME_VERSION "\n"), "commit writes save/.version");
+    if (vf) fclose(vf);
     CHECK(open_file(&h, "save:/a.sav", OPEN_WRITE) == 0 && runtime_fs_save_busy(), "a save file open for writing");
     static const char data[16] = "progress";
     CHECK(write_file(h, 0, data, sizeof data, NULL) == 0 && runtime_fs_save_busy(), "writing");
@@ -333,7 +358,7 @@ void runtime_save_probe(void) {
     CHECK(commit("save") == 0 && !runtime_fs_save_busy() && delete_file("save:/c.sav") == 0 && runtime_fs_save_busy() && commit("save") == 0, "delete and commit");
 #undef CHECK
     remove_tree(dir);
-    printf("{\"status\":\"pass\",\"probe\":\"probe-save\",\"checks\":%u,\"scope\":\"save-in-progress state (runtime_fs_save_busy) through open / write / close / create / rename / delete / commit on a save mount; reads and temporary storage do not count; stale uncommitted changes do not hold a close\"}\n", checks);
+    printf("{\"status\":\"pass\",\"probe\":\"probe-save\",\"checks\":%u,\"scope\":\"save-in-progress state (runtime_fs_save_busy) through open / write / close / create / rename / delete / commit on a save mount; reads and temporary storage do not count; stale uncommitted changes do not hold a close; save/.busy from change to commit, save/.version on commit\"}\n", checks);
 }
 
 void *runtime_fs_host_override(const char *name) {
