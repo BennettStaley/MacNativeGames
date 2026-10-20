@@ -377,6 +377,14 @@ $(RENDER_PROBE_DIR)/depth16-clear-probe: tests/depth16_clear/probe.m third_party
 probe-depth16-clear: $(RENDER_PROBE_DIR)/depth16-clear-probe
 	$(GAME_SLOT_RUN) "$(RENDER_PROBE_DIR)/depth16-clear-probe"
 
+# The picture-settings shaders (anti-aliasing, sharpening) on a synthetic picture; no game data.
+.PHONY: probe-post-aa
+$(RENDER_PROBE_DIR)/post-aa-probe: tests/post_aa/probe.m third_party/d2r_gfx/gfx/nvn/totk_post_msl.h third_party/d2r_gfx/gfx/nvn/smaa_tables.h
+	@mkdir -p "$(RENDER_PROBE_DIR)"
+	xcrun clang -std=c11 -O2 -Wall -Wextra -Werror -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn tests/post_aa/probe.m -framework Metal -framework Foundation -o "$@"
+probe-post-aa: $(RENDER_PROBE_DIR)/post-aa-probe
+	$(GAME_SLOT_RUN) "$(RENDER_PROBE_DIR)/post-aa-probe"
+
 # Independent, game-data-free DSP and production-mixer comparisons (from the original port, 2026-10-18). Keep vectors,
 # .NET build output and executables outside the source checkout. Needs a .NET SDK and a Ryujinx.Audio build.
 AUDIO_TEST_WORK ?= /tmp/totk-native-audio-effects
