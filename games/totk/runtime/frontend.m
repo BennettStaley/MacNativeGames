@@ -99,11 +99,12 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
  (void)link;(void)now;(void)output;(void)flags;(void)out;(void)ctx;
  pthread_mutex_lock(&vsyncLock);for(unsigned i=0;i<vsyncCount;i++)hle_signal_system_event(vsyncEvents[i]);pthread_mutex_unlock(&vsyncLock);return kCVReturnSuccess;
 }
+#include "settings_panel_mac.h"
 @interface TOTKInputView:NSView
 @end
 @implementation TOTKInputView
 -(BOOL)acceptsFirstResponder{return YES;}
--(void)keyDown:(NSEvent *)e{runtime_input_key(e.keyCode,1);}
+-(void)keyDown:(NSEvent *)e{if(e.keyCode==122&&!e.isARepeat){[TOTKSettingsPanel toggle];return;}runtime_input_key(e.keyCode,1);}   /* F1: settings */
 -(void)keyUp:(NSEvent *)e{runtime_input_key(e.keyCode,0);}
 -(void)flagsChanged:(NSEvent *)e{if(e.keyCode==56)runtime_input_key(56,!!(e.modifierFlags&NSEventModifierFlagShift));if(e.keyCode==58)runtime_input_key(58,!!(e.modifierFlags&NSEventModifierFlagOption));}
 @end
@@ -205,6 +206,9 @@ static void front_install_menu(void){
  NSMenuItem *appItem=[NSMenuItem new];appItem.submenu=appMenu;[menu addItem:appItem];
  NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("退出 Tears of the Kingdom","Quit Tears of the Kingdom")) action:@selector(performClose:) keyEquivalent:@"q"];
  quit.keyEquivalentModifierMask=NSEventModifierFlagCommand;quit.target=window;
+ NSMenuItem *prefs=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("设置…","Settings…")) action:@selector(toggle) keyEquivalent:@","];
+ prefs.keyEquivalentModifierMask=NSEventModifierFlagCommand;prefs.target=TOTKSettingsPanel.class;
+ [appMenu addItem:prefs];[appMenu addItem:NSMenuItem.separatorItem];
  [appMenu addItem:quit];NSApp.mainMenu=menu;
 }
 static void *guest_main(void *callback){@autoreleasepool{((void(*)(void))callback)();}return NULL;}

@@ -38,7 +38,7 @@ static const SettingChoice SET_INTERP[] = {{"Off", "off", "0", 0}, {"30 + 30", "
                                            {"Half the refresh rate", "half", "interp", 2}, {"Every frame", "max", "interpmax", 3}};
 static const SettingChoice SET_RES[] = {{"The game's own", "game", NULL, 0}, {"720p", "720", "1280x720", 720}, {"900p", "900", "1600x900", 900},
                                         {"1080p", "1080", "1920x1080", 1080}, {"1440p", "1440", "2560x1440", 1440}};
-static const SettingChoice SET_AA[] = {{"The game's FXAA", "game", "0", 0}, {"Off", "off", "1", 1}, {"FXAA", "fxaa", "2", 2}, {"SMAA", "smaa", "3", 3}};
+static const SettingChoice SET_AA[] = {{"The game's own", "game", "0", 0}, {"Off", "off", "1", 1}, {"FXAA", "fxaa", "2", 2}, {"SMAA", "smaa", "3", 3}};
 static const SettingChoice SET_ANISO[] = {{"The game's", "game", "0", 0}, {"2x", "2", "2", 2}, {"4x", "4", "4", 4}, {"8x", "8", "8", 8}, {"16x", "16", "16", 16}};
 static const SettingChoice SET_TOUCH[] = {{"Always", "always", NULL, 0}, {"Hide with a controller", "controller", NULL, 1},
                                           {"Until touched", "touch", NULL, 2}, {"Off", "off", NULL, 3}};
