@@ -392,7 +392,7 @@ void runtime_cheats_launch(Module *m) {
     main_rx = (m->text_end + 0xFFF) & ~0xFFFULL;   // the code and the padding after it, up to the next 4 KiB segment
     main_module = m;
     load_choices();
-    int applied = 0, at_launch = 0, nmasters = 0, seen = 0;
+    int applied = 0, at_launch = 0, mixed = 0, nmasters = 0, seen = 0;
     static const Cheat *masters[CHEAT_MAX];
     for (int k = 0; k < ncheat; k++) if (cheats[k].master && !cheats[k].error[0]) masters[nmasters++] = &cheats[k];
     for (int k = 0; k < ncheat; k++) {
@@ -405,10 +405,11 @@ void runtime_cheats_launch(Module *m) {
         int code = launch_code(k, masters, cheats[k].master ? seen++ : nmasters);   // a master code sees the ones before it
         if (code < 0) { atomic_fetch_or(&state[k], CHEAT_REFUSED); RuntimeCheatInfo info; runtime_cheats_info(k, &info); fprintf(stderr, "[totk] cheat \"%s\" refused: %s\n", cheats[k].name, info.problem); continue; }
         at_launch += code;
+        mixed += code && runs[k];
         applied += !!(atomic_load(&state[k]) & CHEAT_APPLIED);
     }
-    fprintf(stderr, "[totk] cheats: %d in %d file%s for build %s (%d patch code at launch, %d of them applied now)\n", nlisted, nsources,
-            nsources == 1 ? "" : "s", build_id, at_launch, applied);
+    fprintf(stderr, "[totk] cheats: %d in %d file%s for build %s (%d patch code at launch, %d of them applied now, %d of them also run on the cheat thread)\n",
+            nlisted, nsources, nsources == 1 ? "" : "s", build_id, at_launch, applied, mixed);
     pthread_t th;
     if (pthread_create(&th, NULL, cheat_thread, NULL) == 0) pthread_detach(th);
 }
