@@ -1,5 +1,60 @@
 # Save sync between the Mac and an iPhone / iPad
 
+Three ways, from the simplest:
+
+1. **By hand** with Finder or the Files app ([below](#by-hand-finder-and-the-files-app)).
+2. **AirDrop** (or Messages, Mail, a USB stick): *Send saves* in the game's settings makes one `.totksave` file; opening it
+   on the other device brings the saves in ([below](#airdrop-totksave-files)). No Xcode, no cable.
+3. **`save_sync.py`** over the Xcode connection, by hand or every 2 minutes ([below](#save_syncpy)).
+
+## By hand: Finder and the Files app
+
+The iOS app shares its Documents folder: on the iPhone / iPad it is *Files › On My iPhone › Tears of the Kingdom*; on a
+Mac with the device connected, Finder's sidebar › the device › *Files* tab › *Tears of the Kingdom* (drag folders in and
+out). The saves are in `save/save/<uid>/` there, and in `~/Library/Application Support/MacNativeGames/TOTK/profile/save/<uid>/`
+on the Mac.
+
+**The `<uid>` folder name differs per device**: each game makes its own account (`account.uid`, 16 random bytes) on its
+first start and only opens the folder of that account. Copy the *contents* of one device's `<uid>` folder (the `slot_*`
+folders, `album`, `storage`, `option.sav`) into the other device's own `<uid>` folder; never copy `account.uid`, and a
+folder with another device's name is ignored by the game. Do it with the game closed on the receiving side (on iOS, swipe
+the app away), keep a copy of what you replace, and only from a game version to the same or a newer one.
+
+## AirDrop: `.totksave` files
+
+**Send.** Save in the game first (a manual save, or let it autosave): the newest saves on disk are what is sent, every
+slot at once.
+- Mac: Settings (⌘,) › *Interface* › *Send saves* › *Send…*: the share menu, AirDrop first (Messages, Mail and the rest
+  follow). Return or A on that row does the same.
+- iPhone / iPad: Settings › *Saves* › *Send Saves…*: the share sheet (AirDrop at the top).
+
+The package is refused while the game is writing a save (`save/.busy`, see below): try again a moment later.
+
+**Receive.**
+- Mac: AirDrop puts the file in Downloads. Quit the game, then double-click the file: the app opens, checks it, shows where
+  it comes from and its slots, and on *Replace Saves and Play* puts them in place and starts the game. If the game is
+  already running it says to quit first (a running game would save over them).
+- iPhone / iPad: accept the AirDrop (or tap the file in Files or Messages) and choose Tears of the Kingdom. The app checks
+  it, asks, and puts the saves in place while the game writes no save. The game runs in the same app and still has the old
+  save in memory, so close it (*Close the Game*, or swipe it away) and open it again, then load a save from the title
+  screen; until then do not save in the game, or it saves its old state over a slot.
+
+**What is checked** (runtime/save_package.h has the details): the file is a `.totksave` zip with `manifest.json`
+(format 1, title 0100F2C0115B6000); the game version that sent it is exactly this app's (a 1.4.3 save goes only to a
+1.4.3 app, else it is refused with both versions named); the zip holds exactly the files the manifest lists, each with
+its size and SHA-256 (a changed, missing or extra file refuses it); no path leaves the save folder. The package carries
+only the save folder (`slot_*`, `album`, `storage`, `option.sav`): no `account.uid`, cache, temp or shader lists. Its
+files go into *this* device's own `<uid>` folder (a device that never started the game gets an account made first).
+
+**Backups.** Before anything is replaced the current save folder is copied to `save-backups/<time>-before-import`: on the
+Mac `~/Library/Application Support/MacNativeGames/TOTK/save-backups/`, on iOS *Files › Tears of the Kingdom ›
+save-backups* (the Saves page shows the last one). The newest 10 are kept. The new folder is complete before the old one
+moves aside, and what was written is checked against the manifest. To go back: close the game, then copy a backup's
+contents over the `<uid>` folder (Finder on the Mac; on iOS through the Files app or Finder's Files tab, as in
+[By hand](#by-hand-finder-and-the-files-app)).
+
+## save_sync.py
+
 `games/totk/ios/tools/save_sync.py` copies the game's saves between the Mac app and the iOS app over the same connection
 Xcode uses (`xcrun devicectl`, cable or the same Wi-Fi). It needs the Mac that built (or at least can see) the iOS app,
 with Xcode installed.
