@@ -56,9 +56,12 @@ static void extra(char *err, size_t errn) {
     for (int i = 0; i < 100; i++) { memcpy(text + at, "\xC3\xA9", 2); at += 2; }   // 100 x e-acute (200 bytes)
     memcpy(text + at, "]\n", 3);
     n = cheat_parse(text, p, 8, warn, sizeof warn);
-    CHECK(n == 4 && strcmp(p[0].name, p[1].name) && strcmp(p[1].name, p[2].name) && strcmp(p[0].name, p[2].name), "duplicate names made unique (%s | %s | %s)", p[0].name, p[1].name, p[2].name);
+    char k0[CHEAT_NAME + 16], k1[CHEAT_NAME + 16], k2[CHEAT_NAME + 16];
+    cheat_choice_name(&p[0], k0, sizeof k0); cheat_choice_name(&p[1], k1, sizeof k1); cheat_choice_name(&p[2], k2, sizeof k2);
+    CHECK(n == 4 && !strcmp(p[0].name, p[1].name) && strcmp(k0, k1) && strcmp(k1, k2) && strcmp(k0, k2) && !strcmp(k0, "Same"),
+          "repeated names kept, choice keys distinct (%s | %s | %s)", k0, k1, k2);
     size_t ln = strlen(p[3].name);
-    CHECK(ln < CHEAT_NAME && ln % 2 == 0 && ln > 90, "long name cut at a UTF-8 boundary (%zu bytes)", ln);
+    CHECK(ln < CHEAT_NAME && ln % 2 == 0 && ln > 120, "long name cut at a UTF-8 boundary (%zu bytes)", ln);
     /* Too many sections: the rest are ignored with a warning, not a failure. */
     n = cheat_parse("[a]\n[b]\n[c]\n", p, 2, warn, sizeof warn);
     CHECK(n == 2 && strstr(warn, "ignored"), "sections past the limit: %d (%s)", n, warn);

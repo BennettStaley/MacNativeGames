@@ -18,7 +18,7 @@ static int is_comment(const char *p, const char *end) { return *p == '#' || (*p 
 static void set_name(Cheat *c, const char *p, const char *end) {
     while (p < end && isspace((unsigned char)*p)) p++;
     while (end > p && isspace((unsigned char)end[-1])) end--;
-    size_t len = (size_t)(end - p), room = sizeof c->name - 8;   // room for a " (123)" suffix
+    size_t len = (size_t)(end - p), room = sizeof c->name - 1;
     if (len > room) {   // cut at a UTF-8 character boundary
         len = room;
         while (len && ((unsigned char)p[len] & 0xC0) == 0x80) len--;
@@ -27,9 +27,8 @@ static void set_name(Cheat *c, const char *p, const char *end) {
     c->name[len] = 0;
     if (!len) snprintf(c->name, sizeof c->name, "(unnamed)");
 }
-static int name_taken(const Cheat *out, int count, int self, const char *name) {
-    for (int j = 0; j < count; j++) if (j != self && !strcmp(out[j].name, name)) return 1;
-    return 0;
+void cheat_choice_name(const Cheat *c, char *out, size_t n) {
+    if (c->dup) snprintf(out, n, "%s (#%u)", c->name, c->dup + 1); else snprintf(out, n, "%s", c->name);
 }
 
 int cheat_parse(const char *s, Cheat *out, int max, char *warn, size_t warnn) {
@@ -81,14 +80,7 @@ int cheat_parse(const char *s, Cheat *out, int max, char *warn, size_t warnn) {
         }
     }
     for (int k = 0; k < count; k++) {
-        if (name_taken(out, k, -1, out[k].name)) {   // an earlier section has this name: number this one
-            char base[CHEAT_NAME];
-            snprintf(base, sizeof base, "%s", out[k].name);
-            for (unsigned d = 2; d < 1000; d++) {
-                snprintf(out[k].name, sizeof out[k].name, "%s (%u)", base, d);
-                if (!name_taken(out, count, k, out[k].name)) break;
-            }
-        }
+        for (int j = 0; j < k; j++) if (!strcmp(out[j].name, out[k].name)) out[k].dup++;
         if (!out[k].error[0] && out[k].n) {
             char err[CHEAT_ERR];
             if (!cheat_check(out[k].w, out[k].n, err, sizeof err)) snprintf(out[k].error, sizeof out[k].error, "%s", err);

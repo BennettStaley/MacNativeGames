@@ -9,6 +9,9 @@
      <Mod>/romfs/...      RomFS files at their game paths, as Yuzu / Ryujinx / Atmosphère mods ship them. A folder
                           whose top level already is RomFS paths (Pack/, Model/, UI/, ...) counts as romfs/ itself.
      <Mod>/exefs/...      code patches (pchtxt, ips, subsdk): detected and reported, not applied yet.
+     <Mod>/cheats/<BID>.txt   Atmosphère cheat files named by the main module's build ID (the Yuzu / Ryujinx layout; also
+                          found deeper, as in atmosphere/contents/<title>/cheats): on the Mac, runtime/cheats.c lists the
+                          running build's file from each mod that is on, in load order (Settings › Cheats).
      <Mod>/mod.json       optional: what the browser knows (name, author, version, source ids, game versions it names).
    Every file a mod ships is checked against the game's RomFS at start (replaces a file, or adds one); a mod's own
    ResourceSizeTable is left out and the runtime fixes the 1.4.3 table for the files mods change instead. A mod's file
@@ -27,6 +30,7 @@ enum {   /* ModInfo.flags: what the menu shows next to a mod */
     MOD_TKCL = 32,               /* a TKMM .tkcl package: not supported yet */
     MOD_EMPTY = 64,              /* nothing the game can load */
     MOD_PROMPTS = 128,           /* button icons (Xbox / PlayStation): switched by the Controls › Button prompts setting */
+    MOD_HAS_CHEATS = 256,        /* a cheats/ folder (Atmosphère cheat files, <build ID>.txt): the Mac's Cheats tab lists them */
 };
 
 typedef struct {
@@ -52,6 +56,9 @@ int mods_remove(const char *folder);             /* deletes the folder */
 int mods_save(void);                             /* writes mods.txt; 0 on success */
 int mods_changed_since_start(void);              /* 1: the list differs from what the game loaded (restart to apply) */
 const char *mods_notice(unsigned flags);         /* one line for a flag, for the menu */
+/* Mod i's cheat file for this build ID (<its cheats folder>/<build_id>.txt, any case) into out; 1 if there is one.
+   Whether the mod is on is the caller's question (mods_get). */
+int mods_cheat_file(int i, const char *build_id, char *out, size_t cap);
 /* Button prompts (settings: controls.prompts): a mod that changes the game's button-icon archive
    (UI/LayoutArchive/Common.Product.*.blarc.zs) and whose mod.json "prompts" or name says Xbox or PlayStation is a
    prompts mod. mods_set_prompts picks the style before mods_scan: the first prompts mod of that style in the list is on,

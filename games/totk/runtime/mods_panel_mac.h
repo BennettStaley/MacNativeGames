@@ -72,7 +72,7 @@ static NSString *mods_when(NSDate *d) {
 /* The lines the menu shows under an installed mod. Code, TKCL, conflicts and other versions in the words the player was
    promised (later updates); the rest from mods_notice. */
 static NSArray<NSString *> *mods_notices(const ModInfo *m) {
-    static const unsigned order[] = {MOD_HAS_CODE, MOD_TKCL, MOD_CONFLICT, MOD_OLD_VERSION, MOD_OWN_RSTB, MOD_EMPTY};
+    static const unsigned order[] = {MOD_HAS_CODE, MOD_TKCL, MOD_CONFLICT, MOD_OLD_VERSION, MOD_OWN_RSTB, MOD_EMPTY, MOD_HAS_CHEATS};
     NSMutableArray *out = [NSMutableArray array];
     for (size_t i = 0; i < sizeof order / sizeof *order; i++) {
         unsigned f = order[i]; if (!(m->flags & f)) continue;

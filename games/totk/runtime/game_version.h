@@ -22,6 +22,7 @@
 #define GAME_ADDR_0x453f648 0x2c7ef90 /* nn::swkbd::ShowKeyboard: main's GOT slot */
 #elif defined(TOTK_GAME_V143)
 #define TOTK_GAME_VERSION "1.4.3"
+#define GAME_BUILD_ID "277178B7DBA1B6D4"   /* main's build ID (NSO header +0x40): the name of its Atmosphère cheat file */
 #define TOTK_GAME_DIR "v143"
 /* Survey only (world_survey.c): forceSetMatrix found through three 1.2.1 callers that match, the scene slot through its
    singleton getter (same 0x490-byte object); setTransform writes +0x2b4 / +0x2c0 as in 1.2.1. */
@@ -37,6 +38,7 @@
 #define GAME_ADDR_0x453f648 0x398b348
 #elif defined(TOTK_GAME_V112)
 #define TOTK_GAME_VERSION "1.1.2"
+#define GAME_BUILD_ID "9A10ED9435C06733"   /* from the cheat databases, not checked against the NSO */
 #define TOTK_GAME_DIR "v112"
 #define GAME_ACTOR_NAME 0x218
 #define GAME_ACTOR_POS 0x2b4
@@ -78,6 +80,7 @@
 #elif defined(TOTK_GAME_V121)
 /* Found from 1.1.2 by scripts/map_version_sites.py --from v112 --to v121 (every original word unchanged). */
 #define TOTK_GAME_VERSION "1.2.1"
+#define GAME_BUILD_ID "9B4E43650501A4D4"   /* from the cheat databases, not checked against the NSO */
 #define TOTK_GAME_DIR "v121"
 #define GAME_ACTOR_NAME 0x218
 #define GAME_ACTOR_POS 0x2b4
@@ -118,6 +121,7 @@
 #define GAME_OUTPUT_CALL_WORD 0x94000083u
 #else
 #define TOTK_GAME_VERSION "1.0.0"
+#define GAME_BUILD_ID "082CE09B06E33A12"
 #define TOTK_GAME_DIR "v0"
 #define GAME_ACTOR_NAME 0x210
 #define GAME_ACTOR_POS 0x2ac

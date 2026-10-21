@@ -5,12 +5,13 @@
 /* Atmosphère cheat programs (the dmnt cheat VM format the Switch scene and Yuzu/Ryujinx use: "[Name]" sections of 32-bit
    hex words, "{Master}" sections that always run), written from Atmosphère's docs/features/cheats.md. Game-independent:
    the runtime glue (cheats.c) supplies the memory region bases, guarded memory access and the held buttons. */
-enum { CHEAT_MAX = 512, CHEAT_MAX_WORDS = 0x400, CHEAT_NAME = 128, CHEAT_ERR = 112 };
+enum { CHEAT_MAX = 1024, CHEAT_MAX_WORDS = 0x400, CHEAT_NAME = 128, CHEAT_ERR = 112 };
 typedef struct {
-    char name[CHEAT_NAME];        /* unique within a file: a repeated name gets " (2)", " (3)"... */
+    char name[CHEAT_NAME];        /* as written (group markers repeat a name); control characters become spaces */
     char error[CHEAT_ERR];        /* why this section cannot run (bad word, unknown instruction); empty when fine */
     int master;                   /* {Master code}: runs first every tick, before the enabled cheats */
     unsigned n, line;             /* instruction words; line of the section header (1-based) */
+    unsigned dup;                 /* earlier sections of the file with the same name: keys a choice (cheat_choice_name) */
     uint32_t w[CHEAT_MAX_WORDS];
     uint64_t latch[CHEAT_MAX_WORDS / 64];   /* C4 with auto-repeat 0: fired and keys still held (bit = word index) */
 } Cheat;
@@ -20,6 +21,9 @@ typedef struct {
    ends, and "//" or "#" comments. warn (may be NULL) receives file-level notes (words before the first section, sections
    past max), or "". Sections without any instruction words (titles, notes) are kept with n = 0. Returns the count. */
 int cheat_parse(const char *text, Cheat *out, int max, char *warn, size_t warnn);
+/* The name a choice is saved under: the name, or for a repeated one "name (#2)", "name (#3)"..., so sections that share
+   a name are switched on and off separately. */
+void cheat_choice_name(const Cheat *c, char *out, size_t n);
 /* Instruction length in words starting at w[i] (0: unknown opcode or truncated). */
 unsigned cheat_insn_len(const uint32_t *w, unsigned n, unsigned i);
 /* Static check of every instruction's fields (widths, memory types, conditions, operations). 1 when runnable. */

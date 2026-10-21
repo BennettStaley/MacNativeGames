@@ -155,12 +155,24 @@ int runtime_cheats_state(int i);   /* CHEAT_ON | CHEAT_AT_LAUNCH | CHEAT_APPLIED
 const char *runtime_cheats_problem(int i);
 int runtime_cheats_set(int i,int on);   /* returns the new state; saved, and the profile backed up before the first cheat */
 enum { CHEAT_ON = 1, CHEAT_AT_LAUNCH = 2, CHEAT_APPLIED = 4, CHEAT_REFUSED = 8 };
+/* The Cheats tab (Mac): every section of every cheat file read, k in file order; role (cheat_files.h): 0 cheat, 1 master
+   code (always on), 2 heading (a group's or a file's title), 3 hidden (a group's end); source: runtime_cheats_source_*. */
+typedef struct { const char *name; int source, role, state; char problem[112]; } RuntimeCheatInfo;
+int runtime_cheats_total(void);
+int runtime_cheats_info(int k, RuntimeCheatInfo *out);   /* 0: no such section */
+int runtime_cheats_set_entry(int k, int on);   /* a cheat (role 0) on or off, as runtime_cheats_set; returns the new state */
+int runtime_cheats_sources(void);
+const char *runtime_cheats_source_label(int s);
+const char *runtime_cheats_source_path(int s);
+const char *runtime_cheats_source_problem(int s);   /* "" or why the file (or part of it) was not read */
+const char *runtime_cheats_build_id(void);   /* the running main's build ID, "" when unknown */
+const char *runtime_cheats_folder(void);     /* the player's cheats folder, "0" for none */
+int runtime_cheats_files_changed(void);      /* 1: the cheat files differ from those read at launch (restart to read them) */
 int runtime_handheld_mode(void);   /* TOTK_OPERATION_MODE=handheld (runtime/services.c) */
 void *runtime_input_override(const char *name);
 typedef struct { uint64_t buttons; int32_t lx,ly,rx,ry; int connected; } RuntimeGamepadState;
 void runtime_gamepad_start(void);
 void runtime_gamepad_read(RuntimeGamepadState *out);
-void runtime_gamepad_set_overlay(int (*hook)(uint64_t held, uint64_t pressed));   /* main queue; 1: keep the controllers from the game */
 uint64_t runtime_gamepad_held(void);   /* held buttons, leaving the press edges for runtime_gamepad_read */
 /* Forget held buttons and sticks: macOS stops delivering controller events (including releases) while the app is in
    the background, so a button held at focus loss would otherwise stay pressed for the game. */

@@ -47,3 +47,7 @@ jobs:
         run: |
           cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all tests/test_mods.c games/totk/third_party/zstd/zstddeclib.c -o "$RUNNER_TEMP/test-mods"
           TMPDIR="$RUNNER_TEMP" "$RUNNER_TEMP/test-mods"
+      - name: Check where cheat files come from (the cheats folder, mods) with the undefined-behavior sanitizer
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all tests/test_cheat_files.c -o "$RUNNER_TEMP/test-cheat-files"
+          TMPDIR="$RUNNER_TEMP" "$RUNNER_TEMP/test-cheat-files"

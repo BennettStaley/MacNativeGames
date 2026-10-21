@@ -96,7 +96,10 @@ int main(void) {
     expect(value(v, "graphics.shadow_res") == 2, "TOTK_SHADOW_RES=2 shows as 2x");
     unsetenv("TOTK_FOG"); unsetenv("TOTK_SHADOW_RES");
     /* World page (runtime/world_patch.h): the time of day in percent, paused included; the render distance in 25 % steps. */
-    expect(SETTINGS_NPAGES == 7 && !strcmp(SETTINGS_PAGES[SETTINGS_NPAGES - 1], "World"), "World is the last settings page (Mods follows it)");
+    expect(SETTINGS_NPAGES == 7 && !strcmp(SETTINGS_PAGES[SETTINGS_NPAGES - 1], "World"), "World is the last settings page (the Mac adds Mods and Cheats after it, settings_panel_mac.h)");
+    for (int p = 0; p < SETTINGS_NPAGES; p++)
+        expect(strcmp(SETTINGS_PAGES[p], "Mods") && strcmp(SETTINGS_PAGES[p], "Cheats"), "Mods and Cheats are the Mac's own tabs, not settings pages (Reset all leaves them alone)");
+    for (int i = 0; i < SETTINGS_COUNT; i++) expect(strncmp(SETTINGS[i].key, "cheats.", 7) != 0, "cheats are not settings: settings.txt and Reset all never hold them");
     expect(SETTINGS_COUNT == 35, "35 settings");
     {
         const SettingDef *ds = &SETTINGS[settings_index("interface.download_shaders")];
