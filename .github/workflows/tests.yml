@@ -39,6 +39,10 @@ jobs:
         run: |
           cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all tests/test_settings.c -o "$RUNNER_TEMP/test-settings"
           "$RUNNER_TEMP/test-settings"
+      - name: Check the automatic frame rate limit with the undefined-behavior sanitizer
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all tests/test_autocap.c -o "$RUNNER_TEMP/test-autocap"
+          "$RUNNER_TEMP/test-autocap"
       - name: Check the mods folder and the ResourceSizeTable patch with the undefined-behavior sanitizer
         run: |
           cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all tests/test_mods.c games/totk/third_party/zstd/zstddeclib.c -o "$RUNNER_TEMP/test-mods"

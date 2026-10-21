@@ -22,7 +22,16 @@ int main(void) {
     settings_defaults(v, 1);
     expect(value(v, "framerate.cap") == 0 && value(v, "interface.shader_counter") == 0, "iOS defaults: display rate, no shader counter");
     settings_defaults(v, 0);
-    expect(value(v, "framerate.cap") == 120 && value(v, "audio.volume") == 100, "Mac defaults");
+    expect(value(v, "framerate.cap") == -1 && value(v, "audio.volume") == 100, "Mac defaults: the auto frame rate limit");
+    {   /* Auto (steady): its word in settings.txt and in TOTK_UNCAPPED_HZ, the fixed limits still read */
+        int a[SETTINGS_COUNT]; settings_defaults(a, 1);
+        expect(settings_parse_text("framerate.cap = auto\n", a) == 1 && value(a, "framerate.cap") == -1, "auto by its word");
+        expect(settings_parse_text("framerate.cap = 120\n", a) == 1 && value(a, "framerate.cap") == 120, "120 still reads");
+        char b[16]; const SettingDef *d = &SETTINGS[settings_index("framerate.cap")];
+        expect(!strcmp(settings_env_text(d, -1, b, sizeof b), "auto") && !strcmp(settings_token(d, -1, b, sizeof b), "auto"), "auto goes out as auto");
+        setenv("TOTK_UNCAPPED_HZ", "auto", 1); a[settings_index("framerate.cap")] = 60; settings_take_env(a);
+        expect(value(a, "framerate.cap") == -1, "TOTK_UNCAPPED_HZ=auto reads as auto"); unsetenv("TOTK_UNCAPPED_HZ");
+    }
 
     int n = settings_parse_text("# comment\n framerate.cap = 60 \naudio.volume=47\ninterface.readout = off # trailing\n"
                                 "unknown.key = 3\ngraphics.interpolation = bogus\ninterface.touch_opacity = 500\n", v);
