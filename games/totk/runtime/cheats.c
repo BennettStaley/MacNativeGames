@@ -60,11 +60,13 @@ static _Atomic int state[CHEAT_MAX];
 static char problem[CHEAT_MAX][112];
 static uint8_t *main_base;
 static uint64_t main_size, main_rx, main_text, main_patch, main_data, main_key;
-static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;   // guards problem[] and the choices; wake waits on it
+static pthread_cond_t wake = PTHREAD_COND_INITIALIZER;   // a cheat was switched: the cheat thread re-checks if it has work
 static Module *main_module;
 static CheatWord patched[1024];   // code words written at launch, to catch overlaps
 static unsigned npatched;
 static unsigned char runs[CHEAT_MAX];   // the cheat has work for the cheat thread (not only code words)
+static void set_problem(int k, const char *msg) { pthread_mutex_lock(&mu); snprintf(problem[k], sizeof problem[k], "%s", msg); pthread_mutex_unlock(&mu); }
 static int dry_run;   // TOTK_CHEATS_DRYRUN=1: memory cheats log their first write per target and change nothing
 
 static const char *cheat_file(void) { const char *e = getenv("TOTK_CHEATS_FILE"); return e && *e ? e : "cheats/cheats.txt"; }
@@ -95,15 +97,15 @@ static int launch_code(int k, const Cheat *const *masters, int nmasters) {
     static CheatCode code;
     char err[CHEAT_ERR];
     if (!cheat_code_scan(&mm, masters, nmasters, &cheats[k], patched, npatched, &code, err, sizeof err)) {
-        snprintf(problem[k], sizeof problem[k], "%s", err);
+        set_problem(k, err);
         return -1;
     }
     runs[k] = code.runtime || !code.n;
     if (!code.n) return 0;
     atomic_fetch_or(&state[k], CHEAT_AT_LAUNCH);
     if (!(atomic_load(&state[k]) & CHEAT_ON)) return 1;
-    if (code.conflict >= 0) snprintf(problem[k], sizeof problem[k], "conflicts with \"%s\"; turn one off", cheats[code.conflict].name);
-    else if (npatched + code.n > sizeof patched / sizeof *patched) snprintf(problem[k], sizeof problem[k], "too many code words from all cheats together");
+    if (code.conflict >= 0) snprintf(err, sizeof err, "conflicts with \"%s\"; turn one off", cheats[code.conflict].name);
+    else if (npatched + code.n > sizeof patched / sizeof *patched) snprintf(err, sizeof err, "too many code words from all cheats together");
     else {
         for (unsigned j = 0; j < code.n; j++) {
             memcpy(main_base + code.w[j].off, &code.w[j].value, 4);
@@ -112,7 +114,8 @@ static int launch_code(int k, const Cheat *const *masters, int nmasters) {
         atomic_fetch_or(&state[k], CHEAT_APPLIED);
         return 1;
     }
-    fprintf(stderr, "[totk] cheat \"%s\" not applied: %s\n", cheats[k].name, problem[k]);
+    set_problem(k, err);
+    fprintf(stderr, "[totk] cheat \"%s\" not applied: %s\n", cheats[k].name, err);
     return 1;
 }
 
@@ -164,13 +167,29 @@ static int guest_write(void *ctx, uint64_t a, const void *in, unsigned n) {
 
 /* One tick: as in Atmosphère, the master code runs first and the enabled cheats after it on the same registers (which
    start at 0 every tick); each cheat keeps its own conditional blocks and loops. */
+static int runnable(int k) {   // on, not refused, with work for the thread, and its code part (if any) applied at launch
+    int st = atomic_load(&state[k]);
+    return (st & CHEAT_ON) && !(st & CHEAT_REFUSED) && runs[k] && cheats[k].n && (!(st & CHEAT_AT_LAUNCH) || (st & CHEAT_APPLIED));
+}
+/* Sleeps (without polling) while no cheat the player chose has work: the master code runs only together with one. */
+static void wait_for_work(void) {
+    pthread_mutex_lock(&mu);
+    for (;;) {
+        int any = 0;
+        for (int k = 0; k < ncheat && !any; k++) any = !cheats[k].master && runnable(k);
+        if (any) break;
+        pthread_cond_wait(&wake, &mu);
+    }
+    pthread_mutex_unlock(&mu);
+}
 static void *cheat_thread(void *arg) {
     (void)arg;
     pthread_setname_np("cheats");
     static CheatVm vm;   // static registers (C3) persist across ticks
     for (;;) {
+        wait_for_work();
         usleep(33000);
-        CheatEnv env = {.ctx = NULL, .read = guest_read, .write = guest_write};
+        CheatEnv env = {.ctx = NULL, .read = guest_read, .write = guest_write, .max_steps = CHEAT_STEPS};
         uint64_t b[3], s[3];
         runtime_guest_regions(b, s);
         env.base[0] = (uintptr_t)main_base; env.base[1] = b[0]; env.base[2] = b[1]; env.base[3] = b[2]; env.base[4] = 0;
@@ -178,15 +197,15 @@ static void *cheat_thread(void *arg) {
         cheat_vm_tick(&vm);
         for (int pass = 0; pass < 2; pass++)
             for (int k = 0; k < ncheat; k++) {
-                int st = atomic_load(&state[k]);
-                if (cheats[k].master != !pass || !(st & CHEAT_ON) || (st & CHEAT_REFUSED) || !runs[k] || !cheats[k].n) continue;
-                if ((st & CHEAT_AT_LAUNCH) && !(st & CHEAT_APPLIED)) continue;   // its code part is not in: wait for the next launch
+                if (cheats[k].master != !pass || !runnable(k)) continue;
                 char err[112] = "";
                 env.ctx = cheats[k].name;
-                if (!cheat_run(&cheats[k], &vm, &env, err, sizeof err) && err[0] && strcmp(err, problem[k])) {   // a failed read (pointer not set up yet) is silent
-                    pthread_mutex_lock(&mu); snprintf(problem[k], sizeof problem[k], "%s", err); pthread_mutex_unlock(&mu);
-                    fprintf(stderr, "[totk] cheat \"%s\": %s\n", cheats[k].name, err);
-                }
+                if (cheat_run(&cheats[k], &vm, &env, err, sizeof err) || !err[0]) continue;   // a failed read (pointer not set up yet) is silent
+                pthread_mutex_lock(&mu);
+                int fresh = strcmp(err, problem[k]) != 0;
+                if (fresh) snprintf(problem[k], sizeof problem[k], "%s", err);
+                pthread_mutex_unlock(&mu);
+                if (fresh) fprintf(stderr, "[totk] cheat \"%s\": %s\n", cheats[k].name, err);
             }
     }
     return NULL;
@@ -337,7 +356,15 @@ static int backup_profile(char *why, size_t n) {
 int runtime_cheats_count(void) { return nlisted; }
 const char *runtime_cheats_name(int i) { return i >= 0 && i < nlisted ? cheats[listed[i]].name : ""; }
 int runtime_cheats_state(int i) { return i >= 0 && i < nlisted ? atomic_load(&state[listed[i]]) : 0; }
-const char *runtime_cheats_problem(int i) { return i >= 0 && i < nlisted ? problem[listed[i]] : ""; }
+/* A copy made under the lock (the cheat thread may be rewriting it): valid on the calling thread until its 8th next call. */
+const char *runtime_cheats_problem(int i) {
+    static _Thread_local char copies[8][112];
+    static _Thread_local unsigned next;
+    if (i < 0 || i >= nlisted) return "";
+    char *out = copies[next++ % 8];
+    pthread_mutex_lock(&mu); snprintf(out, sizeof copies[0], "%s", problem[listed[i]]); pthread_mutex_unlock(&mu);
+    return out;
+}
 int runtime_cheats_set(int i, int on) {
     if (i < 0 || i >= nlisted) return 0;
     int k = listed[i];
@@ -349,6 +376,7 @@ int runtime_cheats_set(int i, int on) {
     } else if (!on) atomic_fetch_and(&state[k], ~CHEAT_ON);
     save_choices();
     int st = atomic_load(&state[k]);
+    pthread_cond_broadcast(&wake);
     pthread_mutex_unlock(&mu);
     fprintf(stderr, "[totk] cheat \"%s\" %s%s\n", cheats[k].name, st & CHEAT_ON ? "on" : "off",
             st & CHEAT_AT_LAUNCH ? " (code patch: takes effect at the next launch)" : "");
@@ -371,11 +399,11 @@ void runtime_cheats_launch(Module *m) {
         if (!cheats[k].n && !cheats[k].error[0]) continue;   // titles and notes
         if (!cheats[k].master) listed[nlisted++] = k; else atomic_fetch_or(&state[k], CHEAT_ON);
         if (cheats[k].error[0]) {   // this section did not parse; the others are unaffected
-            snprintf(problem[k], sizeof problem[k], "%s", cheats[k].error);
-            atomic_fetch_or(&state[k], CHEAT_REFUSED); fprintf(stderr, "[totk] cheat \"%s\" refused: %s\n", cheats[k].name, problem[k]); continue;
+            set_problem(k, cheats[k].error);
+            atomic_fetch_or(&state[k], CHEAT_REFUSED); fprintf(stderr, "[totk] cheat \"%s\" refused: %s\n", cheats[k].name, cheats[k].error); continue;
         }
         int code = launch_code(k, masters, cheats[k].master ? seen++ : nmasters);   // a master code sees the ones before it
-        if (code < 0) { atomic_fetch_or(&state[k], CHEAT_REFUSED); fprintf(stderr, "[totk] cheat \"%s\" refused: %s\n", cheats[k].name, problem[k]); continue; }
+        if (code < 0) { atomic_fetch_or(&state[k], CHEAT_REFUSED); RuntimeCheatInfo info; runtime_cheats_info(k, &info); fprintf(stderr, "[totk] cheat \"%s\" refused: %s\n", cheats[k].name, info.problem); continue; }
         at_launch += code;
         applied += !!(atomic_load(&state[k]) & CHEAT_APPLIED);
     }
