@@ -9,10 +9,23 @@ const char *runtime_cheats_name(int i) { (void)i; return ""; }
 int runtime_cheats_state(int i) { (void)i; return 0; }
 const char *runtime_cheats_problem(int i) { (void)i; return ""; }
 int runtime_cheats_set(int i, int on) { (void)i; (void)on; return 0; }
+int runtime_cheats_total(void) { return 0; }
+int runtime_cheats_info(int k, RuntimeCheatInfo *out) { (void)k; (void)out; return 0; }
+int runtime_cheats_set_entry(int k, int on) { (void)k; (void)on; return 0; }
+int runtime_cheats_sources(void) { return 0; }
+const char *runtime_cheats_source_label(int s) { (void)s; return ""; }
+const char *runtime_cheats_source_path(int s) { (void)s; return ""; }
+const char *runtime_cheats_source_problem(int s) { (void)s; return ""; }
+const char *runtime_cheats_build_id(void) { return ""; }
+const char *runtime_cheats_folder(void) { return ""; }
+int runtime_cheats_files_changed(void) { return 0; }
 #else
 #include "runtime.h"
 #include "cheat_vm.h"
+#include "cheat_files.h"
+#include "game_version.h"
 #include <copyfile.h>
+#include <ctype.h>
 #include <libgen.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -24,8 +37,9 @@ int runtime_cheats_set(int i, int on) { (void)i; (void)on; return 0; }
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* Cheats baked into the app (build_app.py --cheats: the Atmosphère cheat file for this game's build ID, at
-   cheats/cheats.txt; TOTK_CHEATS_FILE overrides). Nothing here is specific to one game.
+/* Atmosphère cheat files for this game's build ID, read at launch from the app (build_app.py --cheats: cheats/cheats.txt;
+   TOTK_CHEATS_FILE overrides), the cheats folder and the mods that are on (cheat_files.h). Nothing here is specific to
+   one game; the Mac settings menu's Cheats tab (settings_panel_mac.h) lists and switches them.
    - Cheats that write instructions into the main module's code (with a code cave in the padding after its text) are
      applied once at launch, before the modules are sealed r-x: the code is never made writable while guest threads run
      it, so toggling one takes effect at the next launch. A patch is refused when its site is a rewritten instruction
@@ -203,25 +217,124 @@ static void *cheat_thread(void *arg) {
     return NULL;
 }
 
+/* --- where the cheats come from (cheat_files.h) ------------------------------------------------------------------ */
+static CheatSource sources[CHEAT_SOURCES_MAX];
+static int nsources, source_of[CHEAT_MAX];
+static char source_problem[CHEAT_SOURCES_MAX][112];
+static char build_id[20], folder_path[1100];
+static pthread_once_t folder_once = PTHREAD_ONCE_INIT;
+
+/* The main module's build ID: TOTK_CHEATS_BUILD_ID (tests), the extracted NSO when the game runs from a build tree,
+   else the one game_version.h records for this version. */
+static void find_build_id(void) {
+    const char *e = getenv("TOTK_CHEATS_BUILD_ID");
+    if (e && *e) snprintf(build_id, sizeof build_id, "%s", e);
+#ifdef TOTK_GAME_DIR
+    else {
+        uint8_t id[8]; FILE *f = fopen("extracted/" TOTK_GAME_DIR "/exefs/main", "rb");
+        if (f && !fseek(f, 0x40, SEEK_SET) && fread(id, 1, sizeof id, f) == sizeof id)
+            for (int i = 0; i < 8; i++) snprintf(build_id + 2 * i, sizeof build_id - 2 * i, "%02X", id[i]);
+        if (f) fclose(f);
+    }
+#endif
+#ifdef GAME_BUILD_ID
+    if (!*build_id) snprintf(build_id, sizeof build_id, "%s", GAME_BUILD_ID);
+#endif
+    for (char *p = build_id; *p; p++) *p = (char)toupper((unsigned char)*p);
+}
+/* The player's cheats folder (TOTK_CHEATS_DIR, which the launcher sets; 0 = none), made on first use. */
+static void make_folder(void) {
+    const char *e = getenv("TOTK_CHEATS_DIR"), *home = getenv("HOME");
+    if (e && *e) snprintf(folder_path, sizeof folder_path, "%s", e);
+    else snprintf(folder_path, sizeof folder_path, "%s/Library/Application Support/MacNativeGames/" GAME_FOLDER "/cheats", home ? home : ".");
+    if (!strcmp(folder_path, "0")) return;
+    char p[1100]; snprintf(p, sizeof p, "%s", folder_path);
+    for (char *s = p + 1; *s; s++) if (*s == '/') { *s = 0; mkdir(p, 0755); *s = '/'; }
+    mkdir(p, 0755);
+}
+static const char *cheat_folder(void) { pthread_once(&folder_once, make_folder); return folder_path; }
+static const char *app_file(void) { return access(cheat_file(), R_OK) == 0 ? cheat_file() : NULL; }
+
+/* Parses every source into cheats[] (at most CHEAT_MAX sections in all); a file that does not parse is skipped with its
+   reason. Returns the number of sections. */
+static int load_sources(void) {
+    find_build_id();
+    nsources = cheat_sources(app_file(), cheat_folder(), build_id, sources, CHEAT_SOURCES_MAX);
+    if (!nsources) {
+        fprintf(stderr, "[totk] cheats: none (cheat files for this game are named %s.txt; the cheats folder is %s)\n", *build_id ? build_id : "<build ID>", cheat_folder());
+        return 0;
+    }
+    static char text[1 << 20];
+    Cheat *one = malloc(CHEAT_MAX * sizeof *one);
+    cheats = calloc(CHEAT_MAX, sizeof *cheats);
+    if (!one || !cheats) { free(one); fprintf(stderr, "[totk] cheats: out of memory\n"); return 0; }
+    for (int s = 0; s < nsources; s++) {
+        FILE *f = fopen(sources[s].path, "rb");
+        if (!f) { snprintf(source_problem[s], sizeof source_problem[s], "cannot be read"); continue; }
+        size_t got = fread(text, 1, sizeof text - 1, f);
+        int too_big = got == sizeof text - 1 && fgetc(f) != EOF;
+        fclose(f);
+        text[got] = 0;
+        char err[128] = "";
+        int n = too_big ? -1 : cheat_parse(text, one, CHEAT_MAX, err, sizeof err);
+        if (n < 0) {
+            snprintf(source_problem[s], sizeof source_problem[s], "not a cheat file this game can read: %s", too_big ? "larger than 1 MB" : err);
+            fprintf(stderr, "[totk] cheats: %s: %s\n", sources[s].path, source_problem[s]);
+            continue;
+        }
+        int take = n < CHEAT_MAX - ncheat ? n : CHEAT_MAX - ncheat;
+        if (take < n) snprintf(source_problem[s], sizeof source_problem[s], "%d of its cheats left out (at most %d in all files)", n - take, CHEAT_MAX);
+        memcpy(cheats + ncheat, one, (size_t)take * sizeof *one);
+        for (int j = 0; j < take; j++) source_of[ncheat + j] = s;
+        ncheat += take;
+        fprintf(stderr, "[totk] cheats: %d sections from %s (%s)\n", take, sources[s].path, sources[s].label);
+    }
+    free(one);
+    return ncheat;
+}
+
 /* --- chosen cheats ----------------------------------------------------------------------------------------------- */
+/* cheats-enabled.txt holds one key per chosen cheat (cheat_key); lines for files not read this launch (a mod that is off)
+   are kept as they were. */
+static char *kept_choices;
+static void key_of(int k, char *out, size_t n) { cheat_key(sources[source_of[k]].id, cheats[k].name, out, n); }
+static int source_loaded(const char *line) {
+    const char *tab = strchr(line, '\t');
+    for (int s = 0; s < nsources; s++)
+        if (tab ? strlen(sources[s].id) == (size_t)(tab - line) && !strncmp(sources[s].id, line, (size_t)(tab - line)) : !strcmp(sources[s].id, "app")) return 1;
+    return 0;
+}
 static void load_choices(void) {
-    char path[1100], line[CHEAT_NAME + 4];
+    char path[1100], line[400 + CHEAT_NAME], key[400 + CHEAT_NAME];
     if (!state_file(path, sizeof path)) return;
     FILE *f = fopen(path, "r");
     if (!f) return;
+    size_t kept = 0;
     while (fgets(line, sizeof line, f)) {
         line[strcspn(line, "\r\n")] = 0;
-        for (int k = 0; k < ncheat; k++) if (!cheats[k].master && !strcmp(cheats[k].name, line)) atomic_fetch_or(&state[k], CHEAT_ON);
+        if (!*line) continue;
+        int found = 0;
+        for (int k = 0; k < ncheat; k++) {
+            if (cheats[k].master) continue;
+            key_of(k, key, sizeof key);
+            if (!strcmp(key, line)) { atomic_fetch_or(&state[k], CHEAT_ON); found = 1; }
+        }
+        if (!found && !source_loaded(line)) {
+            char *more = realloc(kept_choices, kept + strlen(line) + 2);
+            if (more) { kept_choices = more; snprintf(kept_choices + kept, strlen(line) + 2, "%s\n", line); kept += strlen(line) + 1; }
+        }
     }
     fclose(f);
 }
 static void save_choices(void) {
-    char path[1100], tmp[1120];
+    char path[1100], tmp[1120], key[400 + CHEAT_NAME];
     if (!state_file(path, sizeof path)) return;
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "w");
     if (!f) return;
-    for (int k = 0; k < ncheat; k++) if (!cheats[k].master && (atomic_load(&state[k]) & CHEAT_ON)) fprintf(f, "%s\n", cheats[k].name);
+    for (int k = 0; k < ncheat; k++)
+        if (!cheats[k].master && (atomic_load(&state[k]) & CHEAT_ON)) { key_of(k, key, sizeof key); fprintf(f, "%s\n", key); }
+    if (kept_choices) fputs(kept_choices, f);
     if (fclose(f) == 0) rename(tmp, path); else unlink(tmp);
 }
 static int backup_profile(char *why, size_t n) {
@@ -261,18 +374,7 @@ int runtime_cheats_set(int i, int on) {
 }
 
 void runtime_cheats_launch(Module *m) {
-    FILE *f = fopen(cheat_file(), "rb");
-    if (!f) return;
-    static char text[1 << 20];
-    size_t got = fread(text, 1, sizeof text - 1, f);
-    fclose(f);
-    text[got] = 0;
-    cheats = calloc(CHEAT_MAX, sizeof *cheats);
-    char err[128];
-    if (!cheats || (ncheat = cheat_parse(text, cheats, CHEAT_MAX, err, sizeof err)) < 0) {
-        fprintf(stderr, "[totk] cheats: %s is not a valid cheat file: %s\n", cheat_file(), cheats ? err : "out of memory");
-        ncheat = 0; return;
-    }
+    if (!load_sources()) return;
     const char *dr = getenv("TOTK_CHEATS_DRYRUN");
     dry_run = dr && !strcmp(dr, "1");
     if (dry_run) fprintf(stderr, "[totk] cheats: dry run (memory cheats log their targets and write nothing)\n");
@@ -292,8 +394,34 @@ void runtime_cheats_launch(Module *m) {
             atomic_fetch_or(&state[k], CHEAT_APPLIED); applied++;
         }
     }
-    fprintf(stderr, "[totk] cheats: %d in %s (%d patch code at launch, %d of them applied now)\n", nlisted, cheat_file(), at_launch, applied);
+    fprintf(stderr, "[totk] cheats: %d in %d file%s for build %s (%d patch code at launch, %d of them applied now)\n", nlisted, nsources,
+            nsources == 1 ? "" : "s", build_id, at_launch, applied);
     pthread_t th;
     if (pthread_create(&th, NULL, cheat_thread, NULL) == 0) pthread_detach(th);
+}
+
+/* --- the Cheats tab (settings_panel_mac.h): every section of every file, by its index k in cheats[] ----------------- */
+int runtime_cheats_total(void) { return ncheat; }
+int runtime_cheats_info(int k, RuntimeCheatInfo *out) {
+    if (k < 0 || k >= ncheat || !out) return 0;
+    out->name = cheats[k].name; out->source = source_of[k]; out->role = cheat_role(&cheats[k]);
+    out->state = atomic_load(&state[k]);
+    pthread_mutex_lock(&mu); snprintf(out->problem, sizeof out->problem, "%s", problem[k]); pthread_mutex_unlock(&mu);
+    return 1;
+}
+int runtime_cheats_set_entry(int k, int on) {
+    for (int i = 0; i < nlisted; i++) if (listed[i] == k) return runtime_cheats_set(i, on);
+    return 0;
+}
+int runtime_cheats_sources(void) { return nsources; }
+const char *runtime_cheats_source_label(int s) { return s >= 0 && s < nsources ? sources[s].label : ""; }
+const char *runtime_cheats_source_path(int s) { return s >= 0 && s < nsources ? sources[s].path : ""; }
+const char *runtime_cheats_source_problem(int s) { return s >= 0 && s < nsources ? source_problem[s] : ""; }
+const char *runtime_cheats_build_id(void) { if (!*build_id) find_build_id(); return build_id; }
+const char *runtime_cheats_folder(void) { return cheat_folder(); }
+int runtime_cheats_files_changed(void) {
+    static CheatSource now[CHEAT_SOURCES_MAX];   /* main queue only */
+    int n = cheat_sources(app_file(), cheat_folder(), runtime_cheats_build_id(), now, CHEAT_SOURCES_MAX);
+    return !cheat_sources_same(sources, nsources, now, n);
 }
 #endif

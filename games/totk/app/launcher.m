@@ -386,6 +386,8 @@ int main(int argc, char **argv) {
            set wins (a test's own folder). The older single folder <data>/mods/<version> with its manifest.tsv still loads. */
         setenv("TOTK_MODS_DIR", [data stringByAppendingPathComponent:@"mods"].fileSystemRepresentation, 0);
         setenv("TOTK_ROMFS_MODS", [data stringByAppendingPathComponent:@"mods/" TOTK_GAME_DIR].fileSystemRepresentation, 0);
+        /* Cheats (runtime/cheat_files.h): <build ID>.txt files in <data>/cheats, read at every start; a test's own folder wins. */
+        setenv("TOTK_CHEATS_DIR", [data stringByAppendingPathComponent:@"cheats"].fileSystemRepresentation, 0);
         /* The game's language (runtime/services.c): the app's first preferred language, which also follows a per-app
            language (defaults write org.macnativegames.totk AppleLanguages -array pt-BR). TOTK_LANG still overrides it. */
         NSString *preferred = NSLocale.preferredLanguages.firstObject;

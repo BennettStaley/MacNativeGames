@@ -21,7 +21,7 @@
 #define MAX_FILES 400000
 
 typedef struct { char *path, *file; uint64_t size; int mod, replaces; } Rec;
-typedef struct { ModInfo info; char root[4096]; size_t first, count; int listed; } Mod;   /* root: the RomFS folder, "" = none; listed: named in mods.txt */
+typedef struct { ModInfo info; char root[4096], cheats[4096]; size_t first, count; int listed; } Mod;   /* root: the RomFS folder, "" = none; cheats: its cheats/ folder, "" = none; listed: named in mods.txt */
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static char dir_path[4096];
@@ -162,8 +162,9 @@ static int is_root_name(const char *name) {
 }
 static int is_dir(const char *p) { struct stat st; return !stat(p, &st) && S_ISDIR(st.st_mode); }
 typedef struct { char path[4096]; int depth; } Cand;
-/* Looks for romfs/ folders (and folders whose entries are RomFS top-level names) under p; also notes exefs/ and .tkcl. */
-static void find_roots(const char *p, int depth, Cand *romfs, int *nromfs, Cand *bare, int *nbare, unsigned *flags) {
+/* Looks for romfs/ folders (and folders whose entries are RomFS top-level names) under p; also notes exefs/, .tkcl and
+   the shallowest cheats/ folder (Yuzu / Ryujinx <Mod>/cheats, or Atmosphère's atmosphere/contents/<title>/cheats). */
+static void find_roots(const char *p, int depth, Cand *romfs, int *nromfs, Cand *bare, int *nbare, unsigned *flags, Cand *cheats) {
     DIR *d = opendir(p); if (!d) return;
     struct dirent *e; char sub[4096]; int roots_here = 0;
     char (*dirs)[256] = malloc(64 * 256); int ndirs = 0;
@@ -176,14 +177,15 @@ static void find_roots(const char *p, int depth, Cand *romfs, int *nromfs, Cand 
             continue;
         }
         if (!strcasecmp(e->d_name, "romfs")) { if (*nromfs < 16) { copy(romfs[*nromfs].path, sizeof romfs->path, sub); romfs[(*nromfs)++].depth = depth; } continue; }
-        if (!strcasecmp(e->d_name, "exefs") || !strcasecmp(e->d_name, "cheats")) { if (!strcasecmp(e->d_name, "exefs")) *flags |= MOD_HAS_CODE; continue; }
+        if (!strcasecmp(e->d_name, "exefs")) { *flags |= MOD_HAS_CODE; continue; }
+        if (!strcasecmp(e->d_name, "cheats")) { if (!*cheats->path || depth < cheats->depth) { copy(cheats->path, sizeof cheats->path, sub); cheats->depth = depth; } continue; }
         if (is_root_name(e->d_name)) { roots_here = 1; continue; }
         if (dirs && ndirs < 64) copy(dirs[ndirs++], 256, e->d_name);
     }
     closedir(d);
     if (roots_here && *nbare < 16) { copy(bare[*nbare].path, sizeof bare->path, p); bare[(*nbare)++].depth = depth; }
     if (depth < MAX_DEPTH && !roots_here)
-        for (int i = 0; i < ndirs; i++) { snprintf(sub, sizeof sub, "%s/%s", p, dirs[i]); find_roots(sub, depth + 1, romfs, nromfs, bare, nbare, flags); }
+        for (int i = 0; i < ndirs; i++) { snprintf(sub, sizeof sub, "%s/%s", p, dirs[i]); find_roots(sub, depth + 1, romfs, nromfs, bare, nbare, flags, cheats); }
     free(dirs);
 }
 /* The shallowest candidate when it is the only one at its depth; "" otherwise. */
@@ -258,18 +260,20 @@ static void analyse(Mod *m, int index) {
     if (ends_with_ci(i->folder, ".tkcl")) { i->flags |= MOD_TKCL | MOD_EMPTY; return; }
     char json[4200]; snprintf(json, sizeof json, "%s/mod.json", p); read_mod_json(json, i);
     if (!*i->name) copy(i->name, sizeof i->name, i->folder);
-    Cand *romfs = malloc(16 * sizeof *romfs), *bare = malloc(16 * sizeof *bare); int nr = 0, nb = 0;
-    if (romfs && bare) {
-        find_roots(p, 0, romfs, &nr, bare, &nb, &i->flags);
+    Cand *romfs = malloc(16 * sizeof *romfs), *bare = malloc(16 * sizeof *bare), *cheats = calloc(1, sizeof *cheats); int nr = 0, nb = 0;
+    if (romfs && bare && cheats) {
+        find_roots(p, 0, romfs, &nr, bare, &nb, &i->flags, cheats);
+        copy(m->cheats, sizeof m->cheats, cheats->path);
         int got = pick(romfs, nr, m->root, sizeof m->root, i->folder);
         if (!got) got = pick(bare, nb, m->root, sizeof m->root, i->folder);
         if (got < 0) *m->root = 0;
     }
-    free(romfs); free(bare);
+    free(romfs); free(bare); free(cheats);
+    if (*m->cheats) i->flags |= MOD_HAS_CHEATS;
     m->first = nrecs;
     if (*m->root) walk(m, index, m->root, "", 0);
     m->count = nrecs - m->first;
-    if (i->files) i->flags |= MOD_HAS_ROMFS; else i->flags |= MOD_EMPTY;
+    if (i->files) i->flags |= MOD_HAS_ROMFS; else if (!(i->flags & MOD_HAS_CHEATS)) i->flags |= MOD_EMPTY;   /* a cheats-only mod is not empty */
     if (old_version(i) || other_version_files(m)) i->flags |= MOD_OLD_VERSION;
     /* Button icons: only a mod that changes the icon archive counts, named by mod.json or by its name. */
     int icons = 0;
@@ -458,8 +462,32 @@ const char *mods_notice(unsigned flags) {
     if (flags & MOD_CONFLICT) return "Changes files a mod higher in the list also changes: that mod's copies are used.";
     if (flags & MOD_HAS_CODE) return "Has code patches (exefs): not applied; only its game files are loaded.";
     if (flags & MOD_OWN_RSTB) return "Ships its own ResourceSizeTable: left out, the game's table is adjusted instead.";
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+    if (flags & MOD_HAS_CHEATS) return "Has cheats: cheats work on the Mac for now, not on iPhone or iPad.";
+#else
+    if (flags & MOD_HAS_CHEATS) return "Has cheats: listed in Settings › Cheats while the mod is on.";
+#endif
     if (flags & MOD_HAS_ROMFS) return "Game files: loaded at the next start.";
     return "";
+}
+int mods_cheat_file(int i, const char *build_id, char *out, size_t cap) {
+    if (!build_id || !*build_id || !out || !cap) return 0;
+    pthread_mutex_lock(&lock);
+    char dir[4096] = ""; if (i >= 0 && i < nmods) copy(dir, sizeof dir, mods[i].cheats);
+    pthread_mutex_unlock(&lock);
+    *out = 0;
+    if (!*dir) return 0;
+    char want[64]; if (snprintf(want, sizeof want, "%s.txt", build_id) >= (int)sizeof want) return 0;
+    DIR *d = opendir(dir); if (!d) return 0;
+    struct dirent *e; int found = 0;
+    while (!found && (e = readdir(d))) {   /* the build ID's case varies between cheat databases */
+        char p[4400]; struct stat st;
+        if (strcasecmp(e->d_name, want) || snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= (int)sizeof p || stat(p, &st) || !S_ISREG(st.st_mode)) continue;
+        found = snprintf(out, cap, "%s", p) < (int)cap;
+    }
+    closedir(d);
+    if (!found) *out = 0;
+    return found;
 }
 void mods_set_romfs_lookup(ModsRomfsLookup lookup) { pthread_mutex_lock(&lock); romfs_lookup = lookup; pthread_mutex_unlock(&lock); }
 int mods_files(const ModFile **out) { pthread_mutex_lock(&lock); if (out) *out = winners; int n = (int)nwinners; pthread_mutex_unlock(&lock); return n; }

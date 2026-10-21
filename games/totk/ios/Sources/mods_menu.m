@@ -7,7 +7,7 @@ static NSString *const CONFLICT_TEXT = @"Two mods change the same file: the firs
 /* The lines under an installed mod: code, TKCL, conflicts and other versions in the words the player was promised; the
    rest from mods_notice (runtime/mods_panel_mac.h shows the same on the Mac). */
 static NSArray<NSString *> *notices_for(const ModInfo *m) {
-    static const unsigned order[] = {MOD_HAS_CODE, MOD_TKCL, MOD_CONFLICT, MOD_OLD_VERSION, MOD_OWN_RSTB, MOD_EMPTY};
+    static const unsigned order[] = {MOD_HAS_CODE, MOD_TKCL, MOD_CONFLICT, MOD_OLD_VERSION, MOD_OWN_RSTB, MOD_EMPTY, MOD_HAS_CHEATS};
     NSMutableArray *out = [NSMutableArray array];
     for (size_t i = 0; i < sizeof order / sizeof *order; i++) {
         unsigned f = order[i]; if (!(m->flags & f)) continue;
