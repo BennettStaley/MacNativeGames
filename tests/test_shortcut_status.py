@@ -31,9 +31,13 @@ class ShortcutStatus(unittest.TestCase):
                            str(ROOT / 'tests/shortcut_output_fixture.c'),
                            str(gfx / 'totk_mfx.m'), str(gfx / 'totk_mfx_up.m'),
                            str(gfx / 'fps_overlay.c'),
+                           # Objective-C classes the in-window settings menu names (the Mods tab, Send saves):
+                           # resolved when the image loads, unlike C functions under dynamic_lookup.
+                           str(ROOT / 'games/totk/runtime/mod_browser.m'), str(ROOT / 'games/totk/runtime/save_package.m'),
+                           '-I' + str(ROOT / 'games/totk/runtime'), '-lz',
                            '-framework', 'Cocoa', '-framework', 'Metal',
                            '-framework', 'MetalFX', '-framework', 'QuartzCore',
-                           '-framework', 'CoreVideo', '-o', str(executable)]
+                           '-framework', 'CoreVideo', '-framework', 'GameController', '-o', str(executable)]
                 if version:
                     command.append('-D' + version + '=1')
                 build = subprocess.run(command, capture_output=True, text=True, timeout=90)
