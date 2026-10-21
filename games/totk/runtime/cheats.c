@@ -1,3 +1,15 @@
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+/* iPhone and iPad have no cheats yet: no Cheats menu or panel there (frontend.m is Mac-only), and the iOS SDK has no
+   mach_vm_read / mach_vm_write for reading guest memory safely. build_app.py refuses --cheats for --platform ios. */
+#include "runtime.h"
+void runtime_cheats_launch(Module *main_module) { (void)main_module; }
+int runtime_cheats_count(void) { return 0; }
+const char *runtime_cheats_name(int i) { (void)i; return ""; }
+int runtime_cheats_state(int i) { (void)i; return 0; }
+const char *runtime_cheats_problem(int i) { (void)i; return ""; }
+int runtime_cheats_set(int i, int on) { (void)i; (void)on; return 0; }
+#else
 #include "runtime.h"
 #include "cheat_vm.h"
 #include <copyfile.h>
@@ -284,3 +296,4 @@ void runtime_cheats_launch(Module *m) {
     pthread_t th;
     if (pthread_create(&th, NULL, cheat_thread, NULL) == 0) pthread_detach(th);
 }
+#endif
