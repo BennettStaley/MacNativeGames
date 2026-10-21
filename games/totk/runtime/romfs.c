@@ -538,6 +538,30 @@ unsigned runtime_romfs_entry_type(int *out,const char *path) {
 int runtime_romfs_owns(const char *path) {size_t n=strlen(mount_name);return n&&path&&!strncmp(path,mount_name,n)&&path[n]==':';}
 int runtime_romfs_handle(uint64_t h) {return h>0x100000000ULL&&h<0x100000000ULL+NH;}
 unsigned runtime_romfs_read_options(uint64_t *out,uint64_t h,int64_t off,void *buf,uint64_t size) {return runtime_romfs_read(out,h,off,buf,size);}
+/* Host-side reads for the shared shader list (third_party/d2r_gfx/gfx/nvn/totk_shader_list.m): it finds the shaders a
+   downloaded list names in the player's own game files on a background thread, without the guest's file handles. The
+   bytes are what the game itself reads (a mod's copy where one replaces a file). */
+const char *runtime_game_dir(void) {return TOTK_GAME_DIR;}   /* the game's modules are rewritten/<this>/ (relative to the game folder) */
+size_t runtime_romfs_file_count(void) {return image_fd<0?0:(size_t)file_count;}
+const char *runtime_romfs_file_name(size_t i) {return image_fd>=0&&i<file_count?entry_name(entry(i)):NULL;}
+uint8_t *runtime_romfs_host_read(const char *p,size_t *n) {
+ if(image_fd<0||!p||!n||!path_ok(p))return NULL;uint64_t i=file_index(p);if(i==UINT64_MAX)return NULL;
+ uint32_t ov=overlay_slot(i);if(ov)return host_file(overlays[ov-1].path,n,(size_t)1<<30);
+ return i<file_count?image_file(i,n):NULL;
+}
+static pthread_once_t dicts_once=PTHREAD_ONCE_INIT;
+static void dicts_load_once(void) {load_dicts();}
+uint8_t *runtime_romfs_zs_decompress(const uint8_t *src,size_t n,size_t *out) {
+ if(image_fd<0||!src||n<4||!out)return NULL;pthread_once(&dicts_once,dicts_load_once);return zs_decompress(src,n,out);
+}
+/* This RomFS with its player layers: the index digest the build verified and each overlay's place, size and modification
+   time. A shader index made from other files (a mod added or removed) is not reused. */
+void runtime_romfs_identity(char out[65]) {
+ CC_SHA256_CTX c;CC_SHA256_Init(&c);CC_SHA256_Update(&c,ROMFS_INDEX_SHA256,(CC_LONG)strlen(ROMFS_INDEX_SHA256));
+ for(size_t k=0;k<noverlay;k++){char line[160];int l=snprintf(line,sizeof line,"\n%llu\t%llu\t%lld.%09ld\t",(unsigned long long)overlays[k].index,(unsigned long long)overlays[k].size,(long long)overlays[k].mtime.tv_sec,(long)overlays[k].mtime.tv_nsec);
+  CC_SHA256_Update(&c,line,(CC_LONG)l);CC_SHA256_Update(&c,overlays[k].name,(CC_LONG)strlen(overlays[k].name));}
+ unsigned char d[32];CC_SHA256_Final(d,&c);for(int i=0;i<32;i++)snprintf(out+2*i,3,"%02x",d[i]);
+}
 void *runtime_fs_override(const char *name) {
  static const struct{const char *name;void *fn;} map[]={
  {"_ZN2nn2fs8MountRomEPKcPvm",mount_rom},{"_ZN2nn2fs22QueryMountRomCacheSizeEPm",cache_size}};
