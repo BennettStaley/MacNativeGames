@@ -156,7 +156,7 @@ static int cimg_ok = 1;
 static int cimage_word(void *ctx, uint64_t off, uint32_t *out) { (void)ctx; if (!cimg_ok || off + 4 > sizeof cimg) return 0; memcpy(out, cimg + off, 4); return 1; }
 static const uint32_t cchanged[] = {0x200, 0x204, 0x300, 0x308}, cmoved[] = {0x400, 0x410};
 static CheatMain cmain(void) {
-    return (CheatMain){.mem = cmem, .text_end = 0xF00, .rx_end = 0x1000, .image_end = 0x8000, .changed = cchanged, .nchanged = 2,
+    return (CheatMain){.mem = cmem, .text_end = 0xF00, .rx_end = 0x1000, .ro_end = 0x4000, .image_end = 0x8000, .changed = cchanged, .nchanged = 2,
                        .moved = cmoved, .nmoved = 1, .image_word = cimage_word};
 }
 static Cheat cp[4];
@@ -219,6 +219,13 @@ static void code_tests(void) {
     CHECK(r == 1, "free padding usable as a cave (%s)", err);
     r = scan_word(0x502, 0xD503201F, err, sizeof err);
     CHECK(r == 0 && strstr(err, "part of"), "unaligned code write refused (%s)", err);
+    /* Read-only data: applied at launch like code, without the instruction checks; never under a condition. */
+    r = scan_word(0x2000, 0x3F000000, err, sizeof err);
+    CHECK(r == 1 && cc.n == 1 && cc.w[0].off == 0x2000 && !cc.runtime, "read-only data write applied at launch (%s)", err);
+    r = scan("[G]\n80000001\n04000000 00002000 3F000000\n20000000\n", NULL, 0, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "read-only data"), "read-only data write under a button refused (%s)", err);
+    r = scan_word(0x4000, 1, err, sizeof err);
+    CHECK(r == 1 && cc.n == 0 && cc.runtime, "the first writable data word is runtime work (%s)", err);
     r = scan("[H]\n02000000 00000500 0000D503\n", NULL, 0, err, sizeof err);
     CHECK(r == 0 && strstr(err, "part of"), "2-byte code write refused (%s)", err);
     /* Branch and PC-relative targets of written instructions. */
@@ -288,13 +295,14 @@ static void guard_tests(void) {
     CHECK(!guest_range_in(0x1000, 0, 0, 0x10000), "empty access refused");
     /* main: code [0, 0x1000) rx to 0x4000, data from 0x8000, key page at 0xC000 */
     uint64_t b = 0x100000;
-    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0x10, 4, 0) == 1, "main code readable");
-    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0x10, 4, 1) == 2, "main code write is compare-only");
-    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0x5000, 4, 1) == 0, "read-only data not writable");
-    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0x8000, 8, 1) == 1, "data writable");
-    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0xBFFC, 8, 1) == 0, "a write running into the key page is refused");
-    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0xC000, 4, 0) == 0, "the key page is not readable");
-    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0x3FFC, 8, 1) == 0, "a write straddling code and padding end is refused");
+    CHECK(guest_main_access(b, 0x8000, 0xC000, b + 0x10, 4, 0) == 1, "main code readable");
+    CHECK(guest_main_access(b, 0x8000, 0xC000, b + 0x10, 4, 1) == 2, "main code write is compare-only");
+    CHECK(guest_main_access(b, 0x8000, 0xC000, b + 0x5000, 4, 1) == 2, "read-only data write is compare-only");
+    CHECK(guest_main_access(b, 0x8000, 0xC000, b + 0x8000, 8, 1) == 1, "data writable");
+    CHECK(guest_main_access(b, 0x8000, 0xC000, b + 0xBFFC, 8, 1) == 0, "a write running into the key page is refused");
+    CHECK(guest_main_access(b, 0x8000, 0xC000, b + 0xC000, 4, 0) == 0, "the key page is not readable");
+    CHECK(guest_main_access(b, 0x8000, 0xC000, b + 0x7FFC, 8, 1) == 0, "a write straddling read-only and writable data is refused");
+    CHECK(guest_main_access(0, 0x8000, 0xC000, 0x10, 4, 0) == 0, "no main module: refused");
 }
 
 int main(void) {

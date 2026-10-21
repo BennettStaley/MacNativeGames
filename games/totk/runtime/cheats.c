@@ -91,7 +91,7 @@ static int image_word(void *ctx, uint64_t off, uint32_t *out) { return runtime_m
 /* Classifies cheat k (masters: the master codes that run before it) and, when it is on, writes all of its code words or
    none. Returns -1 when refused, 0 when it writes no code, 1 when it does (applied or not). */
 static int launch_code(int k, const Cheat *const *masters, int nmasters) {
-    CheatMain mm = {.mem = main_base, .text_end = main_text, .rx_end = main_rx, .image_end = main_key,
+    CheatMain mm = {.mem = main_base, .text_end = main_text, .rx_end = main_rx, .ro_end = main_data, .image_end = main_key,
                     .changed = main_module->changed, .nchanged = main_module->nchanged, .moved = main_module->moved,
                     .nmoved = main_module->nmoved, .image_word = image_word, .ctx = main_module};
     static CheatCode code;
@@ -135,9 +135,9 @@ static int accept(void *p) { (void)p; return 1; }
 /* write: 0 read, 1 write, 2 only check that a write would be allowed */
 static int guest_access(uint64_t a, void *buf, unsigned n, int write) {
     Access x = {a, buf, n, write == 1};
-    switch (guest_main_access((uintptr_t)main_base, main_data, main_rx, main_key, a, n, write != 0)) {
+    switch (guest_main_access((uintptr_t)main_base, main_data, main_key, a, n, write != 0)) {
     case 1: return write == 2 || host_access(&x);
-    case 2: return buf && !memcmp((const void *)(uintptr_t)a, buf, n);   // code: never written; equal to what launch applied
+    case 2: return buf && !memcmp((const void *)(uintptr_t)a, buf, n);   // code / read-only data: never written; equal to what launch applied
     default: return runtime_guest_access(a, n, write == 2 ? accept : host_access, &x);
     }
 }

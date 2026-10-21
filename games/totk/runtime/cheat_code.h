@@ -1,9 +1,9 @@
 #pragma once
 #include "cheat_vm.h"
 
-/* Cheats that write instructions into the main module's code. Here the code is never writable while guest threads run it,
-   so those words are written once at launch, before the modules are sealed r-x; the rest of such a cheat (its data
-   writes, button conditions) runs on the cheat thread like any other cheat, where a write of a code word it already
+/* Cheats that write instructions into the main module's code (or its read-only data). Here neither is writable while
+   guest threads run, so those words are written once at launch, before the modules are sealed; the rest of such a cheat
+   (its data writes, button conditions) runs on the cheat thread like any other cheat, where a write of a word it already
    applied is a no-op compare. This file decides which words those are and whether they are safe to write, against the
    ground truth of what the port changed:
    - changed: words the Apple-silicon rewrite (patch_nso.py) changed, from the original main text vs the rewritten
@@ -13,7 +13,8 @@
      (game_patches*.c, its veneers in the padding after the text). */
 typedef struct {
     const uint8_t *mem;                         /* main as loaded now */
-    uint64_t text_end, rx_end, image_end;       /* end of code; end of the executable padding page; start of the key page */
+    uint64_t text_end, rx_end, ro_end, image_end;   /* end of code; of the executable padding page; of read-only data
+                                                   (start of writable data); start of the runtime's key page */
     const uint32_t *changed; unsigned nchanged; /* sorted, disjoint [start, end) offset pairs */
     const uint32_t *moved; unsigned nmoved;     /* sorted, disjoint [start, end) offset pairs */
     int (*image_word)(void *ctx, uint64_t off, uint32_t *out);

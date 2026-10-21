@@ -75,11 +75,13 @@ static int walk(const CheatMain *m, const Cheat *c, Abs *s, CheatCode *out, char
         case 0x0: {
             unsigned mt = NIB(x, 2), r = NIB(x, 3);
             uint64_t imm = (uint64_t)(x & 0xFF) << 32 | w[1];
-            if (mt != 0 || !known(s, r) || s->v[r] + imm >= m->rx_end) { if (out) out->runtime = 1; break; }
+            if (mt != 0 || !known(s, r) || s->v[r] + imm >= m->ro_end) { if (out) out->runtime = 1; break; }
             if (!out) break;
             uint64_t off = s->v[r] + imm;
-            if (!top) FAIL("code patch at main+%#llx is under a condition or in a loop (cannot be split from it)", (unsigned long long)off);
-            if ((t != 4 && t != 8) || (off & 3) || off + t > m->rx_end) FAIL("writes part of an instruction at main+%#llx", (unsigned long long)off);
+            const char *what = off < m->rx_end ? "code" : "read-only data";
+            if (!top) FAIL("%s patch at main+%#llx is under a condition or in a loop (only possible at launch)", what, (unsigned long long)off);
+            if ((t != 4 && t != 8) || (off & 3) || (off < m->rx_end && off + t > m->rx_end) || off + t > m->ro_end)
+                FAIL("writes part of a word of the game's %s at main+%#llx", what, (unsigned long long)off);
             uint32_t words[2] = {t == 8 ? w[3] : w[2], w[2]};   // a 64-bit value is stored low word first
             for (unsigned j = 0; j < t / 4; j++) {
                 unsigned k = 0;
@@ -95,7 +97,7 @@ static int walk(const CheatMain *m, const Cheat *c, Abs *s, CheatCode *out, char
             uint64_t rel = len == 2 ? (uint64_t)(x & 0xF) << 32 | w[1] : 0, addr = 0;
             int fixed = xx == 0 && ((o == 4) || ((o == 3 || o == 5) && known(s, r)));
             if (fixed) addr = (o == 4 ? 0 : s->v[r]) + (o == 3 ? 0 : rel);
-            if (out && fixed && addr < m->rx_end) FAIL("stores a register into the code at main+%#llx (not supported)", (unsigned long long)addr);
+            if (out && fixed && addr < m->ro_end) FAIL("stores a register into the game's code or read-only data at main+%#llx (not supported)", (unsigned long long)addr);
             if (out) out->runtime = 1;
             if (inc) { if (known(s, r) && top) s->v[r] += t; else forget(s, r); }
             break;
@@ -168,6 +170,7 @@ int cheat_code_scan(const CheatMain *m, const Cheat *const *masters, int nmaster
         const CheatWord *p = find_word(prior, nprior, at);
         if (p) { if (p->value != want && out->conflict < 0) out->conflict = p->cheat; }
         else if (now != img) FAIL("overlaps the game runtime's own patch at main+%#llx", (unsigned long long)at);
+        if (at >= m->rx_end) continue;   // read-only data: no instruction checks
         const char *bad = needs_rewrite(want);
         if (bad) FAIL("writes %s at main+%#llx, which the Apple-silicon rewrite would have to replace", bad, (unsigned long long)at);
         uint64_t to;

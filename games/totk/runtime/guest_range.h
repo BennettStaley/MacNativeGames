@@ -14,13 +14,12 @@ static inline int guest_pages_mapped(const unsigned char *pages, uint64_t start,
     return 1;
 }
 /* The main module, at runtime: 1 when a cheat may read (anywhere before the runtime's key page) or write (only data and
-   bss, [data_off, image_end)); 2 when a write falls wholly on code words ([0, rx_end), never writable while the game
-   runs: the caller may only compare them with what was applied at launch); 0 otherwise. */
-static inline int guest_main_access(uint64_t base, uint64_t data_off, uint64_t rx_end, uint64_t image_end,
-                                    uint64_t a, uint64_t n, int write) {
+   bss, [data_off, image_end)); 2 when a write falls wholly on code or read-only data ([0, data_off), never writable while
+   the game runs: the caller may only compare it with what was applied at launch); 0 otherwise (straddling). */
+static inline int guest_main_access(uint64_t base, uint64_t data_off, uint64_t image_end, uint64_t a, uint64_t n, int write) {
     if (!base) return 0;
     if (!write) return guest_range_in(a, n, base, image_end);
     if (guest_range_in(a, n, base + data_off, image_end - data_off)) return 1;
-    if (guest_range_in(a, n, base, rx_end)) return 2;
+    if (guest_range_in(a, n, base, data_off)) return 2;
     return 0;
 }
