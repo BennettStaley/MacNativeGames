@@ -32,6 +32,23 @@ targets:
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # Save packages (.totksave, runtime/save_package.h): AirDrop and Files open them with the app (saves_menu.m);
+        # the Mac app declares the same type (build_app.py).
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: org.macnativegames.totk.save
+            UTTypeDescription: Tears of the Kingdom saves
+            UTTypeConformsTo:
+              - public.zip-archive
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - totksave
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Tears of the Kingdom saves
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - org.macnativegames.totk.save
         UIRequiresFullScreen: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationLandscapeLeft

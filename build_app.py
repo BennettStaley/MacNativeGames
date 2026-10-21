@@ -50,6 +50,7 @@ UPDATES = ('v112', 'v121', 'v143')
 HACTOOL = ('https://github.com/SciresM/hactool.git', '1d64a83450e025622f3468c28fc4164dad2c5ef6')
 APP_NAME = 'Tears of the Kingdom'
 BUNDLE_ID = 'org.macnativegames.totk'
+SAVE_PACKAGE_TYPE = 'org.macnativegames.totk.save'   # .totksave (runtime/save_package.h); also in ios/project.yml
 LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
 # Pinned upstream sources fetched at build time (repository, commit)
 SPIRV_CROSS = ('https://github.com/KhronosGroup/SPIRV-Cross.git', 'aa217aeb6c9f0ace7a0ab233b28807edf45eb165')
@@ -727,8 +728,8 @@ def step_shader_libs(tree, logs, *, version='v0'):
 def step_binary(tree, game, keys, env, logs, *, version="v0"):
     say('4/4 app: building the game binary and the launcher')
     run(['make', f'-j{os.cpu_count() or 4}', 'runtime' if version == 'v0' else f'runtime-{version}'], logs / 'runtime.log', cwd=tree, env=env)
-    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-DTOTK_GAME_{version.upper()}=1']), 'app/launcher.m', '-framework', 'AppKit',
-         '-o', 'build/app-launcher'], logs / 'launcher.log', cwd=tree, env=env)
+    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-DTOTK_GAME_{version.upper()}=1']), 'app/launcher.m',
+         'runtime/save_package.m', '-framework', 'AppKit', '-lz', '-o', 'build/app-launcher'], logs / 'launcher.log', cwd=tree, env=env)
     # used only while packaging (step_warm_metal); not part of the app
     run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Wextra', 'tools/warm_metal_cache.m', '-framework', 'Metal',
          '-framework', 'Foundation', '-o', 'build/warm-metal-cache'], logs / 'warm-metal-cache-build.log', cwd=tree, env=env)
@@ -948,6 +949,13 @@ def step_app(tree, out, logs, *, version="v0", store=None):
                 CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
                 LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
                 GCSupportsControllerUserInteraction=True)
+    # Save packages (.totksave, runtime/save_package.h): AirDrop / a double-click opens them with the app, whose launcher
+    # imports them before the game starts (docs/save-sync.md). The iOS app declares the same type (ios/project.yml).
+    info['UTExportedTypeDeclarations'] = [dict(UTTypeIdentifier=SAVE_PACKAGE_TYPE, UTTypeDescription='Tears of the Kingdom saves',
+                                               UTTypeConformsTo=['public.zip-archive', 'public.data'],
+                                               UTTypeTagSpecification={'public.filename-extension': ['totksave']})]
+    info['CFBundleDocumentTypes'] = [dict(CFBundleTypeName='Tears of the Kingdom saves', CFBundleTypeRole='Viewer',
+                                          LSHandlerRank='Owner', LSItemContentTypes=[SAVE_PACKAGE_TYPE])]
     icon = tree / 'build/AppIcon.icns'
     if icon.exists():
         clone(icon, tmp / 'Contents/Resources/AppIcon.icns')
