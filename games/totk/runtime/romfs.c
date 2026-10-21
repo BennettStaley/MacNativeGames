@@ -49,7 +49,8 @@ static uint64_t handles[NH]; /* file index + 1; 0 is free */
    original stops the start. The directories, in this order: the build's patches (scripts/make_romfs_patches.py;
    TOTK_ROMFS_PATCHES, default extracted/<version>/romfs-patches, 0 = none), the true-2K HeapDef overlay
    (scripts/make_output_res_overlay.py) and the player's mods (TOTK_ROMFS_MODS, which the launcher sets to
-   <data>/mods/<version>; no manifest there = none). Each file can be replaced once. An overlay file is opened when the
+   <data>/mods/<version>; no manifest there = none). Each file can be replaced once, except that a mod file merged with the
+   build's edit takes the place of the build's overlay (overlay_load). An overlay file is opened when the
    game opens it, so a mod can replace thousands of files (a dub's voice streams) without holding a descriptor each; the
    file's identity (device, inode, size, modification time) is kept from the start check, and an open that finds another
    file there stops the game instead of serving bytes nobody checked. scripts/make_mod_manifest.py writes a mod's manifest.
@@ -62,8 +63,9 @@ static uint64_t handles[NH]; /* file index + 1; 0 is free */
    overlay: the heap sizes for the output), where the build's copy is kept; the Common layout archive that UI mods ship
    gets the build's quick-menu background fix applied again (capture_refix). The log says which. The mods folder's files
    are not hashed; their identity check at open time is the same. When player files are loaded, the ResourceSizeTable is
-   served adjusted for them (rstb_serve). */
-typedef struct { uint64_t index,size; char *path; dev_t dev; ino_t ino; struct timespec mtime; char *name; } Overlay;
+   served adjusted for them (rstb_serve). A TOTK_ROMFS_MODS line may also hold the build's edit already (its original's
+   SHA-256 is that of the build's overlay, make_mod_manifest.py after upstream #134): it replaces that overlay in place. */
+typedef struct { uint64_t index,size; char *path; dev_t dev; ino_t ino; struct timespec mtime; char *name; char sha[65]; } Overlay;
 static Overlay *overlays; /* sorted by RomFS index after overlay_init */
 static size_t noverlay,overlay_cap;
 #define ADDED UINT64_MAX   /* an added file's index until overlay_init numbers it */
@@ -177,33 +179,43 @@ static size_t npatch;   /* overlays[0..npatch): scripts/make_romfs_patches.py; [
 static size_t build_owner(uint64_t i,const char *name);
 static int build_yield(size_t owner,const char *who,const char *name);
 static int capture_refix(const char *who,const char *name,const char *file,const struct stat *st,char *out,size_t cap);
+/* With player set (TOTK_ROMFS_MODS), a line whose original SHA-256 is that of a build overlay loaded before it for the same
+   path (the build's romfs-patches) replaces that overlay: scripts/make_mod_manifest.py wrote it by applying the build's edit
+   to the mod's own file (upstream #134, issue #73: translations replace the UI archive the build patches for the quick-menu
+   capture). Its original is then the build's checked file, so the RomFS original is not read again. Any other collision
+   with a build layer goes to build_yield. */
 static void overlay_load(const char *dir,int required,int player) {
  char path[4096];need(snprintf(path,sizeof(path),"%s/manifest.tsv",dir)<(int)sizeof(path),"RomFS overlay path");FILE *m=fopen(path,"r");
  if(!m&&required){fprintf(stderr,"[totk] RomFS overlay: %s missing; build it with scripts/make_output_res_overlay.py <w>x<h>\n",path);runtime_fail("true-2K HeapDef overlay missing (make romfs-patches-out OUTPUT_RES=<w>x<h>)");}
  if(!m){fprintf(stderr,"[totk] RomFS overlay: none (%s)\n",path);return;}
- char line[8192];size_t first=noverlay;uint64_t hashed=0,t0=runtime_now_ns();
+ char line[8192];size_t first=noverlay,replaced=0;uint64_t hashed=0,t0=runtime_now_ns();
  while(fgets(line,sizeof(line),m)){
   if(line[0]=='#'||line[0]=='\n')continue;char name[4096],sha[65],orig[65];unsigned long long size=0;
   need(sscanf(line,"%4095[^\t]\t%llu\t%64[0-9a-f]\t%64[0-9a-f-]",name,&size,sha,orig)==4&&strlen(sha)==64&&(strlen(orig)==64||!strcmp(orig,"-")),"RomFS overlay manifest line");
   need(path_ok(name),"RomFS overlay path");uint64_t i=lower(name);int known=i<file_count&&!strcmp(entry_name(entry(i)),name),add=!strcmp(orig,"-");
   if(!known&&!add){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv names %s, which the RomFS lacks; a new file has \"-\" as its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay names a file the RomFS lacks");}
   if(known&&add){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv adds %s, which the RomFS already has; give its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay adds a file the RomFS already has");}
-  /* A player's file the build's layers also change: build_yield decides (the build's copy where the port needs it). */
-  size_t owner=player?build_owner(known?i:ADDED,name):0;int yield=owner?build_yield(owner,dir,name):0;
+  /* The build's edit already in the player's file (its original is the build overlay's SHA-256): replaces that overlay. */
+  size_t over=SIZE_MAX;if(player&&known)for(size_t k=0;k<nbuild&&k<first;k++)if(overlays[k].index==i&&!strcmp(overlays[k].sha,orig)){over=k;break;}
+  /* Another player's file the build's layers also change: build_yield decides (the build's copy where the port needs it). */
+  size_t owner=player&&over==SIZE_MAX?build_owner(known?i:ADDED,name):0;int yield=owner?build_yield(owner,dir,name):0;
   if(owner&&!yield)continue;
   if(owner)first--;   /* the build's slot is gone */
-  Entry e={0};if(known){e=entry(i);sha_range(image_fd,e.offset,e.size,orig,"original");}else i=ADDED;
+  Entry e={0};if(known){e=entry(i);if(over==SIZE_MAX)sha_range(image_fd,e.offset,e.size,orig,"original");}else i=ADDED;
   char file[8200];need(snprintf(file,sizeof(file),"%s/%s",dir,name)<(int)sizeof(file),"RomFS overlay file path");int fd=open(file,O_RDONLY|O_CLOEXEC);struct stat st;
   need(fd>=0&&fstat(fd,&st)==0&&(uint64_t)st.st_size==size,"RomFS overlay file missing or wrong size");sha_range(fd,0,size,sha,name);close(fd);
-  hashed+=e.size+size;
+  hashed+=(over==SIZE_MAX?e.size:0)+size;
   char fixed[4096];if(yield==MODS_BUILD_REFIX&&capture_refix(dir,name,file,&st,fixed,sizeof fixed)){need(stat(fixed,&st)==0,"RomFS overlay fixed copy");snprintf(file,sizeof file,"%s",fixed);size=(unsigned long long)st.st_size;}
   if(noverlay==overlay_cap){overlay_cap=overlay_cap?overlay_cap*2:16;overlays=realloc(overlays,overlay_cap*sizeof(*overlays));need(overlays!=NULL,"RomFS overlay table");}
-  char *copy=strdup(file),*rel=strdup(name);need(copy&&rel,"RomFS overlay path copy");overlays[noverlay++]=(Overlay){i,size,copy,st.st_dev,st.st_ino,st.st_mtimespec,rel};
+  char *copy=strdup(file),*rel=strdup(name);need(copy&&rel,"RomFS overlay path copy");Overlay o={i,size,copy,st.st_dev,st.st_ino,st.st_mtimespec,rel,{0}};memcpy(o.sha,sha,65);
+  if(over!=SIZE_MAX){fprintf(stderr,"[totk] RomFS overlay: %s (%llu bytes) replaces the build's overlay %s (the mod holds its edit)\n",name,size,overlays[over].path);
+   free(overlays[over].path);free(overlays[over].name);overlays[over]=o;replaced++;continue;}
+  overlays[noverlay++]=o;
   if(noverlay-first<=16)fprintf(stderr,"[totk] RomFS overlay: %s (%llu bytes) %s\n",name,size,add?"is added":"replaces the original");
  }
  fclose(m);
- if(noverlay-first>16)fprintf(stderr,"[totk] RomFS overlay: %zu files from %s (%zu more not listed)\n",noverlay-first,dir,noverlay-first-16);
- if(noverlay>first)fprintf(stderr,"[totk] RomFS overlay: %s checked, %zu files, %.1f MB hashed in %.2f s\n",dir,noverlay-first,hashed/1048576.0,(runtime_now_ns()-t0)/1e9);
+ if(noverlay-first>16)fprintf(stderr,"[totk] RomFS overlay: %zu files from %s (%zu more not listed)\n",noverlay-first+replaced,dir,noverlay-first-16);
+ if(noverlay>first||replaced)fprintf(stderr,"[totk] RomFS overlay: %s checked, %zu files, %.1f MB hashed in %.2f s\n",dir,noverlay-first+replaced,hashed/1048576.0,(runtime_now_ns()-t0)/1e9);
 }
 /* The build layer's overlay slot + 1 that already changes RomFS file i (or adds name, i = ADDED), else 0. */
 static size_t build_owner(uint64_t i,const char *name) {
@@ -260,7 +272,7 @@ static int romfs_lookup(const char *p,char *real,size_t cap) {
 }
 static void push_overlay(uint64_t i,const char *file,const char *name,const struct stat *st) {
  if(noverlay==overlay_cap){overlay_cap=overlay_cap?overlay_cap*2:16;overlays=realloc(overlays,overlay_cap*sizeof(*overlays));need(overlays!=NULL,"RomFS overlay table");}
- char *copy=strdup(file),*rel=strdup(name);need(copy&&rel,"RomFS overlay path copy");overlays[noverlay++]=(Overlay){i,(uint64_t)st->st_size,copy,st->st_dev,st->st_ino,st->st_mtimespec,rel};
+ char *copy=strdup(file),*rel=strdup(name);need(copy&&rel,"RomFS overlay path copy");overlays[noverlay++]=(Overlay){i,(uint64_t)st->st_size,copy,st->st_dev,st->st_ino,st->st_mtimespec,rel,{0}};
 }
 static void mods_load(void) {
  const char *dir=mods_dir();if(!strcmp(dir,"0")){fprintf(stderr,"[totk] mods: off (TOTK_MODS_DIR=0)\n");return;}

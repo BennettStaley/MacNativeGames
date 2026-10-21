@@ -36,7 +36,7 @@ static int display_apply(const char *changed) {
     pthread_mutex_lock(&lock);
     int out = values[settings_index("display.output")], custom = values[settings_index("display.custom_width")];
     int scale = values[settings_index("display.scale")], aspect = values[settings_index("display.aspect")];
-    unsigned dw = disp_w, dh = disp_h, nw = native_w;
+    unsigned dw = disp_w, nw = native_w;
     pthread_mutex_unlock(&lock);
     int r = 0; unsigned cw = 1280, ch = 720;
     if (!settings_ios()) {
@@ -59,18 +59,12 @@ static int display_apply(const char *changed) {
         sw &= ~7u; sh &= ~7u; if (sw < 64) sw = 64; if (sh < 64) sh = 64;
     }
     if (runtime_render_request(sw, sh)) r = -1;
-    if (!settings_ios() && (!changed || !strcmp(changed, "display.aspect") || aspect == 0)) {
-        static const float ratios[] = {0, 16.0f / 9, 16.0f / 10, 21.0f / 9, 32.0f / 9};
-        float a = aspect == 0 ? (dw && dh ? (float)dw / dh : 0) : ratios[aspect < 5 ? aspect : 1];
-        if (a && fabsf(a / (16.0f / 9) - 1) < 0.01f) a = 0;   /* 16:9 is the game's own: no stretch */
-        if (changed || a) runtime_aspect_set(a);
-        /* Vert+: on a screen taller than 16:9 the game keeps its horizontal view and sees more above and below (the
-           vertical angle widened by the shapes' ratio, tan-corrected for the game's usual ~50 degrees), instead of
-           losing the sides. */
-        extern void runtime_fov_aspect(float k);
-        float k = 1;
-        if (a && a < 16.0f / 9) { const float half = 0.436f; k = atanf(tanf(half) * (16.0f / 9) / a) / half; }
-        if (changed || k != 1) runtime_fov_aspect(k);
+    if (!settings_ios() && (!changed || !strcmp(changed, "display.aspect"))) {
+        /* The shape is key 4's engine (aspect_patch.h): "Fill the screen" is its fit step, which follows the window
+           (frontend.m runtime_aspect_view); a fixed shape is its wide step, 16:9 the game's own. Vert+ (a screen taller
+           than 16:9 keeps the sides and sees more above and below) comes with it. */
+        static const float ratios[] = {-1, 0, 16.0f / 10, 21.0f / 9, 32.0f / 9};
+        runtime_aspect_set(ratios[aspect >= 0 && aspect < 5 ? aspect : 1]);
     }
     pthread_mutex_lock(&lock);
     if (sw) snprintf(display_status, sizeof display_status, "Output %u x %u, 3D scene %u x %u", cw, ch, sw, sh);
@@ -84,9 +78,9 @@ void settings_display_size(unsigned drawable_w, unsigned drawable_h, unsigned sc
     pthread_mutex_lock(&lock);
     int same = drawable_w == disp_w && drawable_h == disp_h && screen_w == native_w, ready = loaded;
     disp_w = drawable_w; disp_h = drawable_h; native_w = screen_w;
-    int out = loaded ? values[settings_index("display.output")] : -1, aspect = loaded ? values[settings_index("display.aspect")] : -1;
+    int out = loaded ? values[settings_index("display.output")] : -1;
     pthread_mutex_unlock(&lock);
-    if (!same && ready && (out == SET_OUT_WINDOW || out == SET_OUT_NATIVE || aspect == 0)) display_apply("window");
+    if (!same && ready && (out == SET_OUT_WINDOW || out == SET_OUT_NATIVE)) display_apply("window");   /* the aspect ratio follows the window itself (runtime_aspect_view) */
 }
 
 /* Live settings go to the code that owns them; the touch controls and the menu button are the iOS app's own views, which

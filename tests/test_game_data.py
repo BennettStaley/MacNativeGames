@@ -98,7 +98,7 @@ class GameData(unittest.TestCase):
             (self.tree / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.tree / rel).write_bytes(b'test')
         out = self.root / 'Game.app'
-        with mock.patch.object(build_app, 'sign_app'):
+        with mock.patch.object(build_app, 'sign_app'), mock.patch.object(build_app, 'app_seal_valid', return_value=True):   # unsigned here
             build_app.step_app(self.tree, out, self.logs, version='v143', store=pointer)
         res = out / 'Contents/Resources/totk'
         self.assertEqual(json.loads((res / 'game-data.json').read_text()), pointer)

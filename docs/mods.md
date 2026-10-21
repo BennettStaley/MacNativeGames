@@ -98,11 +98,37 @@ the game's table and raises the entry of every file the mods change or add (and 
 | Archives with an extra top folder, folders without `romfs/` whose top level is RomFS folders | works |
 | A mod's own ResourceSizeTable | left out; the game's table is adjusted instead |
 | Files the port also patches (UI layouts, the game over flow) | the mod's copy; the port's quick-menu fix is applied to the UI layouts again |
-| Code patches (`exefs/`: `.pchtxt`, `.ips`, `subsdk`) | not applied: the port's code is translated ahead of time; coming later |
+| Code patches for main (`exefs/`: `.pchtxt`, `.ips`, `.ips32`) | not loaded from the mods folder: merged when the app is built with `--mod <mod folder>` ([Code patches](#code)); the Mods tab says so for such a mod |
+| Extra code modules (`subsdk9` and the like) | not loaded: the app runs main, sdk and subsdk0 only |
 | TKMM packages (`.tkcl`) | listed but not loaded; coming later |
 | Two mods changing the same file (merging packs, text, parameters) | the first in the order wins; merging is coming later |
 | Mods made for 1.0-1.2.x | load, flagged: files whose format changed in 1.4.3 can crash or look wrong |
 | Cheats (`<mod>/cheats/<build ID>.txt`, Atmosphère format) | Mac: listed in Settings › Cheats while the mod is on, in the load order ([settings](settings.md#cheats)); iPhone / iPad: not yet |
+
+<a id="code"></a>
+## Code patches (build time)
+
+`--mod <mod folder>` merges a mod's main-module code patches into the app while it is built. The app has no module
+loader: at start it maps the three code modules it was built from (main, sdk and subsdk0), rewritten for Apple
+silicon and bound by SHA-256. The patches are applied to the verified retail main of the version being built before
+that rewrite, so the app still matches the hash it is bound to; RomFS (data) mods are unaffected and are still
+loaded at start.
+
+```bash
+python3.14 build_app.py "/path/to/Tears of the Kingdom.xci" -k "/path/to/prod.keys" --mod "/path/to/Mod"
+```
+
+Several mods with code patches are combined in a mod manager first: TKMM's merged output is one folder with one
+`exefs/` and one `romfs/` (a manager may also pack several mods' records into one `.ips`), and `--mod` takes that
+folder as it is. Two patch files that change the same bytes are refused with both names, so a merge that overwrote
+one mod's change with another's stops the build instead of shipping silently.
+
+The folder holds the mod's files in the usual layout - `exefs/` for code, `romfs/` for data - and either half is
+enough: without `exefs/` there is no code to merge, and without `romfs/` the version folder is never touched. An
+`exefs/` that holds nothing to merge into main (`subsdk9`, a `main.npdm`) is a note, not a failure: the build
+carries on, its code half is in the app, and its data half takes effect once the folder is installed
+(`--install-mod-romfs`, or by hand). With `--update` the patch is merged into the updated module, which is the one
+the app runs.
 
 ## The older layout
 
@@ -123,7 +149,11 @@ python3 games/totk/scripts/make_mod_manifest.py "$MODDIR" --app "/path/to/Tears 
 
 The script hashes each file and its original in the app's RomFS, leaves out files identical to the original, and prints
 `...: N files (R replaced, A added)`; the log then says `.../mods/v143 checked, N files`. Regenerate it after every
-change and never edit it by hand. (Upstream's guide to this layout, also in Chinese:
+change and never edit it by hand. A build with `--mod <mod folder> --install-mod-romfs` fills this folder itself:
+it replaces it with the mod's `romfs/` and writes the manifest (what it held is moved next to it as
+`<version>.backup-<date>-<time>`). A file there that the build's own patches also replace (a translation's UI archive,
+`Common.Product.<n>`) is merged with the build's edit by `make_mod_manifest.py`, and its manifest line names the build's
+file as the original, so the game lets it take the place of the build's overlay (upstream #134, issue #73). (Upstream's guide to this layout, also in Chinese:
 [ly05010419/MacNativeGames docs/mods.md](https://github.com/ly05010419/MacNativeGames/blob/main/docs/mods.md).)
 
 ## Button-icon mods
