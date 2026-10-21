@@ -22,6 +22,7 @@
 #include "settings_schema.h"
 #include "include/totk_ui_lang.h"
 #include "totk_shader_contrib.h"   // the shared shader list contribution and its reminder
+#import "save_package.h"           // .totksave: saves sent from another Mac or an iPhone / iPad
 
 static void show_error(NSString *detail) {
     NSAlert *alert = [NSAlert new];
@@ -141,6 +142,77 @@ static NSString *game_data(NSString *root, BOOL apply) {
     return nil;
 }
 
+/* Files opened with the app (a .totksave double-clicked in Downloads, where AirDrop puts it): Launch Services hands them
+   over as an Apple event once the app runs, before applicationDidFinishLaunching, so the launcher runs the event loop
+   just that long (2 s at most). A path given on the command line counts too. */
+@interface TOTKLaunchDelegate : NSObject <NSApplicationDelegate>
+@property (nonatomic, strong) NSMutableArray<NSURL *> *opened;
+@end
+@implementation TOTKLaunchDelegate
+- (void)application:(NSApplication *)app openURLs:(NSArray<NSURL *> *)urls { (void)app; [self.opened addObjectsFromArray:urls]; }
+- (void)applicationDidFinishLaunching:(NSNotification *)note { (void)note; [self stop]; }
+- (void)stop {
+    if (!NSApp.isRunning) return;
+    [NSApp stop:nil];
+    [NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint modifierFlags:0 timestamp:0
+                                     windowNumber:0 context:nil subtype:0 data1:0 data2:0] atStart:YES];
+}
+@end
+static NSArray<NSString *> *opened_packages(int argc, char **argv) {
+    TOTKLaunchDelegate *delegate = [TOTKLaunchDelegate new]; delegate.opened = [NSMutableArray array];
+    for (int i = 1; i < argc; i++) if (argv[i][0] != '-') [delegate.opened addObject:[NSURL fileURLWithPath:@(argv[i])]];
+    [NSApplication sharedApplication]; NSApp.delegate = delegate;
+    [delegate performSelector:@selector(stop) withObject:nil afterDelay:2.0];
+    [NSApp run];
+    [NSObject cancelPreviousPerformRequestsWithTarget:delegate];
+    NSApp.delegate = nil;
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSURL *url in delegate.opened) if (url.isFileURL && [url.pathExtension.lowercaseString isEqual:TOTKSavePackageExtension]) [out addObject:url.path];
+    return out;
+}
+
+/* A save package opened with the app: checked (runtime/save_package.h: same game version, every file's SHA-256), shown,
+   and on the player's yes put into this Mac's profile, the current saves copied to <data>/save-backups first. The game is
+   not running here (the launcher checked), so nothing can save over it. Returns NO when the player chose Quit. */
+static BOOL import_package(NSString *package, NSString *profile, NSString *backups) {
+    [NSApp activateIgnoringOtherApps:YES];
+    NSError *error = nil;
+    TOTKSavePackageInfo *info = TOTKSaveInspect(package, @TOTK_GAME_VERSION, &error);
+    NSAlert *alert = [NSAlert new];
+    if (info) {
+        alert.messageText = [NSString stringWithFormat:@"Use the saves from %@?", info.fromText];
+        alert.informativeText = [NSString stringWithFormat:@"%@\nSent %@ (game version %@).\n\n%@\n\nThey replace the saves on this Mac. "
+                                 @"The current saves are copied to %@ first (the last %d copies are kept).",
+                                 package.lastPathComponent, info.created ? [NSDateFormatter localizedStringFromDate:info.created
+                                 dateStyle:NSDateFormatterMediumStyle timeStyle:NSDateFormatterShortStyle] : @"at an unknown time",
+                                 info.gameVersion, info.slotsText, backups, TOTK_SAVE_BACKUPS_KEPT];
+        [alert addButtonWithTitle:@"Replace Saves and Play"];
+        [alert addButtonWithTitle:@"Play Without Them"];
+        [alert addButtonWithTitle:@"Quit"];
+        NSModalResponse choice = [alert runModal];
+        if (choice == NSAlertThirdButtonReturn) return NO;
+        if (choice == NSAlertSecondButtonReturn) return YES;
+        info = TOTKSaveImport(package, profile, backups, @TOTK_GAME_VERSION, &error);
+        fprintf(stderr, "[launcher] save import %s: %s\n", package.fileSystemRepresentation,
+                info ? "done" : error.localizedDescription.UTF8String);
+        if (info) {
+            NSAlert *done = [NSAlert new];
+            done.messageText = [NSString stringWithFormat:@"Saves from %@ are on this Mac now", info.fromText];
+            done.informativeText = [NSString stringWithFormat:@"%@\n\n%@ Load one from the title screen.", info.slotsText,
+                                    info.backup ? [NSString stringWithFormat:@"The saves they replaced are in %@.", info.backup] : @""];
+            [done addButtonWithTitle:@"Play"]; [done addButtonWithTitle:@"Quit"];
+            return [done runModal] == NSAlertFirstButtonReturn;
+        }
+        alert = [NSAlert new];
+    }
+    alert.alertStyle = NSAlertStyleWarning;
+    alert.messageText = @"These saves can't be used";
+    alert.informativeText = [NSString stringWithFormat:@"%@\n\n%@\n\nThe saves on this Mac are unchanged.", package.lastPathComponent,
+                             error.localizedDescription ?: @"Unknown error."];
+    [alert addButtonWithTitle:@"Play"]; [alert addButtonWithTitle:@"Quit"];
+    return [alert runModal] == NSAlertFirstButtonReturn;
+}
+
 static BOOL make_dir(NSString *path) {
     return [NSFileManager.defaultManager createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
 }
@@ -181,11 +253,22 @@ int main(int argc, char **argv) {
             show_error([NSString stringWithFormat:@"Cannot create %@.", data]);
             return 1;
         }
+        NSArray<NSString *> *packages = opened_packages(argc, argv);
         pid_t running = running_game(slot);
         if (running) {
+            if (packages.count) {   /* the running game holds its save in memory and would save over an import */
+                [NSApp activateIgnoringOtherApps:YES];
+                NSAlert *alert = [NSAlert new];
+                alert.messageText = @"Quit the game to use these saves";
+                alert.informativeText = [NSString stringWithFormat:@"The game is running, and it would save over saves brought in now. "
+                                         @"Save in the game if you need to, quit it (⌘Q), then open %@ again.", packages.firstObject.lastPathComponent];
+                [alert runModal];
+            }
             [[NSRunningApplication runningApplicationWithProcessIdentifier:running] activateWithOptions:NSApplicationActivateAllWindows];
             return 0;
         }
+        for (NSString *package in packages)
+            if (!import_package(package, profile, [data stringByAppendingPathComponent:@"save-backups"])) return 0;
 #if defined(TOTK_GAME_V112) || defined(TOTK_GAME_V121) || defined(TOTK_GAME_V143)
         NSString *backup = [profile stringByAppendingFormat:@"-before-%s", TOTK_GAME_VERSION];
         NSFileManager *fm = NSFileManager.defaultManager;

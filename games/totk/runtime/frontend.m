@@ -223,6 +223,19 @@ static void note_occlusion(const char *when){int v=(window.occlusionState&NSWind
 -(void)windowDidChangeBackingProperties:(NSNotification *)n{(void)n;front_sync_drawable();}
 @end
 static TOTKWindowDelegate *windowDelegate;
+/* A save package (.totksave, runtime/save_package.h) opened while the game runs (a double-click, or AirDrop's Open): the
+   launcher imports one before the game starts (app/launcher.m), never into a running game, which would save over it. */
+@interface TOTKAppDelegate:NSObject<NSApplicationDelegate>
+@end
+@implementation TOTKAppDelegate
+-(void)application:(NSApplication *)app openURLs:(NSArray<NSURL *> *)urls{(void)app;
+ fprintf(stderr,"[saves] %lu file(s) opened while the game runs: refused (quit the game first)\n",(unsigned long)urls.count);
+ NSAlert *a=[NSAlert new];a.messageText=@"Quit the game to use these saves";
+ a.informativeText=[NSString stringWithFormat:@"%@ can only be brought in while the game is closed: the running game would save over it. "
+  "Save in the game if you need to, quit it (⌘Q), then open the file again (it stays in %@).",urls.firstObject.lastPathComponent,urls.firstObject.URLByDeletingLastPathComponent.path];
+ if(window.visible)[a beginSheetModalForWindow:window completionHandler:nil];else [a runModal];}
+@end
+static TOTKAppDelegate *appDelegate;
 int runtime_front_window_visible(void){return atomic_load(&windowVisible);}
 void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(), ^{[window performClose:nil];});}
 /* The menu's Restart now (mods and after-restart settings): a detached shell waits for this process to end, then opens the
@@ -255,6 +268,7 @@ void runtime_front_run(void(*callback)(void)){
  @autoreleasepool{
   bootStartNS=runtime_now_ns();
   [NSApplication sharedApplication];[NSApp setActivationPolicy:background_run()?NSApplicationActivationPolicyAccessory:NSApplicationActivationPolicyRegular];
+  appDelegate=[TOTKAppDelegate new];NSApp.delegate=appDelegate;
   runtime_gamepad_start();
   /* Default window: the docked output size, 1920x1080, scaled down (16:9 kept) when the screen's visible area is smaller. */
   /* TOTK_WINDOW_SIZE=<w>x<h> (test scripts only, e.g. the 2K output test; the desktop launcher never sets it): another starting size. */

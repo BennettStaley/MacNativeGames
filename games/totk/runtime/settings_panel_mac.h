@@ -4,13 +4,16 @@
    controller's Home button (or Options and Menu together). Mouse, keyboard (arrows choose and change, Return toggles,
    Q / E or Tab switch tabs, Escape closes) and controller (D-pad or left stick, A, B, shoulder buttons) all work. While it
    is open the game reads a neutral controller (runtime_input_hold). The last tab, Mods, is runtime/mods_panel_mac.h (the
-   installed mods and the GameBanana browser); the sidebar widens while it shows. The iPhone / iPad menu is
-   ios/Sources/settings_menu.m. */
+   installed mods and the GameBanana browser); the sidebar widens while it shows. The Interface tab ends with Send saves:
+   the profile's saves as one .totksave file (runtime/save_package.h) for AirDrop, Messages, Mail or Finder; the other
+   device opens it to bring them in (docs/save-sync.md). The iPhone / iPad menu is ios/Sources/settings_menu.m. */
 #pragma once
 #import <Cocoa/Cocoa.h>
 #import <GameController/GameController.h>
+#include <sys/sysctl.h>
 #include "runtime.h"
 #include "settings.h"
+#import "save_package.h"
 
 @interface TOTKFlippedView : NSView @end   /* the scrolling rows start at the top */
 @implementation TOTKFlippedView
@@ -26,6 +29,7 @@
 
 static NSWindow *settings_window(void);   /* frontend.m: the game window */
 
+@interface TOTKSettingsPanel () <NSSharingServicePickerDelegate> @end
 @implementation TOTKSettingsPanel {
     NSSegmentedControl *tabs;
     NSScrollView *scroll;
@@ -34,13 +38,14 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     NSButton *reset, *restartNow;   /* restartNow: shown while a setting or the mods wait for a restart */
     TOTKModsPane *mods;                   /* the Mods tab (page MODS_PAGE) */
     NSMutableArray<NSView *> *rows;       /* the rows of the page shown, in order */
-    NSMutableArray<NSNumber *> *rowSetting;
+    NSMutableArray<NSNumber *> *rowSetting;   /* the setting of each row; SAVES_ROW: Send saves (Interface tab) */
+    NSButton *sendButton; NSTextField *savesNote;
     NSInteger page, focus;
     NSTimer *pollTimer;
     uint64_t padPrev; double padRepeatAt; int padDir;
 }
 static TOTKSettingsPanel *settingsPanel;
-enum { PANEL_WIDTH = 440, PANEL_MARGIN = 16, MODS_PAGE = SETTINGS_NPAGES, NPAGES = SETTINGS_NPAGES + 1 };
+enum { PANEL_WIDTH = 440, PANEL_MARGIN = 16, MODS_PAGE = SETTINGS_NPAGES, NPAGES = SETTINGS_NPAGES + 1, SAVES_ROW = -1 };
 static NSString *const SETTINGS_HINT = @"↑↓ choose   ←→ change   Q E tabs   Esc close\nController: D-pad, A, B, shoulder buttons";
 
 static BOOL settings_row_shown(const SettingDef *d) {
@@ -176,6 +181,61 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
     return row;
 }
 
+/* Send saves, at the end of the Interface tab: what is on disk now, sent as one file (runtime/save_package.h). */
+static NSString *saves_profile(void) { const char *d = getenv("TOTK_PROFILE_DIR"); return d && *d ? @(d) : @"user-data"; }
+- (NSView *)savesRow {
+    NSView *row = [NSView new]; row.wantsLayer = YES; row.layer.cornerRadius = 8; row.translatesAutoresizingMaskIntoConstraints = NO;
+    NSTextField *label = [NSTextField labelWithString:@"Send saves"];
+    label.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium]; label.textColor = NSColor.labelColor;
+    NSTextField *help = [NSTextField wrappingLabelWithString:[NSString stringWithFormat:@"%@. To an iPhone, iPad or another Mac with "
+        "AirDrop: save in the game first, the newest saves on disk are what is sent. Opening the file there brings them in "
+        "(the saves it replaces are kept).", TOTKSaveSummary(saves_profile())]];
+    help.font = [NSFont systemFontOfSize:11]; help.textColor = NSColor.secondaryLabelColor; help.preferredMaxLayoutWidth = 250;
+    savesNote = [NSTextField wrappingLabelWithString:@""]; savesNote.hidden = YES;
+    savesNote.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium]; savesNote.textColor = NSColor.systemOrangeColor; savesNote.preferredMaxLayoutWidth = 250;
+    NSStackView *text = [NSStackView stackViewWithViews:@[label, help, savesNote]]; text.orientation = NSUserInterfaceLayoutOrientationVertical;
+    text.alignment = NSLayoutAttributeLeading; text.spacing = 2;
+    sendButton = [NSButton buttonWithTitle:@"Send…" target:self action:@selector(sendSaves)];
+    sendButton.image = [NSImage imageWithSystemSymbolName:@"square.and.arrow.up" accessibilityDescription:nil]; sendButton.imagePosition = NSImageLeading;
+    sendButton.controlSize = NSControlSizeSmall; sendButton.bezelStyle = NSBezelStyleRounded; sendButton.refusesFirstResponder = YES;
+    for (NSView *v in @[text, sendButton]) { v.translatesAutoresizingMaskIntoConstraints = NO; [row addSubview:v]; }
+    [NSLayoutConstraint activateConstraints:@[
+        [row.widthAnchor constraintEqualToConstant:PANEL_WIDTH - 2 * 8 - 14],
+        [text.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:12], [text.topAnchor constraintEqualToAnchor:row.topAnchor constant:9],
+        [text.bottomAnchor constraintEqualToAnchor:row.bottomAnchor constant:-9], [text.widthAnchor constraintLessThanOrEqualToConstant:256],
+        [sendButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-10], [sendButton.topAnchor constraintEqualToAnchor:row.topAnchor constant:9],
+        [sendButton.leadingAnchor constraintGreaterThanOrEqualToAnchor:text.trailingAnchor constant:8]]];
+    return row;
+}
+- (void)savesNote:(NSString *)text {
+    savesNote.stringValue = text ?: @""; savesNote.hidden = !text.length;
+    if (text.length) fprintf(stderr, "[saves] %s\n", text.UTF8String);
+}
+- (void)sendSaves {
+    NSString *profile = saves_profile();
+    if (runtime_fs_save_busy() || TOTKSaveBusy(profile)) { [self savesNote:@"The game is saving right now. Try again in a moment."]; return; }
+    char model[64] = ""; size_t n = sizeof model - 1; sysctlbyname("hw.model", model, &n, NULL, 0);
+    NSError *error = nil;
+    NSString *path = TOTKSaveExport(profile, [NSTemporaryDirectory() stringByAppendingPathComponent:@"totk-saves-out"], @TOTK_GAME_VERSION,
+                                    @"mac", NSHost.currentHost.localizedName, @(model), &error);
+    if (!path) { [self savesNote:error.localizedDescription]; return; }
+    [self savesNote:nil];
+    fprintf(stderr, "[saves] packed %s\n", path.fileSystemRepresentation);
+    NSSharingServicePicker *picker = [[NSSharingServicePicker alloc] initWithItems:@[[NSURL fileURLWithPath:path]]];
+    picker.delegate = self;
+    [picker showRelativeToRect:sendButton.bounds ofView:sendButton preferredEdge:NSRectEdgeMinY];
+}
+/* AirDrop first; Finder's Reveal stays available through the picker's own services. */
+- (NSArray<NSSharingService *> *)sharingServicePicker:(NSSharingServicePicker *)picker sharingServicesForItems:(NSArray *)items
+                              proposedSharingServices:(NSArray<NSSharingService *> *)proposed {
+    (void)picker; (void)items;
+    NSSharingService *airdrop = [NSSharingService sharingServiceNamed:NSSharingServiceNameSendViaAirDrop];
+    NSMutableArray *out = [NSMutableArray array];
+    if (airdrop) [out addObject:airdrop];
+    for (NSSharingService *service in proposed) if (!airdrop || ![service.title isEqual:airdrop.title]) [out addObject:service];
+    return out;
+}
+
 - (void)buildPage {
     BOOL modsPage = page == MODS_PAGE;
     scroll.hidden = modsPage; mods.hidden = !modsPage; reset.hidden = modsPage;
@@ -189,6 +249,10 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
         if (strcmp(d->page, SETTINGS_PAGES[page]) || !settings_row_shown(d)) continue;
         NSView *row = [self rowFor:d index:i];
         [list addArrangedSubview:row]; [rows addObject:row]; [rowSetting addObject:@(i)];
+    }
+    if (!strcmp(SETTINGS_PAGES[page], "Interface")) {
+        NSView *saves = [self savesRow];
+        [list addArrangedSubview:saves]; [rows addObject:saves]; [rowSetting addObject:@(SAVES_ROW)];
     }
     if (!rows.count) {
         NSTextField *none = [NSTextField labelWithString:@"Nothing to set here on the Mac."]; none.textColor = NSColor.secondaryLabelColor;
@@ -249,7 +313,9 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
 - (void)step:(int)dir {
     if (page == MODS_PAGE) { [mods step:dir]; return; }
     if (focus >= (NSInteger)rows.count) return;
-    int i = rowSetting[focus].intValue; const SettingDef *d = &SETTINGS[i]; int v = settings_get(d->key);
+    int i = rowSetting[focus].intValue;
+    if (i == SAVES_ROW) { if (!dir) [self sendSaves]; return; }
+    const SettingDef *d = &SETTINGS[i]; int v = settings_get(d->key);
     if (d->type == SET_BOOL) v = dir ? dir > 0 : !v;
     else if (d->type == SET_RANGE) { if (!dir) return; v += dir * d->step; v = v < d->min ? d->min : v > d->max ? d->max : v; }
     else {
