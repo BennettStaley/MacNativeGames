@@ -460,7 +460,7 @@ const char *mods_notice(unsigned flags) {
     if (flags & MOD_OLD_VERSION) return "Made for an older game version: may not work on 1.4.3.";
     if (flags & MOD_PROMPTS) return "Button icons: switched on or off by Controls › Button prompts (after a restart).";
     if (flags & MOD_CONFLICT) return "Changes files a mod higher in the list also changes: that mod's copies are used.";
-    if (flags & MOD_HAS_CODE) return "Has code patches (exefs): not applied; only its game files are loaded.";
+    if (flags & MOD_HAS_CODE) return "Has code patches (exefs): they apply only when the app is built with --mod (docs/mods.md); its game files load either way.";
     if (flags & MOD_OWN_RSTB) return "Ships its own ResourceSizeTable: left out, the game's table is adjusted instead.";
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
     if (flags & MOD_HAS_CHEATS) return "Has cheats: cheats work on the Mac for now, not on iPhone or iPad.";

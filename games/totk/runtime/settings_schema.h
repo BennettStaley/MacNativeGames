@@ -79,7 +79,7 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_RANGE, SET_LIVE, SET_MAC, 2560, 2560, 640, 3840, 64, " px", NULL, 0, "iPhone and iPad show 720p.", "display.output", SET_OUT_CUSTOM},
     {"display.scale", "Display", "3D render scale", "The 3D scene against the output: 50% is half the width and height (four times fewer pixels), above 100% supersamples.",
      NULL, SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_SCALE, SET_N(SET_SCALE), NULL, NULL, 0},
-    {"display.aspect", "Display", "Aspect ratio", "Fill the screen shows more of the world on a wider or taller screen; text and icons stretch to it.",
+    {"display.aspect", "Display", "Aspect ratio", "Fill the screen shows more of the world on a wider or taller screen; text and icons keep their shape. Key 4 also cycles it.",
      NULL, SET_CHOICE, SET_LIVE, SET_MAC, 1, 1, 0, 0, 0, NULL, SET_ASPECT, SET_N(SET_ASPECT), "Not on iPhone and iPad yet.", NULL, 0},
     {"display.headroom", "Display", "Maximum output", "The biggest output resolution you can switch to while playing. Higher sets more memory aside; takes effect after a restart.",
      "TOTK_OUTPUT_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_HEADROOM, SET_N(SET_HEADROOM), "Fixed on iPhone and iPad.", NULL, 0},

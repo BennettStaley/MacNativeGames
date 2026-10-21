@@ -2,6 +2,7 @@
    TOTK_JQ_CHECK diagnostics. The functions the shared runtime calls for the output size and keys 3 / 4 answer
    "not available" until BotW's own sites are found. */
 #include <stdatomic.h>
+#include "world_survey.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -370,6 +371,7 @@ static void patch_render_1080(Module *m) {
 }
 void runtime_game_patches(Module *m) {
     fprintf(stderr, "[botw] %s game-code patches\n", TOTK_GAME_VERSION);
+    runtime_survey_init(m);   /* TOTK_SURVEY=1: survey pos / move (world_survey.c) */
     patch_render_1080(m);
     if (realtime_enabled()) patch_realtime(m);
     else fprintf(stderr, "[botw] real-time frame step off (TOTK_REALTIME=0): the game advances by its present interval\n");
@@ -533,3 +535,5 @@ int runtime_render_request(unsigned w, unsigned h) { return !w && !h ? 0 : -1; }
 void runtime_render_reserve(unsigned *w, unsigned *h) { *w = *h = 0; }
 void runtime_output_max(unsigned *w, unsigned *h) { *w = 1920; *h = 1080; }
 int runtime_output_request(unsigned w, unsigned h) { return w == 1920 && h == 1080 ? 0 : -1; }
+void runtime_aspect_view(double w, double h) { (void)w; (void)h; }
+int runtime_aspect_step(void) { return -1; }

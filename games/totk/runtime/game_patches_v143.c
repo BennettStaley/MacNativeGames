@@ -273,6 +273,7 @@ void runtime_diag_xpoke(unsigned off,float value){
 #endif
 static void patch_output_res(Module *m);
 static void patch_render_res(Module *m);
+static void patch_fixed_res(Module *m);
 void runtime_game_patches(Module *m) {
     runtime_survey_init(m);
     if (strcmp(m->name, "main")) runtime_fail("1.4.3 game patches expect main");
@@ -281,13 +282,17 @@ void runtime_game_patches(Module *m) {
     patch_realtime(m);
     patch_output_res(m);
     patch_render_res(m);
+    patch_fixed_res(m);
     patch_slowmo_bounce(m);
 #if !TARGET_OS_IPHONE
     diag_main=m;   /* frmwatch / xpoke */
 #endif
     { static const uint64_t sites[] = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0};   /* camera update and setup, viewport x2 */
-      aspect_install(m, "1.4.3", sites, 4, ((m->text_end + 15) & ~15ULL) + 48,   /* after the two veneers above */
-                     (m->file_size + 0x3fff) & ~0x3fffULL); }
+      /* No Vert+ stubs of upstream's own (vert_off 0): their 2 x 304 bytes do not fit beside the fork's stubs in the
+         1024 bytes of padding, and their fovy loads (0x628c3c, 0xb4342c) carry the field of view's stubs below, whose
+         multiplier gives Vert+ instead (aspect_patch.h aspect_fov_follow). */
+      aspect_install(m, "1.4.3", sites, 4, 2, ((m->text_end + 15) & ~15ULL) + 48,   /* after the two veneers above */
+                     0, (m->file_size + 0x3fff) & ~0x3fffULL); }
     /* Field of view (aspect_patch.h): the projection writers' fovy loads, 0x628c3c in the camera update (beside 0x628c74)
        and 0xb4342c in the camera setup (beside 0xb43460); each is followed by fmul s8, s0, s1 (the half angle), the fovy
        store at +0xa0 and the sin / cos / tan calls. Stubs at +288, after the bounce veneer; always in on the Mac and in the iOS
@@ -656,6 +661,29 @@ static void patch_render_res(Module *m){
     if(set)atomic_store(&render_request,pack_size(w,h));
     render_page=m->base+data;render_write((unsigned)runtime_output_size_current());
     fprintf(stderr,"[totk] 1.4.3 render resolution patch: 4 instructions at main+0x585e48, veneer +%#llx, size on the data page (live: runtime_render_request)\n",(unsigned long long)stub);
+}
+/* TOTK_FIXED_RES=1: no dynamic resolution. The game's controller (main+0x584300, called from the renderer's per-frame update at
+   main+0x58196c) keeps a window of 24 frame-time samples, predicts the next frame's cost and steps through resolution tiers
+   (the scene came out at 3024x1888, 2712x1696, 2416x1512 on a 3024x1890 canvas: 100 %, 90 %, 80 %). It returns the tier's scale
+   as a float in the low word of x0 (bit 33 set: the tier did not change); the caller stores cc4 * scale / cc0 as the renderer's
+   scale at +0xccc. Every path leaves through one epilogue, so the single instruction that moves the scale into the result
+   (main+0x5848a8, mov w9, w23) is replaced by a move of 1.0f: the controller still runs and picks tiers, but every tier is 100 %.
+   The size the render-resolution patch above chooses (TOTK_RENDER_RES) stays; this only stops the dynamic part. */
+static void patch_fixed_res(Module *m){
+    const char *e=getenv("TOTK_FIXED_RES");
+    if(!e||!*e||!strcmp(e,"0"))return;
+#if TARGET_OS_IPHONE
+    fprintf(stderr,"[totk] TOTK_FIXED_RES: not available in the embedded build\n");(void)m;
+#else
+    const uint64_t site=0x5848a8;const uint32_t original=0x2a1703e9,replacement=0x52a7f009;   /* mov w9, w23 -> mov w9, #0x3f800000 */
+    uint32_t word;memcpy(&word,m->base+site,4);
+    if(word!=original){
+        fprintf(stderr,"[totk] fixed resolution patch main+%#llx: found %08x, expected %08x\n",(unsigned long long)site,word,original);
+        runtime_fail("fixed resolution patch: main does not match 1.4.3");
+    }
+    memcpy(m->base+site,&replacement,4);
+    fprintf(stderr,"[totk] 1.4.3 fixed resolution (TOTK_FIXED_RES): the dynamic resolution controller's scale is held at 100 %% (1 instruction at main+%#llx)\n",(unsigned long long)site);
+#endif
 }
 int runtime_output_res_toggle(void){
     if(!output_page)return 0;
