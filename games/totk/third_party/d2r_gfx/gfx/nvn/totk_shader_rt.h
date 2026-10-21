@@ -38,6 +38,9 @@ NSString *totk_rt_prepare(NSString *shader, int stage, const uint8_t *control, c
    cache lacks, compiling each through compile (0 when it failed). */
 void totk_shader_list_boot(void);
 void totk_shader_list_warm_done(int (*compile)(NSString *variant_b, int stage));
+// The variant totk_rt_variant would return when the cache index already names one; nil otherwise (never translates).
+NSString *totk_rt_variant_cached(NSString *shader, NSDictionary *answers);
+void totk_rt_probe_index(NSString *shader, NSArray<NSDictionary *> *rows);   // probe-gfx only
 #endif
 #include <stdint.h>
 void totk_shader_list_set_enabled(int on);   // the setting Interface > Download new shaders (settings.c, live)
