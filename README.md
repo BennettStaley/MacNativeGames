@@ -54,6 +54,8 @@ Update history:
 
 | Date | Platform | Update |
 |---|---|---|
+| Oct 20 | Mac, iPad | **This fork:** in-game settings menu (34 settings, nearly all live), Mods tab with a GameBanana browser, Button prompts, AirDrop save transfer, Restart now, the game's icon on iPad |
+| Oct 20 | Mac | **This fork:** game data outside the app: a code-only rebuild takes about 40 seconds instead of about 12 minutes |
 | Oct 19 | Mac | Key 4 switches to a true 21:9 ultrawide view and back (1.2.1, 1.4.3); the HUD keeps its shape in the middle 16:9 |
 | Oct 19 | iPhone, iPad | Tested with 1.4.3: a fresh install shows the game from the first launch, without a played cache |
 | Oct 19 | iPhone, iPad | Touch controls laid out like a Switch controller, with every button and both sticks |
@@ -106,7 +108,7 @@ brew install xcodegen cmake ninja
 
 Optional: with Xcode's Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`), the build compiles the startup shaders into the app. It finds an Xcode kept outside `/Applications` too (on another volume, or set `DEVELOPER_DIR`). Without it, the build compiles them into the Mac's own Metal cache for the app's location instead, which does not move with the app: after moving it, the first launch compiles them again.
 
-**2. Download or clone this repository**, then open Terminal in its `MacNativeGames` folder and run the script with your game file and keys:
+**2. Download or clone this repository** (`git clone https://github.com/BennettStaley/NativeTOTK-Apple-Silicon`), then open Terminal in its `NativeTOTK-Apple-Silicon` folder and run the script with your game file and keys:
 
 ```sh
 python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys
@@ -130,7 +132,7 @@ python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys --platform ios -o ~
 
 Add `--update ~/Games/1.4.3.nsp` to select an update, and keep the `--firmware` or `--shared-fonts` option when the base game is an NSP. The first iOS build downloads and compiles device versions of Opus and libvpx and compiles the shader seed for iOS, so it needs an internet connection and substantial temporary disk space (allow at least **45 GB free** for a fresh base build, or **60 GB** for a fresh build with an update). The resulting IPA is unsigned: sign and install it with your sideloading tool, keeping its entitlements (it uses the increased memory limit). iOS/iPadOS 26 and iPhone 14 or newer are required. See [iPhone and iPad](#iphone-and-ipad) for what has been tested.
 
-Without `-o`, the selected output appears next to the game file (`Tears of the Kingdom.app` on Mac or `Tears of the Kingdom.ipa` for iOS). Before full shader preparation was added, a local clean base-1.0.0 Mac build took about 6 minutes on an M4 Mac mini (this is not a timing estimate for the current build; hardware, disk and network conditions affect the time): about a minute each to rewrite the main code module and to decrypt the 17 GB of game data, and two to three minutes for macOS to check the finished app once. The current build then also prepares the startup shaders (about 3 minutes for 1.4.3 on an M4) and compiles them for your GPU (a few more minutes; without the Metal toolchain this step is skipped, with a message, while a game is running). A Mac build needs no .NET or CMake, and the finished game needs no Python: its shader translator is a native program that comes with this repository (`games/totk/prebuilt`). Every intermediate file is in a work folder next to the game file (`TOTK_build`, or `--work`); running the script again reuses what is already done.
+Without `-o`, the selected output appears next to the game file (`Tears of the Kingdom.app` on Mac or `Tears of the Kingdom.ipa` for iOS). **How long it takes:** the first build of a version does all the work below (about 12 minutes for 1.4.3 on an M-series Mac); after that, a rebuild whose game data did not change (a code change, or this repository updated) takes about **40 seconds**, because the game data stays outside the app (see *Where the game data goes* below). The details of a first build: before full shader preparation was added, a local clean base-1.0.0 Mac build took about 6 minutes on an M4 Mac mini (this is not a timing estimate for the current build; hardware, disk and network conditions affect the time): about a minute each to rewrite the main code module and to decrypt the 17 GB of game data, and two to three minutes for macOS to check the finished app once. The current build then also prepares the startup shaders (about 3 minutes for 1.4.3 on an M4) and compiles them for your GPU (a few more minutes; without the Metal toolchain this step is skipped, with a message, while a game is running). A Mac build needs no .NET or CMake, and the finished game needs no Python: its shader translator is a native program that comes with this repository (`games/totk/prebuilt`). Every intermediate file is in a work folder next to the game file (`TOTK_build`, or `--work`); running the script again reuses what is already done.
 
 The extracted code modules, rewritten modules, RomFS and shared fonts are checked against the selected version's `games/totk/assets/expected-v1.0.0.json`, `expected-v1.1.2.json`, `expected-v1.2.1.json` or `expected-v1.4.3.json`; the prebuilt shader translator has its own SHA-256 check. A mismatch stops the build, with one exception: a different genuine retail dump of the same version is accepted — its `main.npdm` is checked by Nintendo’s ACID signature (`npdm_signed()`) instead of the pinned hash, and its firmware’s shared fonts are checked for a valid BFTTF structure and bound by their actual SHA-256. Key values are never printed.
 
@@ -179,6 +181,7 @@ The 1.2.1 port (October 19) passed the same rewrite verification (600 of 600 neg
 
 Version 1.4.3 has been played on an **iPhone 14 (iOS 26.6.1)** and an **iPad with the A16 chip (iPadOS 26.7.1)**, both signed with a personal development team in Xcode. Versions 1.0.0, 1.1.2 and 1.2.1 have not been tested on iOS.
 
+- **This fork on iPad:** installed on an iPad Pro 13" M4 (iPadOS 26) with the game's own icon, the settings menu (the gear at the top, a three-finger tap, a controller's Home button, or − and + held together), the Mods tab (zip mods) and AirDrop saves. It has not been played through on the iPad yet. The output stays at 720p (the 3D render scale works); shadow resolution and aspect ratio are Mac only so far.
 - **First launch:** the app checks the game data (about 15 seconds) and imports the shaders it carries, with a progress bar. On an iPhone 14 this takes about 3 minutes before the title appears. Later launches show the title in about 8 seconds.
 - **Picture:** the game runs in handheld mode, as a Switch does without its dock: 1280×720.
 - **Shaders:** an iPhone or iPad cannot translate shaders while playing. A draw whose shader variant the app does not carry is skipped, so objects can be missing in places no player has reported yet. The device records what it missed in `shader-list-contribution.txt` (Files app › On My iPhone › Tears of the Kingdom); the game never asks about it during play. While the device is connected to the Mac that built the app (cable or the same Wi-Fi), the Mac checks every 10 minutes and every 500 new shaders asks once to send the file in a [GitHub issue](https://github.com/ly05010419/MacNativeGames/issues/new?template=shader-list.yml) (`games/totk/ios/tools/shader_contrib_watch.py`, installed by the iOS build; `--no-shader-reminder` skips it, `shader_contrib_watch.py uninstall` removes it). Once merged into the [shared shader list](docs/shader-list.md), the next build carries them for everyone. With a Mac, `games/totk/ios/tools/fill_shaders.py` also translates them and sends them to the device right away.
@@ -212,26 +215,39 @@ To run without holding a button, two lines can drive the run button: `south = b 
 
 The launcher checks the file at every start and names the first bad line in an alert. Delete the file for the default layout.
 
+Settings and screen keys (Mac): **⌘,** or **F1** opens the in-game settings menu (a controller's **Home** button, or Options and Menu pressed together, does too), **F2** hides or shows the game's HUD. Keys **3** and **4** below predate the menu: *Settings › Display › Output resolution* and *Aspect ratio* do the same and more.
+
 Mac-only extra keys: **1** show or hide all on-screen overlays (FPS, shader count, system load and the shortcut reminder, together in one small box in the window's top-right corner; `TOTK_HUD=corners` puts the readings back in the picture's corners), **2** frame interpolation (off → 30+30 → half the refresh rate → unlimited), **3** cycle picture mode (MetalFX 2K → native 2K → off), **4** ultrawide 21:9 on / off (1.2.1 and 1.4.3: the camera sees more at the sides and the picture fills a wider window; `TOTK_ASPECT=32:9` or `3440x1440` picks another shape and starts with it on; the HUD, menus and map keep their shape in the middle 16:9 of the window, the map with black bars at the sides; markers that follow objects in the world are not moved out yet). The shortcut reminder shows the current interpolation and picture modes and refreshes twice a second in both HUD layouts. MetalFX is off by default and only starts when you select its mode with **3**; resizing the window never enables it automatically. Text entry (naming a horse) uses the Mac keyboard. iPhone/iPad uses touch controls or a compatible game controller and does not show the Mac 1/2/3/4 shortcut prompts. The touch layout follows a Switch controller: L and ZL at the top left, R and ZR at the top right, − and + between them, the d-pad on the left and A, B, X, Y on the right. The d-pad sits above the left stick and A, B, X, Y above the right stick, and L3 and R3 (stick presses) are in the bottom corners. Touch the left half away from the buttons and drag for the left stick, the right half for the camera (right stick); each stick is centred where your finger goes down. With a game controller connected the touch controls are hidden: touch the screen to show and use them, and they hide again 3 seconds after you lift your fingers.
 
-Native 2K changes the game's composition canvas and UI to 2560×1440. The 3D scene still follows the game's separate render scaling; this does not force every internal render target to 1440p. The manual MetalFX mode also works in smaller windows and scales to the actual output size, including 4K.
+Native 2K (key 3) changes the game's composition canvas and UI to 2560×1440. For any other size, up to your display's native pixels or 4K, and for the 3D scene's own resolution, use *Settings › Display* (Output resolution, 3D render scale). The manual MetalFX mode also works in smaller windows and scales to the actual output size, including 4K.
 
 Language: the game and the launcher's own text (startup screen, shader warm-up progress, overlays, keyboard prompt) follow the Mac's language. The launcher text is Chinese on a Chinese Mac and English otherwise. In a 1.4.3 build, Brazilian Portuguese selects the game's official pt-BR text. To give only this game another language, set its preferred language, for example `defaults write org.macnativegames.totk AppleLanguages -array pt-BR` (`defaults delete org.macnativegames.totk AppleLanguages` removes it). To override, launch with `TOTK_LANG` for the game (for example `open --env TOTK_LANG=en-US "Tears of the Kingdom.app"`) or `TOTK_UI_LANG=zh` / `en` for the launcher text.
 
 ## Settings menu
 
-The game has an in-game settings menu on Mac, iPad and iPhone: output resolution (up to your display's native pixels or
-4K), 3D render scale (25–200 %), aspect ratio (wider and taller screens see more, nothing stretched), field of view,
-anti-aliasing (FXAA / SMAA), sharpening, anisotropic filtering, frame rate limit, frame interpolation, the HUD readouts,
-touch controls, controller face buttons and volume. Changes apply while you play. On the Mac open it with **⌘,** or
-**F1** (or a controller's Home button); it is a sidebar inside the game window, so it works in full screen. On iPad and
-iPhone use the gear at the top, a three-finger tap or a controller's Home button. See [docs/settings.md](docs/settings.md).
+The game has an in-game settings menu on Mac, iPad and iPhone, built like a recomp's: 34 settings across Display, Graphics,
+Frame rate, Interface, Controls, Audio and World, plus a Mods tab. Nearly everything applies while you play; *Maximum
+output*, *Button prompts* and mod changes apply at the next start, and on the Mac **Restart now** does that in one click.
+
+- **Display:** output resolution (match the window, display native, 4K … 720p, custom width), 3D render scale (25–200 %),
+  aspect ratio (wider and taller screens see more, nothing is stretched), maximum output.
+- **Graphics:** field of view, anti-aliasing (the game's / off / FXAA / SMAA), sharpening (AMD CAS), anisotropic filtering,
+  texture detail, frame interpolation, bloom, depth of field, lens flare, cave fog, shadow resolution, render distance.
+- **Frame rate, Interface, Controls, Audio, World:** frame rate limit, performance readout (with average and 1 % low),
+  shader counter (compiling / new / total), Hide HUD, touch controls (iOS), camera speed, face buttons, Button prompts
+  (Switch / Xbox / PlayStation icons from a mod), rumble, motion, volume, time of day speed, Send saves (AirDrop).
+
+On the Mac open it with **⌘,** or **F1** (or a controller's Home button); it is a sidebar inside the game window, so it
+works in full screen and the picture stays in view while you change things. On iPad and iPhone use the gear at the top, a
+three-finger tap or a controller's Home button. See [docs/settings.md](docs/settings.md), [mods](docs/mods.md) and
+[save transfer](docs/save-sync.md).
 
 ## Where things are
 
 - Settings: `~/Library/Application Support/MacNativeGames/TOTK/settings.txt` (the menu writes it; see [docs/settings.md](docs/settings.md))
 - Save sync between the Mac and an iPhone / iPad: [docs/save-sync.md](docs/save-sync.md)
-- Saves: `~/Library/Application Support/MacNativeGames/TOTK/profile`
+- Saves: `~/Library/Application Support/MacNativeGames/TOTK/profile`; saves replaced by an AirDrop import are kept in `save-backups` next to it (the last 10)
+- Button prompts *Automatic* remembers the last controller in `last-controller.txt` next to `settings.txt`
 - Shader cache: `~/Library/Application Support/MacNativeGames/TOTK/shader-cache` (delete it to translate everything again)
 - Game data the app uses (RomFS image, prepared shaders): `~/Library/Application Support/MacNativeGames/TOTK/game-data` (`python3.14 build_app.py --prune-data` deletes what no app uses)
 - Shaders the shared list does not have yet: `~/Library/Application Support/MacNativeGames/TOTK/shader-list-contribution.txt`
@@ -243,7 +259,8 @@ iPhone use the gear at the top, a three-finger tap or a controller's Home button
 - Supports base 1.0.0, or base plus the separate 1.1.2, 1.2.1 or 1.4.3 update NSP/NSZ. Other versions, DLC, combined packages, compressed base games (NSZ/XCZ) and personalized tickets remain unsupported. On iPhone and iPad only 1.4.3 has been tested; places no player has reported can show missing objects, and on an iPhone 14 iOS can close the game when memory runs out (see [iPhone and iPad](#iphone-and-ipad)).
 - No online features, no amiibo.
 - New shaders can cause compilation stutters. Cache reuse reduces these, but does not guarantee stutter-free gameplay.
-- The 79 automated tests cover generated container/update fixtures, relocation formats, work-folder isolation, packaging, desktop migration, shader extraction (BNSH, agl `.sharcb` and game-module shaders), the shared shader list and the players' contribution file, first-import cache preservation, the Metal toolchain lookup and 27 native RomFS path cases. GitHub Actions is configured to run the source tests and the native path parser under the undefined-behavior sanitizer, without game data or keys. A complete Mac build also passed with a local XCI-derived NSP fixture and generated common ticket. An independent retail base NSP and gameplay from that input have not yet been tested.
+- This fork: *Cave fog* changes the fog in caves and enclosed places, not the outdoor haze; *Render distance* only shows a difference below 100 % (the game already draws to 25 km); camera speed above 100 % only speeds up a partial stick push; Hide HUD also blanks menus while it is on; AirDrop save transfer and the iPad build have not been tried on devices end to end yet.
+- The automated tests (98 Python tests and C tests for settings, mods, controller layouts, RomFS paths and serial sets) cover generated container/update fixtures, relocation formats, work-folder isolation, packaging, desktop migration, shader extraction (BNSH, agl `.sharcb` and game-module shaders), the shared shader list and the players' contribution file, first-import cache preservation, the Metal toolchain lookup and 27 native RomFS path cases. GitHub Actions is configured to run the source tests and the native path parser under the undefined-behavior sanitizer, without game data or keys. A complete Mac build also passed with a local XCI-derived NSP fixture and generated common ticket. An independent retail base NSP and gameplay from that input have not yet been tested.
 
 ## How it works
 
@@ -258,6 +275,7 @@ Recorded performance experiments, remaining work and comparison methods: [Mac pe
 - **[nxnative](https://github.com/seedds/nxnative)**: the one-script packaging and NSP common-ticket import follow its approach.
 - **Ryujinx** (MIT): its shader translator (`vendor/ryujinx`) turns the game's Maxwell shaders into SPIR-V, and its system-service code is a reference. With this project's patches and service it is compiled ahead of time (.NET NativeAOT) into `games/totk/prebuilt/macos-arm64/totk_xlate`; `games/totk/tools/totk_xlate/publish_native.sh` rebuilds it (needs the .NET 10 SDK, only for developers).
 - **[SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross)** (Apache-2.0) turns SPIR-V into Metal Shading Language; it is fetched at a pinned commit and compiled with clang during the build.
+- **[TkSharp](https://github.com/TKMM-Team/TkSharp)** (MIT, TKMM Team): the ResourceSizeTable size estimate the mod loader uses. **[zstd](https://github.com/facebook/zstd)** (BSD): the decoder for the game's compressed files. **[SMAA](https://github.com/iryoku/smaa)** (MIT) and **[AMD FidelityFX CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS)** (MIT), ported to Metal: the SMAA anti-aliasing and sharpening settings (the FXAA option is this port's own) (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). Mods are browsed and downloaded from **[GameBanana](https://gamebanana.com)**; each mod keeps its author's license and is never re-hosted.
 - **deko3d** (zlib): texture layout sizes. **bcdec**: BC texture decoding. **libopus** and **libvpx** (BSD) from Homebrew: audio and the pre-rendered movies.
 
 ## License
