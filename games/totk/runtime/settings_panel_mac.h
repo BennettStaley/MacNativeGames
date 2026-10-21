@@ -3,8 +3,10 @@
    table (runtime/settings_schema.h), one tab per page. Opened with Command-comma, F1, the app menu's Settings item, or a
    controller's Home button (or Options and Menu together). Mouse, keyboard (arrows choose and change, Return toggles,
    Q / E or Tab switch tabs, Escape closes) and controller (D-pad or left stick, A, B, shoulder buttons) all work. While it
-   is open the game reads a neutral controller (runtime_input_hold). The last tab, Mods, is runtime/mods_panel_mac.h (the
-   installed mods and the GameBanana browser); the sidebar widens while it shows. The Interface tab ends with Send saves:
+   is open the game reads a neutral controller (runtime_input_hold). After the settings pages, Mods is runtime/mods_panel_mac.h
+   (the installed mods and the GameBanana browser; the sidebar widens while it shows), and Cheats lists the cheat files
+   read at launch (runtime/cheats.c, cheat_files.h): one switch per cheat, grouped by file, with the folder, Turn off all
+   and Restart now; it is built here like the settings pages, and Reset all leaves cheats alone. The Interface tab ends with Send saves:
    the profile's saves as one .totksave file (runtime/save_package.h) for AirDrop, Messages, Mail or Finder; the other
    device opens it to bring them in (docs/save-sync.md). The iPhone / iPad menu is ios/Sources/settings_menu.m. */
 #pragma once
@@ -25,6 +27,7 @@
 + (void)toggle;
 + (BOOL)snapshotTo:(NSString *)path;   /* the menu as a PNG (test runs, TOTK_INPUT_FILE "settings-shot") */
 + (void)key:(NSEvent *)event;          /* a key for the open menu (test runs, TOTK_INPUT_FILE "menukey") */
++ (void)showCheats;                    /* opens the menu on the Cheats tab (the app menu's Cheats… item) */
 @end
 
 static NSWindow *settings_window(void);   /* frontend.m: the game window */
@@ -38,14 +41,15 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     NSButton *reset, *restartNow;   /* restartNow: shown while a setting or the mods wait for a restart */
     TOTKModsPane *mods;                   /* the Mods tab (page MODS_PAGE) */
     NSMutableArray<NSView *> *rows;       /* the rows of the page shown, in order */
-    NSMutableArray<NSNumber *> *rowSetting;   /* the setting of each row; SAVES_ROW: Send saves (Interface tab) */
+    NSMutableArray<NSNumber *> *rowSetting;   /* the setting of each row; SAVES_ROW: Send saves (Interface tab); CHEAT_ROW...: the Cheats tab */
     NSButton *sendButton; NSTextField *savesNote;
     NSInteger page, focus;
     NSTimer *pollTimer;
     uint64_t padPrev; double padRepeatAt; int padDir;
 }
 static TOTKSettingsPanel *settingsPanel;
-enum { PANEL_WIDTH = 440, PANEL_MARGIN = 16, MODS_PAGE = SETTINGS_NPAGES, NPAGES = SETTINGS_NPAGES + 1, SAVES_ROW = -1 };
+enum { PANEL_WIDTH = 440, PANEL_MARGIN = 16, MODS_PAGE = SETTINGS_NPAGES, CHEATS_PAGE = SETTINGS_NPAGES + 1, NPAGES = SETTINGS_NPAGES + 2,
+       SAVES_ROW = -1, CHEATS_FOLDER_ROW = -2, CHEATS_OFF_ROW = -3, CHEATS_RESTART_ROW = -4, CHEAT_ROW = -1000 /* - k: cheat k */ };
 static NSString *const SETTINGS_HINT = @"↑↓ choose   ←→ change   Q E tabs   Esc close\nController: D-pad, A, B, shoulder buttons";
 
 static BOOL settings_row_shown(const SettingDef *d) {
@@ -86,11 +90,11 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
 
     NSMutableArray *labels = [NSMutableArray array];
     for (int p = 0; p < SETTINGS_NPAGES; p++) [labels addObject:@(SETTINGS_PAGES[p])];
-    [labels addObject:@"Mods"];
+    [labels addObject:@"Mods"]; [labels addObject:@"Cheats"];
     tabs = [NSSegmentedControl segmentedControlWithLabels:labels trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(tabClicked:)];
     tabs.segmentStyle = NSSegmentStyleAutomatic; tabs.selectedSegment = 0; tabs.refusesFirstResponder = YES;
     tabs.segmentDistribution = NSSegmentDistributionFillEqually; tabs.controlSize = NSControlSizeSmall;
-    tabs.font = [NSFont systemFontOfSize:11];
+    tabs.font = [NSFont systemFontOfSize:10.5];
 
     list = [NSStackView new]; list.orientation = NSUserInterfaceLayoutOrientationVertical;
     list.alignment = NSLayoutAttributeLeading; list.spacing = 4; list.translatesAutoresizingMaskIntoConstraints = NO;
@@ -236,21 +240,172 @@ static NSString *saves_profile(void) { const char *d = getenv("TOTK_PROFILE_DIR"
     return out;
 }
 
+/* ---- the Cheats tab (runtime/cheats.c) ---- */
+
+/* Code cheats switched since this launch: they apply (or turn off) only when the game starts again. */
+static int cheats_pending(void) {
+    int n = 0;
+    for (int i = 0; i < runtime_cheats_count(); i++) {
+        int st = runtime_cheats_state(i);
+        if ((st & CHEAT_AT_LAUNCH) && !(st & CHEAT_REFUSED) && !!(st & CHEAT_ON) != !!(st & CHEAT_APPLIED)) n++;
+    }
+    return n;
+}
+static int cheats_any_on(void) { for (int i = 0; i < runtime_cheats_count(); i++) if (runtime_cheats_state(i) & CHEAT_ON) return 1; return 0; }
+/* The line under a cheat: how it applies, or why it cannot. */
+static NSString *cheat_detail(const RuntimeCheatInfo *c, NSColor **color) {
+    int st = c->state; *color = NSColor.secondaryLabelColor;
+    if (st & CHEAT_REFUSED) { *color = NSColor.systemOrangeColor; return [NSString stringWithFormat:@"Can't be used here: %s", c->problem]; }
+    if (c->problem[0]) { *color = NSColor.systemOrangeColor; return @(c->problem); }   /* a conflict, a refused write */
+    if (st & CHEAT_AT_LAUNCH) {
+        if ((st & CHEAT_ON) && !(st & CHEAT_APPLIED)) { *color = NSColor.systemOrangeColor; return @"Applies after restart"; }
+        if (!(st & CHEAT_ON) && (st & CHEAT_APPLIED)) { *color = NSColor.systemOrangeColor; return @"Turns off after restart"; }
+        return st & CHEAT_ON ? @"Code patch: applied at launch" : @"Code patch: applies at the next start";
+    }
+    if (st & CHEAT_ON) { *color = NSColor.systemGreenColor; return @"Live: running now"; }
+    return @"Live: takes effect at once";
+}
+/* A row of the Cheats tab: a title, a line under it, and a control on the right (or none). */
+- (NSView *)cheatsRow:(NSString *)title detail:(NSString *)detail color:(NSColor *)color control:(NSView *)control {
+    NSView *row = [NSView new]; row.wantsLayer = YES; row.layer.cornerRadius = 8; row.translatesAutoresizingMaskIntoConstraints = NO;
+    NSTextField *label = [NSTextField wrappingLabelWithString:title];
+    label.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium]; label.textColor = NSColor.labelColor;
+    CGFloat textWidth = control ? 300 : PANEL_WIDTH - 2 * 8 - 14 - 24;
+    label.preferredMaxLayoutWidth = textWidth;
+    NSStackView *text = [NSStackView stackViewWithViews:@[label]]; text.orientation = NSUserInterfaceLayoutOrientationVertical;
+    text.alignment = NSLayoutAttributeLeading; text.spacing = 2;
+    if (detail.length) {
+        NSTextField *help = [NSTextField wrappingLabelWithString:detail];
+        help.font = [NSFont systemFontOfSize:11]; help.textColor = color ?: NSColor.secondaryLabelColor; help.preferredMaxLayoutWidth = textWidth;
+        help.selectable = NO; [text addArrangedSubview:help];
+    }
+    text.translatesAutoresizingMaskIntoConstraints = NO; [row addSubview:text];
+    NSMutableArray *c = [NSMutableArray arrayWithArray:@[
+        [row.widthAnchor constraintEqualToConstant:PANEL_WIDTH - 2 * 8 - 14],
+        [text.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:12], [text.topAnchor constraintEqualToAnchor:row.topAnchor constant:8],
+        [text.bottomAnchor constraintEqualToAnchor:row.bottomAnchor constant:-8], [text.widthAnchor constraintLessThanOrEqualToConstant:textWidth]]];
+    if (control) {
+        control.translatesAutoresizingMaskIntoConstraints = NO; [row addSubview:control];
+        [c addObjectsFromArray:@[[control.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-10],
+            [control.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+            [control.leadingAnchor constraintGreaterThanOrEqualToAnchor:text.trailingAnchor constant:8]]];
+    }
+    [NSLayoutConstraint activateConstraints:c];
+    return row;
+}
+- (NSButton *)cheatsButton:(NSString *)title action:(SEL)action {
+    NSButton *b = [NSButton buttonWithTitle:title target:self action:action];
+    b.controlSize = NSControlSizeSmall; b.bezelStyle = NSBezelStyleRounded; b.refusesFirstResponder = YES;
+    return b;
+}
+/* A group's title over its rows (not focused): a file, or a heading the file itself has. */
+- (void)cheatsHeading:(NSString *)title detail:(NSString *)detail problem:(NSString *)problem big:(BOOL)big {
+    NSTextField *label = [NSTextField wrappingLabelWithString:title];
+    label.font = big ? [NSFont systemFontOfSize:12 weight:NSFontWeightBold] : [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+    label.textColor = big ? NSColor.labelColor : NSColor.secondaryLabelColor; label.preferredMaxLayoutWidth = PANEL_WIDTH - 60;
+    NSStackView *box = [NSStackView stackViewWithViews:@[label]]; box.orientation = NSUserInterfaceLayoutOrientationVertical;
+    box.alignment = NSLayoutAttributeLeading; box.spacing = 1; box.edgeInsets = NSEdgeInsetsMake(big ? 12 : 6, 12, 2, 12);
+    for (int i = 0; i < 2; i++) {
+        NSString *t = i ? problem : detail; if (!t.length) continue;
+        NSTextField *l = [NSTextField wrappingLabelWithString:t];
+        l.font = [NSFont systemFontOfSize:10.5]; l.textColor = i ? NSColor.systemOrangeColor : NSColor.tertiaryLabelColor;
+        l.preferredMaxLayoutWidth = PANEL_WIDTH - 60; l.selectable = NO; [box addArrangedSubview:l];
+    }
+    [list addArrangedSubview:box];
+}
+- (void)addCheatsRow:(NSView *)row id:(int)rid { [list addArrangedSubview:row]; [rows addObject:row]; [rowSetting addObject:@(rid)]; }
+- (void)buildCheats {
+    int total = runtime_cheats_total(), nsrc = runtime_cheats_sources();
+    const char *bid = runtime_cheats_build_id(), *folder = runtime_cheats_folder();
+    NSString *file = [NSString stringWithFormat:@"%s.txt", *bid ? bid : "<build ID>"];
+    BOOL hasFolder = folder && *folder && strcmp(folder, "0");
+    NSString *where = hasFolder ? [@(folder) stringByAbbreviatingWithTildeInPath] : @"(off: TOTK_CHEATS_DIR=0)";
+    NSString *about = nsrc
+        ? [NSString stringWithFormat:@"%@ (Atmosphère format, as Yuzu and Ryujinx use) in %@, or in a mod's cheats folder. Files are read when the game starts.", file, where]
+        : [NSString stringWithFormat:@"No cheat files for this game version yet. Put %@ (Atmosphère format, the file Yuzu and Ryujinx use; "
+           "this game's build ID is %s) in %@, or in a mod's cheats folder, then restart. No codes come with the game: bring your own "
+           "from a cheat database.", file, *bid ? bid : "unknown", where];
+    [self addCheatsRow:[self cheatsRow:@"Cheats folder" detail:about color:nil control:hasFolder ? [self cheatsButton:@"Open" action:@selector(openCheatsFolder)] : nil]
+                    id:CHEATS_FOLDER_ROW];
+    if (runtime_cheats_count()) {
+        NSButton *off = [self cheatsButton:@"Turn off" action:@selector(cheatsAllOff)]; off.enabled = cheats_any_on();
+        [self addCheatsRow:[self cheatsRow:@"Turn off all cheats" detail:@"Live cheats stop at once; code patches after a restart. "
+                            "The first cheat you turn on backs up your saves (profile-before-cheats)." color:nil control:off] id:CHEATS_OFF_ROW];
+    }
+    int pending = cheats_pending(), changed = runtime_cheats_files_changed();
+    if (pending || changed) {
+        NSString *why = pending ? [NSString stringWithFormat:@"%d code patch change%s waiting for the game to start again.", pending, pending == 1 ? "" : "s"]
+                                : @"The cheat files changed since the game started: they are read again at the next start.";
+        NSButton *restart = runtime_front_can_restart() ? [self cheatsButton:@"Restart now" action:@selector(restartGame)] : nil;
+        restart.bezelColor = NSColor.systemOrangeColor;
+        [self addCheatsRow:[self cheatsRow:@"Restart to apply" detail:why color:NSColor.systemOrangeColor control:restart] id:CHEATS_RESTART_ROW];
+    }
+    for (int s = 0; s < nsrc; s++) {
+        [self cheatsHeading:@(runtime_cheats_source_label(s)) detail:[@(runtime_cheats_source_path(s)) stringByAbbreviatingWithTildeInPath]
+                    problem:@(runtime_cheats_source_problem(s)) big:YES];
+        for (int k = 0; k < total; k++) {
+            RuntimeCheatInfo c; if (!runtime_cheats_info(k, &c) || c.source != s) continue;
+            if (c.role == 3) continue;   /* a group's end */
+            if (c.role == 2) { [self cheatsHeading:@(c.name) detail:nil problem:nil big:NO]; continue; }
+            NSColor *color; NSString *detail = cheat_detail(&c, &color);
+            if (c.role == 1) {   /* a master code: always on with its file, nothing to switch */
+                [self addCheatsRow:[self cheatsRow:@(c.name) detail:[@"Master code: always on. " stringByAppendingString:detail] color:color control:nil] id:CHEAT_ROW - k];
+                continue;
+            }
+            NSSwitch *toggle = [NSSwitch new]; toggle.state = (c.state & CHEAT_ON) ? NSControlStateValueOn : NSControlStateValueOff;
+            toggle.enabled = !(c.state & CHEAT_REFUSED); toggle.tag = k; toggle.target = self; toggle.action = @selector(cheatSwitched:);
+            toggle.refusesFirstResponder = YES;
+            [self addCheatsRow:[self cheatsRow:@(c.name) detail:detail color:color control:toggle] id:CHEAT_ROW - k];
+        }
+    }
+}
+- (void)rebuildKeepingPlace {
+    NSInteger keep = focus; CGFloat y = scroll.contentView.bounds.origin.y;
+    [self buildPage];
+    focus = keep < (NSInteger)rows.count ? keep : focus; [self showFocus];
+    [scroll.contentView scrollToPoint:NSMakePoint(0, y)]; [scroll reflectScrolledClipView:scroll.contentView];
+}
+- (void)setCheat:(int)k on:(int)on {
+    RuntimeCheatInfo c;
+    if (!runtime_cheats_info(k, &c) || c.role != 0 || (c.state & CHEAT_REFUSED) || !!(c.state & CHEAT_ON) == !!on) return;
+    runtime_cheats_set_entry(k, on);
+    [self rebuildKeepingPlace];
+}
+- (void)cheatSwitched:(NSSwitch *)toggle {
+    NSUInteger at = [rowSetting indexOfObject:@(CHEAT_ROW - (int)toggle.tag)]; if (at != NSNotFound) focus = at;
+    [self setCheat:(int)toggle.tag on:toggle.state == NSControlStateValueOn];
+    [self.window makeFirstResponder:self];
+}
+- (void)cheatsAllOff {
+    for (int i = 0; i < runtime_cheats_count(); i++) if (runtime_cheats_state(i) & CHEAT_ON) runtime_cheats_set(i, 0);
+    [self rebuildKeepingPlace];
+}
+- (void)openCheatsFolder {
+    const char *folder = runtime_cheats_folder();
+    if (folder && *folder && strcmp(folder, "0")) [NSWorkspace.sharedWorkspace openURL:[NSURL fileURLWithPath:@(folder) isDirectory:YES]];
+}
++ (void)showCheats {
+    TOTKSettingsPanel *p = [self shared];
+    p->page = CHEATS_PAGE; p->focus = 0;
+    if (p.superview) [p buildPage]; else [p show];
+}
+
 - (void)buildPage {
     BOOL modsPage = page == MODS_PAGE;
-    scroll.hidden = modsPage; mods.hidden = !modsPage; reset.hidden = modsPage;
+    scroll.hidden = modsPage; mods.hidden = !modsPage; reset.hidden = modsPage || page == CHEATS_PAGE;   /* Reset all: settings only */
     hint.stringValue = modsPage ? MODS_HINT : SETTINGS_HINT;
     if (self.superview) [self place];
     if (modsPage) { tabs.selectedSegment = page; [mods refresh]; [self refreshStatus]; return; }
     for (NSView *v in list.arrangedSubviews.copy) { [list removeArrangedSubview:v]; [v removeFromSuperview]; }
     [rows removeAllObjects]; [rowSetting removeAllObjects];
-    for (int i = 0; i < SETTINGS_COUNT; i++) {
+    for (int i = 0; i < SETTINGS_COUNT && page < SETTINGS_NPAGES; i++) {
         const SettingDef *d = &SETTINGS[i];
         if (strcmp(d->page, SETTINGS_PAGES[page]) || !settings_row_shown(d)) continue;
         NSView *row = [self rowFor:d index:i];
         [list addArrangedSubview:row]; [rows addObject:row]; [rowSetting addObject:@(i)];
     }
-    if (!strcmp(SETTINGS_PAGES[page], "Interface")) {
+    if (page == CHEATS_PAGE) [self buildCheats];
+    else if (!strcmp(SETTINGS_PAGES[page], "Interface")) {
         NSView *saves = [self savesRow];
         [list addArrangedSubview:saves]; [rows addObject:saves]; [rowSetting addObject:@(SAVES_ROW)];
     }
@@ -268,6 +423,7 @@ static NSString *saves_profile(void) { const char *d = getenv("TOTK_PROFILE_DIR"
     status.stringValue = s && *s ? @(s) : @"";
     int pending = mods_changed_since_start();   /* Restart now: a setting marked (after restart), or mod changes */
     for (int i = 0; i < SETTINGS_COUNT && !pending; i++) pending = settings_pending_restart(SETTINGS[i].key);
+    if (!pending) pending = cheats_pending() || runtime_cheats_files_changed();   /* code patches switched, cheat files changed */
     restartNow.hidden = !pending || !runtime_front_can_restart();
 }
 - (void)restartGame { [self hide]; runtime_front_restart(); }
@@ -315,6 +471,14 @@ static NSString *saves_profile(void) { const char *d = getenv("TOTK_PROFILE_DIR"
     if (focus >= (NSInteger)rows.count) return;
     int i = rowSetting[focus].intValue;
     if (i == SAVES_ROW) { if (!dir) [self sendSaves]; return; }
+    if (i == CHEATS_FOLDER_ROW) { if (!dir) [self openCheatsFolder]; return; }
+    if (i == CHEATS_OFF_ROW) { if (!dir) [self cheatsAllOff]; return; }
+    if (i == CHEATS_RESTART_ROW) { if (!dir && runtime_front_can_restart()) [self restartGame]; return; }
+    if (i <= CHEAT_ROW) {   /* Return / A switches it, left off, right on */
+        RuntimeCheatInfo c; int k = CHEAT_ROW - i;
+        if (runtime_cheats_info(k, &c)) [self setCheat:k on:dir ? dir > 0 : !(c.state & CHEAT_ON)];
+        return;
+    }
     const SettingDef *d = &SETTINGS[i]; int v = settings_get(d->key);
     if (d->type == SET_BOOL) v = dir ? dir > 0 : !v;
     else if (d->type == SET_RANGE) { if (!dir) return; v += dir * d->step; v = v < d->min ? d->min : v > d->max ? d->max : v; }

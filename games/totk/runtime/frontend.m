@@ -300,7 +300,9 @@ static void front_install_menu(void){
  quit.keyEquivalentModifierMask=NSEventModifierFlagCommand;quit.target=window;
  NSMenuItem *prefs=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("设置…","Settings…")) action:@selector(toggle) keyEquivalent:@","];
  prefs.keyEquivalentModifierMask=NSEventModifierFlagCommand;prefs.target=TOTKSettingsPanel.class;
- [appMenu addItem:prefs];[appMenu addItem:NSMenuItem.separatorItem];
+ [appMenu addItem:prefs];
+ NSMenuItem *cheats=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("作弊码…","Cheats…")) action:@selector(showCheats) keyEquivalent:@""];   /* the settings menu's Cheats tab */
+ cheats.target=TOTKSettingsPanel.class;[appMenu addItem:cheats];[appMenu addItem:NSMenuItem.separatorItem];
  [appMenu addItem:quit];front_menubar_fps_add(menu);NSApp.mainMenu=menu;
 }
 static void *guest_main(void *callback){@autoreleasepool{((void(*)(void))callback)();}return NULL;}
