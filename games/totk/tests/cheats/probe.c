@@ -5,6 +5,7 @@
    Prints one JSON line; exit 1 on failure. */
 #include "cheat_vm.h"
 #include "guest_range.h"
+#include "cheat_code.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -144,6 +145,133 @@ static void extra(char *err, size_t errn) {
     CHECK(r == 0 && strstr(err, "steps"), "step cap (%s)", err);
 }
 
+/* Code-patch classification (cheat_code.c) on a synthetic main module: code 0..0xF00, executable padding to 0x1000,
+   image (data) to 0x8000. The rewrite changed 0x200 and 0x300..0x308 and moved the window 0x400..0x410; the runtime
+   patched 0x100 itself and put a veneer at 0xF00. */
+static uint8_t cmem[0x8000], cimg[0x8000];
+static int cimg_ok = 1;
+static int cimage_word(void *ctx, uint64_t off, uint32_t *out) { (void)ctx; if (!cimg_ok || off + 4 > sizeof cimg) return 0; memcpy(out, cimg + off, 4); return 1; }
+static const uint32_t cchanged[] = {0x200, 0x204, 0x300, 0x308}, cmoved[] = {0x400, 0x410};
+static CheatMain cmain(void) {
+    return (CheatMain){.mem = cmem, .text_end = 0xF00, .rx_end = 0x1000, .image_end = 0x8000, .changed = cchanged, .nchanged = 2,
+                       .moved = cmoved, .nmoved = 1, .image_word = cimage_word};
+}
+static Cheat cp[4];
+static CheatCode cc;
+/* Scans the last section of text with the {master} sections before it. Returns the scan result; err gets the reason. */
+static int scan(const char *text, const CheatWord *prior, unsigned nprior, char *err, size_t errn) {
+    int n = cheat_parse(text, cp, 4, NULL, 0);
+    const Cheat *masters[4]; int nm = 0;
+    for (int k = 0; k < n - 1; k++) if (cp[k].master) masters[nm++] = &cp[k];
+    if (n < 1 || cp[n - 1].error[0]) { snprintf(err, errn, "parse %s", n ? cp[n - 1].error : ""); return -1; }
+    CheatMain m = cmain();
+    return cheat_code_scan(&m, masters, nm, &cp[n - 1], prior, nprior, &cc, err, errn);
+}
+static int scan_word(uint32_t at, uint32_t word, char *err, size_t errn) {
+    char t[96];
+    snprintf(t, sizeof t, "[W]\n04000000 %08X %08X\n", at, word);
+    return scan(t, NULL, 0, err, errn);
+}
+static uint32_t b_to(uint32_t from, uint32_t to) { return 0x14000000 | (((to - from) / 4) & 0x3FFFFFF); }
+
+static void code_tests(void) {
+    char err[160];
+    for (unsigned i = 0; i < sizeof cmem; i += 4) { uint32_t v = 0xAA000000 | i; if (i >= 0xF00 && i < 0x1000) v = 0; memcpy(cmem + i, &v, 4); }
+    memcpy(cimg, cmem, sizeof cimg);
+    uint32_t veneer = 0x14000010, runtime_fix = 0xD503201F;
+    memcpy(cmem + 0xF00, &veneer, 4); memcpy(cmem + 0x100, &runtime_fix, 4);
+
+    int r = scan_word(0x500, 0xD503201F, err, sizeof err);
+    CHECK(r == 1 && cc.n == 1 && cc.w[0].off == 0x500 && !cc.runtime, "plain code patch (%s)", err);
+    /* Register offsets are followed: 0TMR with R set by type 4, and R set by the master code. */
+    r = scan("[R]\n400E0000 00000000 00000100\n040E0000 00000400 D503201F\n", NULL, 0, err, sizeof err);
+    CHECK(r == 1 && cc.n == 1 && cc.w[0].off == 0x500, "code patch through a known register (%s) off %llx", err, cc.n ? (unsigned long long)cc.w[0].off : 0ull);
+    r = scan("{M}\n400F0000 00000000 00000600\n[R]\n040F0000 00000000 D503201F\n", NULL, 0, err, sizeof err);
+    CHECK(r == 1 && cc.n == 1 && cc.w[0].off == 0x600, "code patch through a register the master code set (%s)", err);
+    /* Zero-register form most real files use (040E0000 with E never set). */
+    r = scan("[E]\n040E0000 00000600 D503201F\n", NULL, 0, err, sizeof err);
+    CHECK(r == 1 && cc.n == 1 && cc.w[0].off == 0x600, "register E is 0 at the start (%s)", err);
+    /* An unknown register (loaded from memory) leaves the write to the runtime guard. */
+    r = scan("[U]\n580E0000 00007000\n040E0000 00000600 D503201F\n", NULL, 0, err, sizeof err);
+    CHECK(r == 1 && cc.n == 0 && cc.runtime, "unknown register offset: runtime only (%s)", err);
+    /* Conditional and looped code patches are refused; a mixed cheat (code + button + data) is split. */
+    r = scan("[C]\n80000001\n04000000 00000500 D503201F\n20000000\n", NULL, 0, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "condition"), "conditional code patch refused (%s)", err);
+    r = scan("[L]\n30000000 00000002\n040F0000 00000500 D503201F\n31000000\n", NULL, 0, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "loop"), "looped code patch refused (%s)", err);
+    r = scan("[Mix]\n04000000 00000500 D503201F\n80000001\n04100000 00000010 00000001\n20000000\n", NULL, 0, err, sizeof err);
+    CHECK(r == 1 && cc.n == 1 && cc.runtime, "mixed cheat: code at launch, the rest on the thread (%s)", err);
+    /* Rewritten, moved and runtime-patched instructions. */
+    r = scan_word(0x200, 0xD503201F, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "rewrite changed"), "rewritten instruction refused (%s)", err);
+    r = scan("[W8]\n08000000 000002FC D503201F D503201F\n", NULL, 0, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "0x300"), "64-bit write running onto a rewritten word refused (%s)", err);
+    r = scan_word(0x408, 0xD503201F, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "rewrite changed"), "instruction inside a moved window refused (%s)", err);
+    r = scan_word(0x100, 0xD503201F, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "runtime"), "runtime-patched instruction refused (%s)", err);
+    r = scan_word(0xF00, 0xD503201F, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "runtime"), "runtime veneer in the padding refused (%s)", err);
+    r = scan_word(0xF04, 0xD503201F, err, sizeof err);
+    CHECK(r == 1, "free padding usable as a cave (%s)", err);
+    r = scan_word(0x502, 0xD503201F, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "part of"), "unaligned code write refused (%s)", err);
+    r = scan("[H]\n02000000 00000500 0000D503\n", NULL, 0, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "part of"), "2-byte code write refused (%s)", err);
+    /* Branch and PC-relative targets of written instructions. */
+    r = scan_word(0x500, b_to(0x500, 0x2000), err, sizeof err);
+    CHECK(r == 0 && strstr(err, "out of"), "B out of the code refused (%s)", err);
+    r = scan_word(0x500, b_to(0x500, 0x404), err, sizeof err);
+    CHECK(r == 0 && strstr(err, "moved"), "B into a moved window refused (%s)", err);
+    r = scan_word(0x500, b_to(0x500, 0x400), err, sizeof err);
+    CHECK(r == 1, "B to the head of a moved window is fine (%s)", err);
+    r = scan_word(0x500, b_to(0x500, 0xF10), err, sizeof err);
+    CHECK(r == 0 && strstr(err, "padding"), "B into unused padding refused (%s)", err);
+    r = scan("[Cave]\n04000000 00000500 14000284\n04000000 00000F10 D65F03C0\n", NULL, 0, err, sizeof err);
+    CHECK(r == 1 && cc.n == 2, "B into a cave the cheat writes (%s)", err);
+    r = scan_word(0x500, 0x54000000 | ((0x3000 - 0x500) / 4) << 5, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "out of"), "B.cond out of the code refused (%s)", err);
+    r = scan_word(0x500, 0xB4000000 | (((uint32_t)((0x404 - 0x500) / 4)) & 0x7FFFF) << 5, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "moved"), "CBZ backwards into a moved window refused (%s)", err);
+    r = scan_word(0x500, 0x36000000 | ((0x1800 - 0x500) / 4) << 5, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "out of"), "TBZ out of the code refused (%s)", err);
+    r = scan_word(0x500, 0x90000000 | (0x10 >> 2) << 5, err, sizeof err);   // ADRP x0, page 0x10000
+    CHECK(r == 0 && strstr(err, "outside"), "ADRP outside the module refused (%s)", err);
+    r = scan_word(0x500, 0x90000000 | (1u << 29), err, sizeof err);         // ADRP x0, page 0x1000
+    CHECK(r == 1, "ADRP into the module's data is fine (%s)", err);
+    r = scan_word(0x500, 0x58000000 | ((0x7000 - 0x500) / 4) << 5, err, sizeof err);
+    CHECK(r == 1, "LDR literal into the module is fine (%s)", err);
+    r = scan_word(0x500, 0x10000000 | ((0x9000 - 0x500) >> 2) << 5, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "outside"), "ADR outside the module refused (%s)", err);
+    r = scan_word(0x500, 0xD4000001, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "svc"), "svc refused (%s)", err);
+    r = scan_word(0x500, 0xD53BD040, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "thread"), "mrs tpidr_el0 refused (%s)", err);
+    /* A word another cheat already wrote: same value fine, different value is a conflict; its own write is accepted. */
+    CheatWord prior[] = {{0x500, 0xD503201F, 3}};
+    uint32_t nop = 0xD503201F;
+    memcpy(cmem + 0x500, &nop, 4);
+    r = scan("[P]\n04000000 00000500 D503201F\n", prior, 1, err, sizeof err);
+    CHECK(r == 1 && cc.conflict == -1, "same word as an earlier cheat (%s)", err);
+    r = scan("[P]\n04000000 00000500 52800020\n", prior, 1, err, sizeof err);
+    CHECK(r == 1 && cc.conflict == 3, "conflict reported (%d)", cc.conflict);
+    r = scan("[P]\n04000000 00000500 52800020\n", NULL, 0, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "runtime"), "a word changed by nobody known is refused (%s)", err);
+    memcpy(cmem + 0x500, cimg + 0x500, 4);
+    /* Fail closed without the rewrite map or the verified image. */
+    CheatMain m = cmain(); m.changed = NULL; m.nchanged = 0;
+    cheat_parse("[W]\n04000000 00000500 D503201F\n", cp, 4, NULL, 0);
+    r = cheat_code_scan(&m, NULL, 0, &cp[0], NULL, 0, &cc, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "map"), "no rewrite map: refused (%s)", err);
+    cimg_ok = 0;
+    r = scan_word(0x500, 0xD503201F, err, sizeof err);
+    CHECK(r == 0 && strstr(err, "image"), "no verified image: refused (%s)", err);
+    cimg_ok = 1;
+    /* Data writes into main above the code are runtime work, not code. */
+    r = scan_word(0x6000, 1, err, sizeof err);
+    CHECK(r == 1 && cc.n == 0 && cc.runtime, "main data write stays on the thread (%s)", err);
+}
+
 /* The memory guard (guest_range.h, used by cheats.c and services.c runtime_guest_access): only mapped alias pages, only
    the main module's data for writes, code only as compare, no overflow wrap-around. */
 static void guard_tests(void) {
@@ -232,6 +360,7 @@ int main(void) {
     CHECK(r == -1 && err[0], "unknown arithmetic reported (%s)", err);
     extra(err, sizeof err);
     guard_tests();
+    code_tests();
 
     printf("{\"status\":\"%s\",\"probe\":\"probe-cheat-vm\",\"checked\":%d,\"failures\":%d}\n", failures ? "fail" : "pass", checks, failures);
     return failures ? 1 : 0;

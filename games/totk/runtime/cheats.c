@@ -13,6 +13,7 @@ int runtime_cheats_set(int i, int on) { (void)i; (void)on; return 0; }
 #include "runtime.h"
 #include "cheat_vm.h"
 #include "guest_range.h"
+#include "cheat_code.h"
 #include <copyfile.h>
 #include <libgen.h>
 #include <mach/mach.h>
@@ -27,14 +28,15 @@ int runtime_cheats_set(int i, int on) { (void)i; (void)on; return 0; }
 
 /* Cheats baked into the app (build_app.py --cheats: the Atmosphère cheat file for this game's build ID, at
    cheats/cheats.txt; TOTK_CHEATS_FILE overrides). Nothing here is specific to one game.
-   - Cheats that write instructions into the main module's code (with a code cave in the padding after its text) are
-     applied once at launch, before the modules are sealed r-x: the code is never made writable while guest threads run
-     it, so toggling one takes effect at the next launch. A patch is refused when its site is a rewritten instruction
-     (a branch into the rewrite's patch area), when a branch it writes leaves the code (into data, which is not
-     executable here), when it is conditional, or when its cave would overwrite padding the runtime's own patches
-     already use (game_patches*.c and aspect_patch.h put veneers at the start of main's text padding).
-   - Every other cheat (pointer chains into the heap, button conditions) runs about 30 times a second on a host thread,
-     reading and writing guest memory with mach_vm_read/write, so a stale pointer fails instead of crashing.
+   - The code words a cheat writes into the main module (with a code cave in the padding after its text) are applied
+     once at launch, before the modules are sealed r-x: the code is never made writable while guest threads run it, so
+     toggling such a cheat takes effect at the next launch. cheat_code.c decides which words those are and refuses a
+     patch that cannot be applied safely (under a condition, on an instruction the Apple-silicon rewrite changed or
+     moved, over the runtime's own patches, branching where it cannot reach; see there).
+   - Everything else (pointer chains into the heap, button conditions, and the data part of a cheat that also patches
+     code) runs about 30 times a second on a host thread, reading and writing guest memory with mach_vm_read/write
+     through a guard that admits only memory the game has mapped, so a stale pointer fails instead of crashing. On the
+     thread a code word already applied at launch is only compared, never written.
    The chosen cheats are saved beside the profile (cheats-enabled.txt). The first time one is enabled the profile is copied
    to profile-before-cheats, as the launcher does before a version upgrade. */
 
@@ -45,9 +47,10 @@ static char problem[CHEAT_MAX][112];
 static uint8_t *main_base;
 static uint64_t main_size, main_rx, main_text, main_patch, main_data, main_key;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
-typedef struct { uint64_t off; uint32_t value; int cheat; } Patched;
-static Patched patched[512];   // code words written at launch, to catch overlaps
-static int npatched;
+static Module *main_module;
+static CheatWord patched[1024];   // code words written at launch, to catch overlaps
+static unsigned npatched;
+static unsigned char runs[CHEAT_MAX];   // the cheat has work for the cheat thread (not only code words)
 static int dry_run;   // TOTK_CHEATS_DRYRUN=1: memory cheats log their first write per target and change nothing
 
 static const char *cheat_file(void) { const char *e = getenv("TOTK_CHEATS_FILE"); return e && *e ? e : "cheats/cheats.txt"; }
@@ -68,81 +71,35 @@ static int state_file(char *out, size_t n) {
 }
 
 /* --- launch-time code patches ------------------------------------------------------------------------------------ */
-static uint32_t word_at(uint64_t off) { uint32_t v; memcpy(&v, main_base + off, 4); return v; }
-static int branch_target(uint32_t insn, uint64_t at, uint64_t *to) {   // B / BL imm26
-    if ((insn & 0x7C000000) != 0x14000000) return 0;
-    int64_t imm = (int64_t)(insn & 0x03FFFFFF) << 38 >> 36;
-    *to = at + (uint64_t)imm;
+static int image_word(void *ctx, uint64_t off, uint32_t *out) { return runtime_module_image_word(ctx, off, out); }
+/* Classifies cheat k (masters: the master codes that run before it) and, when it is on, writes all of its code words or
+   none. Returns -1 when refused, 0 when it writes no code, 1 when it does (applied or not). */
+static int launch_code(int k, const Cheat *const *masters, int nmasters) {
+    CheatMain mm = {.mem = main_base, .text_end = main_text, .rx_end = main_rx, .image_end = main_key,
+                    .changed = main_module->changed, .nchanged = main_module->nchanged, .moved = main_module->moved,
+                    .nmoved = main_module->nmoved, .image_word = image_word, .ctx = main_module};
+    static CheatCode code;
+    char err[CHEAT_ERR];
+    if (!cheat_code_scan(&mm, masters, nmasters, &cheats[k], patched, npatched, &code, err, sizeof err)) {
+        snprintf(problem[k], sizeof problem[k], "%s", err);
+        return -1;
+    }
+    runs[k] = code.runtime || !code.n;
+    if (!code.n) return 0;
+    atomic_fetch_or(&state[k], CHEAT_AT_LAUNCH);
+    if (!(atomic_load(&state[k]) & CHEAT_ON)) return 1;
+    if (code.conflict >= 0) snprintf(problem[k], sizeof problem[k], "conflicts with \"%s\"; turn one off", cheats[code.conflict].name);
+    else if (npatched + code.n > sizeof patched / sizeof *patched) snprintf(problem[k], sizeof problem[k], "too many code words from all cheats together");
+    else {
+        for (unsigned j = 0; j < code.n; j++) {
+            memcpy(main_base + code.w[j].off, &code.w[j].value, 4);
+            patched[npatched++] = (CheatWord){code.w[j].off, code.w[j].value, k};
+        }
+        atomic_fetch_or(&state[k], CHEAT_APPLIED);
+        return 1;
+    }
+    fprintf(stderr, "[totk] cheat \"%s\" not applied: %s\n", cheats[k].name, problem[k]);
     return 1;
-}
-/* A padding word another cheat wrote this launch (identical or not: different values are left to conflicts()). */
-static int patched_by_cheat(uint64_t off) { for (int p = 0; p < npatched; p++) if (patched[p].off == off) return 1; return 0; }
-/* Classifies cheat k (CHEAT_AT_LAUNCH when it writes main-module code) and checks every code write. apply: write them,
-   unless a word was already written with a different value by another cheat this launch (then nothing of k is written). */
-static int conflicts(int k);
-static int code_patches(int k, int apply) {
-    if (apply && conflicts(k)) return -1;
-    const Cheat *c = &cheats[k];
-    int depth = 0, code = 0;
-    for (unsigned i = 0; i < c->n;) {
-        unsigned len = cheat_insn_len(c->w, c->n, i);
-        if (!len) { snprintf(problem[k], sizeof problem[k], "malformed instruction %08x", c->w[i]); return -1; }
-        uint32_t x = c->w[i];
-        unsigned op = x >> 28, t = x >> 24 & 0xF;
-        if (op == 1 || op == 8 || (op == 0xC && t == 0)) depth++;
-        else if (op == 2 && t == 0) depth--;
-        else if (op == 0 && (x >> 20 & 0xF) == 0) {   // store static value into the main module
-            uint64_t off = (uint64_t)(x & 0xFF) << 32 | c->w[i + 1];
-            if (off < main_rx) {
-                code = 1;
-                if (depth) { snprintf(problem[k], sizeof problem[k], "conditional code patch at main+%#llx", (unsigned long long)off); return -1; }
-                if ((t != 4 && t != 8) || (off & 3) || off + t > main_rx) { snprintf(problem[k], sizeof problem[k], "unaligned code patch at main+%#llx", (unsigned long long)off); return -1; }
-                uint32_t nw[2] = {t == 8 ? c->w[i + 3] : c->w[i + 2], c->w[i + 2]};   // a 64-bit value is stored low word first
-                for (unsigned j = 0; j < t / 4; j++) {
-                    uint64_t at = off + 4 * j, to;
-                    if (at < main_text && branch_target(word_at(at), at, &to) && to >= main_patch) {
-                        snprintf(problem[k], sizeof problem[k], "patches a rewritten instruction at main+%#llx", (unsigned long long)at); return -1;
-                    }
-                    if (at >= main_text && word_at(at) && !patched_by_cheat(at)) {   // the runtime's own veneers live here too
-                        snprintf(problem[k], sizeof problem[k], "overlaps the game runtime's own patch code at main+%#llx", (unsigned long long)at); return -1;
-                    }
-                    if (branch_target(nw[j], at, &to) && to >= main_rx) {
-                        snprintf(problem[k], sizeof problem[k], "branches out of the game's code (main+%#llx)", (unsigned long long)to); return -1;
-                    }
-                }
-                if (apply) {
-                    memcpy(main_base + off, nw, t);
-                    for (unsigned j = 0; j < t / 4 && npatched < (int)(sizeof patched / sizeof *patched); j++)
-                        patched[npatched++] = (Patched){off + 4 * j, nw[j], k};
-                }
-            }
-        }
-        i += len;
-    }
-    return code;
-}
-
-/* Another cheat already applied this launch wrote one of k's code words with a different value. */
-static int conflicts(int k) {
-    const Cheat *c = &cheats[k];
-    for (unsigned i = 0; i < c->n;) {
-        unsigned len = cheat_insn_len(c->w, c->n, i);
-        if (!len) return 0;
-        uint32_t x = c->w[i];
-        if (x >> 28 == 0 && (x >> 20 & 0xF) == 0) {
-            unsigned t = x >> 24 & 0xF;
-            uint64_t off = (uint64_t)(x & 0xFF) << 32 | c->w[i + 1];
-            uint32_t nw[2] = {t == 8 ? c->w[i + 3] : c->w[i + 2], c->w[i + 2]};
-            for (unsigned j = 0; off < main_rx && j < t / 4; j++)
-                for (int p = 0; p < npatched; p++)
-                    if (patched[p].off == off + 4 * j && patched[p].value != nw[j]) {
-                        snprintf(problem[k], sizeof problem[k], "conflicts with \"%s\"; turn one off", cheats[patched[p].cheat].name);
-                        return 1;
-                    }
-        }
-        i += len;
-    }
-    return 0;
 }
 
 /* --- guarded guest memory ---------------------------------------------------------------------------------------- */
@@ -163,7 +120,7 @@ static int guest_access(uint64_t a, void *buf, unsigned n, int write) {
     Access x = {a, buf, n, write == 1};
     switch (guest_main_access((uintptr_t)main_base, main_data, main_rx, main_key, a, n, write != 0)) {
     case 1: return write == 2 || host_access(&x);
-    case 2: return 0;   // code: never written while the game runs
+    case 2: return buf && !memcmp((const void *)(uintptr_t)a, buf, n);   // code: never written; equal to what launch applied
     default: return runtime_guest_access(a, n, write == 2 ? accept : host_access, &x);
     }
 }
@@ -179,7 +136,7 @@ static int guest_write(void *ctx, uint64_t a, const void *in, unsigned n) {
         while (k < nseen && seen[k].addr != a) k++;
         if (k == nseen && nseen < 4096) seen[nseen++] = (Seen){a, ~now, 0};
         else if (k == nseen && !full++) fprintf(stderr, "[totk] cheat dry run: more than 4096 targets, the rest are not logged\n");
-        int ok = guest_access(a, NULL, n, 2);
+        int ok = guest_access(a, (void *)(uintptr_t)in, n, 2);
         if (k < nseen && seen[k].value != now && seen[k].logs < 8) {
             seen[k].value = now; seen[k].logs++;
             fprintf(stderr, "[totk] cheat dry run \"%s\": %#llx (%u bytes) is %s%#llx, would write %#llx%s\n", ctx ? (const char *)ctx : "?",
@@ -208,7 +165,8 @@ static void *cheat_thread(void *arg) {
         for (int pass = 0; pass < 2; pass++)
             for (int k = 0; k < ncheat; k++) {
                 int st = atomic_load(&state[k]);
-                if (cheats[k].master != !pass || !(st & CHEAT_ON) || (st & (CHEAT_AT_LAUNCH | CHEAT_REFUSED)) || !cheats[k].n) continue;
+                if (cheats[k].master != !pass || !(st & CHEAT_ON) || (st & CHEAT_REFUSED) || !runs[k] || !cheats[k].n) continue;
+                if ((st & CHEAT_AT_LAUNCH) && !(st & CHEAT_APPLIED)) continue;   // its code part is not in: wait for the next launch
                 char err[112] = "";
                 env.ctx = cheats[k].name;
                 if (!cheat_run(&cheats[k], &vm, &env, err, sizeof err) && err[0] && strcmp(err, problem[k])) {   // a failed read (pointer not set up yet) is silent
@@ -294,8 +252,11 @@ void runtime_cheats_launch(Module *m) {
     if (dry_run) fprintf(stderr, "[totk] cheats: dry run (memory cheats log their targets and write nothing)\n");
     main_base = m->base; main_size = m->size; main_text = m->text_end; main_patch = m->patch_off; main_data = m->data_off; main_key = m->key_off;
     main_rx = (m->text_end + 0xFFF) & ~0xFFFULL;   // the code and the padding after it, up to the next 4 KiB segment
+    main_module = m;
     load_choices();
-    int applied = 0, at_launch = 0;
+    int applied = 0, at_launch = 0, nmasters = 0, seen = 0;
+    static const Cheat *masters[CHEAT_MAX];
+    for (int k = 0; k < ncheat; k++) if (cheats[k].master && !cheats[k].error[0]) masters[nmasters++] = &cheats[k];
     for (int k = 0; k < ncheat; k++) {
         if (!cheats[k].n && !cheats[k].error[0]) continue;   // titles and notes
         if (!cheats[k].master) listed[nlisted++] = k; else atomic_fetch_or(&state[k], CHEAT_ON);
@@ -303,14 +264,10 @@ void runtime_cheats_launch(Module *m) {
             snprintf(problem[k], sizeof problem[k], "%s", cheats[k].error);
             atomic_fetch_or(&state[k], CHEAT_REFUSED); fprintf(stderr, "[totk] cheat \"%s\" refused: %s\n", cheats[k].name, problem[k]); continue;
         }
-        int code = code_patches(k, 0);
+        int code = launch_code(k, masters, cheats[k].master ? seen++ : nmasters);   // a master code sees the ones before it
         if (code < 0) { atomic_fetch_or(&state[k], CHEAT_REFUSED); fprintf(stderr, "[totk] cheat \"%s\" refused: %s\n", cheats[k].name, problem[k]); continue; }
-        if (!code) continue;
-        atomic_fetch_or(&state[k], CHEAT_AT_LAUNCH); at_launch++;
-        if (atomic_load(&state[k]) & CHEAT_ON) {
-            if (code_patches(k, 1) < 0) { fprintf(stderr, "[totk] cheat \"%s\" not applied: %s\n", cheats[k].name, problem[k]); continue; }
-            atomic_fetch_or(&state[k], CHEAT_APPLIED); applied++;
-        }
+        at_launch += code;
+        applied += !!(atomic_load(&state[k]) & CHEAT_APPLIED);
     }
     fprintf(stderr, "[totk] cheats: %d in %s (%d patch code at launch, %d of them applied now)\n", nlisted, cheat_file(), at_launch, applied);
     pthread_t th;

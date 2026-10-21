@@ -179,8 +179,16 @@ static void map_module(Module *m,const char *dir) {
  make_hash(m);
  fprintf(stderr,"[totk] mapped embedded %s at %p size=%zu symbols=%u\n",m->name,m->base,m->size,m->nsym);
 }
+int runtime_module_image_word(const Module *m,uint64_t off,uint32_t *out){(void)m;(void)off;(void)out;return 0;}
 #else
+static char image_dir[4096];   /* the verified rewritten images (runtime_module_image_word) */
+/* Cheats (cheats.c): a word of a module's rewritten image as verified at load, before the runtime's own patches. */
+int runtime_module_image_word(const Module *m,uint64_t off,uint32_t *out){
+ char path[4200];if(!image_dir[0]||off>m->file_size||m->file_size-off<4||snprintf(path,sizeof path,"%s/%s.patched.bin",image_dir,m->name)>=(int)sizeof path)return 0;
+ int fd=open(path,O_RDONLY);if(fd<0)return 0;int ok=pread(fd,out,4,(off_t)off)==4;close(fd);return ok;
+}
 static void map_module(Module *m,const char *dir) {
+ if(snprintf(image_dir,sizeof image_dir,"%s",dir)>=(int)sizeof image_dir)image_dir[0]=0;
  char path[4096];need(snprintf(path,sizeof(path),"%s/%s.patched.bin",dir,m->name)<(int)sizeof(path),"image path");
  FILE *f=fopen(path,"rb");need(f!=NULL,"open patched module");
  struct stat st;need(fstat(fileno(f),&st)==0&&(size_t)st.st_size==m->file_size,"patched module size");

@@ -10,6 +10,7 @@ typedef struct {
  uint64_t text_end, ro_off, data_off, patch_off, key_off, init, ctor_flag, init_array, init_size;
  const Symbol *symbols; unsigned nsym; const Reloc *relocs; unsigned nreloc;
  const Gate *gates; unsigned ngate; unsigned *hash, hash_mask;
+ const uint32_t *changed, *moved; unsigned nchanged, nmoved;   /* main: [start,end) pairs the Apple-silicon rewrite changed / runs from its patch area (cheats) */
  uint8_t *base; unsigned relative, symbolic, cross, weak;
 } Module;
 extern pthread_key_t runtime_keys[8];
@@ -147,6 +148,7 @@ uint64_t runtime_input_buttons(void);   /* runtime/input.c: held buttons (keyboa
 void runtime_guest_regions(uint64_t base[3],uint64_t size[3]);   /* runtime/services.c: heap, alias and ASLR regions */
 int runtime_guest_access(uint64_t a,uint64_t n,int (*access)(void *ctx),void *ctx);   /* runtime/services.c: access() only on guest-mapped heap / alias pages */
 void runtime_cheats_launch(Module *main_module);   /* runtime/cheats.c: before the modules are sealed */
+int runtime_module_image_word(const Module *m,uint64_t off,uint32_t *out);   /* runtime/loader.c: a word of the verified rewritten image file (Mac) */
 int runtime_cheats_count(void);
 const char *runtime_cheats_name(int i);
 int runtime_cheats_state(int i);   /* CHEAT_ON | CHEAT_AT_LAUNCH | CHEAT_APPLIED | CHEAT_REFUSED */

@@ -111,6 +111,40 @@ assert len(plt) == 1, f'PLT matches {plt}'
 main['probe_plt'] = plt[0]
 main['probe_slot'] = slot
 
+def merge(ranges):
+    out = []
+    for a, b in sorted(ranges):
+        if out and a <= out[-1][1]: out[-1][1] = max(out[-1][1], b)
+        else: out.append([a, b])
+    return out
+
+def rewrite_map(name, layout, image):
+    """Cheats (runtime/cheat_code.c): where main's running code is not the original instruction. changed: every word of the
+    text the rewrite changed (original ELF text vs the rewritten image); moved: instruction windows and call windows the
+    rewrite runs from its patch area (sites.tsv W / C rows: their words in place are dead copies)."""
+    elf = (ROOT / f'extracted/{version}/elf/{name}.elf').read_bytes()
+    assert elf[:4] == b'\x7fELF'
+    phoff, = struct.unpack_from('<Q', elf, 0x20)
+    kind, _, offset, vaddr, _, filesz, _, _ = struct.unpack_from('<IIQQQQQQ', elf, phoff)
+    text = layout['TEXT_END']
+    assert kind == 1 and vaddr == 0 and filesz >= text, 'original text segment'
+    changed = []
+    for at in range(0, text & ~3, 4):
+        if elf[offset + at:offset + at + 4] != image[at:at + 4]: changed.append((at, at + 4))
+    moved = []
+    for line in (ROOT / f'rewritten/{version}/{name}.sites.tsv').read_text().splitlines():
+        f = line.split('\t')
+        if len(f) >= 3 and f[1] in ('W', 'C'):
+            lo, hi = int(f[0], 0), int(f[2], 0)
+            assert 0 <= lo < hi <= text and hi - lo <= 0x400, f'site range {line}'
+            moved.append((lo, hi))
+    return merge(changed), merge(moved)
+
+rewrites = {}
+if (ROOT / f'rewritten/{version}/main.sites.tsv').exists() and (ROOT / f'extracted/{version}/elf/main.elf').exists():
+    main_image = (ROOT / f'rewritten/{version}/main.patched.bin').read_bytes()
+    rewrites[0] = rewrite_map('main', modules[0]['layout'], main_image)
+
 lines = ['/* Generated locally from validated player images; do not commit. */']
 for n, m in enumerate(modules):
     lines.append(f'static const Reloc reloc_{n}[] = {{')
@@ -123,13 +157,17 @@ for n, m in enumerate(modules):
     lines.extend(f'{{{g["ret"]}ULL,{g["original"]}ULL,{g["timer"]!s},{g["arg"]}}},'.replace('True','1').replace('False','0') for g in m['gates'])
     if not m['gates']: lines.append('{0,0,0,0},')
     lines.append('};')
+    changed, moved = rewrites.get(n, ([], []))
+    lines.append(f'static const uint32_t changed_{n}[] = {{' + ','.join(f'{a:#x},{b:#x}' for a, b in changed) + ('' if changed else '0') + '};')
+    lines.append(f'static const uint32_t moved_{n}[] = {{' + ','.join(f'{a:#x},{b:#x}' for a, b in moved) + ('' if moved else '0') + '};')
 lines.append('static Module modules[] = {')
 for n, m in enumerate(modules):
     l = m['layout']
-    lines.append('{' + f'.name={json.dumps(m["name"])},.digest={json.dumps(m["sha256"])},.file_size={m["size"]}ULL,.text_end={l["TEXT_END"]}ULL,.ro_off={l["RO_OFF"]}ULL,.data_off={l["DATA_OFF"]}ULL,.patch_off={l["PATCH_OFF"]}ULL,.key_off={l["KEY_PAGE_OFF"]}ULL,.symbols=symbol_{n},.nsym={len(m["symbols"])},.relocs=reloc_{n},.nreloc={len(m["relocs"])},.gates=gate_{n},.ngate={len(m["gates"])},.init={m["tags"].get(12,0)}ULL,.ctor_flag={m["ctor_flag"]}ULL,.init_array={m["tags"].get(25,0)}ULL,.init_size={m["tags"].get(27,0)}ULL' + '},')
+    lines.append('{' + f'.name={json.dumps(m["name"])},.digest={json.dumps(m["sha256"])},.file_size={m["size"]}ULL,.text_end={l["TEXT_END"]}ULL,.ro_off={l["RO_OFF"]}ULL,.data_off={l["DATA_OFF"]}ULL,.patch_off={l["PATCH_OFF"]}ULL,.key_off={l["KEY_PAGE_OFF"]}ULL,.symbols=symbol_{n},.nsym={len(m["symbols"])},.relocs=reloc_{n},.nreloc={len(m["relocs"])},.gates=gate_{n},.ngate={len(m["gates"])},.init={m["tags"].get(12,0)}ULL,.ctor_flag={m["ctor_flag"]}ULL,.init_array={m["tags"].get(25,0)}ULL,.init_size={m["tags"].get(27,0)}ULL' + f',.changed=changed_{n},.nchanged={len(rewrites.get(n, ([], []))[0])},.moved=moved_{n},.nmoved={len(rewrites.get(n, ([], []))[1])}' + '},')
 lines.append('};')
 lines.append(f'#define PROBE_PLT {main["probe_plt"]}ULL\n#define PROBE_SLOT {slot}ULL')
 (OUT / 'runtime_tables.h').write_text('\n'.join(lines) + '\n')
 # Details are evidence, not additional source code.
 (ROOT / ('analysis/runtime-layout.json' if version == 'v0' else f'analysis/{version}-port/runtime-layout.json')).write_text(json.dumps(modules, indent=2) + '\n')
-print(json.dumps(dict(modules=len(modules), relocations=sum(len(m['relocs']) for m in modules), original_main_plt=hex(plt[0]), original_main_slot=hex(slot))))
+print(json.dumps(dict(modules=len(modules), relocations=sum(len(m['relocs']) for m in modules), original_main_plt=hex(plt[0]), original_main_slot=hex(slot),
+                 main_rewrite_changed_ranges=len(rewrites.get(0, ([], []))[0]), main_rewrite_moved_ranges=len(rewrites.get(0, ([], []))[1]))))
