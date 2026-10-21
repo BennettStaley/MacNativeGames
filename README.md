@@ -23,20 +23,21 @@ Play your own copy of **The Legend of Zelda: Tears of the Kingdom** natively on 
 [BennettStaley/NativeTOTK-Apple-Silicon](https://github.com/BennettStaley/NativeTOTK-Apple-Silicon), branch `feat/settings-menu`, adds a
 recomp-style in-game layer on top of the 1.4.3 port. Tested on an M-series MacBook Pro (macOS, background test runs on
 a prologue save and an outdoor Sky Temple save) and installed on an iPad Pro 13" M4 (iPadOS 26); the iPad build has not
-been played through yet.
+been played through yet. Upstream is merged through `e55ad1c` (2026-10-22: background shader translation, the pipeline
+archive, key 4's fit-to-window step, `--mod` code patches), plus upstream PRs #188, #190 and #191.
 
 | Area | What's there | Status |
 |---|---|---|
 | **Settings menu** ([docs](docs/settings.md)) | A sidebar inside the game window on the Mac (works in full screen; mouse, keyboard, controller; ⌘, / F1 / Home), a menu on iPad / iPhone; 34 settings, almost all live | Mac tested; iPad installed |
-| Display | Output resolution up to display native or 4K, 3D render scale 25-200 %, aspect ratio with Vert+ on taller screens (HUD keeps its shape), maximum output | Tested live |
+| Display | Output resolution up to display native or 4K, 3D render scale 25-200 %, aspect ratio (upstream's key-4 engine: fill the screen, 16:9, 16:10, 21:9, 32:9) with Vert+ on taller screens (HUD keeps its shape), maximum output | Tested live |
 | Graphics | FOV, AA (game / off / FXAA / SMAA), CAS sharpening, anisotropic filtering, LOD bias, frame interpolation, bloom, depth of field, lens flare, cave fog, shadow resolution (live), render distance | Tested; fog only affects caves, render distance only cuts below 100 % |
 | World / interface / controls | Time of day speed, frame rate limit (also on display-paced 120 Hz), Hide HUD (F2), readout detail (avg / 1 % low), shader counter (compiling / new / total), camera speed, face buttons, Button prompts (Switch / Xbox / PlayStation via icon mods) | Tested |
 | **Mods** ([docs](docs/mods.md), [browser](docs/mod-browser.md)) | One folder per mod (Yuzu / Ryujinx layout), load order, a GameBanana browser in the Mods tab, the 1.4.3 size table rebuilt for mods, old-version and code-patch mods flagged | Tested with Defogger and Xbox UI for v1.4.3 |
 | **Save transfer** ([docs](docs/save-sync.md)) | Files app / Finder Files tab; `.totksave` over AirDrop (Send saves…, double-click / Open in to import, with backups and version checks); `save_sync.py` over USB / Wi-Fi | AirDrop not yet tried on devices |
 | Builds | Game data outside the Mac app: a code-only rebuild takes ~40 s instead of ~12 min; the iPad app carries the game's icon | Done |
 
-Next: AirDrop and iPad on-device testing, merging mods that change the same file, TKMM `.tkcl` packages, 1.4.3 code
-patches (pchtxt) on the Mac, 7z / RAR on iPad, free camera / photo mode, cheats, faster iPad re-installs (keep the game
+Next: AirDrop and iPad on-device testing, merging mods that change the same file, TKMM `.tkcl` packages, code patches
+(pchtxt) from the Mods tab without a rebuild (today: `build_app.py --mod`), 7z / RAR on iPad, free camera / photo mode, cheats, faster iPad re-installs (keep the game
 data on the device between installs), outdoor haze, the AutoBuilder quick-menu check. Several settings follow ideas from
 MaxLastBreath's UltraCam and NX Optimizer (no code of theirs is included; see Acknowledgements).
 
