@@ -1,5 +1,6 @@
 #import "settings_menu.h"
 #import "mods_menu.h"
+#import "saves_menu.h"
 #import <GameController/GameController.h>
 #import <Metal/Metal.h>
 #include <os/proc.h>
@@ -76,19 +77,23 @@ static unsigned device_mask(void) { return UIDevice.currentDevice.userInterfaceI
 
 #pragma mark - Rows
 
-/* The settings pages, then Mods (one row: the installed mods and GameBanana, mods_menu.m), then About. */
+/* The settings pages, then Mods (one row: the installed mods and GameBanana, mods_menu.m), Saves (one row: send and
+   receive saves, saves_menu.m), then About. */
 - (NSIndexPath *)modsRow { return [NSIndexPath indexPathForRow:0 inSection:(NSInteger)sections.count]; }
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { (void)tableView; return (NSInteger)sections.count + 2; }
+- (NSIndexPath *)savesRow { return [NSIndexPath indexPathForRow:0 inSection:(NSInteger)sections.count + 1]; }
+- (BOOL)isPageRow:(NSIndexPath *)path { return [path isEqual:[self modsRow]] || [path isEqual:[self savesRow]]; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { (void)tableView; return (NSInteger)sections.count + 3; }
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     (void)tableView;
-    return section < (NSInteger)sections.count ? (NSInteger)sections[section].count : section == (NSInteger)sections.count ? 1 : (NSInteger)about.count;
+    return section < (NSInteger)sections.count ? (NSInteger)sections[section].count : section <= (NSInteger)sections.count + 1 ? 1 : (NSInteger)about.count;
 }
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    (void)tableView; return section < (NSInteger)titles.count ? titles[section] : section == (NSInteger)sections.count ? @"Mods" : @"About";
+    (void)tableView;
+    return section < (NSInteger)titles.count ? titles[section] : section == (NSInteger)sections.count ? @"Mods" : section == (NSInteger)sections.count + 1 ? @"Saves" : @"About";
 }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     (void)tableView;
-    return section == (NSInteger)sections.count + 1 ? @"Open this menu with three fingers, the gear, a controller's Home button or − and + held together, or Esc on a keyboard." : nil;
+    return section == (NSInteger)sections.count + 2 ? @"Open this menu with three fingers, the gear, a controller's Home button or − and + held together, or Esc on a keyboard." : nil;
 }
 
 - (const SettingDef *)defAt:(NSIndexPath *)path {
@@ -119,6 +124,14 @@ static NSString *value_text(const SettingDef *d, int v) {
         mods.imageView.image = [UIImage systemImageNamed:@"shippingbox"];
         mods.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         return mods;
+    }
+    if ([path isEqual:[self savesRow]]) {
+        UITableViewCell *saves = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+        saves.textLabel.text = @"Send or receive saves"; saves.detailTextLabel.text = TOTKSavesSummary();
+        saves.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+        saves.imageView.image = [UIImage systemImageNamed:@"square.and.arrow.up.on.square"];
+        saves.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        return saves;
     }
     if (!d) {
         UITableViewCell *info = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
@@ -178,20 +191,24 @@ static NSString *value_text(const SettingDef *d, int v) {
 }
 
 - (NSIndexPath *)tableView:(UITableView *)tableView willSelectRowAtIndexPath:(NSIndexPath *)path {
-    (void)tableView; const SettingDef *d = [self defAt:path]; return (d && [self available:d]) || [path isEqual:[self modsRow]] ? path : nil;
+    (void)tableView; const SettingDef *d = [self defAt:path]; return (d && [self available:d]) || [self isPageRow:path] ? path : nil;
 }
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)path {
     (void)tableView; cursor = path; [self activate:path step:0];
 }
-- (void)viewWillAppear:(BOOL)animated {   /* back from Mods: its summary */
+- (void)viewWillAppear:(BOOL)animated {   /* back from Mods or Saves: their summaries */
     [super viewWillAppear:animated];
-    if (sections) [self.tableView reloadRowsAtIndexPaths:@[[self modsRow]] withRowAnimation:UITableViewRowAnimationNone];
+    if (sections) [self.tableView reloadRowsAtIndexPaths:@[[self modsRow], [self savesRow]] withRowAnimation:UITableViewRowAnimationNone];
 }
 
 /* A, Return or a tap: a switch flips, a choice moves to the next one. Left / right (step -1 / +1) move a choice or a slider. */
 - (void)activate:(NSIndexPath *)path step:(int)step {
     if ([path isEqual:[self modsRow]]) {
         if (!step) [self.navigationController pushViewController:[TOTKModsViewController new] animated:YES];
+        return;
+    }
+    if ([path isEqual:[self savesRow]]) {
+        if (!step) [self.navigationController pushViewController:[TOTKSavesViewController new] animated:YES];
         return;
     }
     const SettingDef *d = [self defAt:path]; if (!d || ![self available:d]) return;
@@ -214,7 +231,7 @@ static NSString *value_text(const SettingDef *d, int v) {
             NSIndexPath *p = [NSIndexPath indexPathForRow:(NSInteger)r inSection:(NSInteger)s];
             if ([self available:[self defAt:p]]) [all addObject:p];
         }
-    [all addObject:[self modsRow]];
+    [all addObject:[self modsRow]]; [all addObject:[self savesRow]];
     if (!all.count) return;
     NSUInteger at = cursor ? [all indexOfObject:cursor] : NSNotFound;
     NSInteger next = at == NSNotFound ? 0 : MAX(0, MIN((NSInteger)all.count - 1, (NSInteger)at + delta));
@@ -223,7 +240,7 @@ static NSString *value_text(const SettingDef *d, int v) {
 }
 
 - (void)press:(unsigned)button {
-    if (self.navigationController.topViewController != self) {   /* a Mods page is shown: B goes back, the rest is touch */
+    if (self.navigationController.topViewController != self) {   /* a Mods or Saves page is shown: B goes back, the rest is touch */
         if (button & PAD_BACK) [self.navigationController popViewControllerAnimated:YES];
         return;
     }

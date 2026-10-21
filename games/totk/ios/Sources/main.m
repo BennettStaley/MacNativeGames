@@ -11,6 +11,7 @@
 #include "runtime.h"
 #import "touch_pad.h"
 #import "settings_menu.h"
+#import "saves_menu.h"
 #include "controller_map.h"
 #include "settings.h"
 
@@ -152,6 +153,12 @@ static void settings_changed(const char *key, int value) {
     host_argv[0] = strdup("TOTK"); host_argv[1] = strdup(res.fileSystemRepresentation); host_argv[2] = strdup("boot");
     self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     self.window.rootViewController = [TOTKGameController new]; [self.window makeKeyAndVisible]; return YES;
+}
+/* A file the app is asked to open (AirDrop, Files, Messages; also at a start the file caused): a save package (.totksave)
+   goes to saves_menu.m, which checks it and asks before it replaces anything. */
+- (BOOL)application:(UIApplication *)application openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenURLOptionsKey, id> *)options {
+    (void)application; (void)options;
+    return [TOTKSaveReceiver openURL:url];
 }
 @end
 
