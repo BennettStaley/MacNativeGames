@@ -2778,7 +2778,7 @@ static void acap_tick(double work_ms, double wall_ms, int skip) {
     if (g_acap.changed) { acap_apply(k);
         LOG("[auto-cap] %s to %d fps (%d refresh%s a frame at %d Hz): frame time without pacing p90 %.2f / p95 %.2f ms over the last %.1f s, %s; next rise after %.0f s of calm", g_acap.changed < 0 ? "down" : "up",
             acap_fps(&g_acap), k, k > 1 ? "es" : "", g_acap.hz, g_acap.p90, g_acap.p95, ACAP_WIN_MS / 1000,
-            g_acap.changed < 0 ? "more than 1 frame in 10 missed the budget" : "under 85% of the faster budget long enough", g_acap.rise_need / 1000); }
+            g_acap.changed < 0 ? "more than 1 frame in 10 missed the budget" : g_acap.rise_try ? "a try after a steady stretch" : "under 85% of the faster budget long enough", g_acap.rise_need / 1000); }
 }
 static void present_cfg(const win_t *o) {
     if (g_hz >= 0) return;

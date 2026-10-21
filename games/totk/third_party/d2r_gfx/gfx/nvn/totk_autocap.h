@@ -54,7 +54,7 @@ typedef struct {
     int changed;                   /* +1 rose / -1 dropped at the last call (for the log), 0 otherwise */
     double clock;                  /* ms of frames seen */
     double fail_p95[ACAP_KMAX + 1], fail_at[ACAP_KMAX + 1];   /* per k: the p95 before a failed rise from k, and when (0: none) */
-    double rise_p95; int rise_from; /* the last rise */
+    double rise_p95; int rise_from, rise_try; /* the last rise: p95 before it, from k, 1 = a try (not calm) */
 } acap_t;
 
 static inline int acap_cmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
@@ -106,7 +106,7 @@ static inline int acap_frame(acap_t *s, double work_ms, double wall_ms, int skip
     if (s->k > s->kmin && (calm || steady) && !failed) {
         s->good += step;
         if (s->good >= (calm ? s->rise_need : s->rise_need > ACAP_PROBE_MS ? s->rise_need : ACAP_PROBE_MS)) {
-            s->rise_p95 = s->p95; s->rise_from = s->k; s->k--; s->changed = 1; s->since_rise = 0; acap_clear_window(s); }
+            s->rise_p95 = s->p95; s->rise_from = s->k; s->rise_try = !calm; s->k--; s->changed = 1; s->since_rise = 0; acap_clear_window(s); }
     } else s->good = 0;
     return s->k;
 }

@@ -58,8 +58,23 @@ Limits and why:
 
 ## Frame rate, interface, controls, audio
 
-- **Frame rate limit**: 30, 40, 60, 120 fps or the display's refresh rate. When the display paces the game (a 120 Hz
-  display) the limit holds each frame for whole refreshes (30 fps = 4 refreshes at 120 Hz); 40 needs a 120 Hz display.
+- **Frame rate limit**: *Auto (steady)*, 30, 40, 60, 120 fps or the display's refresh rate. When the display paces the
+  game (a 120 Hz display) the limit holds each frame for whole refreshes (30 fps = 4 refreshes at 120 Hz); 40 needs a
+  120 Hz display.
+  *Auto (steady)* (`framerate.cap = auto`, `TOTK_UNCAPPED_HZ=auto`; the Mac default) picks the highest rate that divides
+  the display's and that the game holds: 120 / 60 / 40 / 30 at 120 Hz, 60 / 30 at 60 Hz. A frame rate between those
+  steps judders: at about 98 fps on a 120 Hz display one frame in five stays up for two refreshes, so motion alternates
+  between 8.3 and 16.7 ms. Auto measures the game's own frame time without the limit's wait (the newest 2.5 s, leaving
+  out shader builds, loading and light title / loading frames, and single frames over 100 ms). It goes down as soon as
+  more than 1 frame in 10 misses the current rate, to the rate the 95th percentile fits with 8 % to spare. It goes up
+  after 10 s in which the 95th percentile stayed under 85 % of the faster rate's frame time, or tries the faster rate
+  after 20 s at a steady rate (a frame time measured at a lower rate misleads both ways: the GPU overlaps our wait,
+  and it clocks down when idle); a try that fails within 5 s is remembered, and that rate is not tried again for
+  5 minutes unless the scene gets lighter. Frames after a stall of 100 ms or more and after a size change are left
+  out. Each change is logged (`[auto-cap]`). With frame interpolation at *30 + 30* or *Half the refresh rate* the interpolation paces the game and
+  Auto steps aside (it resumes at its last choice when interpolation is turned off); with *Every frame* it limits the
+  game frames as a fixed limit would. On a display the game does not wait for (the uncapped mode below 120 Hz) Auto
+  moves the uncapped clock's ceiling instead (60 Hz: 60 or 30). The iPhone / iPad default stays the display rate.
 - **Performance readout**, and its **Readout detail**: *Simple* (`FPS 60  2560x1440`) or *Detailed*, which adds the
   average and the 1 % low over the last 5 seconds (`FPS 60  avg 59  1% low 48  2560x1440`). The 1 % low is the frame
   rate of the slowest 1 % of the game's frames in that window, so a single long hitch shows there while the average
