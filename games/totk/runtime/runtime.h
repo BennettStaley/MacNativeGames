@@ -143,11 +143,22 @@ void runtime_front_restart(void);       /* frontend.m: close the game and open t
 int runtime_front_can_restart(void);   /* 1 when launched from the app (TOTK_APP_BUNDLE) */
 void runtime_front_settings_toggle(void);   /* frontend.m: open or close the Mac settings menu (gamepad.m: Home, or Options + Menu) */
 void runtime_front_settings_shot(const char *path);   /* frontend.m: the Mac settings panel as a PNG (TOTK_INPUT_FILE "settings-shot") */   /* 1 while the settings menu is open: the game reads a neutral controller */
+uint64_t runtime_input_buttons(void);   /* runtime/input.c: held buttons (keyboard and controller), npad bit order */
+void runtime_guest_regions(uint64_t base[3],uint64_t size[3]);   /* runtime/services.c: heap, alias and ASLR regions */
+void runtime_cheats_launch(Module *main_module);   /* runtime/cheats.c: before the modules are sealed */
+int runtime_cheats_count(void);
+const char *runtime_cheats_name(int i);
+int runtime_cheats_state(int i);   /* CHEAT_ON | CHEAT_AT_LAUNCH | CHEAT_APPLIED | CHEAT_REFUSED */
+const char *runtime_cheats_problem(int i);
+int runtime_cheats_set(int i,int on);   /* returns the new state; saved, and the profile backed up before the first cheat */
+enum { CHEAT_ON = 1, CHEAT_AT_LAUNCH = 2, CHEAT_APPLIED = 4, CHEAT_REFUSED = 8 };
 int runtime_handheld_mode(void);   /* TOTK_OPERATION_MODE=handheld (runtime/services.c) */
 void *runtime_input_override(const char *name);
 typedef struct { uint64_t buttons; int32_t lx,ly,rx,ry; int connected; } RuntimeGamepadState;
 void runtime_gamepad_start(void);
 void runtime_gamepad_read(RuntimeGamepadState *out);
+void runtime_gamepad_set_overlay(int (*hook)(uint64_t held, uint64_t pressed));   /* main queue; 1: keep the controllers from the game */
+uint64_t runtime_gamepad_held(void);   /* held buttons, leaving the press edges for runtime_gamepad_read */
 /* Forget held buttons and sticks: macOS stops delivering controller events (including releases) while the app is in
    the background, so a button held at focus loss would otherwise stay pressed for the game. */
 void runtime_gamepad_clear(void);

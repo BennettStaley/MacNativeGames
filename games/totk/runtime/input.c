@@ -43,6 +43,9 @@ void runtime_input_key(unsigned code,int down){if(down&&code<128)user_input("key
 /* While the settings menu is open the game reads a neutral controller: nothing the player presses there reaches it. */
 static _Atomic int inputHeld;
 void runtime_input_hold(int on){atomic_store(&inputHeld,on?1:0);if(on)runtime_input_clear();}
+/* Cheats (cheats.c): the buttons held now (keyboard and controller), in the npad bit order. */
+uint64_t runtime_input_buttons(void){uint64_t b=0;pthread_mutex_lock(&inputLock);for(unsigned i=0;i<128;i++)if(keys[i])b|=button(i);pthread_mutex_unlock(&inputLock);
+ return b|runtime_gamepad_held();}
 void runtime_input_clear(void){pthread_mutex_lock(&inputLock);memset(keys,0,sizeof(keys));pending=0;pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
 static void initialize(void){pthread_mutex_lock(&inputLock);enabled=true;pthread_mutex_unlock(&inputLock);fprintf(stderr,"[totk] native keyboard controller initialized\n");}
 /* Docked: one full-key controller as player 1 (id 0, style bit 0). Handheld (TOTK_OPERATION_MODE=handheld, the iPhone):
