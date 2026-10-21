@@ -88,7 +88,15 @@ int main(void) {
     unsetenv("TOTK_FOG"); unsetenv("TOTK_SHADOW_RES");
     /* World page (runtime/world_patch.h): the time of day in percent, paused included; the render distance in 25 % steps. */
     expect(SETTINGS_NPAGES == 7 && !strcmp(SETTINGS_PAGES[SETTINGS_NPAGES - 1], "World"), "World is the last settings page (Mods follows it)");
-    expect(SETTINGS_COUNT == 34, "34 settings");
+    expect(SETTINGS_COUNT == 35, "35 settings");
+    {
+        const SettingDef *ds = &SETTINGS[settings_index("interface.download_shaders")];
+        expect(ds->type == SET_BOOL && ds->def_mac == 1 && ds->def_ios == 0 && ds->apply == SET_LIVE && ds->platforms == SET_MAC &&
+               !ds->env && !strcmp(ds->page, "Interface") && ds->unavailable,
+               "download new shaders: on by default on the Mac, live, no start variable, greyed on iPhone and iPad");
+        settings_defaults(v, 0);
+        expect(settings_parse_text("interface.download_shaders = off\n", v) == 1 && value(v, "interface.download_shaders") == 0, "download new shaders off parses");
+    }
     {
         const SettingDef *lf = &SETTINGS[settings_index("graphics.lens_flare")];
         expect(lf->type == SET_BOOL && lf->def_mac == 1 && lf->def_ios == 1 && lf->apply == SET_LIVE && lf->platforms == SET_ALL && !lf->env,
