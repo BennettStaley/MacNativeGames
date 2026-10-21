@@ -15,7 +15,7 @@ it while you change things. Navigate with the mouse, the keyboard (↑ ↓ choos
 switch tabs, Esc closes) or a controller (D-pad or left stick, A, B, the shoulder buttons switch tabs). While the menu is
 open the game receives no input.
 
-A setting marked *(after restart)*, or a change in the Mods tab, shows **Restart now** at the bottom of the menu (and on
+A setting marked *(after restart)*, a change in the Mods tab, or a code cheat switched in the Cheats tab shows **Restart now** at the bottom of the menu (and on
 the Mods tab's banner): the game closes the usual way (a save in progress finishes first) and the app opens again. Mac only;
 on iPhone and iPad close the app from the app switcher and open it again.
 
@@ -108,6 +108,36 @@ reimplements them independently for 1.4.3 and contains none of their code.
 |---|---|
 | **Time of day speed** | *Paused*, 0.25×, 0.5×, *Normal* (the game's own), 2×, 4× or 8×: how fast the day passes, the clock, the sun, the sky and the shadows with it. *Paused* stops the time of day where it is. Events that set the time (sleeping, cutscenes) still do, and where the game holds the clock itself (the opening beneath Hyrule Castle stays at 7:00) the setting has nothing to speed up. |
 
+## Cheats
+
+Mac only for now (iPhone and iPad cannot change the game's code while it runs; their menu has no Cheats section). The
+last tab lists the Atmosphère cheat files the game read when it started (the format Atmosphère, Yuzu and Ryujinx use; no
+codes come with the port, bring your own from a cheat database). A file is read only when its name is the running game's
+build ID, in any case: 1.0.0 `082CE09B06E33A12`, 1.4.3 `277178B7DBA1B6D4` (both read from the game's own files), 1.2.1 `9B4E43650501A4D4` and 1.1.2 `9A10ED9435C06733` (from the cheat databases, not checked). The places, each file a group of its own:
+
+1. the file built into the app with `build_app.py --cheats`;
+2. the cheats folder, `~/Library/Application Support/MacNativeGames/TOTK/cheats/<build ID>.txt` (**Open** shows it in
+   Finder; `TOTK_CHEATS_DIR` overrides, `0` = none);
+3. each mod that is on, in the load order: `<mod>/cheats/<build ID>.txt` (the Yuzu / Ryujinx layout; Atmosphère's
+   `atmosphere/contents/<title ID>/cheats/` inside a mod is found too). See [mods](mods.md).
+
+Files are read at the start: a file added or changed while the game runs shows **Restart to apply**.
+
+Each cheat has a switch (mouse, Return / A, or ← off and → on) and a line that says how it applies:
+
+| | |
+|---|---|
+| *Live* | changes values in memory about 30 times a second; on and off at once |
+| *Code patch* | writes the game's code, which is only possible before the game starts: *applies after restart* / *turns off after restart* until then |
+| *Can't be used here* | refused, with the reason (it would overwrite code this port rewrites, jump out of the game's code, or patch code only while a button is held) |
+
+Master codes (`{...}` sections) are always on with their file and shown without a switch. The cheat databases' group
+sections (one `20000000` or `20000001` word, opening and closing a group) are shown as headings. **Turn off all cheats** switches every cheat off (code patches at
+the next start). The choices are saved in `cheats-enabled.txt` next to the profile, one line per cheat: the source and
+the name (`folder<TAB>[name]`, `mod:<folder><TAB>[name]`; the app's own file just the name, as before), so equal names
+in two files are separate cheats. **Reset all** leaves cheats alone. The first cheat turned on copies the profile to
+`profile-before-cheats` first.
+
 ## The file
 
 `settings.txt` — Mac: `~/Library/Application Support/MacNativeGames/TOTK/settings.txt`; iPhone / iPad: the app's
@@ -121,4 +151,4 @@ runtime, the iOS app and `tests/test_settings.c`.
 
 Test runs drive the menu's own code path through `TOTK_INPUT_FILE`: `set <key> <value>` changes a setting as the menu
 does (`set display.scale 50`, `set graphics.aa smaa`), `menu` opens or closes the Mac menu, `menukey <Mac key code>`
-presses a key in it, and `settings-shot <png>` saves the Mac menu as a picture.
+presses a key in it (`menukey 12`, Q, from the first tab opens the last one, Cheats), and `settings-shot <png>` saves the Mac menu as a picture.

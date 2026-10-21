@@ -259,6 +259,7 @@ static const char *app_file(void) { return access(cheat_file(), R_OK) == 0 ? che
    reason. Returns the number of sections. */
 static int load_sources(void) {
     find_build_id();
+    if (!mods_count()) mods_scan();   /* the mods folder is read for the RomFS after this (romfs.c scans it again) */
     nsources = cheat_sources(app_file(), cheat_folder(), build_id, sources, CHEAT_SOURCES_MAX);
     if (!nsources) {
         fprintf(stderr, "[totk] cheats: none (cheat files for this game are named %s.txt; the cheats folder is %s)\n", *build_id ? build_id : "<build ID>", cheat_folder());
@@ -404,7 +405,8 @@ void runtime_cheats_launch(Module *m) {
 int runtime_cheats_total(void) { return ncheat; }
 int runtime_cheats_info(int k, RuntimeCheatInfo *out) {
     if (k < 0 || k >= ncheat || !out) return 0;
-    out->name = cheats[k].name; out->source = source_of[k]; out->role = cheat_role(&cheats[k]);
+    int first = k; while (first > 0 && source_of[first - 1] == source_of[k]) first--;
+    out->name = cheats[k].name; out->source = source_of[k]; out->role = cheat_role_at(cheats, first, k);
     out->state = atomic_load(&state[k]);
     pthread_mutex_lock(&mu); snprintf(out->problem, sizeof out->problem, "%s", problem[k]); pthread_mutex_unlock(&mu);
     return 1;

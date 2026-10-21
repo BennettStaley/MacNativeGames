@@ -48,7 +48,7 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     uint64_t padPrev; double padRepeatAt; int padDir;
 }
 static TOTKSettingsPanel *settingsPanel;
-enum { PANEL_WIDTH = 440, PANEL_MARGIN = 16, MODS_PAGE = SETTINGS_NPAGES, CHEATS_PAGE = SETTINGS_NPAGES + 1, NPAGES = SETTINGS_NPAGES + 2,
+enum { PANEL_WIDTH = 480, PANEL_MARGIN = 16, MODS_PAGE = SETTINGS_NPAGES, CHEATS_PAGE = SETTINGS_NPAGES + 1, NPAGES = SETTINGS_NPAGES + 2,
        SAVES_ROW = -1, CHEATS_FOLDER_ROW = -2, CHEATS_OFF_ROW = -3, CHEATS_RESTART_ROW = -4, CHEAT_ROW = -1000 /* - k: cheat k */ };
 static NSString *const SETTINGS_HINT = @"↑↓ choose   ←→ change   Q E tabs   Esc close\nController: D-pad, A, B, shoulder buttons";
 
@@ -93,7 +93,7 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
     [labels addObject:@"Mods"]; [labels addObject:@"Cheats"];
     tabs = [NSSegmentedControl segmentedControlWithLabels:labels trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(tabClicked:)];
     tabs.segmentStyle = NSSegmentStyleAutomatic; tabs.selectedSegment = 0; tabs.refusesFirstResponder = YES;
-    tabs.segmentDistribution = NSSegmentDistributionFillEqually; tabs.controlSize = NSControlSizeSmall;
+    tabs.segmentDistribution = NSSegmentDistributionFillProportionally; tabs.controlSize = NSControlSizeSmall;   /* nine tabs, widths after their names */
     tabs.font = [NSFont systemFontOfSize:10.5];
 
     list = [NSStackView new]; list.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -359,10 +359,12 @@ static NSString *cheat_detail(const RuntimeCheatInfo *c, NSColor **color) {
         }
     }
 }
-- (void)rebuildKeepingPlace {
-    NSInteger keep = focus; CGFloat y = scroll.contentView.bounds.origin.y;
+- (void)rebuildKeepingPlace {   /* the focus stays on the same row, though Restart to apply may come or go above it */
+    NSNumber *keep = focus < (NSInteger)rowSetting.count ? rowSetting[focus] : nil; CGFloat y = scroll.contentView.bounds.origin.y;
     [self buildPage];
-    focus = keep < (NSInteger)rows.count ? keep : focus; [self showFocus];
+    NSUInteger at = keep ? [rowSetting indexOfObject:keep] : NSNotFound;
+    if (at != NSNotFound) focus = (NSInteger)at;
+    [self showFocus];
     [scroll.contentView scrollToPoint:NSMakePoint(0, y)]; [scroll reflectScrolledClipView:scroll.contentView];
 }
 - (void)setCheat:(int)k on:(int)on {

@@ -102,7 +102,7 @@ the game's table and raises the entry of every file the mods change or add (and 
 | TKMM packages (`.tkcl`) | listed but not loaded; coming later |
 | Two mods changing the same file (merging packs, text, parameters) | the first in the order wins; merging is coming later |
 | Mods made for 1.0-1.2.x | load, flagged: files whose format changed in 1.4.3 can crash or look wrong |
-| Cheats | not supported |
+| Cheats (`<mod>/cheats/<build ID>.txt`, Atmosphère format) | Mac: listed in Settings › Cheats while the mod is on, in the load order ([settings](settings.md#cheats)); iPhone / iPad: not yet |
 
 ## The older layout
 

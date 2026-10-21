@@ -82,13 +82,19 @@ int main(void) {
     int k = cheat_parse(CHEATS, c, 16, err, sizeof err);
     expect(k == 6, "six sections");
     if (k == 6) {
-        expect(cheat_role(&c[0]) == CHEAT_ROLE_HEADING, "a section without words is a title");
-        expect(cheat_role(&c[1]) == CHEAT_ROLE_MASTER, "{Master} is a master code");
-        expect(cheat_role(&c[2]) == CHEAT_ROLE_HEADING && !strcmp(c[2].name, "Link"), "20000001 opens a group");
-        expect(cheat_role(&c[3]) == CHEAT_ROLE_CHEAT, "a cheat");
-        expect(cheat_role(&c[4]) == CHEAT_ROLE_HIDDEN, "20000000 closes it");
-        expect(cheat_role(&c[5]) == CHEAT_ROLE_CHEAT, "a cheat that ends a condition is still a cheat");
+        expect(cheat_role_at(c, 0, 0) == CHEAT_ROLE_HEADING, "a section without words is a title");
+        expect(cheat_role_at(c, 0, 1) == CHEAT_ROLE_MASTER, "{Master} is a master code");
+        expect(cheat_role_at(c, 0, 2) == CHEAT_ROLE_HEADING && !strcmp(c[2].name, "Link"), "the first [Link] marker opens a group");
+        expect(cheat_role_at(c, 0, 3) == CHEAT_ROLE_CHEAT, "a cheat");
+        expect(cheat_role_at(c, 0, 4) == CHEAT_ROLE_HIDDEN, "the second [Link] closes it");
+        expect(cheat_role_at(c, 0, 5) == CHEAT_ROLE_CHEAT, "a cheat that ends a condition is still a cheat");
     }
+    /* Another database's way round: 20000000 opens, 20000001 closes; and a group that is never closed. */
+    k = cheat_parse("[Link]\n20000000\n[A]\n04000000 00000000 00000000\n[Link]\n20000001\n[Combat]\n20000000\n[B]\n04000000 00000000 00000000\n"
+                    "[Map]\n20000001\n", c, 16, err, sizeof err);
+    expect(k == 6 && cheat_role_at(c, 0, 0) == CHEAT_ROLE_HEADING && cheat_role_at(c, 0, 2) == CHEAT_ROLE_HIDDEN &&
+           cheat_role_at(c, 0, 3) == CHEAT_ROLE_HEADING && cheat_role_at(c, 0, 5) == CHEAT_ROLE_HEADING,
+           "groups either way round: the first of a name opens, the next closes, a new name opens the next group");
 
     char cmd[1200]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", root); if (system(cmd)) fprintf(stderr, "could not remove %s\n", root);
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }

@@ -61,7 +61,7 @@ static inline int cheat_sources(const char *app_file, const char *folder, const 
     int n = 0; char path[4096];
     if (app_file && *app_file) n = cheat_source_add(out, n, max, CHEAT_SRC_APP, "app", "Built into the app", app_file);
     if (folder && *folder && strcmp(folder, "0") && cheat_file_in(folder, build_id, path, sizeof path))
-        n = cheat_source_add(out, n, max, CHEAT_SRC_FOLDER, "folder", "Cheats folder", path);
+        n = cheat_source_add(out, n, max, CHEAT_SRC_FOLDER, "folder", "From the cheats folder", path);
     for (int i = 0, count = mods_count(); i < count; i++) {
         ModInfo m;
         if (mods_get(i, &m) || !m.enabled || !mods_cheat_file(i, build_id, path, sizeof path)) continue;
@@ -85,12 +85,17 @@ static inline void cheat_key(const char *source_id, const char *name, char *out,
     else snprintf(out, cap, "%s\t%s", source_id, name);
 }
 
-/* What a section is in the list. The cheat databases group their cheats with sections that hold one word: 20000001
-   opens a group (its name is the heading), 20000000 closes it; a section without words is a title or a note. */
+/* What a section is in the list. The cheat databases group their cheats with sections that hold one word, 20000000 or
+   20000001 (which one opens and which closes differs between databases): the first of a pair is the group's heading, the
+   next one with the same name closes it. A section without words is a title or a note, shown as a heading too.
+   c[first..k] are the sections of k's file. */
 enum { CHEAT_ROLE_CHEAT, CHEAT_ROLE_MASTER, CHEAT_ROLE_HEADING, CHEAT_ROLE_HIDDEN };
-static inline int cheat_role(const Cheat *c) {
-    if (c->master) return CHEAT_ROLE_MASTER;
-    if (!c->n || (c->n == 1 && c->w[0] == 0x20000001)) return CHEAT_ROLE_HEADING;
-    if (c->n == 1 && c->w[0] == 0x20000000) return CHEAT_ROLE_HIDDEN;
-    return CHEAT_ROLE_CHEAT;
+static inline int cheat_is_marker(const Cheat *c) { return !c->master && c->n == 1 && (c->w[0] == 0x20000000 || c->w[0] == 0x20000001); }
+static inline int cheat_role_at(const Cheat *c, int first, int k) {
+    if (c[k].master) return CHEAT_ROLE_MASTER;
+    if (!c[k].n) return CHEAT_ROLE_HEADING;
+    if (!cheat_is_marker(&c[k])) return CHEAT_ROLE_CHEAT;
+    const char *open = NULL;   /* the group open before k, if any */
+    for (int i = first; i < k; i++) if (cheat_is_marker(&c[i])) open = open && !strcmp(open, c[i].name) ? NULL : c[i].name;
+    return open && !strcmp(open, c[k].name) ? CHEAT_ROLE_HIDDEN : CHEAT_ROLE_HEADING;
 }
