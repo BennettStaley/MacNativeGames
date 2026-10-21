@@ -145,6 +145,7 @@ void runtime_front_settings_toggle(void);   /* frontend.m: open or close the Mac
 void runtime_front_settings_shot(const char *path);   /* frontend.m: the Mac settings panel as a PNG (TOTK_INPUT_FILE "settings-shot") */   /* 1 while the settings menu is open: the game reads a neutral controller */
 uint64_t runtime_input_buttons(void);   /* runtime/input.c: held buttons (keyboard and controller), npad bit order */
 void runtime_guest_regions(uint64_t base[3],uint64_t size[3]);   /* runtime/services.c: heap, alias and ASLR regions */
+int runtime_guest_access(uint64_t a,uint64_t n,int (*access)(void *ctx),void *ctx);   /* runtime/services.c: access() only on guest-mapped heap / alias pages */
 void runtime_cheats_launch(Module *main_module);   /* runtime/cheats.c: before the modules are sealed */
 int runtime_cheats_count(void);
 const char *runtime_cheats_name(int i);

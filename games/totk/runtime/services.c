@@ -2,6 +2,7 @@
 #include "runtime.h"
 #include <TargetConditionals.h>
 #include "ipc.h"
+#include "guest_range.h"
 #include <mach/mach.h>
 #include "mach_vm_compat.h"
 #include <stdio.h>
@@ -197,9 +198,25 @@ static uint64_t alias_map(int unmap,uint64_t addr,uint64_t size){
 uint64_t runtime_heap_base(void){return (uintptr_t)heap;}
 /* Guest memory the game has committed (heap size + mapped alias pages), for memory reports (iOS app monitor). */
 void runtime_guest_committed(uint64_t *heap_bytes,uint64_t *alias_mapped){*heap_bytes=heap_size;*alias_mapped=alias_bytes;}
-/* Cheats (cheats.c): the guest memory regions an Atmosphère cheat addresses as heap, alias and ASLR. */
+/* Cheats (cheats.c): the bases (and reserved sizes) of the regions an Atmosphère cheat addresses as heap, alias and ASLR.
+   Only bases: the reservations are far larger than what the game has mapped; runtime_guest_access decides what may be
+   touched. */
 void runtime_guest_regions(uint64_t base[3],uint64_t size[3]){
  base[0]=(uintptr_t)heap;size[0]=heap_size;base[1]=alias_space?ALIAS_START:0;size[1]=alias_space?ALIAS_SIZE:0;base[2]=ASLR_START;size[2]=low_space?ASLR_SIZE:0;}
+/* Cheats (cheats.c): runs access(ctx) only while [a, a+n) is guest memory the game has mapped: inside the heap (its
+   current SetHeapSize size) or wholly on alias pages mapped with MapPhysicalMemory, and not on the source of a moved
+   stack. The memory lock is held meanwhile, so the range cannot be unmapped or the heap shrunk under the access. Returns
+   access's result, or 0 (fail closed) for anything else: the reservations' unmapped parts, the stack region, host
+   memory. */
+int runtime_guest_access(uint64_t a,uint64_t n,int (*access)(void *ctx),void *ctx){
+ if(!low_space)return 0;
+ pthread_mutex_lock(&memory_lock);
+ uint64_t h=(uintptr_t)heap,as=ALIAS_START;int ok=guest_range_in(a,n,h,heap_size)||(alias_space&&guest_pages_mapped(alias_pages,as,ALIAS_SIZE,a,n));
+ for(unsigned i=0;ok&&i<nstack_maps;i++)if(overlaps(a,n,stack_maps[i].src,stack_maps[i].size))ok=0;
+ if(ok)ok=access(ctx);
+ pthread_mutex_unlock(&memory_lock);
+ return ok;
+}
 /* Physical memory behind the guest regions (stack+heap and alias): resident pages, of which dirty, and pages the system
    compressed. Committed sizes overstate what the game uses; these are what count against the iOS memory limit. */
 static void region_pages(uint64_t a,uint64_t end,uint64_t *resident,uint64_t *dirty,uint64_t *compressed){
@@ -394,8 +411,9 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
  }
  case 0x01:{size_t size=r[1];if(getenv("TOTK_MEM_LOG"))fprintf(stderr,"[totk-mem] SetHeapSize %#zx (image=%#llx alias=%#llx pool=%#llx)\n",size,(unsigned long long)runtime_image_bytes(),(unsigned long long)alias_bytes,(unsigned long long)APP_POOL);
   if(size>HEAP_CAP||size%0x200000||size+runtime_image_bytes()>APP_POOL){r[0]=0xd401;return r[0];}
+  pthread_mutex_lock(&memory_lock);   /* runtime_guest_access (cheats) checks the size under this lock */
   if(size>heap_size&&mprotect(heap+heap_size,size-heap_size,PROT_READ|PROT_WRITE))runtime_fail("commit heap");
-  if(size<heap_size&&mprotect(heap+size,heap_size-size,PROT_NONE))runtime_fail("decommit heap");heap_size=size;r[0]=0;r[1]=(uintptr_t)heap;return 0;}
+  if(size<heap_size&&mprotect(heap+size,heap_size-size,PROT_NONE))runtime_fail("decommit heap");heap_size=size;pthread_mutex_unlock(&memory_lock);r[0]=0;r[1]=(uintptr_t)heap;return 0;}
  case 0x0c: r[0]=0;r[1]=44;return 0;
  case 0x0e: r[0]=0;r[1]=0;r[2]=15;return 0;
  case 0x25: {uint64_t id;pthread_threadid_np(NULL,&id);r[0]=0;r[1]=id;return 0;}

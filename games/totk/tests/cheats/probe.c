@@ -4,6 +4,7 @@
    0x100 bytes stand for read-only code. A negative control checks that a wrong chain offset writes nothing.
    Prints one JSON line; exit 1 on failure. */
 #include "cheat_vm.h"
+#include "guest_range.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -143,6 +144,28 @@ static void extra(char *err, size_t errn) {
     CHECK(r == 0 && strstr(err, "steps"), "step cap (%s)", err);
 }
 
+/* The memory guard (guest_range.h, used by cheats.c and services.c runtime_guest_access): only mapped alias pages, only
+   the main module's data for writes, code only as compare, no overflow wrap-around. */
+static void guard_tests(void) {
+    static unsigned char pages[16];
+    pages[2] = pages[3] = 1;
+    CHECK(guest_pages_mapped(pages, 0x10000, sizeof pages * 4096, 0x12000, 0x2000), "two mapped pages");
+    CHECK(!guest_pages_mapped(pages, 0x10000, sizeof pages * 4096, 0x12ff8, 0x1010), "a range running onto an unmapped page is refused");
+    CHECK(!guest_pages_mapped(pages, 0x10000, sizeof pages * 4096, 0x11ffc, 8), "a range starting on an unmapped page is refused");
+    CHECK(!guest_pages_mapped(pages, 0x10000, sizeof pages * 4096, 0x0FFFC, 8), "below the region is refused");
+    CHECK(!guest_range_in(UINT64_MAX - 3, 8, 0, UINT64_MAX), "wrap-around refused");
+    CHECK(!guest_range_in(0x1000, 0, 0, 0x10000), "empty access refused");
+    /* main: code [0, 0x1000) rx to 0x4000, data from 0x8000, key page at 0xC000 */
+    uint64_t b = 0x100000;
+    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0x10, 4, 0) == 1, "main code readable");
+    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0x10, 4, 1) == 2, "main code write is compare-only");
+    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0x5000, 4, 1) == 0, "read-only data not writable");
+    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0x8000, 8, 1) == 1, "data writable");
+    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0xBFFC, 8, 1) == 0, "a write running into the key page is refused");
+    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0xC000, 4, 0) == 0, "the key page is not readable");
+    CHECK(guest_main_access(b, 0x8000, 0x4000, 0xC000, b + 0x3FFC, 8, 1) == 0, "a write straddling code and padding end is refused");
+}
+
 int main(void) {
     char err[160];
     /* Parsing: titles and notes keep n = 0, {master} is marked, words are collected per section. */
@@ -208,6 +231,7 @@ int main(void) {
     r = run_text("[Bad]\n98F0F100 00000001\n", 0, err, sizeof err);
     CHECK(r == -1 && err[0], "unknown arithmetic reported (%s)", err);
     extra(err, sizeof err);
+    guard_tests();
 
     printf("{\"status\":\"%s\",\"probe\":\"probe-cheat-vm\",\"checked\":%d,\"failures\":%d}\n", failures ? "fail" : "pass", checks, failures);
     return failures ? 1 : 0;
