@@ -338,6 +338,9 @@ int main(int argc, char **argv) {
         setenv("TOTK_SLOT_PURPOSE", "player", 0);
         NSString *contrib = env_or("TOTK_SHADER_CONTRIB", [data stringByAppendingPathComponent:@"shader-list-contribution.txt"]);
         setenv("TOTK_SHADER_CONTRIB", contrib.fileSystemRepresentation, 1);
+        /* The shared shader list the game downloads once a day and prepares in the background (third_party/d2r_gfx/gfx/nvn/
+           totk_shader_list.m; Interface > Download new shaders). Download only; the game never uploads anything. */
+        setenv("TOTK_SHADER_LIST_DIR", env_or("TOTK_SHADER_LIST_DIR", [data stringByAppendingPathComponent:@"shader-list"]).fileSystemRepresentation, 1);
         contrib_reminder(contrib);
         unsetenv("TOTK_AUTOLOAD");   // the game starts at its title screen, as on the console
         setenv("TOTK_APP_BUNDLE", NSBundle.mainBundle.bundlePath.fileSystemRepresentation, 1);   // the menu's Restart now opens it again

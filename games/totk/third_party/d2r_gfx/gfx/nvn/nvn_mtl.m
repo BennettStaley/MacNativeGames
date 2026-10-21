@@ -6347,6 +6347,15 @@ static void warm_task_done(uint64_t *done,uint64_t total,uint64_t shader_total,u
     if (runtime_warm_progress && (!(*done % 64) || *done == total))
         runtime_warm_progress(*done,total,dict.count,shader_total,g_warm_rps+g_warm_cps,pipeline_total);
 }
+/* A variant the shared shader list prepared (totk_shader_list.m), compiled now and handed to the submit thread like the
+   warm-up's shaders (warm_claim), so its first use in play is neither a translation nor a compile. */
+static int list_compile(NSString *key, int stage) {
+    NvShader *sh = shader_load(key, stage);
+    if (!sh) return 0;
+    WarmItem *item = [WarmItem new]; item->kind = 0; item->key = key; item->shader = sh;
+    warm_enqueue(item);
+    return 1;
+}
 static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                         NSSet<NSString *> *eligible,
                         NSMutableSet<NSString *> *planned_keys,uint64_t total,uint64_t shader_total,uint64_t pipeline_total) {
@@ -6465,6 +6474,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
     }
     atomic_store(&g_warm_running, 0);
     if (runtime_warm_done) runtime_warm_done();
+    totk_shader_list_warm_done(list_compile);   // the shared list's new variants, in the background (Mac)
 }
 // 等后台预热跑完（最多 timeout_ms；负数表示一直等）：返回实际等了多少毫秒，没在跑返回 0。首装时系统着色器缓存全冷，预热慢于玩家进局的话，
 // 没预热到的管线会在提交线程现编 = 局内卡顿；进局读取画面本来就挡着玩家，让它多读一会儿（hle_nvn.c 出图处调）。
@@ -6558,8 +6568,9 @@ static void warm_light(void) {
 static void warm_start(void) {
     if (g_warm_started++) return;
     warm_filled();
+    totk_shader_list_boot();   // fetch the shared shader list in the background (Mac; at most once a day)
     const char *e = getenv("DM_PSO_MANIFEST");
-    if (e && !strcmp(e, "off")) { warm_light(); return; }
+    if (e && !strcmp(e, "off")) { warm_light(); totk_shader_list_warm_done(list_compile); return; }
     NSArray<NSString *> *paths;
     if (e && *e) {
         paths = @[@(e)];
@@ -11284,7 +11295,7 @@ static int shader_overlay_prepare(int slot, MTLViewport vp, MTLViewport *ovp, fl
     uint64_t fresh = 0, last = 0; int64_t total = -1; totk_rt_counts(&fresh, &total, &last);
     uint64_t pso = atomic_load(&g_collect_new[1]) + atomic_load(&g_collect_new[2]), plast = atomic_load(&g_collect_last_ns);
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), newest = last > plast ? last : plast;
-    int64_t compiling = atomic_load(&g_compiling_now) + (atomic_load(&g_warm_running) ? atomic_load(&g_warm_left) : 0);
+    int64_t compiling = atomic_load(&g_compiling_now) + (atomic_load(&g_warm_running) ? atomic_load(&g_warm_left) : 0) + totk_shader_list_pending();
     char text[64]; shader_overlay_text(text, sizeof text, compiling < 0 ? 0 : (uint64_t)compiling, fresh, total, pso);
     int hl = newest && now - newest < 3000000000ull, scale = fps_overlay_scale(vp.height);
     if (hud_compact()) { hud_publish(HUD_SHADER, text, hl); return 0; }
