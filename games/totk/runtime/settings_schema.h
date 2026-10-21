@@ -33,8 +33,9 @@ typedef struct {
 static const char *const SETTINGS_PAGES[] = {"Display", "Graphics", "Frame rate", "Interface", "Controls", "Audio", "World"};
 enum { SETTINGS_NPAGES = sizeof SETTINGS_PAGES / sizeof *SETTINGS_PAGES };
 
-static const SettingChoice SET_CAP[] = {{"30 fps", "30", "30", 30}, {"40 fps", "40", "40", 40}, {"60 fps", "60", "60", 60},
-                                        {"120 fps", "120", "120", 120}, {"Display refresh rate", "display", "display", 0}};
+/* Auto (steady): the highest rate that divides the display's and that the game holds (totk_autocap.h). */
+static const SettingChoice SET_CAP[] = {{"Auto (steady)", "auto", "auto", -1}, {"30 fps", "30", "30", 30}, {"40 fps", "40", "40", 40},
+                                        {"60 fps", "60", "60", 60}, {"120 fps", "120", "120", 120}, {"Display refresh rate", "display", "display", 0}};
 static const SettingChoice SET_INTERP[] = {{"Off", "off", "0", 0}, {"30 + 30", "interp30", "interp30", 1},
                                            {"Half the refresh rate", "half", "interp", 2}, {"Every frame", "max", "interpmax", 3}};
 /* Display (settings.c display_apply): the output is the 16:9 picture the game composes, text and icons included (live up to
@@ -104,8 +105,8 @@ static const SettingDef SETTINGS[] = {
      "TOTK_RENDER_DISTANCE", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 50, 300, 25, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.lod_bias", "Graphics", "Texture detail bias", "Below 0 picks sharper texture levels, in hundredths of a level; too low shimmers.",
      "TOTK_LOD_BIAS", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, -100, 0, 25, NULL, NULL, 0, NULL, NULL, 0},
-    {"framerate.cap", "Frame rate", "Frame rate limit", "The most frames a second the game draws. 40 needs a 120 Hz display.",
-     "TOTK_UNCAPPED_HZ", SET_CHOICE, SET_LIVE, SET_ALL, 120, 0, 0, 0, 0, NULL, SET_CAP, SET_N(SET_CAP), NULL, NULL, 0},
+    {"framerate.cap", "Frame rate", "Frame rate limit", "The most frames a second the game draws. Auto picks the highest steady rate the game holds (120, 60, 40 or 30 on a 120 Hz display), so frames never alternate between one and two refreshes. 40 needs a 120 Hz display.",
+     "TOTK_UNCAPPED_HZ", SET_CHOICE, SET_LIVE, SET_ALL, -1, 0, 0, 0, 0, NULL, SET_CAP, SET_N(SET_CAP), NULL, NULL, 0},
     {"interface.readout", "Interface", "Performance readout", "Frames per second and the game picture's size.",
      "TOTK_HINTS", SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"interface.readout_detail", "Interface", "Readout detail", "Detailed adds the average and the 1% low frame rate over the last 5 seconds.",

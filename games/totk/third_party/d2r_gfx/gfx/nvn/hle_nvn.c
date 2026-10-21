@@ -2329,6 +2329,11 @@ static void trow(uint64_t f, const char *name, double v);
 static void set_time_constraint(uint64_t period_ns);
 static void rt_comp_tick(uint64_t period_ns);
 static _Atomic int g_fps_limit;   // the settings menu's frame rate limit (TOTK_UNCAPPED_HZ as a number; 0 = none), present_ticks
+#include "totk_autocap.h"
+static _Atomic int g_fps_auto;    // framerate.cap = auto (TOTK_UNCAPPED_HZ=auto): g_acap picks the refreshes per frame (totk_autocap.h)
+static _Atomic int g_acap_k;      // its choice, read by present_ticks (0 = none yet)
+static acap_t g_acap;             // present thread only
+static uint64_t g_pace_wait_ns;   // our pacing wait inside this frame's acquires (display-link tick / own clock), left out of the auto cap's frame time
 static int g_uncapped;   // TOTK_UNCAPPED configured, see present_cfg; suspended while frame interpolation paces the game (uncapped_now)
 static int g_paced_hz;   // the display-following rate, used instead of UNCAPPED_HZ while interpolation paces the game
 #include "totk_mfx_mode.h"   /* totk_mfx.m: frame interpolation mode of this game frame (TOTK_MFX, key 2) */
@@ -2382,8 +2387,10 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         static uint64_t rt_period; uint64_t period = present_period(o);
         if (period && rt_period != period) { rt_period = period; set_time_constraint(period); }
         rt_comp_tick(period);
+        uint64_t pw0 = now_ns();
         if (mtl_link_active() && !uncapped_now() && !mfx_own_clock()) { if (!mtl_link_wait_tick(period ? 2 * period : 33333333ull, present_ticks(o)) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK：节拍完全跟显示节拍（跑得快就等下一拍，落后立刻走）；自己的 60 Hz 时钟只作等不到节拍时的兜底 | DM_PRESENT_LINK: pacing fully follows the display link (wait for the next display-link tick when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
         else if (wait) sleep_until_ns(at);
+        g_pace_wait_ns += now_ns() - pw0;
     } else {   // DM_DETCLOCK_PACE=1（画面闸门用）：客体时钟按帧走的同时，每帧墙钟不短于一个步长——帧数与游戏内时间确定，后台加载线程每帧至少有一个步长的墙钟可用； | DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
                // 机器满载时帧只会更慢、后台得到的墙钟只会更多，所以「消息后第 N 帧」截到的画面与负载无关
                // When the machine is fully loaded frames only get slower and the background only gets more wall clock, so the picture captured at "the Nth frame after the message" is independent of load
@@ -2673,21 +2680,105 @@ static int g_hz = -1, g_display_mode;
    held to 60 / 30 steps. */
 static int uncapped_cap(int scr) {
     const char *e = getenv("TOTK_UNCAPPED_HZ");
-    int v = !e ? UNCAPPED_HZ : !strcmp(e, "display") ? (scr > 0 ? scr : 60) : atoi(e);
+    int v = !e ? UNCAPPED_HZ : !strcmp(e, "display") || !strcmp(e, "auto") ? (scr > 0 ? scr : 60) : atoi(e);   /* auto starts at the display rate */
     return v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
 }
 void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; }
 /* The settings menu's frame rate limit at run time: the uncapped clock's ceiling (hz 30..120, 0 = the display's refresh
    rate), as TOTK_UNCAPPED_HZ sets it at start. Before the first present only the variable changes; with fixed pacing
    (TOTK_UNCAPPED=0, frame interpolation) there is no ceiling to move and the value waits for the next start. */
+/* hz < 0: Auto (steady), totk_autocap.h. It starts over at the display rate. */
 void nvn_fps_cap_set(int hz) {
-    char text[16]; if (hz > 0) snprintf(text, sizeof text, "%d", hz); else snprintf(text, sizeof text, "display");
+    char text[16]; if (hz > 0) snprintf(text, sizeof text, "%d", hz); else snprintf(text, sizeof text, hz < 0 ? "auto" : "display");
     setenv("TOTK_UNCAPPED_HZ", text, 1);
     atomic_store(&g_fps_limit, hz > 0 ? hz : 0);
+    atomic_store(&g_acap_k, 0); atomic_store(&g_fps_auto, hz < 0);
     if (g_hz < 0) return;
     if (!g_uncapped) { LOG("[nvn] frame rate limit %s: by display refreshes (%d Hz)", text, g_paced_hz); return; }
     g_hz = uncapped_cap(mtl_display_hz());
     LOG("[nvn] frame rate limit: %d fps (TOTK_UNCAPPED_HZ=%s)", g_hz, text);
+}
+/* The auto cap's choice takes effect: refreshes per frame when the display link paces the game, the own clock's ceiling
+   (display rate / k) in the uncapped mode. */
+static void acap_apply(int k) {
+    atomic_store(&g_acap_k, k);
+    if (g_uncapped && g_paced_hz > 0) { int v = (g_paced_hz + k / 2) / k; g_hz = v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v; }
+}
+/* Adaptive GPU keep-alive (nvn_mtl.m keepalive_start, TOTK_GPU_KEEPALIVE unset / auto). Once 600 frames of the scene
+   (see acap's skip rule) have passed, six windows of KA_PHASE scene frames alternate on, off, off, on, on, off; each
+   window drops its first KA_SETTLE frames (clock ramp, the GPU time arrives 8 frames late) and keeps the median of the
+   frame time without pacing and of the GPU time. On is kept only when the median of its windows' frame times is at
+   least 3% under off's (the M4: 12.1 -> 9.1 ms GPU), otherwise the spinner stays idle. A window with many skipped
+   frames (loading, shader builds) or a change of pacing (frame rate limit, interpolation) starts the measurement over
+   later. Measured again every KA_RECHECK scene frames and after a pacing change. */
+#define KA_PHASE 240
+#define KA_SETTLE 30
+#define KA_RECHECK 30000
+enum { KA_IDLE, KA_MEASURE, KA_DONE };
+static struct { int state, phase, n, skipped, on, decided, decided_on; uint64_t wait; unsigned pace; double work[6][KA_PHASE], gpu[6][KA_PHASE]; int ngpu[6]; double ka_ms[6]; uint64_t ka0; } g_ka;
+static const int ka_order[6] = {1, 0, 0, 1, 1, 0};
+extern void mtl_keepalive_pause(int paused);
+extern void mtl_keepalive_stats(uint64_t v[3]);
+static double ka_median(double *v, int n) { if (n <= 0) return 0; qsort(v, (size_t)n, sizeof *v, dcmp); return v[n / 2]; }
+static void ka_auto_start(const char *why) {
+    g_ka.state = KA_MEASURE; g_ka.phase = 0; g_ka.n = 0; g_ka.skipped = 0; memset(g_ka.ngpu, 0, sizeof g_ka.ngpu);
+    g_ka.on = ka_order[0]; mtl_keepalive_pause(!g_ka.on);
+    LOG("[keepalive-auto] measuring the GPU keep-alive on / off (%s): 6 windows of %d frames", why, KA_PHASE);
+}
+/* A measurement ends without a result: back to the last decision (on before the first), measured again later. */
+static void ka_auto_abort(const char *why) {
+    if (g_ka.state == KA_MEASURE) { mtl_keepalive_pause(g_ka.decided && !g_ka.decided_on); LOG("[keepalive-auto] measurement interrupted (%s); again later", why); }
+    g_ka.state = KA_IDLE; g_ka.wait = 0;
+}
+static void ka_auto_frame(double work_ms, int skip, unsigned pace) {
+    extern int mtl_keepalive_mode(void);
+    static int mode = -1; if (mode < 0) mode = mtl_keepalive_mode();
+    if (mode != 2 || dm_detclock_enabled()) return;
+    if (g_ka.pace != pace) { g_ka.pace = pace; if (g_ka.state != KA_IDLE || g_ka.wait) ka_auto_abort("the pacing changed"); }
+    if (g_ka.state != KA_MEASURE) {
+        if (skip) return;
+        g_ka.wait++;
+        if ((g_ka.state == KA_IDLE && g_ka.wait >= 600) || (g_ka.state == KA_DONE && g_ka.wait >= KA_RECHECK))
+            ka_auto_start(g_ka.state == KA_DONE ? "periodic check" : g_ka.decided ? "after a pacing change or an interruption" : "the scene is up");
+        return;
+    }
+    int p = g_ka.phase;
+    if (skip) { if (++g_ka.skipped > KA_PHASE / 5) ka_auto_abort("loading or shader builds"); return; }
+    if (g_ka.n == KA_SETTLE) { uint64_t v[3]; mtl_keepalive_stats(v); g_ka.ka0 = v[1]; }
+    if (g_ka.n >= KA_SETTLE) g_ka.work[p][g_ka.n - KA_SETTLE] = work_ms;
+    if (++g_ka.n < KA_PHASE + KA_SETTLE) return;
+    { uint64_t v[3]; mtl_keepalive_stats(v); g_ka.ka_ms[p] = (v[1] - g_ka.ka0) / 1e3 / KA_PHASE; }
+    if (++g_ka.phase < 6) { g_ka.n = 0; g_ka.skipped = 0; g_ka.on = ka_order[g_ka.phase]; mtl_keepalive_pause(!g_ka.on); return; }
+    double on_w[3], off_w[3], on_g[3], off_g[3], spin = 0; int a = 0, b = 0;
+    for (int i = 0; i < 6; i++) { double w = ka_median(g_ka.work[i], KA_PHASE), gg = ka_median(g_ka.gpu[i], g_ka.ngpu[i]);
+        if (ka_order[i]) { on_w[a] = w; on_g[a++] = gg; spin += g_ka.ka_ms[i] / 3; } else { off_w[b] = w; off_g[b++] = gg; } }
+    double won = ka_median(on_w, 3), woff = ka_median(off_w, 3), gon = ka_median(on_g, 3), goff = ka_median(off_g, 3);
+    g_ka.decided_on = won < woff * 0.97; g_ka.decided = 1;
+    mtl_keepalive_pause(!g_ka.decided_on); g_ka.state = KA_DONE; g_ka.wait = 0;
+    LOG("[keepalive-auto] on: frame %.2f ms, GPU %.2f ms (spinner %.2f ms of GPU a frame); off: frame %.2f ms, GPU %.2f ms -> keep it %s (%d refresh%s a frame)",
+        won, gon, spin, woff, goff, g_ka.decided_on ? "on" : "off", (int)pace, pace > 1 ? "es" : "");
+}
+static void ka_auto_gpu(double gpu_ms) {   /* the GPU time of a frame 8 frames back: counted in the window that is running */
+    if (g_ka.state != KA_MEASURE || g_ka.n < KA_SETTLE || g_ka.ngpu[g_ka.phase] >= KA_PHASE) return;
+    g_ka.gpu[g_ka.phase][g_ka.ngpu[g_ka.phase]++] = gpu_ms;
+}
+/* Present thread, once per game frame: feeds the auto cap. It steps aside (and starts over afterwards) while frame
+   interpolation at 30 / half the refresh rate or the game itself paces the frames, and under the deterministic clock. */
+static void acap_tick(double work_ms, double wall_ms, int skip) {
+    static int active;
+    int m = mfx_enabled();
+    if (!atomic_load(&g_fps_auto) || dm_detclock_enabled() || m == MFX_HALF || m == MFX_30 || game_holds_30() || g_paced_hz <= 0) { active = 0; return; }
+    if (!active || g_acap.hz != g_paced_hz || !atomic_load(&g_acap_k)) {
+        int keep = g_acap.hz == g_paced_hz ? atomic_load(&g_acap_k) : 0;   /* back after interpolation: from the last choice */
+        acap_reset(&g_acap, g_paced_hz); if (keep >= g_acap.kmin && keep <= g_acap.kmax) { g_acap.k = keep; acap_clear_window(&g_acap); }
+        acap_apply(g_acap.k); active = 1;
+        LOG("[auto-cap] %d Hz display: starts at %d fps (%d refresh%s a frame); choices down to %d fps", g_acap.hz, acap_fps(&g_acap), g_acap.k, g_acap.k > 1 ? "es" : "",
+            (g_acap.hz + g_acap.kmax / 2) / g_acap.kmax); }
+    int k = acap_frame(&g_acap, work_ms, wall_ms, skip);
+    if (g_acap.changed) { acap_apply(k);
+        LOG("[auto-cap] %s to %d fps (%d refresh%s a frame at %d Hz): frame time without pacing p90 %.2f / p95 %.2f ms over the last %.1f s, %s; next rise after %.0f s of calm", g_acap.changed < 0 ? "down" : "up",
+            acap_fps(&g_acap), k, k > 1 ? "es" : "", g_acap.hz, g_acap.p90, g_acap.p95, ACAP_WIN_MS / 1000,
+            g_acap.changed < 0 ? "more than 1 frame in 10 missed the budget" : "under 85% of the faster budget long enough", g_acap.rise_need / 1000); }
 }
 static void present_cfg(const win_t *o) {
     if (g_hz >= 0) return;
@@ -2697,7 +2788,7 @@ static void present_cfg(const win_t *o) {
     const char *e = getenv("DM_PRESENT_HZ"), *rt = getenv("TOTK_REALTIME");
     int realtime = !(rt && !strcmp(rt, "0"));
     g_hz = g_paced_hz = e ? atoi(e) : (realtime && scr > 0 ? scr : 60);
-    { const char *l = getenv("TOTK_UNCAPPED_HZ"); atomic_store(&g_fps_limit, l && atoi(l) > 0 ? atoi(l) : 0); }
+    { const char *l = getenv("TOTK_UNCAPPED_HZ"); atomic_store(&g_fps_limit, l && atoi(l) > 0 ? atoi(l) : 0); atomic_store(&g_fps_auto, l && !strcmp(l, "auto")); }
     { const char *u = getenv("TOTK_UNCAPPED"), *f60 = getenv("TOTK_FPS60");   // the original 30-frame mode needs fixed pacing; MetalFX interpolation suspends it while on (uncapped_now)
       g_uncapped = !e && realtime && !(u && !strcmp(u, "0")) && !(f60 && !strcmp(f60, "0")) && g_hz < UNCAPPED_HZ; }
     if (g_uncapped) { g_hz = uncapped_cap(scr); LOG("[nvn] 不限帧率（TOTK_UNCAPPED，默认开；=0 关）：不等显示器刷新，自己的时钟上限 %d 帧（TOTK_UNCAPPED_HZ）；显示器 %d Hz 每次刷新显示最新一帧%s", g_hz, scr,
@@ -2733,6 +2824,9 @@ static unsigned present_ticks(const win_t *o) {   /* display ticks per game fram
        frame step keeps the game's speed. */
     int lim = atomic_load(&g_fps_limit);
     if (lim > 0 && g_paced_hz > lim && !uncapped_now() && !dm_detclock_enabled()) { unsigned c = (unsigned)((g_paced_hz + lim - 1) / lim); if (c > t) t = c; }
+    /* Auto (steady): the auto cap's refreshes per frame, the same way (totk_autocap.h; the uncapped mode moves its clock instead). */
+    int ak = atomic_load(&g_acap_k);
+    if (ak > 0 && atomic_load(&g_fps_auto) && !uncapped_now() && !dm_detclock_enabled() && (unsigned)ak > t) t = (unsigned)ak;
     return t;
 }
 static uint64_t present_period(const win_t *o) {
@@ -2800,6 +2894,26 @@ void dm_nvn_probe_present_interval(void) {
       atomic_store(&g_fps_limit, 30); if (present_ticks(&w) != 4) die("present interval probe: a 30 fps limit at 120 Hz must hold each frame for 4 refreshes");
       g_hz = saved_hz; g_paced_hz = saved_paced; g_display_mode = saved_display; g_uncapped = saved_uncapped; checked += 2; }
     atomic_store(&g_fps_limit, saved_limit);
+    /* Auto (steady), totk_autocap.h: 98 fps frame times on a 120 Hz display-paced game settle on 2 refreshes a frame
+       (60 fps) through acap_tick, which present_ticks then holds; half-rate interpolation keeps its own 2 ticks and the
+       auto cap steps aside; in the uncapped mode (60 Hz display) the choice moves the own clock (30 fps). Negative
+       control 30: present_ticks ignores the auto cap. */
+    { int saved_auto = atomic_load(&g_fps_auto), saved_k = atomic_load(&g_acap_k); acap_t saved_acap = g_acap;
+      win_t w = {.interval = 1}; g_paced_hz = 120; g_hz = 120; g_display_mode = 1; g_uncapped = 0;
+      atomic_store(&g_fps_auto, 1); atomic_store(&g_acap_k, 0);
+      for (int i = 0; i < 400; i++) { double work = 9.3 + (i * 7 % 23) / 10.0; acap_tick(work, work < 8.34 ? 8.34 : work < 16.67 ? 16.67 : 25, 0); }
+      int got = neg && atoi(neg) == 30 ? 1 : (int)present_ticks(&w);
+      if (atomic_load(&g_acap_k) != 2 || got != 2) die("present interval probe: auto must hold 98 fps frame times at 60 fps on 120 Hz (2 refreshes)");
+      for (int i = 0; i < 2000; i++) acap_tick(9.3 + (i * 7 % 23) / 10.0, 16.67, 0);
+      if (present_ticks(&w) != 2) die("present interval probe: auto must not rise back to 120 with 98 fps frame times");
+      mfx_set(MFX_HALF); mfx_latch(); acap_tick(5, 16.67, 0);
+      if (present_ticks(&w) != 2 || atomic_load(&g_acap_k) != 2) die("present interval probe: auto steps aside for half-rate interpolation");
+      mfx_set(saved_mfx); mfx_latch();
+      g_paced_hz = 60; g_uncapped = 1; g_hz = 60; g_display_mode = 0; atomic_store(&g_acap_k, 0);
+      for (int i = 0; i < 400; i++) acap_tick(18 + (i % 4), 22, 0);
+      if (atomic_load(&g_acap_k) != 2 || g_hz != 30) die("present interval probe: auto on a 60 Hz uncapped game must move the own clock to 30 fps");
+      atomic_store(&g_fps_auto, saved_auto); atomic_store(&g_acap_k, saved_k); g_acap = saved_acap;
+      g_hz = saved_hz; g_paced_hz = saved_paced; g_display_mode = saved_display; g_uncapped = saved_uncapped; checked += 4; }
     LOG("[present-interval] %d pacing cases passed", checked);
 }
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
@@ -2905,13 +3019,22 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             r->make_ms = ((lns - plns) + (pns - ppns)) / 1e6; r->up = (unsigned)(up - pup); r->rup = (unsigned)(rup - prup); r->up_mb = (ub - pub) / 1048576.0; r->up_ms = up_ms;
             plns = lns; ppns = pns; pup = up; prup = rup; pub = ub;
         }
+        {   /* the auto cap: this frame's time without our pacing wait; shader / pipeline builds, loading screens and light
+               frames (title, loading: under 1000 draws) do not show the scene's cost */
+            static int built_prev; int built = lib_ != plib || pso_ != ppso;
+            extern uint64_t mtl_rt_size_frame(void); uint64_t sized = mtl_rt_size_frame();   /* a size change (+120 frames, nvn_mtl.m) and 2 s after it */
+            int skip = built || built_prev || (g_nvn_loadscreen_up && g_nvn_loadscreen_up()) || dr - prev_draw < 1000 || (sized && g_frame < sized + 120);
+            built_prev = built;
+            acap_tick(fr - g_pace_wait_ns / 1e6, fr, skip);
+            ka_auto_frame(fr - g_pace_wait_ns / 1e6, skip, present_ticks(o));
+        }
         plib = lib_; ppso = pso_;
         trow(f, "@t_s", (now_ns() - g_t0_ns) / 1e9);
         trow(f, "@drawable_ms", mtl_drawable_ns_take() / 1e6);
         trow(f, "@sub_wall_ms", atomic_exchange(&g_sub_wall_ns, 0) / 1e6); trow(f, "@sub_cpu_ms", atomic_exchange(&g_sub_cpu_ns, 0) / 1e6); trow(f, "@sub_instr", (double)atomic_exchange(&g_sub_instr, 0));
     } else atomic_store(&g_nvn_ns, 0);
-    g_acq_wait_ns = g_pq_wait_ns = 0;
-    if (f >= 8) { double g = mtl_gpu_ms(f - 8); if (g >= 0) { tpush(3, g); trow(f - 8, "@gpu_ms", g); g_hr[g_hn++ % HRN] = g; }   // GPU 时间滞后 8 帧取（已完成） | GPU time is taken 8 frames late (already completed)
+    g_acq_wait_ns = g_pq_wait_ns = 0; g_pace_wait_ns = 0;
+    if (f >= 8) { double g = mtl_gpu_ms(f - 8); if (g >= 0) { tpush(3, g); ka_auto_gpu(g); trow(f - 8, "@gpu_ms", g); g_hr[g_hn++ % HRN] = g; }   // GPU 时间滞后 8 帧取（已完成） | GPU time is taken 8 frames late (already completed)
         { lf_rec *r = &g_lf[(f - 8) % LFN];   // 长帧日志（缺省开，DM_LONGFRAME=0 关）：整帧 > 20 ms 或 GPU > 16.7 ms、且明显高于近况，才打一行 | long-frame log (on by default, DM_LONGFRAME=0 turns it off): a line is printed only when the whole frame > 20 ms or GPU > 16.7 ms, and it is clearly above recent conditions
           static int on = -1; if (on < 0) { const char *e = getenv("DM_LONGFRAME"); on = !(e && !strcmp(e, "0")); }
           // 「长」是相对近况说的：稳定跑在 30 帧（菜单 / 无窗口宿主）或持续过载时每帧都 > 20 ms，那不是长帧，不刷屏——要比近 16 帧的滑动均值高出四成才算

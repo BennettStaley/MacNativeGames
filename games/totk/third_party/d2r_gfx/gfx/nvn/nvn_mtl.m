@@ -455,6 +455,19 @@ static void udc_selftest(void) {
    (g_q4_inflight, counted in q4_commit), one at a time, sized to ~1 ms from its measured GPU time. With the screen locked
    the GPU stopped interleaving the two queues and the old always-two-in-flight 5 ms kernels (about 30 per world frame)
    held every game frame back to ~115 ms; now a game submission waits at most for one short kernel. */
+/* 2026-10-20, adaptive: on the M3 Pro (18-core GPU, 120 Hz) the spinner bought nothing (frame p50 10.11 ms off vs 10.12 on)
+   while it ran about 3.2 one-millisecond kernels a frame. TOTK_GPU_KEEPALIVE unset or "auto" (default): it starts on and
+   hle_nvn.c (ka_auto_frame) measures the game's frame and GPU time with it on and off in alternating windows once the
+   world is up, keeps whichever is faster (on needs a 3% gain) and checks again every few minutes. =1: always on (the
+   behaviour before), =0: off. */
+static _Atomic int g_ka_paused;   // the adaptive choice: 1 = idle (thread alive, no kernels)
+int mtl_keepalive_mode(void) {    // 0 off, 1 always on, 2 adaptive
+    const char *e = getenv("TOTK_GPU_KEEPALIVE");
+    if (nogpu() || getenv("TOTK_HEADLESS")) return 0;
+    if (!e || !*e || !strcmp(e, "auto")) return 2;
+    return atoi(e) ? 1 : 0;
+}
+void mtl_keepalive_pause(int paused) { atomic_store(&g_ka_paused, paused != 0); }
 static _Atomic uint64_t g_last_sub_ns;
 // Diagnostic timing controls; defaults retain the existing 1 ms keep-alive.
 // The private spin buffer never supplies game data.
@@ -462,21 +475,22 @@ static _Atomic int g_ka_target_us = 1000;
 static _Atomic uint64_t g_ka_n, g_ka_us, g_ka_max_us;   // spin kernels completed, their summed / longest GPU time (us)
 void mtl_keepalive_stats(uint64_t v[3]) { v[0] = atomic_load(&g_ka_n); v[1] = atomic_load(&g_ka_us); v[2] = atomic_exchange(&g_ka_max_us, 0); }
 static void keepalive_start(void) {
-    static int started; const char *e = getenv("TOTK_GPU_KEEPALIVE");
-    if (started || (e && !atoi(e)) || nogpu() || getenv("TOTK_HEADLESS")) return; started = 1;   // not in standalone probes
+    static int started;
+    if (started || !mtl_keepalive_mode()) return; started = 1;   // not in standalone probes
     NSError *err = nil;
     id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nkernel void keep(device float *a [[buffer(0)]], constant uint &n [[buffer(1)]], uint i [[thread_position_in_grid]]) { float x = a[i]; for (uint j = 0; j < n; j++) x = fma(x, 1.0000001f, 0.5f); a[i] = x; }\n" options:nil error:&err];
     id<MTLComputePipelineState> ps = lib ? [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"keep"] error:&err] : nil;
     id<MTLCommandQueue> q = [g_dev newCommandQueue]; id<MTLBuffer> buf = [g_dev newBufferWithLength:4096 options:MTLResourceStorageModePrivate];
     if (!ps || !q || !buf) { MLOG("【红】TOTK_GPU_KEEPALIVE：建不出自旋核 %s", err.localizedDescription.UTF8String); return; }
     { const char *us = getenv("TOTK_GPU_KEEPALIVE_US"); int v = us ? atoi(us) : 0; if (v >= 100 && v <= 1000) atomic_store(&g_ka_target_us, v); }   /* like flag keepalive_us, from the start */
-    MLOG("GPU 保活：独立队列上持续跑短自旋核（每个约 %d µs），避免 GPU 在帧间空闲时降频（TOTK_GPU_KEEPALIVE=0 关闭）", atomic_load(&g_ka_target_us));
+    MLOG("GPU 保活：独立队列上持续跑短自旋核（每个约 %d µs），避免 GPU 在帧间空闲时降频（%s；TOTK_GPU_KEEPALIVE=0 关闭，=1 常开）", atomic_load(&g_ka_target_us),
+         mtl_keepalive_mode() == 2 ? "自适应：进局后开 / 关交替测量，留快的那个" : "常开");
     g_ka_idle = dispatch_semaphore_create(0);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         __block uint32_t n = 40000; dispatch_semaphore_t sem = dispatch_semaphore_create(1);   // ~1 ms on the M4 at full clock
         for (;;) @autoreleasepool {
             int target_us = atomic_load(&g_ka_target_us);
-            if (!target_us) { usleep(2000); continue; }
+            if (!target_us || atomic_load(&g_ka_paused)) { usleep(2000); continue; }
             uint64_t last = atomic_load(&g_last_sub_ns);
             if (!last || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - last > 100000000ull) { usleep(10000); continue; }   // the game is not rendering
             if (atomic_load(&g_q4_inflight) > 0) { dispatch_semaphore_wait(g_ka_idle, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC)); continue; }   // the game's own GPU work keeps the clock up
@@ -12020,19 +12034,23 @@ int mtl_probe_anomaly(void) {
    stayed up for an extra refresh (a judder: uncapped play at 85 fps on a 100 Hz display repeats about every seventh
    refresh; interpolation should leave none while the game keeps up). One line per 600 pictures (6 s at 100 Hz). */
 static int dcmp_mtl(const void *x, const void *y) { double a = *(const double *)x, b = *(const double *)y; return a < b ? -1 : a > b; }
-static void cadence_note(double tt, int interp) {
+/* "超出节拍" (beyond the pacing): intervals more than half a refresh longer than the one the pacing intended for that
+   picture (expect_ms: the frame rate limit's or interpolation's interval). A steady 60 fps cap on 120 Hz holds every
+   picture two refreshes (100% above) and none beyond its pacing; uneven frames count in both. */
+static void cadence_note(double tt, int interp, double expect_ms) {
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     enum { N = 600 };
-    static double last, iv[N]; static int n, ni, hz; static uint64_t dropped;
+    static double last, last_expect, iv[N], ex[N]; static int n, ni, hz; static uint64_t dropped;
     pthread_mutex_lock(&mu);
     if (tt <= 0) dropped++;
-    else { if (last > 0 && tt > last && n < N) { iv[n++] = (tt - last) * 1e3; ni += interp; } if (tt > last) last = tt; }
+    else { if (last > 0 && tt > last && n < N) { ex[n] = last_expect; iv[n++] = (tt - last) * 1e3; ni += interp; } if (tt > last) { last = tt; last_expect = expect_ms; } }
     if (n == N) {
         if (!hz) { hz = mtl_display_hz(); if (hz <= 0) hz = 60; }
+        double tick = 1000.0 / hz; int beyond = 0; for (int i = 0; i < N; i++) beyond += iv[i] > (ex[i] > tick ? ex[i] : tick) + 0.5 * tick;
         double a[N]; memcpy(a, iv, sizeof a); qsort(a, N, sizeof *a, dcmp_mtl);
-        double tick = 1000.0 / hz; int held = 0; for (int i = 0; i < N; i++) held += a[i] > 1.5 * tick;
-        MLOG("上屏节奏（近 %d 张，至帧 %llu，显示器 %d Hz）：间隔 p50 %.2f / p95 %.2f / 最大 %.2f ms；多停一次刷新以上 %d 次（%.1f%%）；其中补帧 %d 张；系统丢弃 %llu 张",
-             N, (unsigned long long)atomic_load(&g_cur_frame), hz, a[N / 2], a[N * 95 / 100], a[N - 1], held, 100.0 * held / N, ni, (unsigned long long)dropped);
+        int held = 0; for (int i = 0; i < N; i++) held += a[i] > 1.5 * tick;
+        MLOG("上屏节奏（近 %d 张，至帧 %llu，显示器 %d Hz）：间隔 p50 %.2f / p95 %.2f / 最大 %.2f ms；多停一次刷新以上 %d 次（%.1f%%）；超出节拍 %d 次（%.1f%%）；其中补帧 %d 张；系统丢弃 %llu 张",
+             N, (unsigned long long)atomic_load(&g_cur_frame), hz, a[N / 2], a[N * 95 / 100], a[N - 1], held, 100.0 * held / N, beyond, 100.0 * beyond / N, ni, (unsigned long long)dropped);
         n = ni = 0; dropped = 0;
     }
     pthread_mutex_unlock(&mu);
@@ -12357,11 +12375,12 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 #if TARGET_OS_SIMULATOR   // iOS 模拟器 SDK 没有呈现时刻回调与最短显示时长（只作画面验收用，不计节拍） | The iOS simulator SDK has no presentation-time callback and no minimum display duration (used only for picture acceptance, display-link ticks are not counted)
     (void)period; [dr present];
 #else
+    double expect_ms = period > 0 ? period * 1e3 / (mfx_enabled() ? 2 : 1) : 0;   // TOTK: the interval the pacing intends for this picture (cadence_note)
     uint64_t pn = ticket;   // 按游戏出图序号（票号）记上屏时刻：hle 的上屏统计按「游戏第 n 次出图」取；显示节拍路径里实际出图次数 ≠ 游戏出图次数（旧帧会被合并丢弃） | Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
     [dr addPresentedHandler:^(id<MTLDrawable> d) {   // 真实呈现时刻（屏幕上真正换上这一帧的时间，CACurrentMediaTime 基准） | Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
         CFTimeInterval tt = d.presentedTime;
         if (interp < 0) g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};   // statistics per game frame; the interpolated one is not a game frame
-        cadence_note(tt, interp >= 0);
+        cadence_note(tt, interp >= 0, expect_ms);
         front_frame_presented();
     }];
     // 每张至少显示一个出图周期：GPU 完成时刻在 120 Hz 刷新边界附近抖动时，不再出现「25 ms + 8.33 ms」成对的顿挫
