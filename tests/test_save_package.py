@@ -105,6 +105,8 @@ class SavePackage(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in (self.tmp / 'out').iterdir()), [second.name])
 
     def test_import_maps_the_account_and_backs_up(self):
+        old = time.mktime((2026, 1, 2, 12, 30, 10, 0, 0, -1))
+        os.utime(self.save_a / 'slot_01/progress.sav', (old, old))
         package = self.export()
         info = json.loads(self.tool('inspect', package, '1.4.3'))
         self.assertEqual(info['slots'], ['slot_00', 'slot_01'])
@@ -122,6 +124,7 @@ class SavePackage(unittest.TestCase):
         self.assertEqual(done['last_backup'], str(backup))
         self.assertAlmostEqual(done['last_backup_time'], time.time(), delta=5)
         self.assertTrue(done['summary'].startswith('2 slots, last saved'))
+        self.assertAlmostEqual((self.save_b / 'slot_01/progress.sav').stat().st_mtime, old, delta=2)   # files keep their times
         self.assertEqual(tree(self.save_a), SAVE_A)                                  # the sender is untouched
 
     def test_import_into_a_profile_that_never_started(self):

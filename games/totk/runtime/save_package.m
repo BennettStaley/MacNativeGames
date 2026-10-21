@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -244,6 +245,14 @@ static NSArray<NSString *> *zip_read(NSString *zip, NSString *dest, NSError **er
         if (![fm createDirectoryAtPath:path.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil] ||
             ![out writeToFile:path options:0 error:nil])
             FAIL(@"Can't write %@.", path);
+        unsigned dtime = rd16(h + 12), ddate = rd16(h + 14);   /* the file keeps its time (the slots' "last saved") */
+        struct tm tm = {.tm_sec = (int)(dtime & 31) * 2, .tm_min = (int)(dtime >> 5 & 63), .tm_hour = (int)(dtime >> 11),
+                        .tm_mday = (int)(ddate & 31), .tm_mon = (int)(ddate >> 5 & 15) - 1, .tm_year = (int)(ddate >> 9) + 80, .tm_isdst = -1};
+        time_t when = mktime(&tm);
+        if (when != (time_t)-1 && tm.tm_mday) {
+            struct timeval tv[2] = {{when, 0}, {when, 0}};
+            utimes(path.fileSystemRepresentation, tv);
+        }
         [names addObject:name];
     }
     return names;
