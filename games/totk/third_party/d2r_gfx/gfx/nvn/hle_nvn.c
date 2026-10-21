@@ -123,6 +123,7 @@ HLE_FORCE("nvnBootstrapLoader", "NVN 图形接口整块换成宿主空设备（�
 
 #include "nvn_obj.h"
 #include "totk_timeline.h"
+void mtl_rt_size_changed(void);   /* nvn_mtl.m: render targets of the old size may go once idle (stor_sweep) */
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse);
 
 // ---------- 设备 ----------
@@ -2321,7 +2322,7 @@ void nvn_set_framewait(int on) {
 NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) { if (((win_t *)w)->interval != v) LOG("[nvn] 游戏设出图间隔 %d → %d", ((win_t *)w)->interval, v); ((win_t *)w)->interval = v; if (!g_game_sys) find_game_sys(); }
 NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
     win_t *o = (win_t *)w; int v[4] = {x, y, ww, hh};
-    if (memcmp(o->crop, v, sizeof v)) { LOG("[nvn] WindowCrop %d,%d %dx%d", x, y, ww, hh); if (getenv("TOTK_SIZE_CHAIN")) guest_chain("window crop"); }
+    if (memcmp(o->crop, v, sizeof v)) { LOG("[nvn] WindowCrop %d,%d %dx%d", x, y, ww, hh); if (getenv("TOTK_SIZE_CHAIN")) guest_chain("window crop"); mtl_rt_size_changed(); }
     memcpy(o->crop, v, sizeof v);
 }
 static void trow(uint64_t f, const char *name, double v);

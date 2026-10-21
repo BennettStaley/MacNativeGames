@@ -31,6 +31,8 @@ static int display_apply(const char *changed) {
     extern int runtime_render_request(unsigned w, unsigned h);
     extern void runtime_render_reserve(unsigned *w, unsigned *h);
     extern void runtime_aspect_set(float ratio);
+    extern void mtl_rt_size_changed(void);   /* old-size render targets may be released once idle (nvn_mtl.m stor_sweep) */
+    mtl_rt_size_changed();
     pthread_mutex_lock(&lock);
     int out = values[settings_index("display.output")], custom = values[settings_index("display.custom_width")];
     int scale = values[settings_index("display.scale")], aspect = values[settings_index("display.aspect")];

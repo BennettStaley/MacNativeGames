@@ -2101,7 +2101,7 @@ static int ser_unaffected(uint64_t from, uint64_t to, uint64_t serial) {
    when its memory pool is finalised. TOTK_TEX_SHARE=0 restores one texture per serial. */
 int nvn_fmt_bpb(int format, int *bw, int *bh);
 typedef struct { uint64_t mem, size; uint32_t w, h, d, levels, target, samples, bpb, depth_fmt; } stor_key;   // 48 bytes, no padding
-typedef struct { stor_key k; void *tex; uint64_t idle_fence; uint64_t *ser; int nser, cser; } stor_ent;      // tex: CFBridgingRetain'ed base texture; ser: serials holding it or a view on it
+typedef struct { stor_key k; void *tex; uint64_t idle_fence; uint64_t *ser; int nser, cser; uint64_t rt_frame, rt_frames; } stor_ent;      // tex: CFBridgingRetain'ed base texture; ser: serials holding it or a view on it; rt_*: last frame / frames it was a render target (stor_note_attach)
 static nvn_hmap g_by_storage = {.klen = sizeof(stor_key)};   // stor_key -> stor_ent *
 static nvn_hmap g_stor_of_obj = {.klen = 8};                  // base texture / view pointer -> stor_ent *
 static uint64_t g_stor_entries, g_stor_shared, g_stor_viewed, g_stor_recreated, g_stor_swept, g_stor_dropped;
@@ -2855,9 +2855,74 @@ static void stor_collect_drop(int (^pick)(const stor_ent *), uint64_t *counter) 
     pthread_mutex_unlock(&g_smu);
     free(gone);
 }
+/* TOTK (2026-10-20): render targets the game stopped drawing into. The game keeps its canvas and scene targets per output
+   size (DynamicTextureAllocator): switching 1080p -> 1440p -> native -> 1080p left every size's targets initialised, so
+   their storage entries stayed held and each size's set stayed in GPU memory (+640 MB GPU allocated, +850 MB footprint on
+   the M3 Pro after four switches; on hardware they are bytes of the game's fixed heap, here they are Metal textures of
+   their own). An entry that was a render target in at least STOR_RT_MIN_FRAMES frames and has not been one for
+   STOR_RT_IDLE_FRAMES frames is dropped like a finalised pool's entry: holders re-resolve, the texture goes once the
+   submissions using it complete. A per-frame target is written again before it is read, so one that comes back (the
+   game returns to that size) gets a new texture and is redrawn; textures drawn once and only sampled afterwards
+   (cube maps, baked tables) never reach STOR_RT_MIN_FRAMES and are kept. Only targets last drawn before the latest size
+   change (settings display.*, the window crop, mtl_rt_size_changed) go: without one nothing is released, so a picture
+   the game keeps showing without redrawing it (the pause menu's frozen scene) is never touched. TOTK_RT_EVICT=0 keeps
+   them all (A/B). */
+#define STOR_RT_MIN_FRAMES 120
+#define STOR_RT_IDLE_FRAMES 1200
+static uint64_t g_stor_rt_evicted, g_stor_rt_evicted_bytes;
+static _Atomic uint64_t g_rt_size_frame;   /* frame of the latest output / scene size change (0: none yet) */
+/* +120: a size is applied up to 0.4 s after the request (output_latch); targets still drawn afterwards stay newer than the change */
+void mtl_rt_size_changed(void) { atomic_store(&g_rt_size_frame, atomic_load(&g_cur_frame) + 120); }
+uint64_t mtl_rt_size_frame(void) { return atomic_load(&g_rt_size_frame); }   /* hle_nvn.c: the auto frame cap leaves the change out */
+static int stor_rt_evict_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_RT_EVICT"); on = !e || atoi(e); } return on; }
+/* A pass renders into mt (a base texture or a view on one): stamp its storage entry. */
+static void stor_note_attach(id<MTLTexture> mt) {
+    if (!mt || !stor_rt_evict_on()) return;
+    uint64_t frame = atomic_load_explicit(&g_cur_frame, memory_order_relaxed), ok = obj_key(mt), pk = mt.parentTexture ? obj_key(mt.parentTexture) : 0;
+    pthread_mutex_lock(&g_smu);
+    stor_ent *e = nvn_hm_get(&g_stor_of_obj, &ok); if (!e && pk) e = nvn_hm_get(&g_stor_of_obj, &pk);
+    if (e && e->rt_frame != frame) { e->rt_frame = frame; e->rt_frames++; }
+    pthread_mutex_unlock(&g_smu);
+}
 static void stor_sweep(uint64_t fence) {
     stor_collect_drop(^int(const stor_ent *e) { return !e->nser && fence > e->idle_fence + STOR_IDLE_SUBMITS; }, &g_stor_swept);
+    if (stor_rt_evict_on()) {
+        static uint64_t last_check; uint64_t frame = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
+        uint64_t changed = atomic_load(&g_rt_size_frame);
+        if (changed && frame >= last_check + 60 && frame > changed + STOR_RT_IDLE_FRAMES) { last_check = frame;   /* about once a second */
+            uint64_t before = g_stor_rt_evicted; __block uint64_t bytes = 0; __block uint64_t *held = NULL; __block int nheld = 0, cheld = 0;
+            stor_collect_drop(^int(const stor_ent *e) { int go = e->rt_frames >= STOR_RT_MIN_FRAMES && e->rt_frame < changed && frame > e->rt_frame + STOR_RT_IDLE_FRAMES;
+                                                         if (go) { bytes += ((__bridge id<MTLTexture>)e->tex).allocatedSize;
+                                                                   for (int i = 0; i < e->nser; i++) { if (nheld == cheld) { cheld = cheld ? cheld * 2 : 64; held = realloc(held, (size_t)cheld * sizeof *held); if (!held) MDIE("evicted holders"); } held[nheld++] = e->ser[i]; } }
+                                                         return go; }, &g_stor_rt_evicted);
+            /* Texture-pool slots registered with the holders keep a view, and a view keeps its base alive (out of the
+               residency set but allocated): the slots let go too and rebuild their view if they are sampled again. */
+            for (int i = 0; i < nheld; i++) treg_drop_serial(held[i]);
+            free(held);
+            if (g_stor_rt_evicted > before) { g_stor_rt_evicted_bytes += bytes;
+                MLOG("render targets not drawn into for %d frames released: %llu (%.1f MB) at frame %llu, %llu (%.0f MB) so far (TOTK_RT_EVICT=0 keeps them)", STOR_RT_IDLE_FRAMES,
+                     (unsigned long long)(g_stor_rt_evicted - before), bytes / 1048576.0, (unsigned long long)frame, (unsigned long long)g_stor_rt_evicted, g_stor_rt_evicted_bytes / 1048576.0); } }
+    }
     stor_det_sweep(^int(const stor_ent *e) { return !e->nser && fence > e->idle_fence + STOR_IDLE_SUBMITS; }, &g_stor_swept);
+}
+/* TOTK_STOR_DUMP=1 (diagnostic): the storage-shared entries grouped by size, with their holders (live = the newest
+   texture initialised at that memory; dead = finalised serial). */
+static void stor_dump(void) {
+    static int on = -1; if (on < 0) on = getenv("TOTK_STOR_DUMP") != NULL; if (!on) return;
+    extern int nvn_tex_live_at(const void *mem, tex_t *out);
+    enum { G = 48 }; struct { uint32_t w, h; int n, held, live, dead, other; uint64_t bytes, idle; } g[G]; int ng = 0;
+    pthread_mutex_lock(&g_smu);
+    for (uint32_t i = 0; i < g_by_storage.cap; i++) { stor_ent *e = g_by_storage.vals[i]; if (!e) continue;
+        int j = 0; while (j < ng && (g[j].w != e->k.w || g[j].h != e->k.h)) j++;
+        if (j == ng) { if (ng == G) continue; memset(&g[ng], 0, sizeof g[ng]); g[ng].w = e->k.w; g[ng].h = e->k.h; ng++; }
+        g[j].n++; g[j].bytes += ((__bridge id<MTLTexture>)e->tex).allocatedSize; if (e->nser) g[j].held++; else g[j].idle++;
+        tex_t live; int have = nvn_tex_live_at((const void *)(uintptr_t)e->k.mem, &live);
+        for (int k = 0; k < e->nser; k++) { uint64_t s = e->ser[k];
+            if (totk_serial_has(&g_dead_serial, s)) g[j].dead++; else if (have && live.serial == s) g[j].live++; else g[j].other++; }
+    }
+    pthread_mutex_unlock(&g_smu);
+    for (int j = 0; j < ng; j++) if (g[j].bytes >= (4u << 20))
+        MLOG("[stor-dump] %ux%u: %d entries %llu MB, held %d (holders: live %d, dead %d, other %d), idle %llu", g[j].w, g[j].h, g[j].n, (unsigned long long)(g[j].bytes >> 20), g[j].held, g[j].live, g[j].dead, g[j].other, (unsigned long long)g[j].idle);
 }
 /* A memory pool is finalised: its storage entries go with it. */
 static void stor_drop_range(uintptr_t lo, uintptr_t hi) {
@@ -3603,7 +3668,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     pthread_mutex_lock(&g_smu); int ndet = g_stor_ndet; pthread_mutex_unlock(&g_smu);
     MLOG("可压缩贴图跨格式换主 %llu 次（其中换回原贴图 %llu 次），暂存旧登记 %d 个（TOTK_COMPRESSED_ALIAS=1 恢复跨格式共用）", (unsigned long long)g_stor_handover, (unsigned long long)g_stor_taken_back, ndet);
     MLOG("共享存储贴图：条目 %llu，共用 %llu 次，格式视图 %llu 次，重建 %llu 次，闲置回收 %llu，随内存池释放 %llu", (unsigned long long)g_stor_entries, (unsigned long long)g_stor_shared, (unsigned long long)g_stor_viewed, (unsigned long long)g_stor_recreated, (unsigned long long)g_stor_swept, (unsigned long long)g_stor_dropped);
-    treg_stale_report();
+    treg_stale_report(); stor_dump();
     MLOG("贴图池已回收重传后的旧视图 %llu 个", (unsigned long long)g_treg_replaced_views);
     MLOG("贴图登记：相同跳过 %llu 次，改变 %llu 次", (unsigned long long)g_treg_same, (unsigned long long)g_treg_changed);
     MLOG("重传贴图复用 %llu 次（留存 %llu 张，现存 %d 张；TOTK_REUP_RECYCLE=0 关）", (unsigned long long)g_reup_reused, (unsigned long long)g_reup_kept, g_nreup);
@@ -4418,6 +4483,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     for (int i = 0; i < R.rt.n; i++) {
         if (!R.rt.color[i] || (clear_only == 1 && !R.clear_c[i])) continue; BOTW_RT_DUP_SKIP(i)
         attach(pd.colorAttachments[i], R.rt.color[i], &R.rt.cview[i], R.rt.has_cview[i]);
+        stor_note_attach(pd.colorAttachments[i].texture);
         { const tex_t *ot = R.rt.color[i]; BOTW_TEX_FOLLOW(ot) int was = gpu_owned(ot->serial); gpu_owned_mark(ot->serial);
           if (ot->mem && tex_mirrored(ot)) wb_note(ot);
           static int ownlog = -1; if (ownlog < 0) ownlog = getenv("DM_NVN_OWNLOG") != NULL;
@@ -4452,14 +4518,14 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     // clear_only：0 全挂 1 只为清除 2 深度模板都不挂 3 只挂模板 4 只挂深度（3 / 4 由 pass_ds_need 前瞻证明整通道只用那一项）
     // clear_only: 0 attach all 1 only for clears 2 neither depth nor stencil attached 3 stencil only 4 depth only (3 / 4: the pass_ds_need lookahead proves the whole pass uses only that one)
     if (R.rt.depth && clear_only == 3) {   // 只挂模板：合一格式的深度平面不进 tile、不读不写（Metal 允许深度附件空、模板附件挂合一贴图） | Stencil only: the depth plane of the combined format does not enter the tile and is neither read nor written (Metal allows an empty depth attachment with the combined texture on the stencil attachment)
-        attach(pd.stencilAttachment, R.rt.depth, &R.rt.dview, R.rt.has_dview);
+        attach(pd.stencilAttachment, R.rt.depth, &R.rt.dview, R.rt.has_dview); stor_note_attach(pd.stencilAttachment.texture);
         MTLPixelFormat pf = pd.stencilAttachment.texture.pixelFormat;
         if (pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatStencil8) {
             any = 1; pd.stencilAttachment.loadAction = R.clear_s ? MTLLoadActionClear : MTLLoadActionLoad;
             pd.stencilAttachment.clearStencil = R.cs; pd.stencilAttachment.storeAction = MTLStoreActionStore;
         } else pd.stencilAttachment.texture = nil;   // 没有模板平面：模板测试恒过，什么都不挂 | No stencil plane: the stencil test always passes, attach nothing
     } else if (R.rt.depth && clear_only != 2 && !(clear_only == 1 && !R.clear_d && !R.clear_s)) {
-        attach(pd.depthAttachment, R.rt.depth, &R.rt.dview, R.rt.has_dview);
+        attach(pd.depthAttachment, R.rt.depth, &R.rt.dview, R.rt.has_dview); stor_note_attach(pd.depthAttachment.texture);
         if (pd.depthAttachment.texture) {
             any = 1;
             pd.depthAttachment.loadAction = R.clear_d ? MTLLoadActionClear : MTLLoadActionLoad;
