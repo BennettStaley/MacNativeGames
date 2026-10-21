@@ -179,26 +179,31 @@ static int guest_write(void *ctx, uint64_t a, const void *in, unsigned n) {
     return allowed(a, n, 1) && mach_vm_write(mach_task_self(), a, (vm_offset_t)(uintptr_t)in, n) == KERN_SUCCESS;
 }
 
+/* One tick: as in Atmosphère, the master code runs first and the enabled cheats after it on the same registers (which
+   start at 0 every tick); each cheat keeps its own conditional blocks and loops. */
 static void *cheat_thread(void *arg) {
     (void)arg;
     pthread_setname_np("cheats");
+    static CheatVm vm;   // static registers (C3) persist across ticks
     for (;;) {
         usleep(33000);
         CheatEnv env = {.ctx = NULL, .read = guest_read, .write = guest_write};
         uint64_t b[3], s[3];
         runtime_guest_regions(b, s);
-        env.base[0] = (uintptr_t)main_base; env.base[1] = b[0]; env.base[2] = b[1]; env.base[3] = b[2];
+        env.base[0] = (uintptr_t)main_base; env.base[1] = b[0]; env.base[2] = b[1]; env.base[3] = b[2]; env.base[4] = 0;
         env.keys = runtime_input_buttons();
-        for (int k = 0; k < ncheat; k++) {
-            int st = atomic_load(&state[k]);
-            if (!(st & CHEAT_ON) || (st & (CHEAT_AT_LAUNCH | CHEAT_REFUSED)) || !cheats[k].n) continue;
-            char err[112] = "";
-            env.ctx = cheats[k].name;
-            if (!cheat_run(&cheats[k], &env, err, sizeof err) && err[0] && strcmp(err, problem[k])) {   // a failed read (pointer not set up yet) is silent
-                pthread_mutex_lock(&mu); snprintf(problem[k], sizeof problem[k], "%s", err); pthread_mutex_unlock(&mu);
-                fprintf(stderr, "[totk] cheat \"%s\": %s\n", cheats[k].name, err);
+        cheat_vm_tick(&vm);
+        for (int pass = 0; pass < 2; pass++)
+            for (int k = 0; k < ncheat; k++) {
+                int st = atomic_load(&state[k]);
+                if (cheats[k].master != !pass || !(st & CHEAT_ON) || (st & (CHEAT_AT_LAUNCH | CHEAT_REFUSED)) || !cheats[k].n) continue;
+                char err[112] = "";
+                env.ctx = cheats[k].name;
+                if (!cheat_run(&cheats[k], &vm, &env, err, sizeof err) && err[0] && strcmp(err, problem[k])) {   // a failed read (pointer not set up yet) is silent
+                    pthread_mutex_lock(&mu); snprintf(problem[k], sizeof problem[k], "%s", err); pthread_mutex_unlock(&mu);
+                    fprintf(stderr, "[totk] cheat \"%s\": %s\n", cheats[k].name, err);
+                }
             }
-        }
     }
     return NULL;
 }
@@ -268,11 +273,10 @@ void runtime_cheats_launch(Module *m) {
     fclose(f);
     text[got] = 0;
     cheats = calloc(CHEAT_MAX, sizeof *cheats);
-    char err[128];
-    if (!cheats || (ncheat = cheat_parse(text, cheats, CHEAT_MAX, err, sizeof err)) < 0) {
-        fprintf(stderr, "[totk] cheats: %s is not a valid cheat file: %s\n", cheat_file(), cheats ? err : "out of memory");
-        ncheat = 0; return;
-    }
+    char warn[160];
+    if (!cheats) { fprintf(stderr, "[totk] cheats: out of memory\n"); return; }
+    ncheat = cheat_parse(text, cheats, CHEAT_MAX, warn, sizeof warn);
+    if (warn[0]) fprintf(stderr, "[totk] cheats: %s: %s\n", cheat_file(), warn);
     const char *dr = getenv("TOTK_CHEATS_DRYRUN");
     dry_run = dr && !strcmp(dr, "1");
     if (dry_run) fprintf(stderr, "[totk] cheats: dry run (memory cheats log their targets and write nothing)\n");
@@ -281,8 +285,12 @@ void runtime_cheats_launch(Module *m) {
     load_choices();
     int applied = 0, at_launch = 0;
     for (int k = 0; k < ncheat; k++) {
-        if (!cheats[k].n) continue;
+        if (!cheats[k].n && !cheats[k].error[0]) continue;   // titles and notes
         if (!cheats[k].master) listed[nlisted++] = k; else atomic_fetch_or(&state[k], CHEAT_ON);
+        if (cheats[k].error[0]) {   // this section did not parse; the others are unaffected
+            snprintf(problem[k], sizeof problem[k], "%s", cheats[k].error);
+            atomic_fetch_or(&state[k], CHEAT_REFUSED); fprintf(stderr, "[totk] cheat \"%s\" refused: %s\n", cheats[k].name, problem[k]); continue;
+        }
         int code = code_patches(k, 0);
         if (code < 0) { atomic_fetch_or(&state[k], CHEAT_REFUSED); fprintf(stderr, "[totk] cheat \"%s\" refused: %s\n", cheats[k].name, problem[k]); continue; }
         if (!code) continue;
