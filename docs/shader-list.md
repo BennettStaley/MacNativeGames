@@ -65,7 +65,7 @@ It only downloads; the game never uploads anything.
   previous list stays. Of a valid file only the `V` rows are used.
 - **Difference.** The `V` rows whose deps the cache's `<key>.variants` do not have. Keys of other game versions are
   skipped: the first time, the game indexes every shader of its own files (BNSH, agl `.sharcb`, SARC packages, zstd
-  with the game's dictionaries, the game module, through the RomFS the game reads, mods included; about 8 s for
+  with the game's dictionaries, the game module, through the RomFS the game reads, mods included; 2–8 s for
   1.4.3's 28,769 shaders, the same count as the build) and keeps the index, so later days read only the files a new
   variant needs. The bytes are checked against the key before use.
 - **Prepare.** After the warm-up (the title screen is up), one variant at a time at utility priority: translated by a
@@ -73,7 +73,7 @@ It only downloads; the game never uploads anything.
   to the game's shader table like the warm-up's shaders: the first use in play is neither a translation nor a compile.
   It pauses while the game is busy (one of the game's own translations in the last 3 s, or under 20 frames a second).
   The shader counter counts the variants still being prepared as compiling. The log says
-  `shader list: N new variants from the shared list (M for shaders of this game …), preparing…` and then
+  `shader list: N new variants from the shared list, preparing…` and then
   `shader list: ready: …`.
 - **Setting.** Settings › Interface › *Download new shaders* (on by default; live). Off: nothing is fetched and a
   preparation in progress stops.

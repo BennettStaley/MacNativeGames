@@ -372,9 +372,13 @@ static void prepare(void) {
     if (!index) return;   // turned off while indexing
     NSMutableArray<NSArray<NSString *> *> *todo = [NSMutableArray array];
     for (NSArray<NSString *> *m in todo0) if (index[m[0]]) [todo addObject:m];
-    LOG("[shader-list] shader list: %lu new variants from the shared list (%lu for shaders of this game; the rest are another version's), preparing…",
-        (unsigned long)todo0.count, (unsigned long)todo.count);
-    if (!todo.count) return;
+    if (!todo.count) {
+        LOG("[shader-list] shader list: nothing new for this game (%lu listed variants are of shaders another game version has) (%.1f s)",
+            (unsigned long)todo0.count, now_s() - t0);
+        return;
+    }
+    LOG("[shader-list] shader list: %lu new variants from the shared list, preparing… (%lu more listed are of shaders another game version has)",
+        (unsigned long)todo.count, (unsigned long)(todo0.count - todo.count));
     atomic_store(&g_pending, (int64_t)todo.count);
     /* by file and members, so each file is read and decompressed once */
     NSMutableDictionary<NSString *, NSMutableArray<NSArray<NSString *> *> *> *groups = [NSMutableDictionary dictionary];
