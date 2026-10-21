@@ -93,8 +93,8 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
     [labels addObject:@"Mods"]; [labels addObject:@"Cheats"];
     tabs = [NSSegmentedControl segmentedControlWithLabels:labels trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(tabClicked:)];
     tabs.segmentStyle = NSSegmentStyleAutomatic; tabs.selectedSegment = 0; tabs.refusesFirstResponder = YES;
-    tabs.segmentDistribution = NSSegmentDistributionFillProportionally; tabs.controlSize = NSControlSizeSmall;   /* nine tabs, widths after their names */
-    tabs.font = [NSFont systemFontOfSize:10.5];
+    tabs.segmentDistribution = NSSegmentDistributionFit; tabs.controlSize = NSControlSizeMini;   /* nine tabs, widths after their names */
+    tabs.font = [NSFont systemFontOfSize:10];
 
     list = [NSStackView new]; list.orientation = NSUserInterfaceLayoutOrientationVertical;
     list.alignment = NSLayoutAttributeLeading; list.spacing = 4; list.translatesAutoresizingMaskIntoConstraints = NO;
