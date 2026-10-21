@@ -110,6 +110,22 @@ Before the mods folder, the port loaded one folder, `mods/<v0|v112|v121|v143>`, 
 `games/totk/scripts/make_mod_manifest.py` (each file's size and SHA-256 and its original's, checked at start). It still
 loads, before the mods folder's mods; it is not listed as a mod.
 
+Each `manifest.tsv` line has four tab-separated fields: `<RomFS path>  <size>  <SHA-256 of the mod file>  <SHA-256 of the
+original, or ->` (`-` adds a file the game does not have). Only the listed files are served: an unlisted new path is
+absent for the game, an unlisted replacement is read from the game, and a listed file whose size or hash changed stops the
+start (`RomFS overlay file missing or wrong size` / `RomFS overlay integrity mismatch`). To make one (from the repository
+root, after copying the mod's `romfs/` contents into the folder):
+
+```bash
+MODDIR="$HOME/Library/Application Support/MacNativeGames/TOTK/mods/v143"
+python3 games/totk/scripts/make_mod_manifest.py "$MODDIR" --app "/path/to/Tears of the Kingdom.app" --version v143
+```
+
+The script hashes each file and its original in the app's RomFS, leaves out files identical to the original, and prints
+`...: N files (R replaced, A added)`; the log then says `.../mods/v143 checked, N files`. Regenerate it after every
+change and never edit it by hand. (Upstream's guide to this layout, also in Chinese:
+[ly05010419/MacNativeGames docs/mods.md](https://github.com/ly05010419/MacNativeGames/blob/main/docs/mods.md).)
+
 ## Button-icon mods
 
 A mod that changes the game's button-icon archive (`UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs`) and whose

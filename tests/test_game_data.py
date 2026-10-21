@@ -32,7 +32,7 @@ class GameData(unittest.TestCase):
         files = {'a' * 64 + '-000000000000_b.metal': b'metal source', 'pso_manifest.tsv': b'rows'}
         for name, data in files.items():
             (seed / name).write_bytes(data)
-        (seed / 'seed-manifest.json').write_text(json.dumps(dict(version='v143', chain='totk-native-v4-unverified',
+        (seed / 'seed-manifest.json').write_text(json.dumps(dict(version='v143', chain='totk-native-v6-unverified',
                                                                  shaders=8000, files={n: sha(d) for n, d in files.items()})))
         libs = self.tree / 'build/shader-libs'
         libs.mkdir()

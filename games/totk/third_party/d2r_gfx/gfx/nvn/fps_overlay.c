@@ -37,16 +37,25 @@ static const Glyph FONT[] = {
     {' ', {0, 0, 0, 0, 0, 0, 0}},
 };
 
-/* TOTK_HINTS=0: start with every HUD layer hidden (the settings menu's "Performance readout"). */
-static _Atomic int g_hints_visible = -1;
-static int hints_now(void) {
-    int v = atomic_load_explicit(&g_hints_visible, memory_order_relaxed);
-    if (v < 0) { const char *e = getenv("TOTK_HINTS"); int start = !(e && !strcmp(e, "0")); atomic_compare_exchange_strong(&g_hints_visible, &v, start); v = atomic_load(&g_hints_visible); }
+/* Key 1 cycles all -> minimal (FPS only) -> off -> all. TOTK_HINTS=0 starts off; the settings menu's "Performance
+   readout" switches between all and off (fps_overlay_set_hints). */
+static _Atomic int g_hud_mode = -1;
+static int hud_mode_now(void) {
+    int v = atomic_load_explicit(&g_hud_mode, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("TOTK_HINTS"); int start = e && !strcmp(e, "0") ? HUD_MODE_OFF : HUD_MODE_ALL;
+        atomic_compare_exchange_strong(&g_hud_mode, &v, start); v = atomic_load(&g_hud_mode); }
     return v;
 }
-int fps_overlay_hints_enabled(void) { return hints_now(); }
-void fps_overlay_set_hints(int visible) { (void)hints_now(); atomic_store(&g_hints_visible, visible ? 1 : 0); }
-int fps_overlay_toggle_hints(void) { (void)hints_now(); return !atomic_fetch_xor_explicit(&g_hints_visible, 1, memory_order_relaxed); }
+int fps_overlay_hud_mode(void) { return hud_mode_now(); }
+int fps_overlay_hints_enabled(void) { return fps_overlay_hud_mode() != HUD_MODE_OFF; }
+int fps_overlay_full_hud(void) { return fps_overlay_hud_mode() == HUD_MODE_ALL; }
+void fps_overlay_set_hints(int visible) { (void)hud_mode_now(); atomic_store(&g_hud_mode, visible ? HUD_MODE_ALL : HUD_MODE_OFF); }
+int fps_overlay_toggle_hints(void) {
+    int mode = hud_mode_now(), next;
+    do next = mode == HUD_MODE_ALL ? HUD_MODE_MINIMAL : mode == HUD_MODE_MINIMAL ? HUD_MODE_OFF : HUD_MODE_ALL;
+    while (!atomic_compare_exchange_weak_explicit(&g_hud_mode, &mode, next, memory_order_relaxed, memory_order_relaxed));
+    return next;
+}
 
 /* The settings menu's "Readout detail": 1 adds the average and the 1% low of the last seconds to the FPS line. */
 static _Atomic int g_detail;

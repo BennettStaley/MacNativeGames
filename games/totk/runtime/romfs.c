@@ -8,6 +8,7 @@
 #include "mods.h"
 #include "../third_party/zstd/zstd.h"
 #include <CommonCrypto/CommonDigest.h>
+#include <TargetConditionals.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -99,10 +100,18 @@ static RomfsProof proof_for(const struct stat *s) {
 }
 static int proof_equal(const RomfsProof *a,const RomfsProof *b) {
  return !memcmp(a->magic,b->magic,sizeof a->magic)&&!memcmp(a->sha256,b->sha256,sizeof a->sha256)
-  &&a->dev==b->dev&&a->ino==b->ino&&a->size==b->size
+  &&a->size==b->size
+#if TARGET_OS_IPHONE
+  /* iOS rewrites ctime and birthtime when a sealed app bundle is read for the first time, so a fresh
+     install never matched its own before/after stat ("FAIL: RomFS changed during verification").
+     The record exists to identify the bytes, and the SHA256 pass above already proved them. */
+  ;
+#else
+  &&a->dev==b->dev&&a->ino==b->ino
   &&a->mtime_sec==b->mtime_sec&&a->mtime_nsec==b->mtime_nsec
   &&a->ctime_sec==b->ctime_sec&&a->ctime_nsec==b->ctime_nsec
   &&a->birth_sec==b->birth_sec&&a->birth_nsec==b->birth_nsec;
+#endif
 }
 /* Split image: one record per part, all of which must be unchanged for the earlier full hash to be reused. */
 static void chunk_proofs(RomfsProof *out) {
@@ -451,8 +460,15 @@ static void rstb_serve(size_t from) {
 static void overlay_init(void) {
  const char *dir=getenv("TOTK_ROMFS_PATCHES");if(!dir||strcmp(dir,"0"))overlay_load(dir?dir:"extracted/" TOTK_GAME_DIR "/romfs-patches",0,0);
  npatch=noverlay;
+ /* A canvas above 1080p and a scene reserve above 1600x900 (1.4.3) grow the heaps: the overlay <w>x<h>[-scene-<sw>x<sh>]. */
  char name[64];if(runtime_heap_overlay(name,sizeof name)){const char *out=getenv("TOTK_ROMFS_PATCHES_OUT");char d[4096];
-  need(snprintf(d,sizeof(d),"%s/%s",out?out:"extracted/" TOTK_GAME_DIR "/romfs-patches-out",name)<(int)sizeof(d),"RomFS output overlay path");overlay_load(d,1,0);}
+  need(snprintf(d,sizeof(d),"%s/%s",out?out:"extracted/" TOTK_GAME_DIR "/romfs-patches-out",name)<(int)sizeof(d),"RomFS output overlay path");
+  /* build_app.py makes the 2560x1440 canvas and, for 1.4.3, the 1920x1080 / 2560x1440 scenes on either canvas; other sizes are one command. */
+  char m[4200];snprintf(m,sizeof(m),"%s/manifest.tsv",d);
+  if(access(m,R_OK)){char canvas[64];snprintf(canvas,sizeof canvas,"%s",name);char *scene=strstr(canvas,"-scene-");if(scene){*scene=0;scene+=7;}
+   fprintf(stderr,"[totk] RomFS overlay %s missing: make it with\n  .venv/bin/python scripts/make_output_res_overlay.py %s%s%s --version " TOTK_GAME_DIR "%s%s\n",d,canvas,scene?" --scene ":"",scene?scene:"",out?" --output-root ":"",out?out:"");
+   runtime_fail("HeapDef overlay for this output / scene size missing (see the line above)");}
+  overlay_load(d,1,0);}
  nbuild=noverlay;
  const char *mods=getenv("TOTK_ROMFS_MODS");if(mods&&*mods&&strcmp(mods,"0"))overlay_load(mods,0,1);
  mods_load();

@@ -36,9 +36,9 @@ typedef struct Mixer {
     float *buf; int nbuf, frame;
     int *offset;                                   /* first mix buffer of each mix id */
     SplitInfo *split; int nsplit; SplitDest *dest; int ndest;
-    AudioComponentInstance unit; int unit_ok;
+    AudioComponentInstance unit; int unit_ok, rate;
     float ring[RING_FRAMES * 2]; _Atomic uint64_t wr, rd, underruns, overruns;
-    _Atomic int playing; int ready; _Atomic uint64_t missing_frames;
+    _Atomic int playing; int ready; _Atomic uint64_t missing_frames, trims, trimmed_frames;
     _Atomic uint64_t flush_until; _Atomic unsigned stop_epoch; unsigned callback_epoch;
     _Atomic uint64_t callback_frames,callback_nonzero;
     EffectState *effect; int *effect_order; unsigned effect_reported;
@@ -118,12 +118,20 @@ static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTi
     if(!atomic_load_explicit(&m->playing,memory_order_acquire)){
         memset(out,0,(size_t)frames*2*sizeof(float));m->ready=0;atomic_store_explicit(&m->rd,wr,memory_order_release);return noErr;
     }
+    uint64_t prefill=(uint64_t)m->frame*(uint64_t)prefill_blocks();if(prefill<frames)prefill=frames;if(prefill>RING_FRAMES)prefill=RING_FRAMES;
     if(!m->ready){
         /* prefill_blocks() 5-ms blocks (default four, 20 ms) of scheduling headroom for the producer.
            A real underrun still counts and requires a fresh prefill. */
-        uint64_t prefill=(uint64_t)m->frame*(uint64_t)prefill_blocks();if(prefill<frames)prefill=frames;if(prefill>RING_FRAMES)prefill=RING_FRAMES;
         if(have<prefill){memset(out,0,(size_t)frames*2*sizeof(float));return noErr;}
         m->ready=1;
+    }
+    /* After a device stall (Bluetooth, CoreAudio) the producer, paced by the wall clock, keeps the backlog it built up:
+       drop all but the prefill once it passes prefill + 30 ms, so the delay does not stay (counted in the output level line). */
+    uint64_t max_backlog = prefill + (uint64_t)m->frame * 6u;
+    if (m->unit_ok && have > max_backlog) {
+        atomic_fetch_add(&m->trims, 1); atomic_fetch_add(&m->trimmed_frames, have - prefill);
+        rd = wr - prefill;
+        have = prefill;
     }
     UInt32 n = frames < have ? frames : (UInt32)have;
     uint64_t nonzero=0;
@@ -150,6 +158,23 @@ static void output_open(Mixer *m, int rate) {
         fprintf(stderr, "[totk-audio] 【红】CoreAudio output setup failed: mixing without sound\n"); AudioComponentInstanceDispose(m->unit); return;
     }
     m->unit_ok = 1; fprintf(stderr, "[totk-audio] CoreAudio output %d Hz stereo\n", rate);
+}
+/* iOS (from nxnative b301431): the system stops the RemoteIO unit when another app takes the audio session (a call,
+   Siri, an alarm) and invalidates it when media services are reset. Nothing started it again, so the game stayed
+   silent for the rest of the session. The app's session observers (ios/Sources/main.m) call this: start the open
+   outputs again, or (recreate, and whenever a start fails) build them anew. */
+static pthread_mutex_t g_out_mu = PTHREAD_MUTEX_INITIALIZER;
+static Mixer *g_out[4];
+void runtime_audio_output_restart(int recreate) {
+    pthread_mutex_lock(&g_out_mu);
+    for (int i = 0; i < 4; i++) {
+        Mixer *m = g_out[i]; if (!m) continue;
+        if (m->unit_ok && !recreate && !AudioOutputUnitStart(m->unit)) { fprintf(stderr, "[totk-audio] output started again\n"); continue; }
+        if (m->unit_ok) { m->unit_ok = 0; AudioOutputUnitStop(m->unit); AudioUnitUninitialize(m->unit); AudioComponentInstanceDispose(m->unit); }
+        m->ready = 0; output_open(m, m->rate);
+        fprintf(stderr, "[totk-audio] output rebuilt (%s): %s\n", recreate ? "media services reset" : "start failed", m->unit_ok ? "playing" : "no sound");
+    }
+    pthread_mutex_unlock(&g_out_mu);
 }
 static void output_push(Mixer *m, const float *lr, int frames) {
     uint64_t wr = atomic_load(&m->wr), rd = atomic_load_explicit(&m->rd, memory_order_acquire);
@@ -191,7 +216,10 @@ void audio_mixer_open(AudioRenderer *r) {
         fprintf(stderr,"[totk-audio] diagnostic capture armed: %d Hz stereo float32, 30 seconds after %lu-second delay from first nonzero frame\n",r->param.sample_rate,seconds);
     }else fprintf(stderr,"[totk-audio] diagnostic capture unavailable (file exists or cannot be opened)\n");}
     prefill_blocks();   // decided before the device's callback can run
-    output_open(m, r->param.sample_rate);
+    pthread_mutex_lock(&g_out_mu);
+    m->rate = r->param.sample_rate; output_open(m, m->rate);
+    for (int i = 0; i < 4; i++) if (!g_out[i]) { g_out[i] = m; break; }
+    pthread_mutex_unlock(&g_out_mu);
 }
 void audio_mixer_set_running(AudioRenderer *r,int running){
     Mixer *m=r->mixer;if(!m)return;
@@ -200,7 +228,10 @@ void audio_mixer_set_running(AudioRenderer *r,int running){
 }
 void audio_mixer_close(AudioRenderer *r) {
     Mixer *m = r->mixer; if (!m) return;
-    if (m->unit_ok) { AudioOutputUnitStop(m->unit); AudioUnitUninitialize(m->unit); AudioComponentInstanceDispose(m->unit); }
+    pthread_mutex_lock(&g_out_mu);
+    for (int i = 0; i < 4; i++) if (g_out[i] == m) g_out[i] = NULL;
+    if (m->unit_ok) { m->unit_ok = 0; AudioOutputUnitStop(m->unit); AudioUnitUninitialize(m->unit); AudioComponentInstanceDispose(m->unit); }
+    pthread_mutex_unlock(&g_out_mu);
     if(m->capture_worker){
         pthread_mutex_lock(&m->capture_lock);m->capture_closing=1;pthread_cond_signal(&m->capture_cond);pthread_mutex_unlock(&m->capture_lock);
         pthread_join(m->capture_thread,NULL);pthread_cond_destroy(&m->capture_cond);pthread_mutex_destroy(&m->capture_lock);free(m->capture_buf);
@@ -695,8 +726,8 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
       for (int k = 0; k < 2 * frames; k++) { double x = lr[k];m->level_sum+=x*x;if(fabs(x)>m->level_peak)m->level_peak=fabs(x); }
       m->level_count+=2*(uint64_t)frames;m->level_frames+=(uint64_t)frames;
       if (m->level_frames >= (uint64_t)r->param.sample_rate * 5) {
-          fprintf(stderr, "[totk-audio] output level: rms %.4f peak %.4f over %.1f s, underruns %llu, overruns %llu, missing frames %llu, callback frames %llu / nonzero %llu\n", sqrt(m->level_sum/(double)m->level_count),m->level_peak,
-                  m->level_frames/(double)r->param.sample_rate,(unsigned long long)atomic_load(&m->underruns),(unsigned long long)atomic_load(&m->overruns),(unsigned long long)atomic_load(&m->missing_frames),(unsigned long long)atomic_load(&m->callback_frames),(unsigned long long)atomic_load(&m->callback_nonzero));
+          fprintf(stderr, "[totk-audio] output level: rms %.4f peak %.4f over %.1f s, underruns %llu, overruns %llu, missing frames %llu, backlog trims %llu (%llu frames), callback frames %llu / nonzero %llu\n", sqrt(m->level_sum/(double)m->level_count),m->level_peak,
+                  m->level_frames/(double)r->param.sample_rate,(unsigned long long)atomic_load(&m->underruns),(unsigned long long)atomic_load(&m->overruns),(unsigned long long)atomic_load(&m->missing_frames),(unsigned long long)atomic_load(&m->trims),(unsigned long long)atomic_load(&m->trimmed_frames),(unsigned long long)atomic_load(&m->callback_frames),(unsigned long long)atomic_load(&m->callback_nonzero));
           m->level_sum=m->level_peak=0;m->level_count=m->level_frames=0;
       } }
     capture_copy(m,lr,frames);

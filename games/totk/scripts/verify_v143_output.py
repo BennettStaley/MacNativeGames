@@ -22,8 +22,12 @@ from unicorn.arm64_const import (
 ROOT = Path(__file__).resolve().parents[1]
 RENDER_SITES = {0x585e48, 0x585e50, 0x585e54, 0x585e60}
 RENDER_KICK = {0x580920}   # the per-frame update's display-state load, ORed with the data page +48 (a live pick)
-# runtime/world_patch.h: the time of day's step (s9) and the two far-plane loads, each a 32-byte stub from +304.
-WORLD_SITES = {0x68c15c: (0xbd403e69, 304, 72), 0x628c30: (0xbd413a60, 336, 76), 0xb43420: (0xbd4062c0, 368, 76)}
+# Text padding after main's text (offsets from the stub base; the layout at the top of runtime/game_patches_v143.c):
+# frame step +0, output +16, aspect +48, cloth/hair clock +176, bounce +256, field of view +288, render veneer +384,
+# world +416, fog +512, shadow +560..+592.
+FOV_STUB, RENDER_VENEER, WORLD_STUB, STUBS_END = 288, 384, 416, 592
+# runtime/world_patch.h: the time of day's step (s9) and the two far-plane loads, each a 32-byte stub from +416.
+WORLD_SITES = {0x68c15c: (0xbd403e69, 416, 72), 0x628c30: (0xbd413a60, 448, 76), 0xb43420: (0xbd4062c0, 480, 76)}
 
 
 def clean_env():
@@ -83,7 +87,7 @@ def render_res_checks(out, raw, data, layout):
     assert struct.unpack('<ff', unset[data + 16:data + 24]) == (1600.0, 900.0), 'unset is not the game\'s own docked size'
     code, set_ = image({'TOTK_RENDER_RES': '960x540'})
     assert code == 0 and sites_changed(set_) == RENDER_SITES, 'TOTK_RENDER_RES=960x540 did not patch the four sites'
-    veneer = (layout['TEXT_END'] + 15 & ~15) + 272
+    veneer = (layout['TEXT_END'] + 15 & ~15) + RENDER_VENEER
     others = {p for p in range(0, data, 4) if off[p:p+4] != set_[p:p+4]}
     assert others == RENDER_SITES | RENDER_KICK | {veneer + 4 * i for i in range(8)}, [hex(p) for p in sorted(others ^ RENDER_SITES)]
     assert struct.unpack('<ff', set_[data + 16:data + 24]) == (960.0, 540.0)
@@ -128,7 +132,7 @@ def world_checks(out, raw, data, layout):
     for site, (word, off, _) in WORLD_SITES.items():
         assert struct.unpack('<I', raw[site:site + 4])[0] == word, f'world site {site:#x} is not the verified 1.4.3 word'
         assert raw[base + off:base + off + 32] == bytes(32), f'world stub padding +{off} not empty'
-    assert base + 400 <= layout['RO_OFF'], 'world stubs would overlap read-only data'
+    assert base + WORLD_STUB + 96 <= layout['RO_OFF'] and base + STUBS_END <= layout['RO_OFF'], 'stubs would overlap read-only data'
 
     def image(extra):
         path = out / 'main-world.bin'
@@ -185,13 +189,13 @@ def world_checks(out, raw, data, layout):
     assert code != 0, 'a render distance below 50 was accepted'
     code, export = image({'TOTK_EXPORT_IOS': str(out / 'unused-export')})
     assert code == 0 and export[:data] == img[:data], 'the iOS export does not embed the same world stubs'
-    return dict(sites={hex(p): hex(w) for p, (w, _, _) in WORLD_SITES.items()}, stubs=[hex(base + 304), hex(base + 400)],
+    return dict(sites={hex(p): hex(w) for p, (w, _, _) in WORLD_SITES.items()}, stubs=[hex(base + WORLD_STUB), hex(base + WORLD_STUB + 96)],
                 game_own_and_x2_5=results, paused_step=paused, ios_export_embedded=True)
 
 
 FOG_SITES = {0xd3050}                 # the Env writer's fog ramp scale, fcsel s9, s18, s1, ne (aspect_patch.h fog_install)
 SHADOW_SITES = {0x683604}             # the shadow map side's rounding, add w11, w11, #7 (aspect_patch.h shadow_install)
-FOG_STUB, SHADOW_STUB = 400, 448      # text padding offsets from the stub base: one 48-byte stub, one 32-byte stub (to +480)
+FOG_STUB, SHADOW_STUB = 512, 560      # text padding offsets from the stub base: one 48-byte stub, one 32-byte stub (to +592)
 FOG_SLOT, SHADOW_SLOT = 80, 84        # data page: the fog multiplier (float), the shadow shift (int)
 
 
@@ -300,7 +304,8 @@ def main():
         'build/v143-output-fixture', 'rewritten/v143/main.patched.bin', str(target),
         str(layout['TEXT_END']),
     ], capture_output=True, text=True, check=True,
-        env=clean_env() | {'TOTK_REALTIME': '1', 'TOTK_FPS60': '1', 'TOTK_OUTPUT_RES': '2560x1440'})
+        env=clean_env() | {'TOTK_REALTIME': '1', 'TOTK_FPS60': '1', 'TOTK_OUTPUT_RES': '2560x1440',
+                           'TOTK_CLOTH_REALTIME': '0', 'TOTK_HIGHFPS_FIX': '0'})   # their words: verify_v143_timing.py
     (out / 'output-fixture.log').write_text(run.stdout + run.stderr)
     patched = target.read_bytes()
     data = (len(raw) + 0x3fff) & ~0x3fff
@@ -317,13 +322,17 @@ def main():
         0xbdb578, 0xbdb584, 0x3dcb28,
         0x2db204, 0x2db208, 0x2db22c, 0x2db360, 0x2db36c, 0x2db340, 0x2db34c,
         0x3e5658, 0x2daa54, 0x2daa58, 0x2daa6c, 0x2daa70, 0x2daa74, 0x2daa78,
-    } | RENDER_SITES | RENDER_KICK | set(WORLD_SITES) | {frame_step + 304 + 4 * i for i in range(24)} | {frame_step + 272 + 4 * i for i in range(8)} | {frame_step + 4 * i for i in range(4)} | {stub + 4 * i for i in range(7)}
-    # The 21:9 view (runtime/aspect_patch.h, always installed since c446bce): four sites and its stubs after the two veneers.
-    # The field of view (aspect_patch.h fov_install): two camera sites and their 48-byte stubs after the aspect stubs.
-    aspect = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0, 0x628c3c, 0xb4342c} | {p for p in changes if frame_step + 48 <= p < frame_step + 272}
-    # Fog density and shadow resolution (aspect_patch.h): three sites, their stubs at +400..+480 (fog_shadow_checks).
+    } | RENDER_SITES | RENDER_KICK | set(WORLD_SITES) | {frame_step + WORLD_STUB + 4 * i for i in range(24)} \
+      | {frame_step + RENDER_VENEER + 4 * i for i in range(8)} | {frame_step + 4 * i for i in range(4)} | {stub + 4 * i for i in range(7)}
+    # The ultrawide view (runtime/aspect_patch.h, always installed since c446bce): four sites and their 4 x 32-byte stubs at +48.
+    # The field of view (aspect_patch.h fov_install): two camera sites and their 48-byte stubs at +288 (after the cloth/hair
+    # clock at +176 and the bounce veneer at +256, which this run turns off: verify_v143_timing.py checks them).
+    aspect = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0, 0x628c3c, 0xb4342c} \
+        | {p for p in changes if frame_step + 48 <= p < frame_step + 176 or frame_step + FOV_STUB <= p < frame_step + FOV_STUB + 96}
+    # Fog density and shadow resolution (aspect_patch.h): two sites, their stubs at +512..+592 (fog_shadow_checks).
     aspect |= FOG_SITES | SHADOW_SITES | {p for p in changes if frame_step + FOG_STUB <= p < frame_step + SHADOW_STUB + 32}
     assert changes - aspect == want, [hex(p) for p in sorted((changes - aspect) ^ want)]
+    assert not {p for p in changes if frame_step + 176 <= p < frame_step + 288}, 'cloth / bounce words changed with both turned off'
 
     def execute(w, h, scale, apply):
         mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)

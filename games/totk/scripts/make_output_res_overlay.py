@@ -10,7 +10,8 @@ looked up by name (main+0x1123b70 -> main+0x8119b0):
 At 2560x1440 the title already runs out of the texture heap (crash at main+0x799390). This overlay scales
 DynamicTextureAllocatorMem with the output pixels (rounded up to whole MiB) and grows Graphics by the same amount; the
 runtime adds that amount to the application memory pool it reports (runtime/services.c), so no other heap shrinks. The
-values are the same formula as runtime_output_res_extra_bytes() (runtime/game_patches.c): keep the two in step.
+values are the same formula as runtime_output_res_extra_bytes() (runtime/game_patches.c; with --scene, 1.4.3 only:
+runtime/game_patches_v143.c): keep the two in step.
 
 Input: the IVFC-verified local RomFS image (extracted/v0/romfs). Output: extracted/v0/romfs-patches-out/<w>x<h>/<path>
 and manifest.tsv (path, size, SHA-256 of the overlay, SHA-256 of the original); game content stays in the ignored folder.
@@ -51,6 +52,8 @@ sw, sh = (int(v) for v in args.scene.lower().split('x')) if args.scene else (0, 
 assert not args.scene or (version == 'v143' and sw * sh > SCENE_W * SCENE_H), '--scene is for 1.4.3 and above 1600x900'
 out_name = f'{w}x{h}-scene-{sw}x{sh}' if args.scene else f'{w}x{h}'
 assert 640 <= w <= 7680 and 360 <= h <= 4320, 'size out of range'
+assert not args.scene or version == 'v143', '--scene: only 1.4.3 renders its scene at TOTK_RENDER_RES'
+assert not args.scene or (64 <= sw <= 4096 and 64 <= sh <= 4096), 'scene size out of range (TOTK_RENDER_RES: 64..4096)'
 manifest = json.loads((root / f'extracted/{version}/romfs/index.json').read_text())
 assert manifest['status'] == 'pass'
 files = {f['path']: f for f in manifest['files']}
@@ -101,7 +104,7 @@ dta_at, graphics_at = size_field('DynamicTextureAllocatorMem'), size_field('Grap
 dta, graphics = (struct.unpack_from('<i', byml, a)[0] for a in (dta_at, graphics_at))
 assert (dta, graphics) == (DTA_KIB, GRAPHICS_KIB), (dta, graphics)
 extra = extra_kib(w, h, sw, sh)
-assert extra > 0, 'the output is not bigger than 1920x1080: no overlay needed'
+assert extra > 0, 'neither the output nor the scene is bigger than the shipped size: no overlay needed'
 struct.pack_into('<i', byml, dta_at, dta + extra)
 struct.pack_into('<i', byml, graphics_at, graphics + extra)
 original = zstd.decompress(raw, zstd_dict=dictionary)
