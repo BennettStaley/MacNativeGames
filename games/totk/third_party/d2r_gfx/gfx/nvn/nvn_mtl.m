@@ -2489,8 +2489,13 @@ static void wb_ent_free(wb_ent *e) { if (!e) return; if (e->obj) { defer_obj_rel
    the CPU. Its few bytes share a 16 KiB page with data the CPU writes every frame, so the page-granular dirty tracking always
    reported "CPU wrote since the render" and the pick never reached the game. Small targets therefore keep a copy of their own
    bytes: when those bytes are unchanged at write-back time, the CPU did not write this texture and the rendering is written
-   back. TOTK_WB_EXACT=0 restores the page-only decision. */
-enum { WB_SNAP_MAX = 4096 };
+   back. TOTK_WB_EXACT=0 restores the page-only decision.
+   TOTK's terrain tile normal maps (260x260 RG8, 9 levels, 209.5 KiB) are rendered by the GPU and sampled through another
+   texture object over the same memory, uploaded from the pool bytes: a skipped write-back left that tile's normal map
+   empty and the ground lit as if facing away from the sun (dark, with the tile's straight edges). Their pages were written
+   by the CPU (neighbouring data, or writes the dirty tracker could not name), their own bytes never: compared byte by byte
+   (targets up to 256 KiB), a walk near the reported spot skipped none of 244 write-backs instead of 12. */
+enum { WB_SNAP_MAX = 256 * 1024 };
 static int wb_exact_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_WB_EXACT"); v = !(e && !strcmp(e, "0")); } return v; }
 static uint64_t g_wb_exact_rescued;
 static void wb_snap(wb_ent *e) {
@@ -2597,6 +2602,11 @@ static void wb_write_list(wb_ent **list, int nl, int force) {
                                okl ? ln : "-", (unsigned long long)(okl ? lo2 : 0), (unsigned long long)(rec[q].page - (uintptr_t)t->mem)); shown++;
             }
             TILELOG(t, "writers since the render (%d records):%s", nr, line);
+        }
+        if (!fresh[i] && tilelog_match(t) && e->snap && e->snap_n == t->L.size) {   // which of its own bytes the CPU changed
+            const uint8_t *a = e->snap, *b = t->mem; size_t nd = 0, lo = 0, hi = 0, nz = 0;
+            for (size_t q = 0; q < e->snap_n; q++) if (a[q] != b[q]) { if (!nd++) lo = q; hi = q; nz += b[q] != 0; }
+            TILELOG(t, "own bytes changed since the render: %zu (offsets %#zx..%#zx, %zu now non-zero)", nd, lo, hi, nz);
         }
         if (!fresh[i]) {   // the CPU wrote it since: its bytes are newer
             if (++g_wb_skip_cpu <= 24) MLOG("[writeback] skipped (CPU wrote since the render) ser=%llu %ux%u nvnfmt=%#x lv%u", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels);
