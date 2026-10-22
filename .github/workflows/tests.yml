@@ -59,3 +59,7 @@ jobs:
         run: |
           cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all tests/test_actor_spawn.c -o "$RUNNER_TEMP/test-actor-spawn"
           "$RUNNER_TEMP/test-actor-spawn"
+      - name: Check the Spawn tab's list, search, favorites and recents with the undefined-behavior sanitizer
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all tests/test_spawn_list.c -o "$RUNNER_TEMP/test-spawn-list"
+          "$RUNNER_TEMP/test-spawn-list"
