@@ -51,3 +51,7 @@ jobs:
         run: |
           cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all tests/test_cheat_files.c -o "$RUNNER_TEMP/test-cheat-files"
           TMPDIR="$RUNNER_TEMP" "$RUNNER_TEMP/test-cheat-files"
+      - name: Check the community cheat list reader and the Cheats tab catalog with the undefined-behavior sanitizer
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all tests/test_cheat_catalog.c -o "$RUNNER_TEMP/test-cheat-catalog"
+          "$RUNNER_TEMP/test-cheat-catalog"
