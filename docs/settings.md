@@ -7,7 +7,7 @@ changes within a frame or two, except the few settings marked *after restart*. S
 
 | | |
 |---|---|
-| Mac | **⌘,**, **F1**, the app menu's **Settings…**, a controller's **Home** button (the Xbox button), or **Options and Menu** (View and Menu on Xbox) held together for a moment |
+| Mac | **⌘,**, **F1**, the app menu's **Settings…**, **L3 + R3** (both stick clicks) or **Options and Menu** (View and Menu on Xbox) held together for a moment, or a controller's **Home** button (on macOS 26 the Xbox button opens the system's Games overlay instead) |
 | iPad / iPhone | the **gear** at the top of the screen, a **three-finger tap**, a controller's **Home** button, **− and +** held together, or **Esc** / **⌘,** on a keyboard |
 
 On the Mac the menu is a sidebar inside the game window, so it works in full screen and the picture stays in view beside
