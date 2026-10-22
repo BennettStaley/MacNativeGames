@@ -4912,6 +4912,7 @@ static void shmap_load(void) {
 
 @interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, writes_depth, lay_ok; uint8_t drv_scanned[3];   /* drv_scanned (TOTK): driver segment c0 / c2 reads found by drv_scan in the MSL but missing from the reflection json */ /* lay_ok (TOTK): vertex MSL can write the layer (1) or not (-1), 0 = not checked yet; writes_depth (TOTK): the fragment function has a [[depth(...)]] output, so its pipeline needs a depth attachment */ const char *builtin; uint64_t logged; char key[80]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint16_t texture_slots[NVN_REFL_MAXB]; uint8_t texture_count, texture_plan_ready;
+    uint32_t cb_ext[NVN_REFL_MAXB];   // TOTK: bytes each user uniform binding can read, 0 = unknown / off (cb_extent_scan)
     // 上次编好的参数缓冲
     // The argument buffer encoded last time
     arg_epoch_key ab_epoch; int ab_epoch_ok;
@@ -5243,6 +5244,57 @@ static void refl_mark_stores(NvShader *o, NSArray *bs, NSString *src) {
         if (msl_stores_through(src, d[@"msl_name"])) b->rw = 1;
     }
 }
+/* TOTK (2026-10-22, from upstream PR #159 / nxnative b0a9079): how far into each user uniform slot the shader reads
+   (o->cb_ext, bytes; 0 = unknown, the whole binding). A renamed inline update makes a private copy of a uniform binding for
+   each draw that reads it (upd_shadow), and the game binds whole 64 KiB blocks it updates in part (upstream measured about
+   80 copies and 3.8 MB a frame on 1.4.3). The copy only needs the bytes the shader can read. Bounded only when every use of
+   the binding's name in the MSL is a read "<name>)._m0[<integer>]" of the translator's "float4 _m0[4096]" block, or its
+   declaration in the argument struct; anything else (a computed / dynamic index, the block passed to a function or taken
+   by reference, another block layout, no MSL source) keeps the whole binding. TOTK_CB_EXTENT=1: on (default off). */
+static int cb_extent_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_CB_EXTENT"); v = e && !strcmp(e, "1"); if (v) MLOG("TOTK_CB_EXTENT=1：uniform 副本只复制着色器读到的范围 | uniform copies take only the bytes the shader reads"); } return v; }
+static uint32_t cb_extent_of(const char *s, const char *name, const char *type) {
+    if (!s || !name || !type || !*name) return 0;
+    char decl[96]; snprintf(decl, sizeof decl, "struct %s\n{\n    float4 _m0[4096];\n};", type);
+    if (!strstr(s, decl)) return 0;
+    size_t n = strlen(name); long top = -1;
+    for (const char *p = strstr(s, name); p; p = strstr(p + n, name)) {
+        char before = p > s ? p[-1] : ' ', after = p[n];
+        if (isalnum((unsigned char)before) || before == '_' || isalnum((unsigned char)after) || after == '_') continue;   // part of a longer name (fp_c1 in fp_c11)
+        const char *q = p + n;
+        if (!strncmp(q, ")._m0[", 6)) {
+            q += 6; char *end; unsigned long idx = strtoul(q, &end, 10);
+            if (end == q || *q < '0' || *q > '9') return 0;   // computed index
+            if (*end == 'u') end++;
+            if (*end != ']' || idx >= 4096) return 0;
+            if ((long)idx > top) top = (long)idx;
+            continue;
+        }
+        while (*q == ' ') q++;
+        if (!strncmp(q, "[[id(", 5)) continue;   // its declaration in the argument struct
+        return 0;
+    }
+    return top < 0 ? 16 : (uint32_t)(top + 1) * 16;
+}
+static void cb_extent_scan(NvShader *o, NSArray *bs, NSString *src) {
+    if (!cb_extent_on() || ![bs isKindOfClass:[NSArray class]] || (int)bs.count != o->rf.nb) return;   // nvn_refl_from_json keeps the json order 1:1
+    const char *s = src.UTF8String; if (!s) return;
+    for (int i = 0; i < o->rf.nb; i++) {
+        if (o->rf.b[i].kind != NVN_RB_CBUF) continue;
+        NSDictionary *d = bs[(NSUInteger)i]; if (![d isKindOfClass:[NSDictionary class]]) continue;
+        NSString *name = d[@"msl_name"], *type = d[@"msl_type"];
+        if (![name isKindOfClass:[NSString class]] || ![type isKindOfClass:[NSString class]] || ![type hasPrefix:@"constant "] || ![type hasSuffix:@"*"] || type.length < 11) continue;
+        NSString *t = [[type substringWithRange:NSMakeRange(9, type.length - 10)] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        o->cb_ext[i] = cb_extent_of(s, name.UTF8String, t.UTF8String);
+    }
+}
+// Bytes of the bound uniform range [addr, addr + size) the shader's binding i can read: its extent rounded up to 256 bytes (so
+// shaders reading nearly the same part of a block share one copy), never more than the binding; the whole binding if unknown.
+static inline uint64_t cb_read_len(const NvShader *sh, int i, uint64_t size) {
+    uint64_t e = i >= 0 && i < NVN_REFL_MAXB ? sh->cb_ext[i] : 0;
+    if (!e) return size;
+    e = (e + 255u) & ~(uint64_t)255u;
+    return e < size ? e : size;
+}
 static int drv_scan(NvShader *o, NSString *src) {   // src: the full MSL (iOS does not keep it in o->src)
     const char *s = src.UTF8String; if (!s) return 0;
     int nunfill = 0;
@@ -5323,7 +5375,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
     o->fn = [lib newFunctionWithName:j[@"entry"]]; o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key);
     NSString *full = rt ? [NSString stringWithContentsOfFile:rt_src encoding:NSUTF8StringEncoding error:nil] : nil;
     o->writes_depth = full && [full rangeOfString:@"[[depth("].location != NSNotFound;
-    if (full) { o->src_path = rt_src; drv_scan(o, full); refl_mark_stores(o, j[@"bindings"], full); }   // TOTK: scan before iOS drops the source (NPC-culling fix needs it there too); rw from the MSL's stores
+    if (full) { o->src_path = rt_src; drv_scan(o, full); refl_mark_stores(o, j[@"bindings"], full); cb_extent_scan(o, j[@"bindings"], full); }   // TOTK: scan before iOS drops the source (NPC-culling fix needs it there too); rw from the MSL's stores
     /* TOTK (2026-10-17): the MSL is read again from its file when a variant needs it (sh_src), on the Mac too -- keeping
        every source cost 255 MB of strings (7,691 of them) in a long session (analysis/long18 heap). TOTK_KEEP_MSL=1 keeps
        them in memory (the Mac's behaviour before). */
@@ -7893,7 +7945,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             void *mb; uint64_t mo, gpu;
             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
             use_rec("buf", u->addr, u->size, 0, NULL);
-            uint64_t ren = g_nupd ? upd_shadow(u->addr, u->size) : 0;   // TOTK: renamed inline updates (see upd_shadow)
+            uint64_t ren = g_nupd ? upd_shadow(u->addr, bl ? u->size : cb_read_len(sh, i, u->size)) : 0;   // TOTK: renamed inline updates (see upd_shadow); with TOTK_CB_EXTENT=1 only the bytes the shader reads (cb_extent_scan; the whole binding while the pass dump reads it back)
             if (ren) { gpu = ren; if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) RED_ONCE(58, "UI 矩阵修补读的是内存，跳过了含内联更新的 uniform 副本"); }
             else if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
             else { const usnap_t *sc = usnap_find(u->addr, u->size ? u->size : 1); if (sc) gpu = sc->gpu + (u->addr - sc->lo); }   // TOTK: contents as of the submit call
@@ -14574,6 +14626,30 @@ int mtl_probe_drv_c0(void) {
         if (c1_reads_bounded(@"float a = (*spvDescriptorSet0.cp_c1)._m0[32].x;", 256)) MDIE("c1 probe: an index past the data and its zero pad was accepted"); checked++;
         if (c1_reads_bounded(@"float a = (*spvDescriptorSet0.fp_c1)._m0[ 3].x;", 256)) MDIE("c1 probe: an index that is not a plain integer was accepted"); checked++;
         if (c1_reads_bounded(nil, 256)) MDIE("c1 probe: a shader without source was accepted"); checked++;
+    }
+    {   // uniform read extents (cb_extent_of, TOTK_CB_EXTENT): plain indices only, the longer name fp_c11 is not fp_c1, anything else is unbounded
+        const char *blk = "struct _16\n{\n    float4 _m0[4096];\n};\nstruct spvDescriptorSetBuffer0\n{\n    constant _16* fp_c1 [[id(0)]];\n    constant _16* fp_c11 [[id(1)]];\n};\n";
+        char s[1024];
+        snprintf(s, sizeof s, "%sfloat a = (*spvDescriptorSet0.fp_c1)._m0[9].x; float b = (*spvDescriptorSet0.fp_c1)._m0[31u].y; float c = (*spvDescriptorSet0.fp_c11)._m0[900].x;", blk);
+        if (cb_extent_of(s, "fp_c1", "_16") != 32 * 16) MDIE("cb extent probe: plain indices gave %u", cb_extent_of(s, "fp_c1", "_16")); checked++;
+        if (cb_extent_of(s, "fp_c11", "_16") != 901 * 16) MDIE("cb extent probe: the longer name was mixed up"); checked++;
+        snprintf(s, sizeof s, "%sfloat a = (*spvDescriptorSet0.fp_c1)._m0[int(_997)].x;", blk);
+        if (cb_extent_of(s, "fp_c1", "_16")) MDIE("cb extent probe: a computed index was bounded"); checked++;
+        snprintf(s, sizeof s, "%sfloat a = (*spvDescriptorSet0.fp_c1)._m0[3].x; float b = (*spvDescriptorSet0.fp_c1)._m0[_5].y;", blk);
+        if (cb_extent_of(s, "fp_c1", "_16")) MDIE("cb extent probe: a dynamic index after a plain one was bounded"); checked++;
+        snprintf(s, sizeof s, "%sfloat a = f((*spvDescriptorSet0.fp_c1));", blk);
+        if (cb_extent_of(s, "fp_c1", "_16")) MDIE("cb extent probe: the block passed whole was bounded"); checked++;
+        snprintf(s, sizeof s, "%sconstant _16& r = *spvDescriptorSet0.fp_c1; float a = r._m0[2].x;", blk);
+        if (cb_extent_of(s, "fp_c1", "_16")) MDIE("cb extent probe: the block taken by reference was bounded"); checked++;
+        snprintf(s, sizeof s, "struct _16\n{\n    uint4 _m0[4096];\n};\nfloat a = (*spvDescriptorSet0.fp_c1)._m0[2].x;");
+        if (cb_extent_of(s, "fp_c1", "_16")) MDIE("cb extent probe: a block of another layout was bounded"); checked++;
+        snprintf(s, sizeof s, "%sfloat a = (*spvDescriptorSet0.fp_c1)._m0[4096].x;", blk);
+        if (cb_extent_of(s, "fp_c1", "_16")) MDIE("cb extent probe: an index past the block was bounded"); checked++;
+        snprintf(s, sizeof s, "%sfloat a = 1.0;", blk);
+        if (cb_extent_of(s, "fp_c1", "_16") != 16) MDIE("cb extent probe: an unread binding"); checked++;
+        if (cb_extent_of(NULL, "fp_c1", "_16")) MDIE("cb extent probe: no source was bounded"); checked++;
+        NvShader *t = [NvShader new]; t->cb_ext[0] = 32 * 16;
+        if (cb_read_len(t, 0, 65536) != 512 || cb_read_len(t, 0, 300) != 300 || cb_read_len(t, 1, 65536) != 65536) MDIE("cb extent probe: copy length"); checked++;
     }
     NvProg *pr = [NvProg new]; pr->sh[5] = cs;
     prog_t p = {0}; p.serial = 0xfffffd00; serial_put(p.serial, pr);
