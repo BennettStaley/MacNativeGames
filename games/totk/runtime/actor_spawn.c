@@ -1,7 +1,9 @@
 /* Actor spawner: creates any actor (items, weapons, enemies, Zonai devices, materials) next to the player by calling the
    game's own engine::actor::ActorMgr::requestCreateActorAsync, the call the game uses to place actors itself. No code is
-   patched (so it can work on iOS too): requests wait in a queue and run on the game's frame-end thread, the point where
-   world_survey.c already calls game code (runtime_survey_tick, after the game's frame-end GPU wait).
+   patched (so it works on iOS too): requests wait in a queue and run on the game's frame-end thread, the point where
+   world_survey.c already calls game code (runtime_survey_tick, after the game's frame-end GPU wait). That tick is set up
+   in every 1.4.3 session (loader.c runtime_frame_controller_return_pc); the survey's own commands stay test-only, and in
+   normal play only the menu's Spawn tab queues requests (the input file's "spawn" needs TOTK_SURVEY=1).
 
    1.4.3 addresses (game_version.h, GAME_SPAWN_*), found from 1.0.0, whose symbols are public (totk-lotuskit
    syms/exking/engine/actor/ActorMgr.py, from dt-12345/totk_syms):
@@ -31,6 +33,10 @@
 #endif
 
 _Atomic int runtime_spawn_waiting;
+static _Atomic int spawn_commands;   /* the input file's "spawn" lines: test profiles only (world_survey.c) */
+static _Atomic(RuntimeSpawnObserver) spawn_observer;
+void runtime_spawn_allow_commands(void) { atomic_store(&spawn_commands, 1); }
+void runtime_spawn_observe(RuntimeSpawnObserver fn) { atomic_store(&spawn_observer, fn); }
 #ifdef SPAWN_SUPPORTED
 static pthread_mutex_t spawn_lock = PTHREAD_MUTEX_INITIALIZER;
 static SpawnQueue spawn_queue;
@@ -63,9 +69,21 @@ int runtime_spawn_actor(const char *name, int count) {
 
 const char *runtime_spawn_error(int code) { return spawn_error_text(code); }
 
+int runtime_spawn_available(void) {
+#ifndef SPAWN_SUPPORTED
+    return SPAWN_ERR_UNSUPPORTED;
+#else
+    return atomic_load(&spawn_enabled) ? SPAWN_OK : SPAWN_ERR_DISABLED;
+#endif
+}
+
 /* "spawn <name> [count]" from the test input file (input.c), next to world_survey's "survey" commands. */
 int runtime_spawn_command(const char *line) {
     if (strncmp(line, "spawn ", 6)) return 0;
+    if (!atomic_load(&spawn_commands)) {
+        fprintf(stderr, "[spawn] rejected: the input file's spawn needs TOTK_SURVEY=1 on a test profile (players use the Spawn tab)\n");
+        return 1;
+    }
     char name[SPAWN_NAME_MAX + 1] = {0}; int count = 1, used = 0;
     if (!(sscanf(line, "spawn %96s %d %n", name, &count, &used) == 2 && used && !line[used])) {
         count = 1; used = 0;
@@ -81,7 +99,7 @@ int runtime_spawn_command(const char *line) {
 }
 
 #ifndef SPAWN_SUPPORTED
-void runtime_spawn_init(Module *m) { (void)m; }
+int runtime_spawn_init(Module *m) { (void)m; return 0; }
 void runtime_spawn_tick(uintptr_t player, uint64_t frame) { (void)player; (void)frame; }
 #else
 typedef struct {
@@ -119,25 +137,30 @@ static const char *result_text(uint32_t r) {
     return r < sizeof names / sizeof *names ? names[r] : "?";
 }
 
-/* Enabled with the survey (agent test profile, world_survey.c checks it) until the spawn tab exists: the frame-end tick
-   that runs the queue is found only while TOTK_SURVEY=1 on 1.4.3 (loader.c, runtime_frame_controller_return_pc). */
-void runtime_spawn_init(Module *m) {
+/* Every 1.4.3 session: the call is only made for requests the player (the Spawn tab) or a test queued. */
+int runtime_spawn_init(Module *m) {
     static const uint32_t entry[] = {0xa9ba7bfd, 0xa9016ffc, 0x910003fd, 0xa90267fa, 0xa9035ff8, 0xa90457f6, 0xa9054ff4};
     if (strcmp(m->name, "main") || GAME_SPAWN_REQUEST_CREATE + sizeof entry > m->text_end || GAME_SPAWN_ACTOR_MGR + 8u > m->size ||
         memcmp(m->base + GAME_SPAWN_REQUEST_CREATE, entry, sizeof entry)) {
         fprintf(stderr, "[spawn] off: requestCreateActorAsync entry does not match " TOTK_GAME_VERSION "\n");
-        return;
+        return 0;
     }
     request_create = (RequestCreate)(void *)(m->base + GAME_SPAWN_REQUEST_CREATE);
     actor_mgr_slot = (void **)(void *)(m->base + GAME_SPAWN_ACTOR_MGR);
     atomic_store(&spawn_enabled, 1);
-    fprintf(stderr, "[spawn] enabled: spawn <actor name> [count] on the game's frame-end thread\n");
+    fprintf(stderr, "[spawn] enabled: the Spawn tab's requests run on the game's frame-end thread\n");
+    return 1;
 }
 
 static void spawn_one(const SpawnRequest *r, const float base[3], float fx, float fz, uint64_t frame) {
     static BlackboardInit blackboard;   /* frame-end thread only; the call copies what it needs */
     void *mgr = *actor_mgr_slot;
-    if (!mgr) { fprintf(stderr, "[spawn] name=%s status=no_actor_mgr frame=%llu\n", r->name, (unsigned long long)frame); return; }
+    RuntimeSpawnObserver observer = atomic_load(&spawn_observer);
+    if (!mgr) {
+        fprintf(stderr, "[spawn] name=%s status=no_actor_mgr frame=%llu\n", r->name, (unsigned long long)frame);
+        if (observer) observer(r->name, r->count, 0, "the game's actor manager is not up yet");
+        return;
+    }
     unsigned created = 0; uint32_t last = 0;
     for (int k = 0; k < r->count; ++k) {
         float off[3];
@@ -160,6 +183,11 @@ static void spawn_one(const SpawnRequest *r, const float base[3], float fx, floa
     }
     fprintf(stderr, "[spawn] name=%s requested=%d created=%u result=%u(%s) at=%.2f,%.2f,%.2f frame=%llu\n", r->name, r->count,
             created, last, result_text(last), base[0], base[1], base[2], (unsigned long long)frame);
+    if (observer) {
+        char why[96];
+        snprintf(why, sizeof why, "the game refused it (%s)", result_text(last));
+        observer(r->name, r->count, (int)created, (int)created == r->count ? NULL : why);
+    }
 }
 
 /* Frame-end thread (world_survey.c runtime_survey_tick). player: the Player actor, or 0 when there is none yet. */

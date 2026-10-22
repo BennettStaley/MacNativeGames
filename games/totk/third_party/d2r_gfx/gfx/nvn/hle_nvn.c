@@ -2299,8 +2299,12 @@ static void find_game_sys(void) {
         if (f0 == fp) return; fp = f0;
     }
 }
+/* runtime/loader.c (weak: GPU probes link without it): 0 where the system object's layout differs (1.4.3), so the report
+   and "flag framewait" below leave it alone; the frame-end tick (runtime_survey_tick) only needs +runtime_survey_sync. */
+extern int runtime_frame_controller_layout_known(void) __attribute__((weak));
+static int game_sys_layout_known(void) { return !runtime_frame_controller_layout_known || runtime_frame_controller_layout_known(); }
 static void game_work_tick(uint64_t frame) {
-    if (!g_game_sys) return;
+    if (!g_game_sys || !game_sys_layout_known()) return;
     static double win[300]; static int n; static uint64_t over33;
     int64_t t = *(volatile int64_t *)(uintptr_t)(g_game_sys + 0x118); double ms = t / 19200.0;
     if (ms >= 0 && ms < 10000 && n < 300) win[n++] = ms;   // loading frames leave the frame start unset (absolute tick) if (ms > 33.333) over33++;
@@ -2318,7 +2322,7 @@ static void game_work_tick(uint64_t frame) {
 /* TOTK diagnostic "flag framewait 0|1": the game's frame-end mode request (system object +0x224: 2 = no per-frame wait for the
    GPU, 1 = wait), applied by the game at the start of its next frame (main+0x8f69e0). Measurement only. */
 void nvn_set_framewait(int on) {
-    if (!g_game_sys) { LOG("【红】[flag] framewait：游戏系统对象还没找到"); return; }
+    if (!g_game_sys || !game_sys_layout_known()) { LOG("【红】[flag] framewait：游戏系统对象还没找到（或此版本布局不同）"); return; }
     *(volatile uint8_t *)(uintptr_t)(g_game_sys + 0x224) = on ? 1 : 2;
     LOG("[flag] framewait = %d（写 +0x224 = %d）", on, on ? 1 : 2);
 }

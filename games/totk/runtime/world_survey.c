@@ -256,6 +256,9 @@ static uintptr_t player_actor(void) {
     return 0;
 }
 void runtime_survey_init(Module *m) {
+    /* The actor spawner (actor_spawn.c, 1.4.3) uses this frame-end tick in every session: it needs the player, found
+       through the scene slot, and nothing else of the survey. pos / move stay behind TOTK_SURVEY below. */
+    if (!strcmp(m->name, "main") && SCENE_SLOT + 8u <= m->size && runtime_spawn_init(m)) survey_main = (uintptr_t)m->base;
     const char *enabled = getenv("TOTK_SURVEY");
     if (!enabled || strcmp(enabled, "1")) return;
     const char *owner = getenv("TOTK_SLOT_OWNER"), *profile = getenv("TOTK_PROFILE_DIR");
@@ -275,7 +278,7 @@ void runtime_survey_init(Module *m) {
     survey_force = (void (*)(void *, const float *, uint32_t))(m->base + FORCE_MATRIX);
     survey_enabled = 1;
     fprintf(stderr, "[survey] enabled: test profile, game frame-end commands, original forceSetMatrix\n");
-    runtime_spawn_init(m);   /* the spawner runs on the same frame-end tick (actor_spawn.c) */
+    runtime_spawn_allow_commands();   /* the input file's "spawn" lines, next to "survey" (actor_spawn.c) */
 }
 static void report(const char *tag, const char *status, uint64_t frame, uintptr_t actor) {
     float xyz[3];

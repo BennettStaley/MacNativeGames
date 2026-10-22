@@ -476,12 +476,22 @@ uintptr_t runtime_frame_controller_return_pc(void) {
 #ifdef GAME_BOTW
  return 0; /* no survey on Breath of the Wild */
 #elif defined(TOTK_GAME_V143)
- /* The older graphics diagnostic reads the pre-1.4 controller layout. The survey only needs the system object (caller's x19
-    at x29 + 0x38, same frame as 1.2.1) for its frame-end fence, so 1.4.3 finds it only while TOTK_SURVEY is on. */
+ /* The frame-end tick (world_survey.c) needs the system object (caller's x19 at x29 + 0x38, same frame as 1.2.1) for its
+    frame-end fence: the actor spawner (the menu's Spawn tab) runs there in every session, the survey with TOTK_SURVEY=1.
+    The older graphics diagnostic that reads the pre-1.4 controller layout is skipped (runtime_frame_controller_layout_known). */
  const char *survey=getenv("TOTK_SURVEY");
- return survey&&!strcmp(survey,"1")?(uintptr_t)modules[0].base+GAME_ADDR(0x8f6cbc):0;
+ extern int runtime_spawn_available(void);
+ return (survey&&!strcmp(survey,"1"))||runtime_spawn_available()==0?(uintptr_t)modules[0].base+GAME_ADDR(0x8f6cbc):0;
 #else
  return (uintptr_t)modules[0].base + GAME_ADDR(0x8f6cbc);
+#endif
+}
+/* hle_nvn.c's frame-work report and "flag framewait" read the system object's pre-1.4 layout (+0x118, +0x222, +0x248). */
+int runtime_frame_controller_layout_known(void) {
+#if defined(TOTK_GAME_V143) || defined(GAME_BOTW)
+ return 0;
+#else
+ return 1;
 #endif
 }
 uint64_t runtime_image_bytes(void) { uint64_t total=0;for(unsigned i=0;i<NM;i++)total+=modules[i].key_off;return page_up(total); }

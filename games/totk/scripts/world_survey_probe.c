@@ -4,7 +4,8 @@
 #include <unistd.h>
 static unsigned checks, moves;
 _Atomic int runtime_spawn_waiting;   /* the spawner (actor_spawn.c) is not part of this probe */
-void runtime_spawn_init(Module *m) { (void)m; }
+int runtime_spawn_init(Module *m) { (void)m; return 0; }
+void runtime_spawn_allow_commands(void) { }
 void runtime_spawn_tick(uintptr_t player, uint64_t frame) { (void)player; (void)frame; }
 _Noreturn void runtime_fail(const char *why) { fprintf(stderr, "probe runtime failure: %s\n", why); _exit(2); }
 static void check(int ok, const char *why) { checks++; if (!ok) { fprintf(stderr, "FAIL: %s\n", why); exit(1); } }
