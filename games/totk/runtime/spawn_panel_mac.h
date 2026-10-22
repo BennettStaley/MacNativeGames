@@ -1,7 +1,8 @@
 /* Tools › Spawn in the Mac settings sidebar (included by runtime/settings_panel_mac.h only): a category column (Favorites,
    Recents, Creatures, NPCs, Items, Weapons, Armor, Zonai, Objects), a search field over every category, and the actors
    of the app's actor list (runtime/spawn_list.h; about 10,000 Objects, so the list is a recycling NSTableView). Each row
-   shows the display name and, dimmed, the internal name; ★ marks a favorite. Amount 1-20. A, Return or a click spawns
+   shows the display name and, dimmed, the internal name; ★ marks a favorite. Amount 1-20, and Place (In front, Above,
+   Far, At Link's feet; P, or ← on the category column, cycles it). A, Return or a click spawns
    (runtime/actor_spawn.c, 1.4.3), Y or F marks a favorite, every spawn goes to Recents; both are kept in spawn-picks.txt
    beside the profile. A toast in the game window's corner says what was spawned or why not (TOTKSpawnToast).
    Levels inside the tab: the category column, then the list; B / Escape goes back one level. The iPhone / iPad version is
@@ -64,7 +65,7 @@ static NSString *const SPAWN_LIST_PATH = @"build/actor_list.tsv";   /* in the ga
 - (void)step:(int)dir;           /* 0 = A / Return */
 - (void)page:(int)dir;
 - (BOOL)key:(NSEvent *)e;        /* YES: handled */
-- (void)button:(char)b;          /* 'X' Show unnamed, 'Y' favorite */
+- (void)button:(char)b;          /* 'X' Show unnamed, 'Y' favorite, 'L' next Place */
 - (void)showFocus:(BOOL)active;  /* active: the menu's focus is in this tab (not on the section bar) */
 - (NSString *)hint;
 @end
@@ -76,6 +77,7 @@ static NSString *const SPAWN_LIST_PATH = @"build/actor_list.tsv";   /* in the ga
     NSSearchField *search;
     NSStepper *amountStepper; NSTextField *amountLabel, *status, *empty;
     NSButton *unnamedBox;
+    NSPopUpButton *placePopup;
     SpawnList list; SpawnPicks picks; BOOL loaded, active;
     int category, level, amount;     /* level 0: the category column, 1: the list */
     int *shown, nshown;
@@ -101,6 +103,10 @@ static void spawn_observed(const char *name, int requested, int created, const c
     amountLabel = [NSTextField labelWithString:@"× 1"]; amountLabel.font = [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold];
     [amountLabel.widthAnchor constraintEqualToConstant:36].active = YES;
     NSTextField *amountName = [NSTextField labelWithString:@"Amount"]; amountName.textColor = NSColor.secondaryLabelColor; amountName.font = [NSFont systemFontOfSize:11];
+    placePopup = [NSPopUpButton new]; placePopup.refusesFirstResponder = YES; placePopup.controlSize = NSControlSizeSmall;
+    placePopup.font = [NSFont systemFontOfSize:11]; placePopup.target = self; placePopup.action = @selector(placeChanged:);
+    for (int i = 0; i < SPAWN_PLACE_COUNT; i++) [placePopup addItemWithTitle:@(SPAWN_PLACE_NAMES[i])];
+    placePopup.toolTip = @"Where spawns appear (P, or ← on the categories, changes it)";
     unnamedBox = [NSButton checkboxWithTitle:@"Show unnamed" target:self action:@selector(unnamedClicked:)];
     unnamedBox.font = [NSFont systemFontOfSize:11]; unnamedBox.refusesFirstResponder = YES;
     status = [NSTextField wrappingLabelWithString:@""]; status.font = [NSFont systemFontOfSize:11]; status.textColor = NSColor.secondaryLabelColor;
@@ -111,7 +117,7 @@ static void spawn_observed(const char *name, int requested, int created, const c
     tableScroll = [self makeTable:@"actor"]; table = tableScroll.documentView; table.rowHeight = SPAWN_ROW_HEIGHT;
     table.usesAlternatingRowBackgroundColors = NO;
 
-    for (NSView *v in @[search, amountName, amountStepper, amountLabel, categoryScroll, tableScroll, unnamedBox, status, empty]) {
+    for (NSView *v in @[search, placePopup, amountName, amountStepper, amountLabel, categoryScroll, tableScroll, unnamedBox, status, empty]) {
         v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v];
     }
     [NSLayoutConstraint activateConstraints:@[
@@ -119,7 +125,8 @@ static void spawn_observed(const char *name, int requested, int created, const c
         [amountLabel.trailingAnchor constraintEqualToAnchor:self.trailingAnchor], [amountLabel.centerYAnchor constraintEqualToAnchor:search.centerYAnchor],
         [amountStepper.trailingAnchor constraintEqualToAnchor:amountLabel.leadingAnchor constant:-2], [amountStepper.centerYAnchor constraintEqualToAnchor:search.centerYAnchor],
         [amountName.trailingAnchor constraintEqualToAnchor:amountStepper.leadingAnchor constant:-4], [amountName.centerYAnchor constraintEqualToAnchor:search.centerYAnchor],
-        [search.trailingAnchor constraintEqualToAnchor:amountName.leadingAnchor constant:-12],
+        [placePopup.trailingAnchor constraintEqualToAnchor:amountName.leadingAnchor constant:-12], [placePopup.centerYAnchor constraintEqualToAnchor:search.centerYAnchor],
+        [search.trailingAnchor constraintEqualToAnchor:placePopup.leadingAnchor constant:-8],
         [categoryScroll.topAnchor constraintEqualToAnchor:search.bottomAnchor constant:8], [categoryScroll.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
         [categoryScroll.widthAnchor constraintEqualToConstant:SPAWN_CATEGORY_WIDTH], [categoryScroll.bottomAnchor constraintEqualToAnchor:unnamedBox.topAnchor constant:-8],
         [tableScroll.topAnchor constraintEqualToAnchor:categoryScroll.topAnchor], [tableScroll.leadingAnchor constraintEqualToAnchor:categoryScroll.trailingAnchor constant:8],
@@ -154,6 +161,7 @@ static void spawn_observed(const char *name, int requested, int created, const c
         int n = spawn_list_load(&list, SPAWN_LIST_PATH.fileSystemRepresentation);
         fprintf(stderr, "[spawn] actor list: %d actors from %s\n", n, SPAWN_LIST_PATH.UTF8String);
         spawn_picks_load(&picks);
+        [self setPlace:picks.place save:NO];
         free(shown); shown = malloc(sizeof *shown * (size_t)(list.count ? list.count : 1));
     }
     [self filter];
@@ -275,10 +283,18 @@ static void spawn_observed(const char *name, int requested, int created, const c
     amount = MAX(1, MIN(SPAWN_COUNT_MAX, n));
     amountStepper.integerValue = amount; amountLabel.stringValue = [NSString stringWithFormat:@"× %d", amount];
 }
+- (void)setPlace:(int)p save:(BOOL)save {
+    p = ((p % SPAWN_PLACE_COUNT) + SPAWN_PLACE_COUNT) % SPAWN_PLACE_COUNT;
+    picks.place = p; runtime_spawn_set_placement(p); [placePopup selectItemAtIndex:p];
+    if (!save) return;
+    if (spawn_picks_save(&picks)) fprintf(stderr, "[spawn] could not save spawn-picks.txt\n");
+    status.stringValue = [NSString stringWithFormat:@"Spawn place: %s", SPAWN_PLACE_NAMES[p]];
+}
+- (void)placeChanged:(NSPopUpButton *)b { [self setPlace:(int)b.indexOfSelectedItem save:YES]; [self.window makeFirstResponder:menu]; }
 - (void)amountChanged:(NSStepper *)s { [self setAmount:(int)s.integerValue]; [self.window makeFirstResponder:menu]; }
 - (void)step:(int)dir {
     if (level == 0) {
-        if (dir < 0) return;
+        if (dir < 0) { [self setPlace:picks.place + 1 save:YES]; return; }   /* ← on the categories: the next Place */
         level = 1; if (table.selectedRow < 0) [self selectRow:0];
         [self showFocus:YES]; return;
     }
@@ -288,6 +304,7 @@ static void spawn_observed(const char *name, int requested, int created, const c
 - (void)button:(char)b {
     if (b == 'X') { unnamedBox.state = unnamedBox.state == NSControlStateValueOn ? NSControlStateValueOff : NSControlStateValueOn; [self unnamedClicked:unnamedBox]; }
     else if (b == 'Y') [self toggleFavorite];
+    else if (b == 'L') [self setPlace:picks.place + 1 save:YES];
 }
 - (void)unnamedClicked:(NSButton *)b { (void)b; status.stringValue = @""; [self filter]; [self.window makeFirstResponder:menu]; }
 - (void)toggleFavorite {
@@ -361,13 +378,14 @@ static void spawn_observed(const char *name, int requested, int created, const c
             if (!e.isARepeat) [self toggleFavorite]; return YES;
     case 16: if (!e.isARepeat) [self toggleFavorite]; return YES;  /* Y */
     case 32: if (!e.isARepeat) [self button:'X']; return YES;      /* U: Show unnamed */
+    case 35: if (!e.isARepeat) [self button:'L']; return YES;      /* P: Place */
     case 27: case 78: [self setAmount:amount - 1]; return YES;     /* - */
     case 24: case 69: [self setAmount:amount + 1]; return YES;     /* = + */
     default: return NO;
     }
 }
 - (NSString *)hint {
-    return @"↑↓ choose   → list   ←→ amount   Return spawn   F favorite   U unnamed   / search   Esc back\n"
-           "Controller: D-pad, A spawn, ←→ amount, Y favorite, X unnamed, LT RT page, B back";
+    return @"↑↓ choose   → list   ←→ amount   Return spawn   F favorite   P place   U unnamed   / search   Esc back\n"
+           "Controller: D-pad, A spawn, ←→ amount, Y favorite, ← on categories place, X unnamed, LT RT page, B back";
 }
 @end
