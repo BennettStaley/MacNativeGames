@@ -871,6 +871,7 @@ def step_update_data(tree, game, update, keys, logs, *, version='v112', mod=None
         jobs += [('make_output_res_overlay.py', [canvas, '--scene', scene]) for canvas in ('2560x1440', '1920x1080')
                  for scene in ('1920x1080', '2560x1440')]
         jobs += [('make_output_res_overlay.py', ['3840x2160', '--scene', '2560x1440'])]   # the settings' 4K headroom (Mac, 16 GB+)
+        jobs += [('prepare_actor_list.py', [])]   # the spawner's actor list from this RomFS (build/v143/actor_list.tsv, never committed)
     for n, (script, arguments) in enumerate(jobs):
         if heapdef and script == 'make_output_res_overlay.py':   # every variant of the file keeps the mod's heap sizes
             arguments = [*arguments, '--heapdef', heapdef]
@@ -1413,6 +1414,9 @@ def step_app(tree, out, logs, *, version="v0", store=None, game='totk', cheats=N
         if not (tree / f'extracted/{version}/aoc/{index}/index.json').is_file():
             continue
         files += [f'extracted/{version}/aoc/{index}/romfs.bin', f'extracted/{version}/aoc/{index}/runtime-index.bin']
+    actors = tree / f'build/{version}/actor_list.tsv'   # the spawner's actor list (scripts/prepare_actor_list.py), when built
+    if actors.is_file():
+        clone(actors, res / 'build/actor_list.tsv')
     for rel in files:
         clone(tree / rel, res / rel)
     clone(tree / 'prebuilt/macos-arm64/totk_xlate', res / 'build/shader-service/totk_xlate')   # where totk_shader_rt.m looks for it
