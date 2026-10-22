@@ -399,7 +399,8 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     if (refused.count) {
         NSButton *show = [self cheatsButton:cheatsUnavailableShown ? @"Hide" : @"Show" action:@selector(toggleCheatsUnavailable)];
         [self addCheatsRow:[self cheatsRow:[NSString stringWithFormat:@"%lu not available here", (unsigned long)refused.count]
-                                    detail:@"They patch the game's code in a way this port cannot follow (under a button condition, or code it rewrote). Show says why for each."
+                                    detail:cheatsUnavailableShown ? @"They patch the game's code in a way this port cannot follow: under a button condition, or where the port patches the game itself."
+                                                           : @"They patch the game's code in a way this port cannot follow. Show says why for each."
                                      color:nil control:show] id:CHEATS_UNAVAILABLE_ROW];
         for (NSNumber *n in cheatsUnavailableShown ? refused : @[]) {
             RuntimeCheatInfo c; runtime_cheats_info(n.intValue, &c);

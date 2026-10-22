@@ -33,7 +33,7 @@ archive, key 4's fit-to-window step, `--mod` code patches), plus upstream PRs #1
 | Graphics | FOV, AA (game / off / FXAA / SMAA), CAS sharpening, anisotropic filtering, LOD bias, frame interpolation, bloom, depth of field, lens flare, cave fog, shadow resolution (live), render distance | Tested; fog only affects caves, render distance only cuts below 100 % |
 | World / interface / controls | Time of day speed, frame rate limit (also on display-paced 120 Hz), Hide HUD (F2), readout detail (avg / 1 % low), shader counter (compiling / new / total), camera speed, face buttons, Button prompts (Switch / Xbox / PlayStation via icon mods) | Tested |
 | **Mods** ([docs](docs/mods.md), [browser](docs/mod-browser.md)) | One folder per mod (Yuzu / Ryujinx layout), load order, a GameBanana browser in the Mods tab, the 1.4.3 size table rebuilt for mods, old-version and code-patch mods flagged | Tested with Defogger and Xbox UI for v1.4.3 |
-| **Cheats** ([docs](docs/settings.md#cheats)) | Atmosphère cheat files (bring your own) from a cheats folder, mods' `cheats/` folders or `--cheats`; a Cheats tab in the settings menu with one switch per cheat: memory cheats live, code patches at the next start (checked against the Apple-silicon rewrite, refused with a reason when unsafe) | Mac only; tested in game on 1.4.3 (Inf. Stamina code patch, Moon Jump live) |
+| **Cheats** ([docs](docs/settings.md#cheats)) | A Cheats tab in the settings menu with the community cheat list for the running version, downloaded by the game from sthetix/nx-cheats-db (no codes in the repository) and shown through our own catalog: clean names in groups, variants as one choice, junk and graphics cheats left out, the ones the port cannot run folded away; plus your own Atmosphère files from a cheats folder, mods' `cheats/` folders or `--cheats`. Memory cheats live, code patches at the next start (checked against the Apple-silicon rewrite, refused with a reason when unsafe) | Mac only; tested in game on 1.4.3 (Infinite health and stamina code patches, Damage ×4 choice applied, Moon jump live from a list downloaded mid-session) |
 | **Save transfer** ([docs](docs/save-sync.md)) | Files app / Finder Files tab; `.totksave` over AirDrop (Send saves…, double-click / Open in to import, with backups and version checks); `save_sync.py` over USB / Wi-Fi | AirDrop not yet tried on devices |
 | Builds | Game data outside the Mac app: a code-only rebuild takes ~40 s instead of ~12 min; the iPad app carries the game's icon | Done |
 
@@ -274,8 +274,10 @@ used; one for another version stops the build):
 python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys --cheats ~/Games/cheats/
 ```
 
-The repository ships no cheat codes: bring your own from a cheat database. The settings menu's **Cheats** tab (⌘, then
-the last tab, or the app menu's **Cheats…**) lists every cheat, all off until you choose them, grouped by file. Cheats
+The repository ships no cheat codes. The game downloads the community cheat list for your version itself
+([sthetix/nx-cheats-db](https://github.com/sthetix/nx-cheats-db), once a day; Settings › Interface › *Download cheat
+list* turns it off), so the settings menu's **Cheats** tab (⌘, then the last tab, or the app menu's **Cheats…**) offers
+those cheats without any files, by group, all off until you choose them; files of your own follow, grouped by file. Cheats
 that only change values in memory switch on and off immediately; cheats that patch the game's code take effect when the
 game restarts (**Restart now**): the code is never made writable while the game runs. A code patch is refused, with the
 reason, when it would overwrite an instruction this project rewrites, jump out of the game's code or depend on a button.

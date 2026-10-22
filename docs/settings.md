@@ -111,8 +111,52 @@ reimplements them independently for 1.4.3 and contains none of their code.
 ## Cheats
 
 Mac only for now (iPhone and iPad cannot change the game's code while it runs; their menu has no Cheats section). The
-last tab lists the Atmosphère cheat files the game read when it started (the format Atmosphère, Yuzu and Ryujinx use; no
-codes come with the port, bring your own from a cheat database). A file is read only when its name is the running game's
+last tab starts with the **cheat list**: the community cheats for the running game version, ready to switch on without
+any files. Below it come the Atmosphère cheat files of your own (the format Atmosphère, Yuzu and Ryujinx use).
+
+### The cheat list
+
+No cheat codes are in this repository or in the app: the codes are their authors', collected without a license, so the
+game downloads them. It fetches [sthetix/nx-cheats-db](https://github.com/sthetix/nx-cheats-db)'s file for the game
+(`cheats/0100F2C0115B6000.json`, every version's cheats) and keeps the running version's part as
+`~/Library/Application Support/MacNativeGames/TOTK/cheats-db/<build ID>.txt` (`TOTK_CHEATS_DB_DIR` overrides, `0` = none),
+which is read first at every start (`runtime/cheat_db_fetch.h`, `runtime/cheat_db.h`). Thanks to sthetix for the
+database and to the cheat authors it credits.
+
+- **When.** 20 s after the game opens, in the background, at most once a day (an unchanged database answers HTTP 304),
+  and when the Cheats tab is opened after the day is over. **Update** in the tab's **Cheat list** row checks now; the row
+  says how many cheats there are, when the list was checked and changed, and why the last check failed. Offline, the
+  cached list keeps working.
+- **Setting.** Settings › Interface › *Download cheat list* (also in the Cheats tab; on by default; live). Off: nothing
+  is fetched, the cached list stays. Download only: the game never uploads anything.
+- **Check.** The download is untrusted: strict JSON, 16 MB at most, https only (redirects too), 20 s timeout; anything
+  else keeps the previous list. The file is rewritten only when this version's cheats changed.
+- **New list.** The first list that arrives while the game runs is read at once: its live cheats work right away, its
+  code patches from the next start. A newer list later replaces the file and is read at the next start (**Restart to
+  apply** says so).
+
+The list is shown through our own catalog of the 1.4.3 cheats (`runtime/cheat_catalog.h`: names, groups and a line
+about each, never codes): Player, Combat, Movement, Inventory, World, Map, and Other for entries the catalog does not
+know yet (their numbering, `№13.` or `#01.`, taken off). Left out of the list:
+
+- titles, notes, group markers and master codes (masters still run together with the cheats you choose);
+- helpers that only undo other cheats (*Restore Code*, *ReEnable Fog*, *Time Resume*): switching a code patch off and
+  restarting already restores the game's code;
+- resolution, frame rate and picture cheats (FPS, resolution, RRS, contrast, saturation): the Display settings do that,
+  and the two would fight;
+- repeats: the same words, the same name or the same catalog entry again (1.4.3's *Show all Miskos treasure* has the
+  words of *Show all Great Fairy*, so only the second is listed).
+
+Variants of one cheat are one row with a menu instead of switches that conflict: *Damage multiplier* (Off, ×2, ×4, ×10,
+×30), *Infinite stamina* (Off, On, the Master Sword quest version), *Default pace* (Off, Running, Walking). Choosing one
+switches the others off. Cheats the port cannot run are folded into one row at the end, **N not available here**;
+**Show** lists them with the reason (on 1.4.3: the paraglider and movement speed variants, the time of day cheats and
+*60 more seconds*). Your choices are saved under the cheat's name without its numbering (`db<TAB>Inf. Health`), so they
+survive the database renumbering its entries.
+
+### Your own cheat files
+
+A file is read only when its name is the running game's
 build ID, in any case: 1.0.0 `082CE09B06E33A12`, 1.4.3 `277178B7DBA1B6D4` (both read from the game's own files), 1.2.1 `9B4E43650501A4D4` and 1.1.2 `9A10ED9435C06733` (from the cheat databases, not checked). The places, each file a group of its own:
 
 1. the file built into the app with `build_app.py --cheats`;
@@ -123,7 +167,8 @@ build ID, in any case: 1.0.0 `082CE09B06E33A12`, 1.4.3 `277178B7DBA1B6D4` (both 
 
 Files are read at the start: a file added or changed while the game runs shows **Restart to apply**.
 
-Each cheat has a switch (mouse, Return / A, or ← off and → on) and a line that says how it applies:
+Each cheat (of the list or a file) has a switch (mouse, Return / A, or ← off and → on; a choice steps through its menu)
+and a line that says how it applies:
 
 | | |
 |---|---|
@@ -157,9 +202,9 @@ note. Two cheats with the same name in one file are kept apart as `name (#2)`, `
 saved in `cheats-enabled.txt`.
 
 Master codes (`{...}` sections) are always on with their file and shown without a switch. The cheat databases' group
-sections (one `20000000` or `20000001` word, opening and closing a group) are shown as headings. **Turn off all cheats** switches every cheat off (code patches at
+sections (one `20000000` or `20000001` word, opening and closing a group) are shown as headings in your own files. **Turn off all cheats** switches every cheat off (code patches at
 the next start). The choices are saved in `cheats-enabled.txt` next to the profile, one line per cheat: the source and
-the name (`folder<TAB>[name]`, `mod:<folder><TAB>[name]`; the app's own file just the name, as before), so equal names
+the name (`db<TAB>[name]` for the cheat list, `folder<TAB>[name]`, `mod:<folder><TAB>[name]`; the app's own file just the name, as before), so equal names
 in two files are separate cheats. **Reset all** leaves cheats alone. The first cheat turned on copies the profile to
 `profile-before-cheats` first.
 
