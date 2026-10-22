@@ -1,6 +1,7 @@
 #import "settings_menu.h"
 #import "mods_menu.h"
 #import "saves_menu.h"
+#import "spawn_menu.h"
 #import <GameController/GameController.h>
 #import <Metal/Metal.h>
 #include <os/proc.h>
@@ -12,11 +13,12 @@ NSNotificationName const TOTKSettingsChangedNotification = @"TOTKSettingsChanged
 static BOOL menuOpen;
 
 /* Controller buttons the menu reads, as bits; a held direction repeats after 0.35 s, every 0.09 s. */
-enum { PAD_UP = 1, PAD_DOWN = 2, PAD_LEFT = 4, PAD_RIGHT = 8, PAD_OK = 16, PAD_BACK = 32 };
+enum { PAD_UP = 1, PAD_DOWN = 2, PAD_LEFT = 4, PAD_RIGHT = 8, PAD_OK = 16, PAD_BACK = 32, PAD_PAGE_UP = 64, PAD_PAGE_DOWN = 128 };
 
 @implementation TOTKSettingsMenu {
-    NSArray<NSArray<NSNumber *> *> *sections;   /* setting indices per page shown */
+    NSArray<NSArray<NSNumber *> *> *sections;   /* per section shown: setting indices, or one row for a page of its own */
     NSArray<NSString *> *titles;
+    NSArray<NSNumber *> *kinds;                 /* MENU_SETTINGS, MENU_MODS, MENU_SAVES, MENU_SPAWN (settings_schema.h) */
     NSArray<NSArray<NSString *> *> *about;       /* label, value */
     CADisplayLink *link;
     unsigned held; CFTimeInterval repeatAt;
@@ -42,18 +44,7 @@ static unsigned device_mask(void) { return UIDevice.currentDevice.userInterfaceI
     [super viewDidLoad];
     self.title = @"Settings";
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
-    NSMutableArray *rows = [NSMutableArray array], *names = [NSMutableArray array];
-    for (int p = 0; p < SETTINGS_NPAGES; p++) {
-        NSMutableArray *page = [NSMutableArray array];
-        for (int i = 0; i < SETTINGS_COUNT; i++) {
-            const SettingDef *d = &SETTINGS[i];
-            if (strcmp(d->page, SETTINGS_PAGES[p]) || (d->shown_key && settings_get(d->shown_key) != d->shown_value)) continue;
-            if (!(d->platforms & device_mask()) && !strncmp(d->key, "display.", 8)) continue;   /* the Mac's output sizes: iOS shows 720p */
-            [page addObject:@(i)];
-        }
-        if (page.count) { [rows addObject:page]; [names addObject:@(SETTINGS_PAGES[p])]; }
-    }
-    sections = rows; titles = names;
+    [self loadSections];
     id<MTLDevice> gpu = MTLCreateSystemDefaultDevice();
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     (void)docs;
@@ -64,6 +55,35 @@ static unsigned device_mask(void) { return UIDevice.currentDevice.userInterfaceI
               @[@"Settings file", @"Files › Tears of the Kingdom › settings.txt"]];
     link = [CADisplayLink displayLinkWithTarget:self selector:@selector(poll:)];
     [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+}
+
+/* The Mac's four tabs (Game, Graphics, Content, Tools) as one list: a section per tab section, titled "Tab · Section".
+   Cheats are Mac only; Mods, Saves and Spawn are one row each that opens their page. */
+- (void)loadSections {
+    NSMutableArray *rows = [NSMutableArray array], *names = [NSMutableArray array], *kindList = [NSMutableArray array];
+    for (int k = 0; k < SETTINGS_NSECTIONS; k++) {
+        const SettingsSection *sec = &SETTINGS_SECTIONS[k];
+        NSString *title = [NSString stringWithFormat:@"%s · %s", SETTINGS_TABS[sec->tab], sec->name];
+        if (sec->kind == MENU_MODS || sec->kind == MENU_SAVES || sec->kind == MENU_SPAWN) {
+            [rows addObject:@[@-1]]; [names addObject:title]; [kindList addObject:@(sec->kind)];
+            continue;
+        }
+        if (sec->kind != MENU_SETTINGS) continue;
+        NSMutableArray *page = [NSMutableArray array];
+        for (int i = 0; i < SETTINGS_COUNT; i++) {
+            const SettingDef *d = &SETTINGS[i];
+            if (strcmp(d->page, sec->name) || (d->shown_key && settings_get(d->shown_key) != d->shown_value)) continue;
+            if (!(d->platforms & device_mask()) && !strncmp(d->key, "display.", 8)) continue;   /* the Mac's output sizes: iOS shows 720p */
+            [page addObject:@(i)];
+        }
+        if (page.count) { [rows addObject:page]; [names addObject:title]; [kindList addObject:@(MENU_SETTINGS)]; }
+    }
+    sections = rows; titles = names; kinds = kindList;
+}
+- (NSInteger)kindOf:(NSInteger)section { return section < (NSInteger)kinds.count ? kinds[section].integerValue : -1; }
+- (NSIndexPath *)rowOfKind:(int)kind {
+    for (NSUInteger k = 0; k < kinds.count; k++) if (kinds[k].intValue == kind) return [NSIndexPath indexPathForRow:0 inSection:(NSInteger)k];
+    return nil;
 }
 
 - (void)viewDidDisappear:(BOOL)animated {
@@ -77,27 +97,28 @@ static unsigned device_mask(void) { return UIDevice.currentDevice.userInterfaceI
 
 #pragma mark - Rows
 
-/* The settings pages, then Mods (one row: the installed mods and GameBanana, mods_menu.m), Saves (one row: send and
-   receive saves, saves_menu.m), then About. */
-- (NSIndexPath *)modsRow { return [NSIndexPath indexPathForRow:0 inSection:(NSInteger)sections.count]; }
-- (NSIndexPath *)savesRow { return [NSIndexPath indexPathForRow:0 inSection:(NSInteger)sections.count + 1]; }
-- (BOOL)isPageRow:(NSIndexPath *)path { return [path isEqual:[self modsRow]] || [path isEqual:[self savesRow]]; }
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { (void)tableView; return (NSInteger)sections.count + 3; }
+/* The sections (settings, and the Mods, Saves and Spawn rows that open their pages: mods_menu.m, saves_menu.m,
+   spawn_menu.m), then About. */
+- (NSIndexPath *)modsRow { return [self rowOfKind:MENU_MODS]; }
+- (NSIndexPath *)savesRow { return [self rowOfKind:MENU_SAVES]; }
+- (NSIndexPath *)spawnRow { return [self rowOfKind:MENU_SPAWN]; }
+- (BOOL)isPageRow:(NSIndexPath *)path { NSInteger k = [self kindOf:path.section]; return k == MENU_MODS || k == MENU_SAVES || k == MENU_SPAWN; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { (void)tableView; return (NSInteger)sections.count + 1; }
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     (void)tableView;
-    return section < (NSInteger)sections.count ? (NSInteger)sections[section].count : section <= (NSInteger)sections.count + 1 ? 1 : (NSInteger)about.count;
+    return section < (NSInteger)sections.count ? (NSInteger)sections[section].count : (NSInteger)about.count;
 }
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     (void)tableView;
-    return section < (NSInteger)titles.count ? titles[section] : section == (NSInteger)sections.count ? @"Mods" : section == (NSInteger)sections.count + 1 ? @"Saves" : @"About";
+    return section < (NSInteger)titles.count ? titles[section] : @"About";
 }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     (void)tableView;
-    return section == (NSInteger)sections.count + 2 ? @"Open this menu with three fingers, the gear, a controller's Home button or − and + held together, or Esc on a keyboard." : nil;
+    return section == (NSInteger)sections.count ? @"Open this menu with three fingers, the gear, a controller's Home button or − and + held together, or Esc on a keyboard." : nil;
 }
 
 - (const SettingDef *)defAt:(NSIndexPath *)path {
-    if (path.section >= (NSInteger)sections.count) return NULL;
+    if (path.section >= (NSInteger)sections.count || [self kindOf:path.section] != MENU_SETTINGS) return NULL;
     return &SETTINGS[sections[path.section][path.row].intValue];
 }
 - (BOOL)available:(const SettingDef *)d { return (d->platforms & device_mask()) != 0; }
@@ -132,6 +153,14 @@ static NSString *value_text(const SettingDef *d, int v) {
         saves.imageView.image = [UIImage systemImageNamed:@"square.and.arrow.up.on.square"];
         saves.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         return saves;
+    }
+    if ([path isEqual:[self spawnRow]]) {
+        UITableViewCell *spawn = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+        spawn.textLabel.text = @"Spawn"; spawn.detailTextLabel.text = TOTKSpawnSummary();
+        spawn.detailTextLabel.textColor = UIColor.secondaryLabelColor; spawn.detailTextLabel.numberOfLines = 0;
+        spawn.imageView.image = [UIImage systemImageNamed:@"sparkles"];
+        spawn.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        return spawn;
     }
     if (!d) {
         UITableViewCell *info = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
@@ -198,7 +227,7 @@ static NSString *value_text(const SettingDef *d, int v) {
 }
 - (void)viewWillAppear:(BOOL)animated {   /* back from Mods or Saves: their summaries */
     [super viewWillAppear:animated];
-    if (sections) [self.tableView reloadRowsAtIndexPaths:@[[self modsRow], [self savesRow]] withRowAnimation:UITableViewRowAnimationNone];
+    if (sections) [self.tableView reloadRowsAtIndexPaths:@[[self modsRow], [self savesRow], [self spawnRow]] withRowAnimation:UITableViewRowAnimationNone];
 }
 
 /* A, Return or a tap: a switch flips, a choice moves to the next one. Left / right (step -1 / +1) move a choice or a slider. */
@@ -209,6 +238,10 @@ static NSString *value_text(const SettingDef *d, int v) {
     }
     if ([path isEqual:[self savesRow]]) {
         if (!step) [self.navigationController pushViewController:[TOTKSavesViewController new] animated:YES];
+        return;
+    }
+    if ([path isEqual:[self spawnRow]]) {
+        if (!step) [self.navigationController pushViewController:[TOTKSpawnViewController new] animated:YES];
         return;
     }
     const SettingDef *d = [self defAt:path]; if (!d || ![self available:d]) return;
@@ -229,9 +262,8 @@ static NSString *value_text(const SettingDef *d, int v) {
     for (NSUInteger s = 0; s < sections.count; s++)
         for (NSUInteger r = 0; r < sections[s].count; r++) {
             NSIndexPath *p = [NSIndexPath indexPathForRow:(NSInteger)r inSection:(NSInteger)s];
-            if ([self available:[self defAt:p]]) [all addObject:p];
+            if ([self isPageRow:p] || [self available:[self defAt:p]]) [all addObject:p];
         }
-    [all addObject:[self modsRow]]; [all addObject:[self savesRow]];
     if (!all.count) return;
     NSUInteger at = cursor ? [all indexOfObject:cursor] : NSNotFound;
     NSInteger next = at == NSNotFound ? 0 : MAX(0, MIN((NSInteger)all.count - 1, (NSInteger)at + delta));
@@ -240,12 +272,15 @@ static NSString *value_text(const SettingDef *d, int v) {
 }
 
 - (void)press:(unsigned)button {
-    if (self.navigationController.topViewController != self) {   /* a Mods or Saves page is shown: B goes back, the rest is touch */
+    UIViewController *top = self.navigationController.topViewController;
+    if (top != self) {   /* a Mods, Saves or Spawn page is shown: B goes back one level; Spawn takes the rest */
+        if ([top isKindOfClass:TOTKSpawnViewController.class] && !(button & PAD_BACK) && [(TOTKSpawnViewController *)top press:button]) return;
         if (button & PAD_BACK) [self.navigationController popViewControllerAnimated:YES];
         return;
     }
     if (button & PAD_BACK) { [self close]; return; }
-    if (button & (PAD_UP | PAD_DOWN)) { [self moveBy:button & PAD_UP ? -1 : 1]; return; }
+    if (button & (PAD_UP | PAD_DOWN)) { [self moveBy:button & PAD_UP ? -1 : 1]; return; }   /* no wrapping round */
+    if (button & (PAD_PAGE_UP | PAD_PAGE_DOWN)) { [self moveBy:button & PAD_PAGE_UP ? -8 : 8]; return; }   /* LT / RT */
     if (!cursor) { [self moveBy:0]; return; }
     if (button & PAD_OK) [self activate:cursor step:0];
     else if (button & (PAD_LEFT | PAD_RIGHT)) [self activate:cursor step:button & PAD_LEFT ? -1 : 1];
@@ -262,10 +297,15 @@ static NSString *value_text(const SettingDef *d, int v) {
         if (pad.dpad.right.pressed || x > .6f) now |= PAD_RIGHT;
         if (pad.buttonA.pressed) now |= PAD_OK;
         if (pad.buttonB.pressed || pad.buttonMenu.pressed) now |= PAD_BACK;
+        if (pad.buttonY.pressed) now |= SPAWN_PAD_FAVORITE;   /* the Spawn page's favorite */
+        if (pad.leftTrigger.value > .5f) now |= PAD_PAGE_UP;
+        if (pad.rightTrigger.value > .5f) now |= PAD_PAGE_DOWN;
     }
     unsigned fresh = now & ~held, repeat = 0; CFTimeInterval t = sender.timestamp;
     if (fresh) repeatAt = t + .35;
-    else if ((now & (PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT)) && t >= repeatAt) { repeat = now & (PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT); repeatAt = t + .09; }
+    else if ((now & (PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT | PAD_PAGE_UP | PAD_PAGE_DOWN)) && t >= repeatAt) {
+        repeat = now & (PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT | PAD_PAGE_UP | PAD_PAGE_DOWN); repeatAt = t + .09;
+    }
     held = now;
     if (fresh | repeat) [self press:fresh | repeat];
 }

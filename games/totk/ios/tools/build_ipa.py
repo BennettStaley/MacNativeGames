@@ -129,6 +129,8 @@ def main():
                     (tree/f'extracted/{a.version}/romfs-patches-out',res/'romfs-patches-out'),
                     (tree/'extracted/firmware/shared-fonts',res/'shared-fonts')]: copy_tree(src,dst)
     copy_tree(seed,res/'shader-seed')
+    actors=tree/f'build/{a.version}/actor_list.tsv'   # the Spawn page's list (scripts/prepare_actor_list.py, ios/Sources/spawn_menu.m)
+    if actors.is_file(): clone(actors,res/'actor_list.tsv')
     # The first frame waits only for the title screen's shaders (pso_title.tsv); the runtime looks for the list next to
     # DM_NVN_SHMAP, which is in shader-seed on iOS. Without it the first frame waits for the whole warm-up.
     # Exported from the one shared shader list (games/totk/assets/shader_list.tsv, docs/shader-list.md).
