@@ -127,7 +127,7 @@ int main(void) {
                settings_in_tab(settings_index("audio.volume"), 0), "Downloads on Content, effects on Graphics, audio on Game");
     }
     for (int i = 0; i < SETTINGS_COUNT; i++) expect(strncmp(SETTINGS[i].key, "cheats.", 7) != 0, "cheats are not settings: settings.txt and Reset all never hold them");
-    expect(SETTINGS_COUNT == 37, "37 settings");
+    expect(SETTINGS_COUNT == 38, "38 settings");
     {
         const SettingDef *ds = &SETTINGS[settings_index("interface.download_shaders")];
         expect(ds->type == SET_BOOL && ds->def_mac == 1 && ds->def_ios == 0 && ds->apply == SET_LIVE && ds->platforms == SET_MAC &&

@@ -74,6 +74,10 @@ static const SettingChoice SET_ASPECT[] = {{"Fill the screen", "auto", NULL, 0},
                                            {"16:10", "16:10", NULL, 2}, {"21:9", "21:9", NULL, 3}, {"32:9", "32:9", NULL, 4}};
 static const SettingChoice SET_HEADROOM[] = {{"Auto (4K on 16 GB)", "auto", NULL, 0}, {"1440p", "1440", "2560x1440", 1440},
                                              {"4K", "2160", "3840x2160", 2160}};
+/* The biggest 3D world (runtime_render_reserve, TOTK_RENDER_RESERVE): above 1440p the texture heap passes 1 GiB, so the
+   launcher lets a memory pool's GPU buffer grow to 2 GiB and raises the GPU memory budget. Needs the 4K maximum output. */
+static const SettingChoice SET_RENDER_MAX[] = {{"1440p (2560 x 1440)", "1440", NULL, 1440}, {"1800p (3200 x 1800)", "1800", "3200x1800", 1800},
+                                               {"4K (3840 x 2160)", "2160", "3840x2160", 2160}};
 static const SettingChoice SET_AA[] = {{"The game's own", "game", "0", 0}, {"Off", "off", "1", 1}, {"FXAA", "fxaa", "2", 2}, {"SMAA", "smaa", "3", 3}};
 static const SettingChoice SET_SHADOW[] = {{"The game's own", "game", NULL, 0}, {"2x", "2", "2", 2}, {"4x", "4", "4", 4}};
 static const SettingChoice SET_ANISO[] = {{"The game's", "game", "0", 0}, {"2x", "2", "2", 2}, {"4x", "4", "4", 4}, {"8x", "8", "8", 8}, {"16x", "16", "16", 16}};
@@ -105,12 +109,14 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_CHOICE, SET_LIVE, SET_MAC, 1080, 1080, 0, 0, 0, NULL, SET_OUTPUT, SET_N(SET_OUTPUT), "iPhone and iPad show 720p.", NULL, 0},
     {"display.custom_width", "Display", "Custom width", "The output's width in pixels; the height follows at 16:9.",
      NULL, SET_RANGE, SET_LIVE, SET_MAC, 2560, 2560, 640, 3840, 64, " px", NULL, 0, "iPhone and iPad show 720p.", "display.output", SET_OUT_CUSTOM},
-    {"display.scale", "Display", "Render resolution", "The size the 3D world is drawn at, as a share of the display resolution: lower is faster but softer, higher is sharper and slower. Text and icons stay at the display resolution. The 3D world goes up to 1440p (2560 x 1440); each choice shows the size it gives now.",
+    {"display.scale", "Display", "Render resolution", "The size the 3D world is drawn at, as a share of the display resolution: lower is faster but softer, higher is sharper and slower. Text and icons stay at the display resolution. The 3D world goes up to the Maximum render resolution (1440p unless raised); each choice shows the size it gives now.",
      NULL, SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_SCALE, SET_N(SET_SCALE), NULL, NULL, 0},
     {"display.aspect", "Display", "Aspect ratio", "Fill the screen shows more of the world on a wider or taller screen; text and icons keep their shape. Key 4 also cycles it.",
      NULL, SET_CHOICE, SET_LIVE, SET_MAC, 1, 1, 0, 0, 0, NULL, SET_ASPECT, SET_N(SET_ASPECT), "Not on iPhone and iPad yet.", NULL, 0},
     {"display.headroom", "Display", "Maximum output", "The biggest output resolution you can switch to while playing. Higher sets more memory aside; takes effect after a restart.",
      "TOTK_OUTPUT_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_HEADROOM, SET_N(SET_HEADROOM), "Fixed on iPhone and iPad.", NULL, 0},
+    {"display.render_max", "Display", "Maximum render resolution", "The biggest the 3D world can be drawn at. Above 1440p needs the 4K maximum output and uses much more memory (about 1 GB more at 4K); for Macs with 16 GB or more. Experimental.",
+     "TOTK_RENDER_RESERVE", SET_CHOICE, SET_RESTART, SET_MAC, 1440, 1440, 0, 0, 0, NULL, SET_RENDER_MAX, SET_N(SET_RENDER_MAX), "Fixed on iPhone and iPad.", NULL, 0},
     {"graphics.fov", "World detail", "Field of view", "How wide the camera sees, against the game's own (version 1.4.3).",
      "TOTK_FOV", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 70, 140, 5, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.fog", "Effects", "Cave fog", "The fog in caves and other enclosed places, against the game's own: 50% reaches it at twice the distance, 0% has none. The outdoor haze is separate and not changed yet (version 1.4.3).",

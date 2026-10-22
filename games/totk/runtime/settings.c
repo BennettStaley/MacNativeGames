@@ -82,7 +82,7 @@ static int display_apply(const char *changed) {
     /* What the two settings make together: the picture (text and icons drawn at it) and the 3D world stretched to it. */
     display_cw = cw; display_ch = ch;
     snprintf(display_status, sizeof display_status, "Display %u×%u · Render %u×%u%s", cw, ch, sw, sh,
-             own ? " (the game's own)" : capped ? " (1440p, the most it can be)" : "");
+             own ? " (the game's own)" : capped ? " (the most it can be; see Maximum render resolution)" : "");
     pthread_mutex_unlock(&lock);
     fprintf(stderr, "[settings] display: %s%s\n", display_status, r ? " (a size waits for the next start)" : "");
     return r;

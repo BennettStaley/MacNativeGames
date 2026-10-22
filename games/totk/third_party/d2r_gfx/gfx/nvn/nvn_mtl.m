@@ -653,7 +653,19 @@ static _Atomic uint64_t g_reg_gen = 1;   // 内存池 / 贴图 / 采样器登记
    kIOReturnNoMemory. A zero-copy buffer makes the whole range resident, so ranges with inaccessible pages (sparse
    virtual pools) or very large ranges are refused here, with details, instead of being handed to the driver. */
 #include "mach_vm_compat.h"
-#define POOL_BUFFER_MAX (1ull << 30)
+/* 1 GiB, or TOTK_POOL_BUFFER_MAX_MB (at most 2048): the launcher allows 2 GiB only for a 3D world above 1440p (settings:
+   Maximum render resolution), whose texture heap passes 1 GiB. That heap holds textures, which are separate Metal textures
+   here, so its zero-copy buffer is not made resident unless the GPU reads a buffer address in it (pool_res logs it). */
+static uint64_t pool_buffer_max(void) {
+    static uint64_t v;
+    if (!v) {
+        const char *e = getenv("TOTK_POOL_BUFFER_MAX_MB"); long mb = e ? atol(e) : 0;
+        v = (mb >= 1024 && mb <= 2048 ? (uint64_t)mb : 1024) << 20;
+        if (v > (1ull << 30)) MLOG("memory pools: zero-copy GPU buffers up to %llu MiB (TOTK_POOL_BUFFER_MAX_MB)", (unsigned long long)(v >> 20));
+    }
+    return v;
+}
+#define POOL_BUFFER_MAX pool_buffer_max()
 static void pool_range_check(uintptr_t a, uintptr_t b, const void *mem, uint64_t size) {
     if (b - a > POOL_BUFFER_MAX) MDIE("memory pool %p+%#llx: %llu MiB zero-copy GPU buffer refused (limit %llu MiB)", mem, (unsigned long long)size,
                                       (unsigned long long)((b - a) >> 20), POOL_BUFFER_MAX >> 20);
@@ -689,6 +701,8 @@ static void pool_res(pidx_ent *p) {   // caller holds g_mu
     if (p->res) return;
     res_add((__bridge id<MTLBuffer>)p->buf); res_commit();
     p->res = 1; g_pool_res_n++; g_pool_res_bytes += p->hi - p->lo;
+    if (p->hi - p->lo > (1ull << 30)) MLOG("memory pool of %llu MiB made resident (the GPU read a buffer address in it): above the old 1 GiB limit",
+                                           (unsigned long long)((p->hi - p->lo) >> 20));
 }
 void mtl_pool_res_stats(uint64_t v[4]) {   // registered pools, their bytes, pools / bytes in the residency set
     pthread_mutex_lock(&g_mu); v[0] = (uint64_t)g_pools.n; v[1] = g_pool_bytes; v[2] = g_pool_res_n; v[3] = g_pool_res_bytes; pthread_mutex_unlock(&g_mu);

@@ -405,6 +405,13 @@ int main(int argc, char **argv) {
           const char *out = getenv("TOTK_OUTPUT_RES");
           int big = out ? !strncmp(out, "3840", 4) : mem >= (16ULL << 30);
           unsigned budget = big ? 6500 : 5000, cap = (unsigned)((mem / 5 * 2) >> 20);
+          /* A 3D world above 1440p (settings: Maximum render resolution): its texture heap passes the 1 GiB a memory pool's
+             GPU buffer may otherwise take, and its targets need more room: the 40% cap itself, at most 8000 MB. */
+          const char *world = getenv("TOTK_RENDER_RESERVE"); unsigned ww = 0, wh = 0;
+          if (world && sscanf(world, "%ux%u", &ww, &wh) == 2 && (uint64_t)ww * wh > 2560u * 1440u) {
+              setenv("TOTK_POOL_BUFFER_MAX_MB", "2048", 0);
+              budget = cap && cap < 8000 ? cap : 8000;
+          }
           if (cap && budget > cap) budget = cap;
           setenv("TOTK_GPU_BUDGET_MB", [NSString stringWithFormat:@"%u", budget].UTF8String, 1); }
         setenv("TOTK_SLOT_OWNER", "user", 0);
