@@ -7,7 +7,7 @@ changes within a frame or two, except the few settings marked *after restart*. S
 
 | | |
 |---|---|
-| Mac | **⌘,**, **F1**, the app menu's **Settings…**, a controller's **Home** button, or **Options and Menu** together |
+| Mac | **⌘,**, **F1**, the app menu's **Settings…**, a controller's **Home** button (the Xbox button), or **Options and Menu** (View and Menu on Xbox) held together for a moment |
 | iPad / iPhone | the **gear** at the top of the screen, a **three-finger tap**, a controller's **Home** button, **− and +** held together, or **Esc** / **⌘,** on a keyboard |
 
 On the Mac the menu is a sidebar inside the game window, so it works in full screen and the picture stays in view beside
@@ -18,7 +18,7 @@ The menu has four tabs, each a bar of sections:
 | Tab | Sections |
 |---|---|
 | **Game** | Display · Frame rate (with frame interpolation) · Controls · Audio · Interface |
-| **Graphics** | Image (anti-aliasing, sharpening, anisotropic filtering, texture detail) · Effects (bloom, depth of field, lens flare, cave fog) · World detail (field of view, render distance, shadow resolution) |
+| **Graphics** | Image (preset, anti-aliasing, sharpening, anisotropic filtering, texture detail) · Effects (bloom, depth of field, lens flare, cave fog) · World detail (field of view, render distance, shadow resolution) |
 | **Content** | Mods · Saves (Send saves) · Downloads (shader list, cheat list) |
 | **Tools** | Cheats · Spawn · World (time of day) · Camera (hide the HUD) |
 
@@ -28,6 +28,15 @@ and closes the menu only from the section bar. Q / E, Tab or LB / RB switch tabs
 section bar) and **Reset everything…** (Shift-R, or Y on the section bar, then Return / A to confirm) set settings back
 to their defaults; cheats, mods, saves and spawn favorites are never reset. On iPhone and iPad the same sections are one
 list ("Game · Display" …). Setting keys did not change, so `settings.txt` files keep working.
+
+**Search** (Mac): / or ⌘F, or the field at the top, lists every setting whose name, description or section has all the
+words typed, with where it lives; ↓ or Return goes into the results, Esc clears them. Each row shows one line of its
+description; the focused row shows all of it. Settings that take effect at the next start say **↻ restart** before
+you change them.
+
+**Graphics preset** (Graphics › Image): *Battery saver* (67 % render scale, 30 fps), *Balanced* (the game's own look,
+the default) and *Quality* (100 % render scale, SMAA, 20 % sharpening, 16x filtering, 2x shadows on the Mac, 150 %
+render distance) set those settings together. Changing one of them by hand shows *Custom*.
 
 A setting marked *(after restart)*, a change in the Mods tab, or a code cheat switched in the Cheats tab shows **Restart now** at the bottom of the menu (and on
 the Mods tab's banner): the game closes the usual way (a save in progress finishes first) and the app opens again. Mac only;
@@ -237,6 +246,11 @@ the next start). The choices are saved in `cheats-enabled.txt` next to the profi
 the name (`db<TAB>[name]` for the cheat list, `folder<TAB>[name]`, `mod:<folder><TAB>[name]`; the app's own file just the name, as before), so equal names
 in two files are separate cheats. **Reset this tab** and **Reset everything…** leave cheats alone. The first cheat turned on copies the profile to
 `profile-before-cheats` first.
+
+## Known issues
+
+- With *Aspect ratio* filling a screen that is not 16:9, the game's pause menu, inventory and map (drawn at 16:9, outside
+  the extended view) sometimes flash for a frame while opening or closing. Seen on a Mac (2026-10-21); not yet looked into.
 
 ## The file
 

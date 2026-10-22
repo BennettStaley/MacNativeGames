@@ -1,7 +1,7 @@
 /* The settings menu on the Mac (included by runtime/frontend.m only): a sidebar drawn inside the game window, so it works
    in full screen and leaves the picture beside it in view while a change takes effect. Built from the shared settings
    table (runtime/settings_schema.h): four tabs (Game, Graphics, Content, Tools), each a bar of sections. Opened with
-   Command-comma, F1, the app menu's Settings item, or a controller's Home button (or Options and Menu together).
+   Command-comma, F1, the app menu's Settings item, or a controller's Home button (or Options and Menu held together for a moment).
    Two levels: the section bar (← → or the D-pad choose a section, ↓ / Return / A open it) and the section's rows (↑ ↓
    choose, ← → change, Page Up / Down or LT / RT page, never wrapping round); Escape or B goes back one level and closes
    the menu only from the section bar. Q / E, Tab or the shoulder buttons switch tabs. Reset this tab (R, X on the bar)
@@ -40,8 +40,9 @@
 
 static NSWindow *settings_window(void);   /* frontend.m: the game window */
 
-@interface TOTKSettingsPanel () <NSSharingServicePickerDelegate> @end
+@interface TOTKSettingsPanel () <NSSharingServicePickerDelegate, NSSearchFieldDelegate> @end
 @implementation TOTKSettingsPanel {
+    NSSearchField *find; NSString *findQuery;   /* search every setting (/ or ⌘F); a query lists the matches instead of the section */
     NSSegmentedControl *tabs, *sectionBar;   /* the four tabs; the sections of the tab shown */
     NSScrollView *scroll;
     NSStackView *list;
@@ -79,6 +80,16 @@ static NSString *settings_value_text(const SettingDef *d, int v) {
     if (d->type == SET_RANGE) return [NSString stringWithFormat:@"%d%s", v, d->unit ? d->unit : ""];
     return v ? @"On" : @"Off";
 }
+static int settings_page_tab(const char *page) {
+    for (int k = 0; k < SETTINGS_NSECTIONS; k++) if (!strcmp(SETTINGS_SECTIONS[k].name, page)) return SETTINGS_SECTIONS[k].tab;
+    return 0;
+}
+static BOOL settings_matches(const SettingDef *d, NSString *q) {   /* every word of the query in the label, help or section */
+    NSString *hay = [NSString stringWithFormat:@"%s %s %s", d->label, d->help ? d->help : "", d->page];
+    for (NSString *w in [q componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet])
+        if (w.length && [hay rangeOfString:w options:NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch].location == NSNotFound) return NO;
+    return YES;
+}
 static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalibratedWhite:w alpha:a]; }
 
 + (TOTKSettingsPanel *)shared {
@@ -105,6 +116,8 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
     title.font = [NSFont systemFontOfSize:22 weight:NSFontWeightBold]; title.textColor = NSColor.whiteColor;
     status = [NSTextField labelWithString:@""];
     status.font = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular]; status.textColor = NSColor.secondaryLabelColor;
+    find = [NSSearchField new]; find.placeholderString = @"Search settings (/)"; find.delegate = self; find.controlSize = NSControlSizeSmall;
+    find.sendsSearchStringImmediately = YES; find.target = self; find.action = @selector(searched:); findQuery = @"";
 
     NSMutableArray *labels = [NSMutableArray array];
     for (int t = 0; t < SETTINGS_NTABS; t++) [labels addObject:@(SETTINGS_TABS[t])];
@@ -140,12 +153,14 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
     [NSNotificationCenter.defaultCenter addObserverForName:TOTKCheatDbChanged object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
         (void)n; if (self.superview && self.kind == MENU_CHEATS) [self rebuildKeepingPlace];
     }];
-    for (NSView *v in @[title, status, tabs, sectionBar, scroll, mods, spawn, hint, resets, restartNow]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v]; }
+    for (NSView *v in @[title, status, find, tabs, sectionBar, scroll, mods, spawn, hint, resets, restartNow]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v]; }
     [NSLayoutConstraint activateConstraints:@[
         [title.topAnchor constraintEqualToAnchor:self.topAnchor constant:18], [title.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20],
-        [status.firstBaselineAnchor constraintEqualToAnchor:title.firstBaselineAnchor], [status.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-20],
-        [status.leadingAnchor constraintGreaterThanOrEqualToAnchor:title.trailingAnchor constant:12],
-        [tabs.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:14],
+        [find.centerYAnchor constraintEqualToAnchor:title.centerYAnchor], [find.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
+        [find.widthAnchor constraintEqualToConstant:170], [find.leadingAnchor constraintGreaterThanOrEqualToAnchor:title.trailingAnchor constant:12],
+        [status.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:4], [status.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20],
+        [status.trailingAnchor constraintLessThanOrEqualToAnchor:self.trailingAnchor constant:-16],
+        [tabs.topAnchor constraintEqualToAnchor:status.bottomAnchor constant:10],
         [tabs.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16], [tabs.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
         [sectionBar.topAnchor constraintEqualToAnchor:tabs.bottomAnchor constant:8],
         [sectionBar.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
@@ -196,13 +211,26 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
 - (NSView *)rowFor:(const SettingDef *)d index:(int)i {
     NSView *row = [NSView new]; row.wantsLayer = YES; row.layer.cornerRadius = 8; row.translatesAutoresizingMaskIntoConstraints = NO;
     NSString *name = settings_pending_restart(d->key) ? [NSString stringWithFormat:@"%s (after restart)", d->label] : @(d->label);
-    NSTextField *label = [NSTextField labelWithString:name];
-    label.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium]; label.textColor = NSColor.labelColor;
+    NSMutableAttributedString *title = [[NSMutableAttributedString alloc] initWithString:name attributes:@{
+        NSFontAttributeName:[NSFont systemFontOfSize:13 weight:NSFontWeightMedium], NSForegroundColorAttributeName:NSColor.labelColor}];
+    if (d->apply == SET_RESTART && !settings_pending_restart(d->key))   /* said before a change, not only after it */
+        [title appendAttributedString:[[NSAttributedString alloc] initWithString:@"  ↻ restart" attributes:@{
+            NSFontAttributeName:[NSFont systemFontOfSize:10 weight:NSFontWeightMedium], NSForegroundColorAttributeName:NSColor.systemOrangeColor}]];
+    if (findQuery.length)   /* a search result: where it lives */
+        [title appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"  %s ▸ %s", SETTINGS_TABS[settings_page_tab(d->page)], d->page]
+            attributes:@{NSFontAttributeName:[NSFont systemFontOfSize:10], NSForegroundColorAttributeName:NSColor.tertiaryLabelColor}]];
+    NSTextField *label = [NSTextField labelWithAttributedString:title];
     NSStackView *text = [NSStackView stackViewWithViews:@[label]]; text.orientation = NSUserInterfaceLayoutOrientationVertical;
     text.alignment = NSLayoutAttributeLeading; text.spacing = 2;
-    if (d->help) {
-        NSTextField *help = [NSTextField wrappingLabelWithString:@(d->help)];
+    if (d->help) {   /* one line; the whole text on the focused row (showFocus) */
+        NSString *about = @(d->help);
+#ifdef TOTK_GAME_V143
+        about = [about stringByReplacingOccurrencesOfString:@" (version 1.4.3)" withString:@""];   /* this is 1.4.3: say it nowhere */
+#endif
+        NSTextField *help = [NSTextField wrappingLabelWithString:about];
         help.font = [NSFont systemFontOfSize:11]; help.textColor = NSColor.secondaryLabelColor; help.preferredMaxLayoutWidth = 176;
+        help.identifier = @"help"; help.maximumNumberOfLines = 1; help.cell.truncatesLastVisibleLine = YES;
+        help.lineBreakMode = NSLineBreakByTruncatingTail;
         [text addArrangedSubview:help];
     }
     NSView *control = [self controlFor:d index:i];
@@ -581,7 +609,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     resetTab.title = [NSString stringWithFormat:@"Reset %s", SETTINGS_TABS[self.tab]];
 }
 - (void)buildPage {
-    int kind = self.kind;
+    int kind = findQuery.length ? MENU_SETTINGS : self.kind;   /* a search lists matching settings from every section */
     BOOL modsPage = kind == MENU_MODS, spawnPage = kind == MENU_SPAWN;
     scroll.hidden = modsPage || spawnPage; mods.hidden = !modsPage; spawn.hidden = !spawnPage;
     [self loadSectionBar]; [self refreshHint];
@@ -592,7 +620,8 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     [rows removeAllObjects]; [rowSetting removeAllObjects];
     for (int i = 0; i < SETTINGS_COUNT && kind == MENU_SETTINGS; i++) {
         const SettingDef *d = &SETTINGS[i];
-        if (strcmp(d->page, SETTINGS_SECTIONS[section].name) || !settings_row_shown(d)) continue;
+        if (!settings_row_shown(d)) continue;
+        if (findQuery.length ? !settings_matches(d, findQuery) : strcmp(d->page, SETTINGS_SECTIONS[section].name) != 0) continue;
         NSView *row = [self rowFor:d index:i];
         [list addArrangedSubview:row]; [rows addObject:row]; [rowSetting addObject:@(i)];
     }
@@ -602,7 +631,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
         [list addArrangedSubview:saves]; [rows addObject:saves]; [rowSetting addObject:@(SAVES_ROW)];
     }
     if (!rows.count) {
-        NSTextField *none = [NSTextField labelWithString:@"Nothing to set here on the Mac."]; none.textColor = NSColor.secondaryLabelColor;
+        NSTextField *none = [NSTextField labelWithString:findQuery.length ? @"No setting matches." : @"Nothing to set here on the Mac."]; none.textColor = NSColor.secondaryLabelColor;
         [list addArrangedSubview:none];
     }
     if (focus >= (NSInteger)rows.count) focus = rows.count ? rows.count - 1 : 0;
@@ -619,12 +648,37 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
 }
 - (void)restartGame { [self hide]; runtime_front_restart(); }
 
+- (void)focusFind { [self.window makeFirstResponder:find]; }
+- (void)searched:(NSSearchField *)f {
+    NSString *q = [f.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    if ([q isEqualToString:findQuery]) return;
+    findQuery = q; focus = 0; onBar = !q.length; [self buildPage];
+}
+- (BOOL)control:(NSControl *)c textView:(NSTextView *)tv doCommandBySelector:(SEL)cmd {
+    (void)tv; if (c != find) return NO;
+    if (cmd == @selector(cancelOperation:)) {   /* Esc: clear and back to the sections */
+        find.stringValue = @""; [self searched:find]; [self.window makeFirstResponder:self]; return YES;
+    }
+    if (cmd == @selector(moveDown:) || cmd == @selector(insertNewline:)) {   /* into the results */
+        [self.window makeFirstResponder:self]; onBar = !rows.count; focus = 0; [self showFocus]; [self refreshHint]; return YES;
+    }
+    return NO;
+}
+static NSTextField *settings_help_label(NSView *v) {   /* a setting row's help text (rowFor:), if it has one */
+    if ([v.identifier isEqual:@"help"]) return (NSTextField *)v;
+    for (NSView *sub in v.subviews) { NSTextField *t = settings_help_label(sub); if (t) return t; }
+    return nil;
+}
 - (void)showFocus {
     sectionBar.layer.borderWidth = onBar ? 2 : 0;   /* the top level: the section bar has the focus */
     sectionBar.layer.borderColor = NSColor.controlAccentColor.CGColor;
     if (self.kind == MENU_SPAWN) { [self spawnShowFocus]; return; }
-    for (NSUInteger k = 0; k < rows.count; k++)
-        rows[k].layer.backgroundColor = !onBar && (NSInteger)k == focus ? panel_color(1, 0.10).CGColor : NSColor.clearColor.CGColor;
+    for (NSUInteger k = 0; k < rows.count; k++) {
+        BOOL on = !onBar && (NSInteger)k == focus;
+        rows[k].layer.backgroundColor = on ? panel_color(1, 0.10).CGColor : NSColor.clearColor.CGColor;
+        NSTextField *help = settings_help_label(rows[k]);
+        if (help && help.maximumNumberOfLines != (on ? 0 : 1)) { help.maximumNumberOfLines = on ? 0 : 1; help.lineBreakMode = on ? NSLineBreakByWordWrapping : NSLineBreakByTruncatingTail; [help invalidateIntrinsicContentSize]; }
+    }
     if (!onBar && focus < (NSInteger)rows.count) {
         [list layoutSubtreeIfNeeded];
         [rows[focus] scrollRectToVisible:NSInsetRect(rows[focus].bounds, 0, -8)];
@@ -776,6 +830,9 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
 
 - (void)keyDown:(NSEvent *)e {
     BOOL shift = (e.modifierFlags & NSEventModifierFlagShift) != 0;
+    BOOL cmdKey = (e.modifierFlags & NSEventModifierFlagCommand) != 0;
+    if (!confirmReset && (e.keyCode == 44 || (e.keyCode == 3 && cmdKey)) && (onBar || (self.kind != MENU_SPAWN && self.kind != MENU_MODS))) { [self focusFind]; return; }
+    if (findQuery.length && e.keyCode == 53) { find.stringValue = @""; [self searched:find]; return; }   /* Esc leaves the results first */
     if (!confirmReset && !onBar && self.kind == MENU_MODS && e.keyCode != 53 && [mods key:e]) return;
     if (!confirmReset && !onBar && self.kind == MENU_SPAWN && [self spawnKey:e]) return;
     switch (e.keyCode) {

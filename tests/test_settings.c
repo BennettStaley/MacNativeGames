@@ -1,3 +1,4 @@
+#include <limits.h>
 /* Test the settings table and settings.txt (games/totk/runtime/settings_schema.h) with synthetic files. */
 #include "../games/totk/runtime/settings_schema.h"
 #include <stdio.h>
@@ -126,7 +127,7 @@ int main(void) {
                settings_in_tab(settings_index("audio.volume"), 0), "Downloads on Content, effects on Graphics, audio on Game");
     }
     for (int i = 0; i < SETTINGS_COUNT; i++) expect(strncmp(SETTINGS[i].key, "cheats.", 7) != 0, "cheats are not settings: settings.txt and Reset all never hold them");
-    expect(SETTINGS_COUNT == 36, "36 settings");
+    expect(SETTINGS_COUNT == 37, "37 settings");
     {
         const SettingDef *ds = &SETTINGS[settings_index("interface.download_shaders")];
         expect(ds->type == SET_BOOL && ds->def_mac == 1 && ds->def_ios == 0 && ds->apply == SET_LIVE && ds->platforms == SET_MAC &&
@@ -160,6 +161,29 @@ int main(void) {
     expect(value(v, "world.time_speed") == 0 && value(v, "graphics.render_distance") == 250, "paused is 0 %, a distance rounds to its step");
     setenv("TOTK_TIME_SPEED", "800", 1); settings_take_env(v); unsetenv("TOTK_TIME_SPEED");
     expect(value(v, "world.time_speed") == 800, "TOTK_TIME_SPEED in percent");
+
+    /* Graphics presets: each preset's members are valid values; the defaults match none (Custom) on the Mac; a preset's
+       values match it, one changed member shows Custom, and iOS ignores members it does not have (shadow resolution). */
+    for (int p = SET_PRESET_BATTERY; p <= SET_PRESET_QUALITY; p++)
+        for (int m = 0; m < SETTINGS_PRESET_NMEMBERS; m++) {
+            int i = settings_index(SETTINGS_PRESET_MEMBERS[m].key), x = settings_preset_value(p, m, 0);
+            expect(i >= 0 && settings_valid(&SETTINGS[i], x), "a preset member is a setting and its value valid");
+        }
+    for (int ios = 0; ios < 2; ios++) {
+        settings_defaults(v, ios);
+        expect(settings_preset_match(v, ios) == SET_PRESET_BALANCED, "the defaults are Balanced");
+        for (int p = SET_PRESET_BATTERY; p <= SET_PRESET_QUALITY; p++) {
+            settings_defaults(v, ios);
+            for (int m = 0; m < SETTINGS_PRESET_NMEMBERS; m++) {
+                int x = settings_preset_value(p, m, ios);
+                if (x != INT_MIN) v[settings_index(SETTINGS_PRESET_MEMBERS[m].key)] = x;
+            }
+            expect(settings_preset_match(v, ios) == p, "a preset's values match it");
+            v[settings_index("graphics.aniso")] = 8;
+            expect(settings_preset_match(v, ios) == SET_PRESET_CUSTOM, "one member changed by hand: Custom");
+        }
+    }
+    expect(settings_preset_value(SET_PRESET_QUALITY, 4, 1) == INT_MIN, "shadow resolution is not a preset member on iOS");
 
     if (failures) { fprintf(stderr, "%d failures\n", failures); return 1; }
     printf("settings: all checks passed (%d settings)\n", SETTINGS_COUNT);

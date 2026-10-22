@@ -2,6 +2,7 @@
    settings.txt once, before the game thread starts on iOS (ios/Sources/main.m) and from the loader on the Mac, where the
    launcher already handed the start-time settings to the game as environment variables. settings_set is the menu's one
    entry: it checks the value, stores it, applies a live setting at once and writes the file. */
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -178,6 +179,7 @@ void settings_init(const char *file) {
         }
     }
     settings_take_env(values);
+    { int p = settings_index("graphics.preset"); if (p >= 0) values[p] = settings_preset_match(values, settings_ios()); }
     settings_export_env(values);   /* iOS: the app is its own launcher; on the Mac these are already set */
     int start[SETTINGS_COUNT]; memcpy(start, values, sizeof start);
     pthread_mutex_unlock(&lock);
@@ -221,10 +223,28 @@ int settings_save(void) {
     return ok ? 0 : -1;
 }
 
+/* Graphics preset: always what the current values match (settings_schema.h), never a stored choice of its own. */
+static void preset_sync(void) {
+    int p = settings_index("graphics.preset"); if (p < 0) return;
+    pthread_mutex_lock(&lock); values[p] = settings_preset_match(values, settings_ios()); pthread_mutex_unlock(&lock);
+}
+
 int settings_set(const char *key, int value) {
     int i = settings_index(key); if (i < 0) return SETTINGS_INVALID;
     const SettingDef *d = &SETTINGS[i];
     if (!settings_valid(d, value)) return SETTINGS_INVALID;
+    if (!strcmp(key, "graphics.preset")) {   /* sets its members; Custom changes nothing */
+        int restart = 0;
+        if (value != SET_PRESET_CUSTOM)
+            for (int m = 0; m < SETTINGS_PRESET_NMEMBERS; m++) {
+                int v = settings_preset_value(value, m, settings_ios());
+                if (v != INT_MIN) restart |= settings_set(SETTINGS_PRESET_MEMBERS[m].key, v) == SETTINGS_RESTART;
+            }
+        preset_sync();
+        fprintf(stderr, "[settings] graphics.preset = %d (now matches %d)\n", value, settings_get(key));
+        if (observer) observer(key, settings_get(key));
+        return restart ? SETTINGS_RESTART : SETTINGS_APPLIED;
+    }
     pthread_mutex_lock(&lock);
     int was = values[i]; values[i] = value; if (was != value && d->apply == SET_RESTART) changed_since_start[i] = 1;
     pthread_mutex_unlock(&lock);
@@ -232,6 +252,7 @@ int settings_set(const char *key, int value) {
     fprintf(stderr, "[settings] %s = %d (was %d)\n", key, value, was);
     int live = d->apply == SET_LIVE && apply_live(d, value) == 0;
     pthread_mutex_lock(&lock); changed_since_start[i] = !live; pthread_mutex_unlock(&lock);   /* a live value the game took clears an earlier refusal */
+    preset_sync();
     if (settings_save()) fprintf(stderr, "[settings] could not write %s\n", *path ? path : "(no settings file)");
     if (observer) observer(key, value);
     return live ? SETTINGS_APPLIED : SETTINGS_RESTART;

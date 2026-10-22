@@ -88,9 +88,16 @@ static const SettingChoice SET_FACE[] = {{"Automatic", "auto", NULL, 0}, {"By po
 static const SettingChoice SET_TIME_SPEED[] = {{"Paused", "paused", "0", 0}, {"0.25x", "0.25", "25", 25}, {"0.5x", "0.5", "50", 50},
                                                {"Normal (1x)", "1", "100", 100}, {"2x", "2", "200", 200}, {"4x", "4", "400", 400},
                                                {"8x", "8", "800", 800}};
+/* Graphics presets (settings.c): choosing one sets the settings in SETTINGS_PRESET_MEMBERS; changing any of them by hand
+   shows Custom again, and so does a mix that matches no preset. Never stored as anything but what it matches. */
+enum { SET_PRESET_CUSTOM = 0, SET_PRESET_BATTERY, SET_PRESET_BALANCED, SET_PRESET_QUALITY };
+static const SettingChoice SET_PRESET[] = {{"Custom", "custom", NULL, SET_PRESET_CUSTOM}, {"Battery saver", "battery", NULL, SET_PRESET_BATTERY},
+                                           {"Balanced", "balanced", NULL, SET_PRESET_BALANCED}, {"Quality", "quality", NULL, SET_PRESET_QUALITY}};
 #define SET_N(a) (int)(sizeof a / sizeof *a)
 
 static const SettingDef SETTINGS[] = {
+    {"graphics.preset", "Image", "Preset", "Balanced is the game's own look. Sets the render scale, anti-aliasing, sharpening, filtering, shadows, render distance and frame rate limit together. Changing one of them shows Custom.",
+     NULL, SET_CHOICE, SET_LIVE, SET_ALL, SET_PRESET_BALANCED, SET_PRESET_BALANCED, 0, 0, 0, NULL, SET_PRESET, SET_N(SET_PRESET), NULL, NULL, 0},
     {"graphics.interpolation", "Frame rate", "Frame interpolation", "MetalFX makes a frame between two game frames.",
      "TOTK_MFX", SET_CHOICE, SET_LIVE, SET_MAC | SET_IPAD, 0, 0, 0, 0, 0, NULL, SET_INTERP, SET_N(SET_INTERP),
      "Not tested on iPhone yet.", NULL, 0},
@@ -181,6 +188,38 @@ static inline int settings_index(const char *key) {
     return -1;
 }
 static inline int settings_default(const SettingDef *d, int ios) { return ios ? d->def_ios : d->def_mac; }
+/* What each preset sets (Battery saver, Balanced, Quality). SET_PRESET_DEFAULT: the platform's default for that setting. */
+#define SET_PRESET_DEFAULT (-1000000)
+typedef struct { const char *key; int value[3]; } SettingPresetMember;
+static const SettingPresetMember SETTINGS_PRESET_MEMBERS[] = {
+    {"display.scale", {67, 0, 100}},
+    {"graphics.aa", {0, 0, 3}},
+    {"graphics.sharpen", {0, 0, 20}},
+    {"graphics.aniso", {0, 0, 16}},
+    {"graphics.shadow_res", {0, 0, 2}},
+    {"graphics.render_distance", {100, 100, 150}},
+    {"framerate.cap", {30, SET_PRESET_DEFAULT, SET_PRESET_DEFAULT}},
+};
+enum { SETTINGS_PRESET_NMEMBERS = sizeof SETTINGS_PRESET_MEMBERS / sizeof *SETTINGS_PRESET_MEMBERS };
+/* The value preset p (SET_PRESET_BATTERY..) gives member m, or INT_MIN when the member is not on this platform. */
+static inline int settings_preset_value(int p, int m, int ios) {
+    int i = settings_index(SETTINGS_PRESET_MEMBERS[m].key);
+    if (i < 0 || !(SETTINGS[i].platforms & (ios ? SET_IOS : SET_MAC))) return -2147483647 - 1;
+    int v = SETTINGS_PRESET_MEMBERS[m].value[p - SET_PRESET_BATTERY];
+    return v == SET_PRESET_DEFAULT ? settings_default(&SETTINGS[i], ios) : v;
+}
+/* The preset values match, or SET_PRESET_CUSTOM. */
+static inline int settings_preset_match(const int *values, int ios) {
+    for (int p = SET_PRESET_BATTERY; p <= SET_PRESET_QUALITY; p++) {
+        int all = 1;
+        for (int m = 0; m < SETTINGS_PRESET_NMEMBERS && all; m++) {
+            int v = settings_preset_value(p, m, ios);
+            if (v != -2147483647 - 1 && values[settings_index(SETTINGS_PRESET_MEMBERS[m].key)] != v) all = 0;
+        }
+        if (all) return p;
+    }
+    return SET_PRESET_CUSTOM;
+}
 static inline const SettingChoice *settings_choice(const SettingDef *d, int value) {
     for (int i = 0; i < d->nchoices; i++) if (d->choices[i].value == value) return &d->choices[i];
     return NULL;

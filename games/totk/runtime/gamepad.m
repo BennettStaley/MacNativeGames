@@ -255,12 +255,13 @@ static void hid_pad_start(void) {}
 
 static void refresh_gamepads(void) {   // on the main queue (controller value handlers and notifications)
     RuntimeGamepadState next = {0};
-    uint64_t physical = 0; int menu = 0;
+    uint64_t physical = 0; int menu = 0, chord = 0;
     for (GCController *controller in GCController.controllers) {
         GCExtendedGamepad *pad = controller.extendedGamepad;
         if (!pad) continue;
         next.connected = 1;
-        if (controller.physicalInputProfile.buttons[GCInputButtonHome].isPressed || (pad.buttonOptions.isPressed && pad.buttonMenu.isPressed)) menu = 1;
+        if (controller.physicalInputProfile.buttons[GCInputButtonHome].isPressed) menu = 1;
+        if (pad.buttonOptions.isPressed && pad.buttonMenu.isPressed) chord = 1;
         physical |= gamepad_buttons(pad, face_by_position(controller));
         next.lx = stronger_axis(next.lx, stick_axis(pad.leftThumbstick.xAxis.value));
         next.ly = stronger_axis(next.ly, stick_axis(pad.leftThumbstick.yAxis.value));
@@ -280,8 +281,18 @@ static void refresh_gamepads(void) {   // on the main queue (controller value ha
     uint64_t now = runtime_now_ns(), edges = physical & ~physicalPrev, synthetic = 0, suppressed = 0;
     int moving = next.lx || next.ly;
     physicalPrev = physical;
-    /* The settings menu: Home, or Options and Menu together (the frontend; on iPhone / iPad the app's own). */
-    static int menuPrev; if (menu && !menuPrev) runtime_front_settings_toggle(); menuPrev = menu;
+    /* The settings menu (the frontend; on iPhone / iPad the app's own): Home at once, or Options and Menu (View and Menu on
+       an Xbox pad) both held for MENU_CHORD_NS. A hold, not a same-instant press: the two never have to land together, and
+       a brush of both in play does not open it. Fires once per hold. */
+    enum { MENU_CHORD_MS = 350 };
+    static int menuPrev, chordFired; static uint64_t chordSince;
+    if (menu && !menuPrev) runtime_front_settings_toggle();
+    menuPrev = menu;
+    if (!chord) chordSince = 0, chordFired = 0;
+    else if (!chordSince) {
+        chordSince = now;   /* no further event comes while both stay held: look again when the hold is long enough */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (MENU_CHORD_MS + 10) * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ refresh_gamepads(); });
+    } else if (!chordFired && now - chordSince >= MENU_CHORD_MS * 1000000ULL) { chordFired = 1; runtime_front_settings_toggle(); }
     for (int i = 0; i < CONTROLLER_BUTTONS; i++) {
         uint64_t bit = 1ULL << i;
         int kind = controller_mode_kind(controllerModes[i]);
