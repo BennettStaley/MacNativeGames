@@ -55,6 +55,23 @@ def main():
     if a.version=='v143': project=project.replace('          - loader.c','          - loader.c\n          - game_patches.c')
     else: project=project.replace('          - loader.c','          - loader.c\n          - game_patches_v143.c')
     if a.version!='v0': project=project.replace('-I../build\n','-I../build -DTOTK_GAME_'+a.version.upper()+'=1\n')
+    # The game version as the app's version, as on the Mac: save_sync.py reads it from the device (devicectl info apps).
+    game_version={'v0':'1.0.0','v112':'1.1.2','v121':'1.2.1','v143':'1.4.3'}[a.version]
+    project=project.replace('CFBundleShortVersionString: "1.0"',f'CFBundleShortVersionString: "{game_version}"')
+    # The app icon: the game's own (build/AppIcon.icns, extracted from its control data by build_app.py's step_binary, the
+    # Mac app's icon) as one 1024 px opaque PNG in an asset catalog; Xcode makes every iPhone / iPad size from it.
+    icon=tree/'build/AppIcon.icns'; icon_set=gen/'Assets.xcassets/AppIcon.appiconset'
+    shutil.rmtree(gen/'Assets.xcassets',ignore_errors=True)
+    if icon.is_file():
+        icon_set.mkdir(parents=True)
+        flat=gen/'icon-1024.jpg'   # through JPEG: iOS app icons must have no alpha channel
+        run(['sips','-s','format','jpeg','-s','formatOptions','best','-z','1024','1024',icon,'--out',flat],tree,logs/'ios-icon.log',env)
+        run(['sips','-s','format','png',flat,'--out',icon_set/'icon-1024.png'],tree,logs/'ios-icon.log',env); flat.unlink()
+        (gen/'Assets.xcassets/Contents.json').write_text('{"info":{"author":"xcode","version":1}}\n')
+        (icon_set/'Contents.json').write_text(json.dumps({'images':[{'filename':'icon-1024.png','idiom':'universal','platform':'ios','size':'1024x1024'}],
+                                                          'info':{'author':'xcode','version':1}},indent=1)+'\n')
+        project=project.replace('      - path: Gen/embed.S','      - path: Gen/embed.S\n      - path: Gen/Assets.xcassets',1)
+    else: print(f'no {icon}: the iOS app gets the default icon',file=sys.stderr)
     (ios/'project.generated.yml').write_text(project)
     # Build device dependencies separately: Homebrew's Mac archives cannot be linked into an iOS application.
     deps=tree/'build/ios-deps'
@@ -94,7 +111,8 @@ def main():
     env.update(TOTK_APP_NAME=a.app_name,TOTK_BUNDLE_ID=a.bundle_id)
     xcconfig=gen/'totk.xcconfig'
     frameworks=' '.join('-framework '+x for x in ['UIKit','Metal','MetalFX','Foundation','QuartzCore','ImageIO','CoreGraphics','CoreText','UniformTypeIdentifiers','CoreFoundation','AudioToolbox','GameController','AVFAudio','Security'])
-    xcconfig.write_text(f'OTHER_LDFLAGS = $(inherited) {frameworks} Gen/deps/lib/libopus.a Gen/deps/lib/libvpx.a {flags}\n')
+    xcconfig.write_text(f'OTHER_LDFLAGS = $(inherited) {frameworks} -lz Gen/deps/lib/libopus.a Gen/deps/lib/libvpx.a {flags}\n'
+                        +('ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon\n' if (gen/'Assets.xcassets').is_dir() else ''))
     run(['xcodegen','generate','--spec','project.generated.yml'],ios,logs/'xcodegen.log',env)
     derived=tree/'build/ios-derived';run(['xcodebuild','-project','TOTKIOS.xcodeproj','-scheme','TOTKIOS','-configuration','Release',
         '-destination','generic/platform=iOS','-derivedDataPath',derived,'CODE_SIGNING_ALLOWED=NO','CODE_SIGNING_REQUIRED=NO','CODE_SIGN_IDENTITY='],
@@ -111,6 +129,8 @@ def main():
                     (tree/f'extracted/{a.version}/romfs-patches-out',res/'romfs-patches-out'),
                     (tree/'extracted/firmware/shared-fonts',res/'shared-fonts')]: copy_tree(src,dst)
     copy_tree(seed,res/'shader-seed')
+    actors=tree/f'build/{a.version}/actor_list.tsv'   # the Spawn page's list (scripts/prepare_actor_list.py, ios/Sources/spawn_menu.m)
+    if actors.is_file(): clone(actors,res/'actor_list.tsv')
     # The first frame waits only for the title screen's shaders (pso_title.tsv); the runtime looks for the list next to
     # DM_NVN_SHMAP, which is in shader-seed on iOS. Without it the first frame waits for the whole warm-up.
     # Exported from the one shared shader list (games/totk/assets/shader_list.tsv, docs/shader-list.md).

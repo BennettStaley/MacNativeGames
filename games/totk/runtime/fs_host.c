@@ -3,10 +3,14 @@
    the profile directory. Application save data is created on first start, as the system launcher does
    for titles that declare save data. Writes reach the host file immediately; Commit flushes them.
    Because of that, quitting in the middle of a save (the game writes several files, then commits) would leave a slot half
-   written: runtime_fs_save_busy tells the window close to wait until the save is done (runtime/frontend.m). */
+   written: runtime_fs_save_busy tells the window close to wait until the save is done (runtime/frontend.m).
+   Tools outside the game see the same state on disk (ios/tools/save_sync.py, docs/save-sync.md): <profile>/save/.busy exists
+   from the first change of a save until its commit (a crash leaves it behind: the next start removes it, the tool ignores
+   one older than 10 minutes), and <profile>/save/.version names the game version that committed the save last. */
 #include "autoload.h"
 #include "runtime.h"
 #include "fs_host.h"
+#include "game_version.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -26,7 +30,11 @@
 #define R_INVALID_PATH 0x2ee602u
 #define R_OPEN_MODE 0x307402u
 #define R_APPEND_REQUIRED 0x2f5e02u
+#ifdef GAME_BOTW
+#define TOTK_APPLICATION_ID 0x01007ef00011e000ULL   /* Breath of the Wild: its own save data is the one that exists */
+#else
 #define TOTK_APPLICATION_ID 0x0100f2c0115b6000ULL
+#endif
 enum { M_FREE, M_SAVE, M_TEMP, M_CACHE };
 enum { OPEN_READ = 1, OPEN_WRITE = 2, OPEN_APPEND = 4 };
 #define FILE_BASE 0x200000000ULL
@@ -41,16 +49,29 @@ static Mount mounts[16];
 static File files[NFILES];
 static Dir dirs[NDIRS];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static char profile[1024], save_root[1024];
+static char profile[1024], save_root[1024], busy_path[1100], version_path[1100];
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 
 static void need(int c, const char *m) { if (!c) runtime_fail(m); }
 
 /* Save in progress: a save-data file open for writing, or save data changed in the last 3 s and not committed yet (TOTK
    writes a slot's files back to back and then commits; between the files nothing is open for a moment). */
-static _Atomic int save_writers, save_dirty;
+static _Atomic int save_writers, save_dirty, busy_marked;
 static _Atomic uint64_t save_changed_ns;
-static void save_touched(void) { atomic_store(&save_changed_ns, runtime_now_ns()); atomic_store(&save_dirty, 1); }
+static void small_file(const char *path, const char *text) {   /* best effort: a missing marker only makes a sync tool less careful */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return;
+    if (write(fd, text, strlen(text)) < 0) fprintf(stderr, "[totk] cannot write %s\n", path);
+    close(fd);
+}
+static void save_touched(void) {
+    atomic_store(&save_changed_ns, runtime_now_ns()); atomic_store(&save_dirty, 1);
+    if (!atomic_exchange(&busy_marked, 1)) { char line[64]; snprintf(line, sizeof line, "%d %s\n", (int)getpid(), TOTK_GAME_VERSION); small_file(busy_path, line); }
+}
+static void save_committed(void) {
+    small_file(version_path, TOTK_GAME_VERSION "\n");
+    unlink(busy_path); atomic_store(&busy_marked, 0); atomic_store(&save_dirty, 0);
+}
 int runtime_fs_save_busy(void) {
     if (atomic_load(&save_writers) > 0) return 1;
     return atomic_load(&save_dirty) && runtime_now_ns() - atomic_load(&save_changed_ns) < 3000000000ull;
@@ -73,6 +94,8 @@ static void init(void) {
     uint64_t uid[2]; runtime_account_uid(uid);
     char p[1100]; make_dir(profile);
     snprintf(p, sizeof p, "%s/save", profile); make_dir(p);
+    snprintf(busy_path, sizeof busy_path, "%s/.busy", p); snprintf(version_path, sizeof version_path, "%s/.version", p);
+    unlink(busy_path);                                     /* left behind by a run that ended in the middle of a save */
     need(snprintf(save_root, sizeof save_root, "%s/save/%016llx%016llx", profile, (unsigned long long)uid[1], (unsigned long long)uid[0]) < (int)sizeof save_root, "save path");
     make_dir(save_root);                                   /* launcher-style EnsureSaveData */
     snprintf(p, sizeof p, "%s/temp", profile); remove_tree(p); make_dir(p);
@@ -172,7 +195,7 @@ static void unmount(const char *name) {
     pthread_mutex_lock(&lock);
     for (int i = 0; i < 16; i++) if (mounts[i].kind && !strcmp(mounts[i].name, name)) { mounts[i].kind = M_FREE; pthread_mutex_unlock(&lock); return; }
     pthread_mutex_unlock(&lock);
-    if (!runtime_romfs_owns(name)) runtime_fail("unmount of unknown fs mount");
+    BOTW_AOC_UNMOUNT(name) if (!runtime_romfs_owns(name)) runtime_fail("unmount of unknown fs mount");
 }
 static unsigned commit(const char *name) {
     pthread_mutex_lock(&lock); int found = 0, save = 0;
@@ -180,7 +203,7 @@ static unsigned commit(const char *name) {
     pthread_mutex_unlock(&lock);
     if (!found) return R_PATH_NOT_FOUND;
     for (int i = 0; i < NFILES; i++) { pthread_mutex_lock(&lock); int fd = files[i].fd; pthread_mutex_unlock(&lock); if (fd > 0) fcntl(fd, F_FULLFSYNC); }
-    if (save && !(getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 23)) atomic_store(&save_dirty, 0);   /* 23: probe-save's negative control */
+    if (save && !(getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 23)) save_committed();   /* 23: probe-save's negative control */
     return 0;
 }
 
@@ -193,7 +216,7 @@ static File *file_of(uint64_t h, int *fd, int *mode) {
 void runtime_fs_log(const char *what, const char *path);
 static unsigned open_file(uint64_t *out, const char *path, int mode) {
     if (path && !runtime_romfs_owns(path)) runtime_fs_log(mode & 2 ? "write" : "read", path);
-    if (runtime_romfs_owns(path)) return runtime_romfs_open(out, path, mode);
+    if (runtime_romfs_owns(path)) return runtime_romfs_open(out, path, mode); BOTW_AOC_OPEN(out, path, mode)
     if (!out || !(mode & (OPEN_READ | OPEN_WRITE)) || (mode & ~7)) return R_INVALID_ARGUMENT;
     char p[1100]; int kind = M_FREE; unsigned r = host_path_kind(path, p, sizeof p, &kind); if (r) return r;
     struct stat st; if (stat(p, &st)) return R_PATH_NOT_FOUND; if (!S_ISREG(st.st_mode)) return R_PATH_NOT_FOUND;
@@ -210,7 +233,7 @@ static unsigned open_file(uint64_t *out, const char *path, int mode) {
     pthread_mutex_unlock(&lock); runtime_fail("host file handle table full");
 }
 static unsigned read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size) {
-    if (runtime_romfs_handle(h)) return runtime_romfs_read(out, h, offset, buffer, size);
+    if (runtime_romfs_handle(h)) return runtime_romfs_read(out, h, offset, buffer, size); BOTW_AOC_READ(out, h, offset, buffer, size)
     int fd, mode; if (!out || offset < 0 || (!buffer && size) || !file_of(h, &fd, &mode)) return R_INVALID_ARGUMENT;
     if (!(mode & OPEN_READ)) return R_OPEN_MODE;
     dm_guest_write_prepare(buffer, (size_t)size);
@@ -236,7 +259,7 @@ static unsigned write_file(uint64_t h, int64_t offset, const void *buffer, uint6
     return 0;
 }
 static unsigned file_size(int64_t *out, uint64_t h) {
-    if (runtime_romfs_handle(h)) return runtime_romfs_size(out, h);
+    if (runtime_romfs_handle(h)) return runtime_romfs_size(out, h); BOTW_AOC_SIZE(out, h)
     int fd; struct stat st; if (!out || !file_of(h, &fd, NULL) || fstat(fd, &st)) return R_INVALID_ARGUMENT;
     *out = st.st_size; return 0;
 }
@@ -248,7 +271,7 @@ static unsigned set_file_size(uint64_t h, int64_t size) {
 }
 static unsigned flush_file(uint64_t h) { int fd; if (!file_of(h, &fd, NULL)) return R_INVALID_ARGUMENT; fcntl(fd, F_FULLFSYNC); return 0; }
 static void close_file(uint64_t h) {
-    if (runtime_romfs_handle(h)) { runtime_romfs_close(h); return; }
+    if (runtime_romfs_handle(h)) { runtime_romfs_close(h); return; } BOTW_AOC_CLOSE(h)
     if (!file_of(h, NULL, NULL)) runtime_fail("close invalid file handle");
     pthread_mutex_lock(&lock); int fd = files[h - FILE_BASE].fd, save = files[h - FILE_BASE].save; files[h - FILE_BASE].fd = 0; pthread_mutex_unlock(&lock);
     close(fd);
@@ -266,7 +289,7 @@ static unsigned rename_file(const char *from, const char *to) {
     return rename(a, b) ? errno_result() : 0;
 }
 static unsigned entry_type(int *out, const char *path) {
-    if (runtime_romfs_owns(path)) return runtime_romfs_entry_type(out, path);
+    if (runtime_romfs_owns(path)) return runtime_romfs_entry_type(out, path); BOTW_AOC_TYPE(out, path)
     char p[1100]; unsigned r = host_path(path, p, sizeof p); if (r) return r; struct stat st;
     if (!out) return R_INVALID_ARGUMENT; if (stat(p, &st)) return R_PATH_NOT_FOUND;
     *out = S_ISDIR(st.st_mode) ? 0 : 1; return 0;
@@ -313,8 +336,14 @@ void runtime_save_probe(void) {
 #define CHECK(c, what) do { checks++; if (!(c)) { fprintf(stderr, "save probe: %s\n", what); runtime_fail("save probe failed"); } } while (0)
     CHECK(mount_save("save", uid) == 0 && mount_temp("temp") == 0, "mount save and temporary storage");
     CHECK(!runtime_fs_save_busy(), "idle at start");
+    struct stat st; char version[32] = {0}; FILE *vf;
+    CHECK(stat(busy_path, &st) != 0, "no .busy marker at start");
     CHECK(create_file("save:/a.sav", 16) == 0 && runtime_fs_save_busy(), "creating a save file starts a save");
+    CHECK(stat(busy_path, &st) == 0, "a save in progress writes save/.busy");
     CHECK(commit("save") == 0 && !runtime_fs_save_busy(), "commit ends it");
+    CHECK(stat(busy_path, &st) != 0, "commit removes save/.busy");
+    CHECK((vf = fopen(version_path, "r")) && fgets(version, sizeof version, vf) && !strcmp(version, TOTK_GAME_VERSION "\n"), "commit writes save/.version");
+    if (vf) fclose(vf);
     CHECK(open_file(&h, "save:/a.sav", OPEN_WRITE) == 0 && runtime_fs_save_busy(), "a save file open for writing");
     static const char data[16] = "progress";
     CHECK(write_file(h, 0, data, sizeof data, NULL) == 0 && runtime_fs_save_busy(), "writing");
@@ -333,12 +362,12 @@ void runtime_save_probe(void) {
     CHECK(commit("save") == 0 && !runtime_fs_save_busy() && delete_file("save:/c.sav") == 0 && runtime_fs_save_busy() && commit("save") == 0, "delete and commit");
 #undef CHECK
     remove_tree(dir);
-    printf("{\"status\":\"pass\",\"probe\":\"probe-save\",\"checks\":%u,\"scope\":\"save-in-progress state (runtime_fs_save_busy) through open / write / close / create / rename / delete / commit on a save mount; reads and temporary storage do not count; stale uncommitted changes do not hold a close\"}\n", checks);
+    printf("{\"status\":\"pass\",\"probe\":\"probe-save\",\"checks\":%u,\"scope\":\"save-in-progress state (runtime_fs_save_busy) through open / write / close / create / rename / delete / commit on a save mount; reads and temporary storage do not count; stale uncommitted changes do not hold a close; save/.busy from change to commit, save/.version on commit\"}\n", checks);
 }
 
 void *runtime_fs_host_override(const char *name) {
     static const struct { const char *name; void *fn; } map[] = {
-        {"_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", open_file}, {"_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", file_size},
+        {"_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", open_file}, {"_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", file_size}, BOTW_AOC_TABLE
         {"_ZN2nn2fs9CloseFileENS0_10FileHandleE", close_file}, {"_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", entry_type},
         {"_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", read_file}, {"_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE", read_options},
         {"_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm", read_exact},
@@ -353,6 +382,10 @@ void *runtime_fs_host_override(const char *name) {
         {"_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", mount_save_ro},
         {"_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE", save_exists},
         {"_ZN2nn2fs21MountTemporaryStorageEPKc", mount_temp}, {"_ZN2nn2fs7UnmountEPKc", unmount}, {"_ZN2nn2fs6CommitEPKc", commit},
+#ifdef GAME_BOTW
+        {"_ZN2nn2fs14CommitSaveDataEPKc", commit},   /* SDK 7 (Breath of the Wild 1.6.0) */
+#endif
+       
         {"_ZN2nn2fs18CreateCacheStorageEill", create_cache}, {"_ZN2nn2fs18DeleteCacheStorageEi", delete_cache},
         {"_ZN2nn2fs17MountCacheStorageEPKci", mount_cache},
         {"_ZN2nn2fs20OpenCacheStorageListEPNS0_22CacheStorageListHandleE", open_cache_list},

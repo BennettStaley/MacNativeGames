@@ -12,6 +12,18 @@ thing for macOS. The rewrites of versions 1.0.0, 1.1.2 and 1.4.3 were verified s
 inputs against the original in an emulator, with negative controls); the build checks that your rewrite is byte for
 byte the selected version (`games/totk/assets/expected-v1.0.0.json` / `expected-v1.1.2.json` / `expected-v1.4.3.json`).
 
+The rewrites are what makes the code the app's own: it is bound by SHA-256, so a patch cannot be applied while the game
+runs. A player mod that changes the code therefore merges its main-module patches *before* that step
+(`--mod <mod folder>`, `games/totk/scripts/mod_exefs.py`): an IPS / IPS32 / pchtxt patch is applied to the verified
+retail main (a `.pchtxt` says in `@nsobid-` which build of main it is for, with `@enabled` / `@disabled` switching the
+sections on and off and `@flag offset_shift 0x100` required before the first patch line; an `.ips` carries no id, so it counts as a
+main patch only when it is named `main` or after main's build id), refused if it lands on a site the app patches itself (the 60 FPS, resolution, ultrawide and cloth sites,
+and the rewriter's registered cuts - `games/totk/scripts/patch_sites.py` reads them out of the C sources, and the signed
+jump tables out of `patch_nso.py`), and the
+merged module is then rewritten and bound like the retail one. Extra code modules a mod ships are not loaded: the app
+loads the three modules below. The same build replaces the version's player mod folder with the mod's RomFS files only
+when `--install-mod-romfs` is given (`games/totk/scripts/mod_folder.py`): that folder may hold files of the player's own.
+
 The loader maps the three rewritten modules (main, sdk, subsdk0) at their original layout, resolves their imports
 against each other, and starts the game's own `nn::init::Start`.
 
@@ -41,7 +53,7 @@ translator (to SPIR-V), SPIRV-Cross (to Metal Shading Language) and Metal, and t
 (`~/Library/Application Support/MacNativeGames/TOTK/shader-cache`). The translator runs as one native program,
 `totk_xlate --service` (`games/totk/tools/totk_xlate`: the Ryujinx translator with this project's patches and the
 service that turns each request into the MSL and its reflection file), compiled ahead of time with .NET NativeAOT; it
-ships ready-made in `games/totk/prebuilt/macos-arm64`, so neither building nor playing needs .NET, and playing needs no Python. Building still requires Python 3.14. The build also prepares a selected-version startup shader seed from the local RomFS: MSL, reflection and dependency indexes, not GPU-specific compiled binaries. The first launch imports it into the user cache and warms it before releasing the first frame. A pipeline identifier list alone cannot do this when its shaders are absent. New binding-dependent variants still use runtime translation. MetalFX upscales the game's 1600x900 scene into its
+ships ready-made in `games/totk/prebuilt/macos-arm64`, so neither building nor playing needs .NET, and playing needs no Python. Building still requires Python 3.14. The build also prepares a selected-version startup shader seed from the local RomFS: MSL, reflection and dependency indexes, not GPU-specific compiled binaries. The first launch imports it into the user cache and warms it before releasing the first frame. A pipeline identifier list alone cannot do this when its shaders are absent. New binding-dependent variants still use runtime translation. Variants added to the [shared shader list](shader-list.md#the-mac-app-keeps-itself-current) after the build are downloaded once a day and prepared in the background from the local game data (download only). MetalFX upscales the game's 1600x900 scene into its
 1080p or 1440p canvas and can generate in-between frames.
 
 ## Texture storage layout
@@ -64,6 +76,12 @@ The live TOTK 1.4.3 comparison on Apple M4 Pro also reproduced the grid with Rec
 
 Historical 1.1.2 Ultrahand captures and the current 1.4.3 Recall pair are hosted in the same [separate evidence attachments](https://github.com/huahuahuahuahuahuahuahua/MacNativeGames/releases/tag/rendering-evidence-20261018) and linked from PR #3. No screenshots, game binaries, extracted assets or saves are included in the code commits.
 
+## Vertex outputs a shader does not write
+
+On Maxwell, a fragment shader reads `(0, 0, 0, 1)` for every component of an input its vertex shader never writes. The Ryujinx translator gives a vertex shader those defaults only for the inputs the next stage reads, which it learns from `SetNextStage`; the service translates every shader on its own, so no next stage is set and nothing was initialised. SPIRV-Cross starts the output struct at zero (`main0_out out = {};`), so the unwritten components reached the fragment shader as 0. The drop marker of a held item depends on them: its vertex shader writes only `xyz` of one output and its fragment shader multiplies the alpha by that output's `w`, so the marker comes out fully transparent. Patch `0005` initialises every user output a vertex shader writes to `(0, 0, 0, 1)` when no next stage is set; the shader's own stores then replace the components it writes.
+
+Over the 18,064 startup variants of a 1.4.3 build, the patched translator changed 6,679 of the 7,000 vertex functions, each only by these initial stores (the variable numbering of the output struct shifts with them); none of the 10,849 fragment and 215 compute shaders changed. With the patch, the marker and its arrow show under a held material on 1.4.3 (Apple M2 Max). The title background gets slightly darker (mean luminance 61.2 -> 57.0): in another native port of this game, the same change was traced to the volumetric light pass, which multiplies the unwritten `w` into the translation column of its shadow matrix, so with `w = 0` the translation was lost. An existing shader cache keeps the vertex functions it already has (the seed import preserves shaders collected on the Mac), so the fix reaches an existing install once its cache is cleared or the chain name changes.
+
 ## Buffer copies through aliased memory
 
 The same game memory can be reached through two Metal buffers, each with its own GPU virtual address: a virtual memory pool maps a physical pool's pages a second time (`mach_vm_remap`), and two memory pools can wrap the same CPU memory. A barrier with only device visibility does not make a write through one buffer visible to a read through the other. Every buffer-to-buffer copy (`mtl_sub_copy`, and the copy fallback of inline uniform updates) therefore carries `MTL4VisibilityOptionResourceAlias` in the barriers the copy encoder already places and at its end; no barriers are added. The fix comes from the original port (`d309e62`, by Codex); its copy-batch experiment, off by default there, is not included.
@@ -82,18 +100,81 @@ The same game memory can be reached through two Metal buffers, each with its own
    RomFS overlays (small data patches: quick-menu capture timing at high frame rates, the game-over retry, the heap
    sizes the 1440p output needs) are made from your own files. The game-over retry patch only matters on 1.0.0:
    1.1.2 and 1.4.3 read Nintendo's own fixed flow (`DmF_SY_GameOver.110`), so there the patch of the old file is made
-   and checked but never read. At start the runtime also loads player mods from
-   `~/Library/Application Support/MacNativeGames/TOTK/mods/<version>` in the same manifest format, after the build's
-   overlays. Every listed file is hashed at start, and each one is opened only when the game opens it. A line whose
-   original SHA-256 is `-` adds a file the RomFS lacks (numbered after the RomFS's own files; its folders exist for the
-   game's entry-type queries); `scripts/make_mod_manifest.py` writes such lines for new files.
+   and checked but never read. At start the runtime then loads the player's mods, after the build's overlays
+   (`runtime/mods.c`, `runtime/romfs.c`; [docs/mods.md](mods.md)): the mods folder
+   (`~/Library/Application Support/MacNativeGames/TOTK/mods`, the iOS app's `Documents/mods`, `TOTK_MODS_DIR`) holds one
+   folder per mod with its `romfs/`, and `mods.txt` gives the order. Every file a mod ships is looked up in the RomFS
+   index: it replaces the file of that path (a path spelt in another case uses the game's spelling, with a warning) or
+   adds one; the first mod in the order wins a path two mods change, and a path a build overlay changes stays the
+   build's (logged; the start goes on). These files are not hashed: each one's identity (device, inode, size,
+   modification time) is kept and checked when the game opens it. A mod's own ResourceSizeTable is never served;
+   instead the game's table (`System/Resource/ResourceSizeTable.Product.143.Nin_NX_NVN.rsizetable.zs`, a RESTBL: CRC32
+   of each resource path without `.zs` with a size, plus a name table for colliding paths) is decompressed with zstd's
+   decoder (`third_party/zstd`), each player file's entry (and each changed member of a replaced `.pack`) is raised to
+   TkSharp's estimate, and the result is served as a zstd frame of raw blocks, cached in `<mods>/.cache` until the
+   files change. The older single folder `mods/<version>` with a `manifest.tsv` still loads first: every listed file
+   is hashed at start, and a line whose original SHA-256 is `-` adds a file the RomFS lacks (numbered after the RomFS's
+   own files; its folders exist for the game's entry-type queries); `scripts/make_mod_manifest.py` writes it.
 3. SPIRV-Cross compiled with clang; the prebuilt shader translator checked against its SHA-256. `prepare_shader_seed.py`
    reads dictionary-compressed startup packages from the selected, verified RomFS, parses supported NVN BNSH programs
    and translates default-binding variants. The version, translation chain, translator/preparer hashes and every
    output file are checked before cache reuse and packaging. No prior user shader cache is read.
-4. The game binary built against your extracted files (it checks their hashes at every start) and everything put into
-   an app bundle; the app's launcher points the game at your profile, cache and log folders. The builder seals and
-   strictly verifies the complete bundle before replacing the previous app, then refreshes its LaunchServices record.
+4. The game binary built against your extracted files (it checks their hashes at every start) and the app bundle: the
+   code and small files inside it, the large game data in the game-data folders next to it (see below); the app's
+   launcher points the game at your profile, cache, log and game-data folders. The builder seals and strictly verifies
+   the bundle before replacing the previous app, then refreshes its LaunchServices record.
+
+## Where the game data lives
+
+The RomFS image (17 GB) and the prepared startup shaders (about 52,000 seed files and 17,000 compiled Metal libraries,
+1 GB) change only when the game files, the shared shader list or the Metal compiler change. Inside the app they made up
+nearly all of what every rebuild cloned file by file, sealed with `codesign` (which reads all 17 GB) and had macOS scan
+again on the first run, so a one-line code change took 10 to 15 minutes. They now live outside the app, in
+content-addressed folders:
+
+```
+~/Library/Application Support/MacNativeGames/TOTK/game-data/
+  v143-romfs-<id>/     romfs.bin, runtime-index.bin, store.json (+ the game's RomFS verification record)
+  v143-shaders-<id>/   shader-seed/, shader-libs/, store.json
+  apps.json            the apps build_app.py made, for --prune-data
+```
+
+`<id>` is derived from the content (the image's pinned SHA-256 and the index's; the seed manifest's SHA-256, the Metal
+compiler's identity and the list of compiled libraries), so a rebuild of the same data finds its folder and a new shader
+list gets a new one next to it. `build_app.py` (`step_store`) writes a folder only when it is missing or damaged: its
+files are APFS clones of the work folder's (`clonefile`, no extra space on the same volume; across volumes a byte copy,
+hashed and compared), made read-only, with `store.json` written last. On a later build each file must still have its
+size, and a file whose identity (inode, size, modification time) changed since it was hashed is hashed again. The
+shader seed is checked file by file against its manifest before it is written. `--data-dir` puts the folders elsewhere
+(they are cloned only on the work folder's volume).
+
+The app carries `Contents/Resources/totk/game-data.json` with the two folders' paths, ids and file sizes and the build
+command. The launcher checks them before it starts the game (and in `--check`, so the build fails when they are wrong); a
+missing or different folder shows a dialog naming the folder and that command. It hands the folders to the game with
+`TOTK_ROMFS`, `TOTK_SHADER_SEED_DIR` and `TOTK_SHADER_LIBS`, and sets `TOTK_ROMFS_PROOF_DIR` to the RomFS folder. The game's
+checks are unchanged: it hashes the index at every start and the whole 17 GB image (SHA-256) when no verification record
+matches the image's device, inode, size and times; the record now lives next to the image, and since a rebuild no longer
+makes a new copy of the image, the image is hashed once per data folder rather than after every rebuild. The prepared
+shaders are checked against the seed's manifest when they are imported, as before.
+
+A rebuild whose game data and shaders are unchanged therefore only rebuilds the code (`make`), finds both folders, and
+assembles and seals an app of about 150 MB, which macOS checks in seconds. Measured on an M4 Mac mini (2026-10-20, 1.4.3,
+work folder already complete): the app with the data inside took 739 s to rebuild (8.5 minutes cloning 69,516 files one
+`cp` at a time and sealing 17 GB, 123 s for the macOS check) and was 17 GB; the first build in this layout, which also
+wrote both data folders, took 76 s, and a rebuild after touching `runtime/settings.c` 45 s (code 17 s, the data and
+shader steps' checks and overlays 24 s, data folders 1 s, assembling and sealing 2 s, the macOS check 1 s), for an app
+of 149 MB in 36 files.
+
+`--embed-data` builds the self-contained app as before (the data inside it, no `game-data.json`), for copying the app to
+another Mac. The iPhone/iPad IPA always carries its data. Moving the default app is fine (the folders are found by their
+absolute paths); copying it to another Mac needs `--embed-data` or a rebuild there.
+
+Disk use: on the work folder's volume the folders share their blocks with the work folder's files, so they take no extra
+space until the work folder is deleted; then they hold the 17 GB of the RomFS and about 1 GB of shaders per shader list.
+Old shader folders stay when the shader list changes. `python3.14 build_app.py --prune-data` deletes every folder no app
+points to (the apps in `apps.json` and every app with the bundle identifier Spotlight finds); an app on a disconnected
+volume is not seen, and would need a rebuild. Deleting the whole `game-data` folder is also safe: the next build makes it
+again (in a minute or two while the work folder has the data), and until then the app says what to run.
 
 The optional `games/totk/tools/install_desktop_entry.py` installer keeps one desktop link to that bundle. When replacing
 the older development launcher, it verifies a copy of its profile in the standard user-data folder, keeps an upgrade

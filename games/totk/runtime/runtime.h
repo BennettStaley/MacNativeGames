@@ -10,6 +10,7 @@ typedef struct {
  uint64_t text_end, ro_off, data_off, patch_off, key_off, init, ctor_flag, init_array, init_size;
  const Symbol *symbols; unsigned nsym; const Reloc *relocs; unsigned nreloc;
  const Gate *gates; unsigned ngate; unsigned *hash, hash_mask;
+ const uint32_t *changed, *moved; unsigned nchanged, nmoved;   /* main: [start,end) pairs the Apple-silicon rewrite changed / runs from its patch area (cheats) */
  uint8_t *base; unsigned relative, symbolic, cross, weak;
 } Module;
 extern pthread_key_t runtime_keys[8];
@@ -19,6 +20,7 @@ void *runtime_override(const char *name);
 void runtime_hle_stack_init(uint64_t tsd_offset);
 void runtime_gpu_path_probe(const char *which);
 void runtime_audio_probe(void);
+void runtime_audio_output_restart(int recreate);   /* audio_mixer.c: start the outputs again after an audio session interruption (iOS) */
 void *runtime_hle_wrap(void *fn);
 void runtime_hle_stack_set(uintptr_t top);
 void *runtime_font_override(const char *name);
@@ -90,6 +92,19 @@ void runtime_boot_count(const char *stage,uint64_t done,uint64_t total);   /* a 
    adds to the texture heap and to Graphics, and so to the application pool (runtime/services.c). */
 int runtime_output_res(unsigned *w,unsigned *h);
 uint64_t runtime_output_res_extra_bytes(void);
+int runtime_heap_overlay(char *out,size_t n);   /* the HeapDef overlay folder in TOTK_ROMFS_PATCHES_OUT the heaps need ("<w>x<h>[-scene-<sw>x<sh>]"), 0 = none */
+/* Live scene (3D) render size (1.4.3, runtime/game_patches_v143.c; Mac and iOS). runtime_render_request asks for w x h,
+   latched at the next present: 0, or -1 when it is above the boot reserve (applies after a restart: TOTK_RENDER_RES) or
+   the scene size is not patched. runtime_render_reserve gives the biggest size the heaps sized at boot hold (a request
+   fits when w*h is at most its pixels); TOTK_RENDER_RESERVE=<w>x<h> sets it. Older versions refuse and report 0x0. */
+int runtime_render_request(unsigned w,unsigned h);
+void runtime_render_reserve(unsigned *w,unsigned *h);
+/* The game's output (its 16:9 canvas, text and icons included), live up to the swapchain sized at start (1.4.3, Mac):
+   runtime_output_request asks for w x h (0, or -1 when outside 640x360 .. runtime_output_max). */
+int runtime_output_request(unsigned w,unsigned h);
+void runtime_output_max(unsigned *w,unsigned *h);
+void runtime_aspect_set(float ratio);   /* aspect_patch.h: the picture's shape, 0 = the game's own 16:9 (Mac) */
+int runtime_render_res(unsigned *w, unsigned *h);   /* the scene reserve above 1600x900 that the heaps count (1.4.3; 0 elsewhere) */
 int runtime_output_res_toggle(void);                    /* legacy two-state output size switch */
 int runtime_output_mode_cycle(void);                    /* key 3: MetalFX 2K -> native 2K -> off */
 uint64_t runtime_output_size_current(void);              /* configured canvas: width in low 32 bits, height in high 32 bits */
@@ -99,9 +114,20 @@ void runtime_game_slot_acquire(const char *mode);   /* runtime/game_slot.c: one 
 void *runtime_front_override(const char *name);
 int runtime_front_focus(void);
 void runtime_shortcut_help_toggle(void);
-int fps_overlay_toggle_hints(void);   /* shared key 1 toggle for FPS, shader and system-load overlays */
-int runtime_aspect_toggle(void);   /* runtime/aspect_patch.h: key 4, 16:9 <-> ultrawide (Mac, 1.2.1 / 1.4.3); 0 where unavailable */
+int fps_overlay_toggle_hints(void);   /* key 1: all -> minimal (FPS only) -> off; returns the new mode, 0 = off */
+int fps_overlay_hud_mode(void);
+int fps_overlay_full_hud(void);
+int runtime_aspect_toggle(void);   /* runtime/aspect_patch.h: key 4, 16:9 -> fit to the window / display -> 21:9 (or TOTK_ASPECT) (Mac, 1.2.1 / 1.4.3); 0 where unavailable */
+int runtime_aspect_step(void);     /* key 4's step: 0 16:9, 1 fit to the window, 2 21:9 / TOTK_ASPECT; -1 where unavailable */
+void runtime_aspect_view(double w, double h);   /* frontend.m: the window's drawable size, which key 4 follows */
 float runtime_aspect_now(void);     /* the ratio in force, 0 = the game's own 16:9 */
+float runtime_aspect_choice(void);  /* key 4's step as the settings menu gives it: -1 fit, 0 16:9, else the wide ratio */
+void runtime_fov_set(int percent);
+void runtime_fog_set(int percent);   /* aspect_patch.h: fog density 0..100 % live (1.4.3, Mac and iOS), 100 = the game's own */
+int runtime_shadow_res(void);        /* aspect_patch.h: the shadow map factor in force from the start (TOTK_SHADOW_RES), 0 = the game's own */
+void runtime_fov_aspect(float k);   /* aspect_patch.h: the vertical angle's factor for a screen taller than 16:9 (Vert+), with the player's */  /* runtime/aspect_patch.h: field of view 70..140 % live (1.4.3, Mac and iOS), 100 = the game's own */
+void runtime_time_speed_set(int percent);       /* runtime/world_patch.h: time of day 0 (paused) .. 800 % live (1.4.3), 100 = the game's own */
+void runtime_render_distance_set(int percent);   /* runtime/world_patch.h: the camera's far clip 50..300 % live (1.4.3), 100 = the game's own */
 int hud_compact(void);   /* gfx/nvn/fps_overlay.c: the overlay lines go to the window's corner panel (TOTK_HUD=corners: in the picture) */
 int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line 0..2: FPS, shaders, load; 0 = not published */
 
@@ -114,11 +140,54 @@ void runtime_memory_probe(void);
 
 void runtime_input_key(unsigned code,int down);
 void runtime_input_clear(void);
+void runtime_input_hold(int on);
+int runtime_setting_test(const char *key, const char *word, int *value);   /* settings.c: TOTK_INPUT_FILE "set <key> <value>", the menu's path */
+void runtime_front_settings_key(unsigned code);   /* frontend.m: a key pressed in the open settings menu (TOTK_INPUT_FILE "menukey") */
+void runtime_front_restart(void);       /* frontend.m: close the game and open the app again (the menu's Restart now) */
+int runtime_front_can_restart(void);   /* 1 when launched from the app (TOTK_APP_BUNDLE) */
+void runtime_front_settings_toggle(void);   /* frontend.m: open or close the Mac settings menu (gamepad.m: Home, or Options + Menu) */
+void runtime_front_settings_shot(const char *path);   /* frontend.m: the Mac settings panel as a PNG (TOTK_INPUT_FILE "settings-shot") */   /* 1 while the settings menu is open: the game reads a neutral controller */
+uint64_t runtime_input_buttons(void);   /* runtime/input.c: held buttons (keyboard and controller), npad bit order */
+void runtime_guest_regions(uint64_t base[3],uint64_t size[3]);   /* runtime/services.c: heap, alias and ASLR regions */
+int runtime_guest_access(uint64_t a,uint64_t n,int (*access)(void *ctx),void *ctx);   /* runtime/services.c: access() only on guest-mapped heap / alias pages */
+void runtime_cheats_launch(Module *main_module);   /* runtime/cheats.c: before the modules are sealed */
+int runtime_module_image_word(const Module *m,uint64_t off,uint32_t *out);   /* runtime/loader.c: a word of the verified rewritten image file (Mac) */
+int runtime_cheats_count(void);
+const char *runtime_cheats_name(int i);
+int runtime_cheats_state(int i);   /* CHEAT_ON | CHEAT_AT_LAUNCH | CHEAT_APPLIED | CHEAT_REFUSED */
+const char *runtime_cheats_problem(int i);
+int runtime_cheats_set(int i,int on);   /* returns the new state; saved, and the profile backed up before the first cheat */
+enum { CHEAT_ON = 1, CHEAT_AT_LAUNCH = 2, CHEAT_APPLIED = 4, CHEAT_REFUSED = 8 };
+/* The Cheats tab (Mac): every section of every cheat file read, k in file order; role (cheat_files.h): 0 cheat, 1 master
+   code (always on), 2 heading (a group's or a file's title), 3 hidden (a group's end); source: runtime_cheats_source_*. */
+typedef struct {
+    const char *name; int source, role, state; char problem[112];
+    /* The community cheat list (cheat_catalog.h); outside it: label = name, about = option = NULL, group = -1, hide = 0, choice = -1. */
+    const char *label;    /* the name shown */
+    const char *about;    /* a line about it, or NULL */
+    const char *option;   /* in a choice: this variant's label */
+    int group, hide;      /* CHEAT_GROUP_*; CHEAT_HIDE_* (not listed) or 0 */
+    int choice;           /* -1, or the first section of its choice (the row its options belong to) */
+} RuntimeCheatInfo;
+int runtime_cheats_total(void);
+int runtime_cheats_info(int k, RuntimeCheatInfo *out);   /* 0: no such section */
+int runtime_cheats_set_entry(int k, int on);   /* a cheat (role 0) on or off, as runtime_cheats_set; returns the new state */
+int runtime_cheats_sources(void);
+const char *runtime_cheats_source_label(int s);
+const char *runtime_cheats_source_path(int s);
+const char *runtime_cheats_source_problem(int s);   /* "" or why the file (or part of it) was not read */
+const char *runtime_cheats_build_id(void);   /* the running main's build ID, "" when unknown */
+const char *runtime_cheats_folder(void);     /* the player's cheats folder, "0" for none */
+int runtime_cheats_files_changed(void);      /* 1: the cheat files differ from those read at launch (restart to read them); 2: only the cheat list */
+const char *runtime_cheats_db_dir(void);     /* where the community cheat list is kept (Mac: cheat_db_fetch.h downloads it), "" for none */
+int runtime_cheats_db_source(void);          /* the cheat list's source index, -1 when none was read */
+int runtime_cheats_db_arrived(void);         /* main thread, after a download wrote a new list: 1 when it was read now (none was at launch) */
 int runtime_handheld_mode(void);   /* TOTK_OPERATION_MODE=handheld (runtime/services.c) */
 void *runtime_input_override(const char *name);
 typedef struct { uint64_t buttons; int32_t lx,ly,rx,ry; int connected; } RuntimeGamepadState;
 void runtime_gamepad_start(void);
 void runtime_gamepad_read(RuntimeGamepadState *out);
+uint64_t runtime_gamepad_held(void);   /* held buttons, leaving the press edges for runtime_gamepad_read */
 /* Forget held buttons and sticks: macOS stops delivering controller events (including releases) while the app is in
    the background, so a button held at focus loss would otherwise stay pressed for the game. */
 void runtime_gamepad_clear(void);

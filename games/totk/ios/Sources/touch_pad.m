@@ -2,6 +2,8 @@
 #import <GameController/GameController.h>
 #include <math.h>
 #include "runtime.h"
+#include "settings.h"
+#import "settings_menu.h"
 
 /* Layout inside the safe area (clear of the iPhone's notch, rounded corners and home indicator), like a Switch
    controller: ZL/L and R/ZR along the top with − and + between them, and two columns mirroring each other: on the left
@@ -10,11 +12,14 @@
    under ZL / ZR.
    A touch that misses every button is a stick, centred where the finger went down: the left stick on the left half,
    the camera (right stick) on the right half. Bits are the Npad buttons. While a game controller is connected the layer
-   is hidden; a touch shows it and works as usual, and it hides again 3 seconds after the last finger lifts. */
+   is hidden; a touch shows it and works as usual, and it hides again 3 seconds after the last finger lifts.
+   The settings menu (interface.touch_*) picks when it shows (always, hidden with a controller as above, until touched, or
+   off), its opacity and its size. */
 typedef struct { CGPoint at; uint64_t bit; NSString *label; CGFloat size; } TouchButton;
 enum { kButtonCount = 16 };
 static const CGFloat kButtonSize = 46;
 static const NSTimeInterval kHideAfter = 3;   // seconds after the last finger lifts, with a controller connected
+enum { TOUCH_ALWAYS, TOUCH_CONTROLLER, TOUCH_UNTIL_TOUCHED, TOUCH_OFF };   // interface.touch_controls
 
 @implementation TOTKTouchPad {
     NSMapTable<UITouch *, NSValue *> *points;
@@ -22,6 +27,7 @@ static const NSTimeInterval kHideAfter = 3;   // seconds after the last finger l
     NSMapTable<UITouch *, NSValue *> *rightOrigins;   // the same for the camera stick
     BOOL gamepad, concealed;                          // a controller is connected; the layer is hidden for it
     NSTimer *hideTimer;
+    int mode; CGFloat opacity, scale;                 // the settings menu's choices
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -33,10 +39,25 @@ static const NSTimeInterval kHideAfter = 3;   // seconds after the last finger l
         NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
         [center addObserver:self selector:@selector(controllersChanged:) name:GCControllerDidConnectNotification object:nil];
         [center addObserver:self selector:@selector(controllersChanged:) name:GCControllerDidDisconnectNotification object:nil];
+        [center addObserver:self selector:@selector(applySettings) name:TOTKSettingsChangedNotification object:nil];
+        [self applySettings];
         [self controllersChanged:nil];
     }
     return self;
 }
+
+- (void)applySettings {
+    int was = mode;
+    mode = settings_get("interface.touch_controls"); opacity = settings_get("interface.touch_opacity") / 100.0; scale = settings_get("interface.touch_size") / 100.0;
+    self.userInteractionEnabled = mode != TOUCH_OFF;
+    [hideTimer invalidate]; hideTimer = nil;
+    if (mode == TOUCH_OFF || (mode == TOUCH_UNTIL_TOUCHED && was != mode) || (mode == TOUCH_CONTROLLER && gamepad)) [self conceal];
+    else if (mode == TOUCH_ALWAYS || (mode == TOUCH_CONTROLLER && !gamepad)) concealed = NO;
+    [self setNeedsDisplay];
+}
+/* Hidden while idle: with a controller in the default mode, and always in "until touched". */
+- (BOOL)hidesWhenIdle { return mode == TOUCH_UNTIL_TOUCHED || (mode == TOUCH_CONTROLLER && gamepad); }
+- (CGFloat)buttonSize { return kButtonSize * scale; }
 
 - (void)controllersChanged:(NSNotification *)note {
     BOOL connected = NO;
@@ -44,29 +65,30 @@ static const NSTimeInterval kHideAfter = 3;   // seconds after the last finger l
         if (controller.extendedGamepad && !([note.name isEqualToString:GCControllerDidDisconnectNotification] && controller == note.object)) connected = YES;
     if (connected == gamepad) return;
     gamepad = connected; [hideTimer invalidate]; hideTimer = nil;
+    if (mode != TOUCH_CONTROLLER) return;
     if (gamepad) [self conceal]; else { concealed = NO; [self setNeedsDisplay]; }
 }
 
 - (void)conceal {
-    concealed = YES;
+    concealed = YES; [self setNeedsDisplay];
     // Fingers on the screen when it hides would otherwise hold their buttons and sticks.
     [points removeAllObjects]; [leftOrigins removeAllObjects]; [rightOrigins removeAllObjects]; [self updateState];
 }
 
 - (void)hideLater {
     [hideTimer invalidate]; hideTimer = nil;
-    if (!gamepad || points.count) return;
+    if (![self hidesWhenIdle] || points.count) return;
     __weak TOTKTouchPad *weakSelf = self;
     hideTimer = [NSTimer scheduledTimerWithTimeInterval:kHideAfter repeats:NO block:^(NSTimer *timer) {
         (void)timer; TOTKTouchPad *pad = weakSelf; if (pad) [pad concealIfIdle];
     }];
 }
-- (void)concealIfIdle { if (gamepad && !points.count) [self conceal]; }
+- (void)concealIfIdle { if ([self hidesWhenIdle] && !points.count) [self conceal]; }
 
 - (CGRect)area { return UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets); }
-- (CGFloat)stickRadius { return MIN(70, self.area.size.height * .16); }
+- (CGFloat)stickRadius { return MIN(70, self.area.size.height * .16) * scale; }
 /* Distance between the centre of a button diamond (A/B/X/Y, the d-pad) and each of its buttons. */
-- (CGFloat)diamond { return MIN(52, self.area.size.height * .14); }
+- (CGFloat)diamond { return MIN(52, self.area.size.height * .14) * scale; }
 - (CGFloat)hitRadius { return MIN(36, self.diamond * .68); }
 /* How far the two columns sit inside the safe area: 14% of its width. On an iPhone they move halfway from there toward
    the screen edge, so the gap between the screen edge and the d-pad or A/B/X/Y is half as wide (the user's choice,
@@ -74,7 +96,7 @@ static const NSTimeInterval kHideAfter = 3;   // seconds after the last finger l
 - (CGFloat)columnInset {
     CGFloat full = self.area.size.width * .14;
     if (self.traitCollection.userInterfaceIdiom != UIUserInterfaceIdiomPhone) return full;
-    CGFloat side = MAX(self.safeAreaInsets.left, self.safeAreaInsets.right), edgeGap = side + full - (self.diamond + kButtonSize / 2);
+    CGFloat side = MAX(self.safeAreaInsets.left, self.safeAreaInsets.right), edgeGap = side + full - (self.diamond + self.buttonSize / 2);
     return MAX(full - edgeGap / 2, self.stickRadius + 4);
 }
 /* The shoulder buttons move outward the same way on an iPhone: the gap between the screen edge and ZL / ZR is halved,
@@ -82,7 +104,7 @@ static const NSTimeInterval kHideAfter = 3;   // seconds after the last finger l
 - (CGFloat)shoulderShift {
     if (self.traitCollection.userInterfaceIdiom != UIUserInterfaceIdiomPhone) return 0;
     CGFloat side = MAX(self.safeAreaInsets.left, self.safeAreaInsets.right);
-    return (side + self.area.size.width * .05 - kButtonSize / 2) / 2;
+    return (side + self.area.size.width * .05 - self.buttonSize / 2) / 2;
 }
 - (CGPoint)restingStick:(BOOL)right {
     CGRect a = self.area; CGFloat inset = self.columnInset + self.stickRadius * 1.9;
@@ -92,14 +114,14 @@ static const NSTimeInterval kHideAfter = 3;   // seconds after the last finger l
 - (void)buttons:(TouchButton *)b {
     CGRect a = self.area; CGFloat x = CGRectGetMinX(a), y = CGRectGetMinY(a), w = a.size.width, h = a.size.height, d = self.diamond;
     CGFloat top = y + h * .12, bottom = y + h * .88;
-    CGFloat inset = self.columnInset, shift = self.shoulderShift;
+    CGFloat inset = self.columnInset, shift = self.shoulderShift, size = self.buttonSize;
     CGPoint face = CGPointMake(x + w - inset, y + h * .42), pad = CGPointMake(x + inset, y + h * .42);
     TouchButton all[kButtonCount] = {
-        {{face.x + d, face.y}, 1, @"A", kButtonSize}, {{face.x, face.y + d}, 2, @"B", kButtonSize}, {{face.x, face.y - d}, 4, @"X", kButtonSize}, {{face.x - d, face.y}, 8, @"Y", kButtonSize},
-        {{x + w * .05 - shift, top}, 256, @"ZL", kButtonSize}, {{x + w * .16 - shift, top}, 64, @"L", kButtonSize}, {{x + w * .84 + shift, top}, 128, @"R", kButtonSize}, {{x + w * .95 + shift, top}, 512, @"ZR", kButtonSize},
-        {{x + w * .40, top}, 2048, @"−", kButtonSize}, {{x + w * .60, top}, 1024, @"+", kButtonSize},
-        {{pad.x - d, pad.y}, 4096, @"◀", kButtonSize}, {{pad.x, pad.y - d}, 8192, @"▲", kButtonSize}, {{pad.x + d, pad.y}, 16384, @"▶", kButtonSize}, {{pad.x, pad.y + d}, 32768, @"▼", kButtonSize},
-        {{x + w * .05 - shift, bottom}, 16, @"L3", kButtonSize}, {{x + w * .95 + shift, bottom}, 32, @"R3", kButtonSize}};
+        {{face.x + d, face.y}, 1, @"A", size}, {{face.x, face.y + d}, 2, @"B", size}, {{face.x, face.y - d}, 4, @"X", size}, {{face.x - d, face.y}, 8, @"Y", size},
+        {{x + w * .05 - shift, top}, 256, @"ZL", size}, {{x + w * .16 - shift, top}, 64, @"L", size}, {{x + w * .84 + shift, top}, 128, @"R", size}, {{x + w * .95 + shift, top}, 512, @"ZR", size},
+        {{x + w * .40, top}, 2048, @"−", size}, {{x + w * .60, top}, 1024, @"+", size},
+        {{pad.x - d, pad.y}, 4096, @"◀", size}, {{pad.x, pad.y - d}, 8192, @"▲", size}, {{pad.x + d, pad.y}, 16384, @"▶", size}, {{pad.x, pad.y + d}, 32768, @"▼", size},
+        {{x + w * .05 - shift, bottom}, 16, @"L3", size}, {{x + w * .95 + shift, bottom}, 32, @"R3", size}};
     for (int i = 0; i < kButtonCount; i++) b[i] = all[i];
 }
 
@@ -148,26 +170,26 @@ static void stick_axes(CGPoint from, CGPoint to, CGFloat radius, int32_t *x, int
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self touchesEnded:touches withEvent:event]; }
 - (void)safeAreaInsetsDidChange { [super safeAreaInsetsDidChange]; [self setNeedsDisplay]; }
 
-static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r) {
+static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r, CGFloat size) {
     int32_t x, y; stick_axes(o, p, r, &x, &y); CGContextStrokeEllipseInRect(c, CGRectMake(o.x - r, o.y - r, 2 * r, 2 * r));
     CGPoint k = CGPointMake(o.x + x / 32767.0 * r, o.y - y / 32767.0 * r);
-    CGRect knob = CGRectMake(k.x - kButtonSize / 2, k.y - kButtonSize / 2, kButtonSize, kButtonSize);
+    CGRect knob = CGRectMake(k.x - size / 2, k.y - size / 2, size, size);
     CGContextFillEllipseInRect(c, knob); CGContextStrokeEllipseInRect(c, knob);
 }
 
 - (void)drawRect:(CGRect)rect {
     if (concealed) return;
-    (void)rect; CGContextRef c = UIGraphicsGetCurrentContext(); UIColor *ink = [UIColor colorWithWhite:1 alpha:.32];
+    (void)rect; CGContextRef c = UIGraphicsGetCurrentContext(); UIColor *ink = [UIColor colorWithWhite:1 alpha:opacity];
     // One fill for every button and knob, set before each fill: drawing a label leaves the context's fill colour at the
     // label's, which once made every button after A (the first drawn) brighter than A and the stick knobs.
     CGColorRef fill = ink.CGColor; CGContextSetStrokeColorWithColor(c, ink.CGColor); CGContextSetFillColorWithColor(c, fill); CGContextSetLineWidth(c, 2);
     CGFloat r = self.stickRadius;
     // Each stick is drawn where its finger went down, or at its resting place while idle.
-    if (!leftOrigins.count) { CGPoint rest = [self restingStick:NO]; draw_stick(c, rest, rest, r); }
-    if (!rightOrigins.count) { CGPoint rest = [self restingStick:YES]; draw_stick(c, rest, rest, r); }
-    for (UITouch *t in leftOrigins.keyEnumerator) draw_stick(c, [leftOrigins objectForKey:t].CGPointValue, [points objectForKey:t].CGPointValue, r);
-    for (UITouch *t in rightOrigins.keyEnumerator) draw_stick(c, [rightOrigins objectForKey:t].CGPointValue, [points objectForKey:t].CGPointValue, r);
-    NSDictionary *attrs = @{NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold], NSForegroundColorAttributeName: ink};
+    if (!leftOrigins.count) { CGPoint rest = [self restingStick:NO]; draw_stick(c, rest, rest, r, self.buttonSize); }
+    if (!rightOrigins.count) { CGPoint rest = [self restingStick:YES]; draw_stick(c, rest, rest, r, self.buttonSize); }
+    for (UITouch *t in leftOrigins.keyEnumerator) draw_stick(c, [leftOrigins objectForKey:t].CGPointValue, [points objectForKey:t].CGPointValue, r, self.buttonSize);
+    for (UITouch *t in rightOrigins.keyEnumerator) draw_stick(c, [rightOrigins objectForKey:t].CGPointValue, [points objectForKey:t].CGPointValue, r, self.buttonSize);
+    NSDictionary *attrs = @{NSFontAttributeName: [UIFont systemFontOfSize:15 * scale weight:UIFontWeightSemibold], NSForegroundColorAttributeName: ink};
     TouchButton b[kButtonCount]; [self buttons:b];
     for (int i = 0; i < kButtonCount; i++) {
         CGFloat size = b[i].size; CGRect box = CGRectMake(b[i].at.x - size / 2, b[i].at.y - size / 2, size, size);

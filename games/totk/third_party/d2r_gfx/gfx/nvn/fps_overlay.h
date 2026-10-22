@@ -9,13 +9,20 @@ enum { FPS_OVERLAY_TEX_W = 768, FPS_OVERLAY_TEX_H = 64, FPS_OVERLAY_MAX_SCALE = 
 
 /* fps / screen size < 0 / 0: not known yet ("--"). mfx: MetalFX upscaled the picture in the last frames. gen > 0: MetalFX
    frame interpolation shows that many generated frames a second besides the game's fps frames -> "FPS 50+50" (key 2).
-   big: the game itself outputs more than 1920x1080 (true 2K) -> " 2K" at the end. */
-typedef struct { int fps, screen_w, screen_h, mfx, gen, big; } fps_overlay_info;
+   big: the game itself outputs more than 1920x1080 (true 2K) -> " 2K" at the end.
+   detail: "Readout detail" is Detailed -> "FPS 60  avg 59  1% low 48  2560x1440" (avg / low < 0: "--", not measured yet). */
+typedef struct { int fps, screen_w, screen_h, mfx, gen, big, detail, avg, low; } fps_overlay_info;
+enum { FPS_STATS_SECONDS = 5 };   /* the window the average and the 1% low are measured over */
 
 int fps_overlay_enabled(void);
 /* Shared user toggle for every in-picture HUD layer: FPS, shader collection and load telemetry. */
-int fps_overlay_hints_enabled(void);
-int fps_overlay_toggle_hints(void);   /* atomically toggles all HUD layers and returns the new visibility */
+/* Key 1: HUD_MODE_ALL (FPS, shader collection, load and the shortcut reminder) -> HUD_MODE_MINIMAL (FPS only) -> HUD_MODE_OFF. */
+enum { HUD_MODE_OFF = 0, HUD_MODE_ALL = 1, HUD_MODE_MINIMAL = 2 };
+int fps_overlay_hud_mode(void);
+int fps_overlay_hints_enabled(void);   /* the FPS readout shows (all or minimal) */
+int fps_overlay_full_hud(void);        /* everything shows (all) */
+int fps_overlay_toggle_hints(void);   /* atomically steps to the next mode and returns it (HUD_MODE_OFF = nothing shows) */
+void fps_overlay_set_hints(int visible);   /* the settings menu: all (1) or off (0); TOTK_HINTS=0 starts off */
 /* Pixel scale (1..FPS_OVERLAY_MAX_SCALE) for a game picture view_h pixels tall: one text line is about 3% of its height. */
 int fps_overlay_scale(double view_h);
 /* The line in a 5x7 pixel font on a dark box, as BGRA8 pixels in out (FPS_OVERLAY_TEX_W x FPS_OVERLAY_TEX_H,
@@ -40,11 +47,18 @@ int fps_overlay_line_pixel_font(const char *text);   // 0: the line has a charac
 /* TOTK automatic shader collection, bottom-left box (2026-10-16 night): "SHADER +<new>/<in the cache> PSO +<new pipelines>",
    yellow for 3 s after something new was collected. TOTK_SHADER_OVERLAY=0 hides it (default on on the Mac, off on iOS). */
 int shader_overlay_enabled(void);
-void shader_overlay_text(char *out, size_t n, uint64_t fresh, int64_t total, uint64_t pipelines);   /* total < 0: "--" (not counted yet) */
+void shader_overlay_set(int on);   /* the settings menu's Shader counter, live */
+void shader_overlay_text(char *out, size_t n, uint64_t compiling, uint64_t fresh, int64_t total, uint64_t pipelines);   /* total < 0: "--" (not counted yet) */
 /* Record that the game's present number `ticket` reached the screen at now_s (seconds). The rate of game presents is
    re-measured every half second; fps_overlay_value() returns it, or -1 before the first measurement. */
 void fps_overlay_note(uint64_t ticket, double now_s);
 int fps_overlay_value(void);
+/* Over the last FPS_STATS_SECONDS of game presents: the average rate and the rate of the slowest 1% of frames (-1: less
+   than a second measured yet). The settings menu's "Readout detail" (fps_overlay_set_detail) shows them. */
+int fps_overlay_avg_value(void);
+int fps_overlay_low_value(void);
+void fps_overlay_set_detail(int detailed);
+int fps_overlay_detail(void);
 /* The same for interpolated frames shown (n counts them); fps_overlay_gen_value() is that rate, or -1. */
 void fps_overlay_note_gen(uint64_t n, double now_s);
 int fps_overlay_gen_value(void);

@@ -1,5 +1,6 @@
 #include "game_patches.h"
 #include "aspect_patch.h"
+#include "world_patch.h"   /* the setters only: time of day and render distance are 1.4.3 patches */
 #include "game_version.h"
 #include "world_survey.h"
 #include <TargetConditionals.h>
@@ -94,6 +95,11 @@ static uint32_t adrp_reg(unsigned rd, uint64_t site, uint64_t target) {
     return 0x90000000u | ((imm & 3u) << 29) | ((imm >> 2) << 5) | (rd & 31u);
 }
 static uint32_t adrp_x9(uint64_t site, uint64_t target) { return adrp_reg(9, site, target); }
+static uint32_t branch_to(uint64_t site, uint64_t target) {   /* b <target>, both offsets in main */
+    int64_t delta = (int64_t)target - (int64_t)site;
+    if ((delta & 3) || delta < -(1 << 27) || delta >= (1 << 27)) runtime_fail("patch branch outside range");
+    return 0x14000000u | ((uint32_t)(delta >> 2) & 0x3ffffffu);
+}
 
 /* iOS cannot write code pages at run time: tools/export (TOTK_EXPORT_IOS, runtime/loader.c) runs these same patches on the
    Mac and the patched text is embedded in the app. On the device the loader only checks that the patched words are there. */
@@ -111,6 +117,93 @@ static void put_word(Module *m, uint64_t off, uint32_t word, const char *what) {
         fprintf(stderr, "[totk] %s main+%#llx: embedded %08x, expected patched %08x\n", what, (unsigned long long)off, have, word);
         runtime_fail("embedded main text was not patched at build time (ios/tools/build_embed.sh)");
     }
+}
+
+/* Hair and cloth (PR #79 for 1.4.3, game_patches_v143.c patch_secondary_animation): the actor animation update builds a
+   second clock {seconds = factor / 30, ratio = factor} every rendered frame, so above 30 FPS hair and cloth swing too fast
+   (4x at 120 FPS). The ordinary animation clock already follows the real-time step. The older compiler inlines the update
+   in three places and calls the shared update (1.2.1 main+0x89822c) from one more; its other caller already passes
+   measured time and is left alone. Each inline place gets two veneers: at the fmul, seconds = measured seconds * factor;
+   at the store of the factor into the clock's ratio slot, ratio = measured 30 Hz ratio * factor (the ratio is stored
+   before the fmul in some places and after it in others). The call gets PR #79's veneer: s2 / s3 *= measured ratio.
+   The veneers read the real-time page (ratio at +0, seconds at +4) and save the registers they use on the stack.
+   Text padding +160 (after the bounce veneer). TOTK_CLOTH_REALTIME=0 keeps the original clock (Mac). */
+/* One inline place: fmul s<r>, s<f>, s<r> (s<r> = 1/30, s<f> = the time factor) at fmul; the factor goes into the ratio
+   slot at store, str s<f>, [sp, #off] or (pair) stp s<r>, s<f>, [x29, #off]. */
+typedef struct { uint64_t fmul, store; unsigned r, f; int off; int pair; } ClothInline;
+#if defined(TOTK_GAME_V121)
+static const ClothInline cloth_inline[3] = {{0x82192c, 0x821928, 0, 8, 0x124, 0}, {0x822a64, 0x822a40, 0, 8, 0x124, 0},
+                                            {0x83182c, 0x831830, 1, 0, 0x134, 0}};
+static const uint64_t cloth_call = 0x8222f0, cloth_update = 0x89822c;
+#elif defined(TOTK_GAME_V112)
+static const ClothInline cloth_inline[3] = {{0x9d1e64, 0x9d1e74, 0, 8, 0x104, 0}, {0x9d2d34, 0x9d2d2c, 0, 8, 0x104, 0},
+                                            {0x9e7648, 0x9e764c, 1, 0, 0x134, 0}};
+static const uint64_t cloth_call = 0x9d2774, cloth_update = 0x88a998;
+#else
+static const ClothInline cloth_inline[3] = {{0x7b5988, 0x7b598c, 0, 8, -0x40, 1}, {0x7b6b28, 0x7b6b2c, 0, 8, -0x40, 1},
+                                            {0x7f5ec4, 0x7f5ed0, 1, 0, 0x114, 0}};
+static const uint64_t cloth_call = 0x7b6358, cloth_update = 0x82c224;
+#endif
+static uint32_t stp_x29(unsigned rt, unsigned rt2, int off) { return 0x2d000000u | ((uint32_t)(off / 4) & 0x7f) << 15 | rt2 << 10 | 29u << 5 | rt; }
+static uint32_t str_sp(unsigned rt, unsigned off) { return 0xbd000000u | (off / 4) << 10 | 31u << 5 | rt; }
+static uint64_t cloth_put(Module *m, uint64_t at, const uint32_t *code, unsigned n) {
+    if (!CODE_PATCHED_AT_BUILD) for (unsigned i = 0; i < 4 * n; i++) if (m->base[at + i]) runtime_fail("cloth veneer padding not empty");
+    for (unsigned i = 0; i < n; i++) put_word(m, at + 4 * i, code[i], "cloth/hair clock veneer");
+    return at + 4 * n;
+}
+static void cloth_site(Module *m, uint64_t site, uint32_t original, uint32_t replacement) {
+    if (!CODE_PATCHED_AT_BUILD) {
+        uint32_t w; memcpy(&w, m->base + site, 4);
+        if (w != original) {
+            fprintf(stderr, "[totk] cloth/hair clock main+%#llx: found %08x expected %08x\n", (unsigned long long)site, w, original);
+            runtime_fail("cloth/hair clock: original instruction mismatch");
+        }
+    }
+    put_word(m, site, replacement, "cloth/hair clock");
+}
+static void patch_cloth_clock(Module *m, uint64_t data_off) {
+    const char *e = getenv("TOTK_CLOTH_REALTIME");
+    if (!CODE_PATCHED_AT_BUILD && e && !strcmp(e, "0")) return;
+    const uint64_t base = ((m->text_end + 15) & ~15ULL) + 160, end = (m->text_end + 0xfff) & ~0xfffULL;
+    const uintptr_t mb = (uintptr_t)m->base;
+    uint64_t at = base;
+    for (unsigned k = 0; k < 3; k++) {
+        const ClothInline *c = &cloth_inline[k];
+        const unsigned r = c->r, f = c->f;
+        /* seconds: s<r> = measured seconds * s<f> */
+        const uint32_t sec[6] = {0xf81f0fe9,                            /* str x9, [sp, #-16]! */
+                                 adrp_reg(9, mb + at + 4, mb + data_off),
+                                 0xbd400520u | r,                       /* ldr s<r>, [x9, #4] */
+                                 0x1e200800u | r << 16 | f << 5 | r,    /* fmul s<r>, s<f>, s<r> */
+                                 0xf84107e9,                            /* ldr x9, [sp], #16 */
+                                 branch_to(at + 20, c->fmul + 4)};
+        cloth_site(m, c->fmul, 0x1e200800u | r << 16 | f << 5 | r, branch_to(c->fmul, at));
+        at = cloth_put(m, at, sec, 6);
+        /* ratio: measured 30 Hz ratio * s<f> into the slot (s31 and x9 saved; sp moves by 32 for sp-relative slots) */
+        const uint32_t original = c->pair ? stp_x29(r, f, c->off) : str_sp(f, (unsigned)c->off);
+        const uint32_t store = c->pair ? stp_x29(r, 31, c->off) : str_sp(31, (unsigned)c->off + 32);
+        const uint32_t rat[11] = {0xd10083ff,                           /* sub sp, sp, #32 */
+                                  0xf90003e9,                           /* str x9, [sp] */
+                                  0x3d8007ff,                           /* str q31, [sp, #16] */
+                                  adrp_reg(9, mb + at + 12, mb + data_off),
+                                  0xbd40013f,                           /* ldr s31, [x9] */
+                                  0x1e3f0800u | f << 5 | 31u,           /* fmul s31, s<f>, s31 */
+                                  store,
+                                  0x3dc007ff,                           /* ldr q31, [sp, #16] */
+                                  0xf94003e9,                           /* ldr x9, [sp] */
+                                  0x910083ff,                           /* add sp, sp, #32 */
+                                  branch_to(at + 40, c->store + 4)};
+        cloth_site(m, c->store, original, branch_to(c->store, at));
+        at = cloth_put(m, at, rat, 11);
+    }
+    /* the call: s2 = factor / 30, s3 = factor; x8 and s4 are caller-saved and not arguments of the update */
+    const uint32_t call[5] = {adrp_reg(8, mb + at, mb + data_off), 0xbd400104 /* ldr s4, [x8] */,
+                              0x1e240842 /* fmul s2, s2, s4 */, 0x1e240863 /* fmul s3, s3, s4 */, branch_to(at + 16, cloth_update)};
+    cloth_site(m, cloth_call, branch_to(cloth_call, cloth_update) | 0x80000000u, branch_to(cloth_call, at) | 0x80000000u);
+    at = cloth_put(m, at, call, 5);
+    if (at > end) runtime_fail("cloth/hair clock veneers reach read-only data");
+    fprintf(stderr, "[totk] %s cloth/hair clock: real-time seconds and ratio at 3 inline places and 1 call, veneers +%#llx..+%#llx\n",
+            TOTK_GAME_VERSION, (unsigned long long)base, (unsigned long long)at);
 }
 
 static void patch_realtime(Module *m) {
@@ -149,6 +242,7 @@ static void patch_realtime(Module *m) {
         put_word(m, sites[i].off, repl[i], "real-time frame step");
     frame_step_data = (_Atomic uint64_t *)(void *)(m->base + data_off);
     atomic_store(frame_step_data, frame_step_bits(1.0f / 60.0f));
+    patch_cloth_clock(m, data_off);
     fprintf(stderr,"[totk] real-time frame step: %zu verified instructions; initial 16.67 ms, sampled at each present\n",
             sizeof sites / sizeof *sites);
 }
@@ -268,6 +362,8 @@ static int output_res(unsigned *w, unsigned *h) {
     return on;
 }
 int runtime_output_res(unsigned *w, unsigned *h) { return !CODE_PATCHED_AT_BUILD && output_res(w, h); }
+/* Only 1.4.3 counts a bigger scene in its heaps (runtime_output_res_extra_bytes): no scene overlay here. */
+int runtime_render_res(unsigned *w, unsigned *h) { (void)w; (void)h; return 0; }
 /* The canvas-sized render targets come from agl::utl::DynamicTextureAllocator (initialised once, main+0x8e1a98): a single
    heap of the HeapDef size "DynamicTextureAllocatorMem" (113664 KiB), carved from the "Graphics" heap (201728 KiB, the heap
    of gsys::SystemTask), with no parent to grow from. At 2560x1440 the title runs out of it (the allocator main+0x798934
@@ -282,6 +378,22 @@ uint64_t runtime_output_res_extra_bytes(void) {
     uint64_t kib = (uint64_t)ceil(113664.0 * ratio / 1024.0) * 1024 - 113664;
     return kib << 10;
 }
+int runtime_heap_overlay(char *out, size_t n) {
+    unsigned w, h;
+    if (!runtime_output_res(&w, &h) || !runtime_output_res_extra_bytes()) return 0;
+    snprintf(out, n, "%ux%u", w, h);
+    return 1;
+}
+/* Live scene sizes are 1.4.3 only (runtime/game_patches_v143.c); here TOTK_RENDER_RES stays a boot setting. */
+int runtime_render_request(unsigned w, unsigned h) {
+    if (!w && !h) return 0;   /* the game's own */
+    fprintf(stderr, "[totk] render request %ux%u refused: live scene sizes need 1.4.3 (TOTK_RENDER_RES applies after a restart)\n", w, h);
+    return -1;
+}
+void runtime_render_reserve(unsigned *w, unsigned *h) { *w = *h = 0; }
+/* The settings menu's output size is 1.4.3 only too: here the game's own 1080p (key 3 still switches a 2K start). */
+void runtime_output_max(unsigned *w, unsigned *h) { *w = 1920; *h = 1080; }
+int runtime_output_request(unsigned w, unsigned h) { return w == 1920 && h == 1080 ? 0 : -1; }
 enum { DP_OUTPUT_SIZE = 32, DP_RENDERER = 40 };   /* data page: the output size {w, h} the game reads; the renderer it stores */
 static _Atomic(uint8_t *) output_page;
 static unsigned output_w, output_h;   /* the largest output size (the swapchain) */
@@ -387,9 +499,13 @@ static void check_site(const Module *m, const GamePatch *p) {
 /* TOTK_PCHTXT=<file>: an emulator ExeFS patch for main in pchtxt form, as community mods ship them (for example
    TOTK-Ultrawide's aspect-ratio patch), for trying them here. Mac only: the phone's code is patched at build. Its
    @nsobid must be main's build id, read from the extracted ExeFS (extracted/<version>/exefs/main at 0x40); the lines
-   between @enabled and @stop are "<main address> <bytes>" (offset_shift 0x100 is the NSO header only the IPS form
-   counts). It is applied before this runtime's own patches, whose checks of the original words then refuse a file that
-   overlaps them. */
+   after @enabled are "<main address> <bytes>", @disabled switches the lines that follow off again (a section the author
+   keeps without applying it) and @stop ends the file. "@flag offset_shift 0x100" must come before the first patch line:
+   it says the addresses leave out the NSO header only the IPS form counts, which is how they are applied here; a file
+   without it, or with another shift, would land 0x100 bytes off and stops the start. "@flag print_values" (a display
+   option of the patching tools) is accepted, any other flag stops the start. The same reading as the build's --mod
+   (scripts/mod_exefs.py). It is applied before this runtime's own patches, whose checks of the original words then
+   refuse a file that overlaps them. */
 static void patch_pchtxt(Module *m) {
     const char *path = getenv("TOTK_PCHTXT");
     if (!path || !*path) return;
@@ -401,18 +517,28 @@ static void patch_pchtxt(Module *m) {
     if (!n || fseek(n, 0x40, SEEK_SET) || fread(id, 1, sizeof id, n) != sizeof id) runtime_fail("TOTK_PCHTXT: cannot read main's build id from extracted/<version>/exefs/main");
     fclose(n);
     for (int i = 0; i < 20; i++) snprintf(want + 2 * i, 3, "%02X", id[i]);
-    char line[1024]; int enabled = 0, matched = 0; unsigned count = 0, bytes = 0;
+    char line[1024]; int enabled = 0, matched = 0, shifted = 0; unsigned count = 0, bytes = 0;
     while (fgets(line, sizeof line, f)) {
         if (!strncmp(line, "@nsobid-", 8)) {
             if (strncasecmp(line + 8, want, 40)) runtime_fail("TOTK_PCHTXT is for another build of main");
             matched = 1; continue;
         }
         if (!strncmp(line, "@enabled", 8)) { enabled = 1; continue; }
+        if (!strncmp(line, "@disabled", 9)) { enabled = 0; continue; }
+        if (!strncmp(line, "@flag", 5)) {
+            char name[64] = "", value[64] = "";
+            sscanf(line + 5, "%63s %63s", name, value);
+            if (!strcmp(name, "print_values")) continue;
+            if (strcmp(name, "offset_shift")) runtime_fail("TOTK_PCHTXT: only @flag offset_shift 0x100 and print_values are supported");
+            if (strtoull(value, NULL, 16) != 0x100) runtime_fail("TOTK_PCHTXT: @flag offset_shift must be 0x100 (the addresses are main addresses)");
+            shifted = 1; continue;
+        }
         if (!strncmp(line, "@stop", 5)) break;
         unsigned long long at; char hex[512];
         if (!enabled || line[0] == '@' || sscanf(line, "%llx %511s", &at, hex) != 2) continue;
         size_t len = strlen(hex);
         if (!matched) runtime_fail("TOTK_PCHTXT: patches before its @nsobid line");
+        if (!shifted) runtime_fail("TOTK_PCHTXT: no @flag offset_shift 0x100 before the first patch line");
         if (len % 2 || at + len / 2 > m->file_size) runtime_fail("TOTK_PCHTXT: a patch line is malformed or outside main");
         for (size_t i = 0; i < len / 2; i++) { unsigned v; sscanf(hex + 2 * i, "%2x", &v); m->base[at + i] = (uint8_t)v; }
         count++; bytes += (unsigned)(len / 2);
@@ -420,6 +546,39 @@ static void patch_pchtxt(Module *m) {
     fclose(f);
     if (!matched) runtime_fail("TOTK_PCHTXT has no @nsobid line");
     fprintf(stderr, "[totk] TOTK_PCHTXT %s: %u patches, %u bytes in main (build id %s)\n", path, count, bytes, want);
+}
+
+/* High frame rates (#61, sky-island trampolines): main+0xce3fec (1.0.0) compares X+0x28 with 100 and, when greater,
+   scales the velocity Link takes over from the ground body by 0.1. X is the game's time object ([GOT]+0xc8; X+0x38 the
+   30 Hz ratio, X+0x28 = 30 / (ratio * time scale)); at the shipping 30 Hz the check means "time slowed below 0.3", but
+   above 100 FPS it fires with time running normally and the trampolines stop bouncing. A veneer in main's text padding
+   (+128, after the 1.2.1 ultrawide veneers) compares X+0x28 * X+0x38 = 30 / time scale instead: the same value at 30 Hz,
+   independent of the frame rate. Same code in all four versions (1.4.3: game_patches_v143.c). TOTK_HIGHFPS_FIX=0 keeps
+   the original check (Mac). */
+static void patch_slowmo_bounce(Module *m) {
+    const char *e = getenv("TOTK_HIGHFPS_FIX");
+    if (!CODE_PATCHED_AT_BUILD && e && !strcmp(e, "0")) return;
+    const uint64_t site = GAME_ADDR(0xce3fec), stub = ((m->text_end + 15) & ~15ULL) + 128;
+    if (stub + 20 > ((m->text_end + 15) & ~15ULL) + 0x400) runtime_fail("bounce veneer layout");
+    static const uint32_t original[3] = {0xbd402900,   /* ldr s0, [x8, #0x28] */
+                                         0x52a85908,   /* mov w8, #0x42c80000 (100.0) */
+                                         0x1e270101};  /* fmov s1, w8 */
+    if (!CODE_PATCHED_AT_BUILD) {
+        for (unsigned i = 0; i < 3; i++) {
+            uint32_t w; memcpy(&w, m->base + site + 4 * i, 4);
+            if (w != original[i]) runtime_fail("bounce check: original instruction mismatch");
+        }
+        for (unsigned i = 0; i < 20; i++) if (m->base[stub + i]) runtime_fail("bounce veneer padding not empty");
+    }
+    const uint32_t veneer[5] = {0xbd402900,   /* ldr s0, [x8, #0x28]: X+0x28 */
+                                0xbd403901,   /* ldr s1, [x8, #0x38]: the 30 Hz ratio (the next original instruction sets s1 again) */
+                                0x1e210800,   /* fmul s0, s0, s1 */
+                                0x52a85908,   /* mov w8, #0x42c80000: the original 100.0 */
+                                branch_to(stub + 16, site + 8)};
+    for (unsigned i = 0; i < 5; i++) put_word(m, stub + 4 * i, veneer[i], "bounce veneer");
+    put_word(m, site, branch_to(site, stub), "bounce check");
+    fprintf(stderr, "[totk] %s high-FPS fix: trampoline slow-motion check uses the time scale, veneer +%#llx\n",
+            TOTK_GAME_VERSION, (unsigned long long)stub);
 }
 
 void runtime_game_patches(Module *m) {
@@ -431,6 +590,7 @@ void runtime_game_patches(Module *m) {
            step and the 60 FPS patch), so the phone is not held at the shipping 30 fps; here we only verify the words. */
         patch_realtime(m);
         patch_render_res(m);
+        patch_slowmo_bounce(m);
         for (size_t i = 0; i < n; i++) {
             uint32_t word;
             memcpy(&word, m->base + fps60_sites[i].offset, sizeof word);
@@ -448,10 +608,12 @@ void runtime_game_patches(Module *m) {
     else fprintf(stderr,"[totk] real-time frame step off (TOTK_REALTIME=0)\n");
     patch_render_res(m);
     patch_output_res(m);
+    patch_slowmo_bounce(m);
     patch_trap(m);
 #if defined(TOTK_GAME_V121)
     { static const uint64_t sites[] = {0xcb4b10, 0x12521cc, 0x19b36f0, 0x1ecdf68};   /* camera x2, viewport x2 (aspect_patch.h) */
-      aspect_install(m, "1.2.1", sites, 4, (m->text_end + 15) & ~15ULL, (m->file_size + 0x3fff) & ~0x3fffULL); }
+      aspect_install(m, "1.2.1", sites, 4, 2, (m->text_end + 15) & ~15ULL, 0,   /* no free padding for Vert+ stubs */
+                     (m->file_size + 0x3fff) & ~0x3fffULL); }
 #else
     if (aspect_requested()) runtime_fail("TOTK_ASPECT: only 1.2.1 and 1.4.3 so far");
 #endif

@@ -1,4 +1,4 @@
-// TOTK: runtime shader translation. A shader is identified by SHA-256(control 0x880 + code area); each
+// TOTK: runtime shader translation. A shader is identified by SHA-256(control section + code area) (nvn_mtl.m ctl_key_len: 0x880 of control, or its own smaller size); each
 // translation ("variant") also records the translator answers it depended on (texture slot types, vertex
 // input and colour output component types). A variant is reused only when those answers match the current
 // bound state; otherwise a new one is produced by the translation service and cached on disk: the native program
@@ -13,7 +13,12 @@
 #include <CommonCrypto/CommonDigest.h>
 #include <mach-o/dyld.h>
 #include <pthread.h>
+#include <signal.h>
 #include <spawn.h>
+#include <sys/wait.h>
+#include <pthread/spawn.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -21,6 +26,7 @@
 #include <dirent.h>
 #include <stdatomic.h>
 #include "totk_shader_seed.h"
+#include "totk_shader_observed.h"
 #include "totk_shader_contrib.h"
 extern void runtime_boot_status(const char *,const char *) __attribute__((weak_import));
 extern void runtime_boot_count(const char *,uint64_t,uint64_t) __attribute__((weak_import));
@@ -35,20 +41,35 @@ extern char **environ;
 static pthread_mutex_t g_rt_lock = PTHREAD_MUTEX_INITIALIZER;
 static NSMutableDictionary<NSString *, NSMutableArray<NSDictionary *> *> *g_variants;
 static NSMutableSet<NSString *> *g_msl_checked;
-static FILE *g_svc_in, *g_svc_out;
+typedef struct { FILE *in, *out; } rt_svc;   // one translator service process
+static rt_svc g_svc;   // the caller's (the submit thread); background jobs have their own (bg_translate)
 static NSString *g_root, *g_dir;
+/* iOS: the seed inside the signed app is read where it is instead of being copied into the cache (totk_shader_seed.h
+   totk_seed_sealed). Its files are taken from there; the cache holds the rest (fill packs, pso_collected.tsv), and a
+   shader's .variants lists of both places are joined. nil on the Mac, where the seed is cloned into the cache. */
+static NSString *g_seed_dir;
+static NSSet<NSString *> *g_seed_names;
 static uint64_t g_translated;
 /* The bottom-left box (nvn_mtl.m shader_overlay_prepare): variants new to the cache this run, when the last one came,
    and the variants in the cache (counted once in the background, plus the new ones since). */
 static _Atomic uint64_t g_new_variants, g_new_variant_ns, g_new_at_count;
 static _Atomic int64_t g_cached_variants = -1;
+static _Atomic uint64_t g_last_translation_ns, g_prepared_variants;   // the game's last own translation; variants the shared list added
 
 static NSString *root_dir(void) {   // native-port/ (the executable lives in native-port/build/)
-    if (g_root) return g_root;
-    char path[4096]; uint32_t n = sizeof path;
-    if (_NSGetExecutablePath(path, &n)) die("executable path too long");
-    g_root = [[[@(path) stringByResolvingSymlinksInPath] stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        char path[4096]; uint32_t n = sizeof path;
+        if (_NSGetExecutablePath(path, &n)) die("executable path too long");
+        g_root = [[[@(path) stringByResolvingSymlinksInPath] stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
+    });
     return g_root;
+}
+NSString *totk_rt_root(void) { return root_dir(); }
+uint64_t totk_rt_last_translation_ns(void) { return atomic_load(&g_last_translation_ns); }
+static NSString *seed_dir(void) {   // the prepared startup shaders that come with the app (build_app.py)
+    const char *seedPath = getenv("TOTK_SHADER_SEED_DIR");
+    return seedPath ? @(seedPath) : [root_dir() stringByAppendingPathComponent:@"build/shader-seed"];
 }
 NSString *totk_rt_dir(void) {
     static dispatch_once_t once;
@@ -64,11 +85,11 @@ NSString *totk_rt_dir(void) {
         if (!(seedMode && !strcmp(seedMode, "off"))) {
             NSError *error = nil;
             if (runtime_boot_status) runtime_boot_status(TOTK_UI("检查着色器缓存","Checking the shader cache"),TOTK_UI("校验 App 附带的着色器，并按需导入本机缓存","Verifying the shaders bundled with the app and importing them into the local cache if needed"));
-            const char *seedPath = getenv("TOTK_SHADER_SEED_DIR");
-            NSString *source = seedPath ? @(seedPath) : [root_dir() stringByAppendingPathComponent:@"build/shader-seed"];
+            NSString *source = seed_dir();
             totk_seed_progress = seed_progress;
             NSDictionary *seed = totk_seed_import(source, g_dir, &error);
             totk_seed_progress = NULL;
+            if ([seed[@"overlay"] isKindOfClass:NSArray.class]) { g_seed_dir = source; g_seed_names = [NSSet setWithArray:seed[@"overlay"]]; }
             if (!seed) {   // 2026-10-18: a damaged bundle or a full disk used to end the game here with nothing on screen. The
                            // cache stays usable (totk_seed_import writes shader files before the indexes that name them),
                            // so play on and translate shaders as they first appear, as before the prepared shaders existed.
@@ -79,10 +100,15 @@ NSString *totk_rt_dir(void) {
             }
             if ([seed[@"available"] boolValue]) {
                 unsigned long long imported=[seed[@"imported_files"] unsignedLongLongValue];
-                LOG("[shader-seed] 发现随 App 准备的着色器 %llu 个，导入 %llu 个文件；首次启动即可预热",
-                    [seed[@"shaders"] unsignedLongLongValue], imported);
+                LOG("[shader-seed] 发现随 App 准备的着色器 %llu 个，导入 %llu 个文件%s%s；首次启动即可预热",
+                    [seed[@"shaders"] unsignedLongLongValue], imported,
+                    [seed[@"cloned_folder"] boolValue] ? "（整个文件夹一次克隆）" : "",
+                    g_seed_dir ? "（App 包已签名，原地读取，不校验也不复制）" : "");
+                if ([seed[@"folder_skipped"] length]) LOG("[shader-seed] 缓存里已有文件（例如 %s），逐个导入", [seed[@"folder_skipped"] UTF8String]);
+                if ([seed[@"clone_errno"] intValue]) LOG("[shader-seed] 【红】克隆失败（%s），改为复制文件", strerror([seed[@"clone_errno"] intValue]));
                 if (runtime_boot_status) runtime_boot_status(TOTK_UI("着色器缓存已就绪","Shader cache ready"),imported
                     ? [NSString stringWithFormat:@(TOTK_UI("已导入 %llu 个预置文件，开始预热","Imported %llu prepared files; starting warm-up")),imported].UTF8String
+                    : g_seed_dir ? TOTK_UI("直接读取 App 附带的着色器，无需导入；开始预热","Reading the shaders bundled with the app in place, nothing to import; starting warm-up")
                     : TOTK_UI("本机缓存已存在，无需重新导入；开始预热","Local cache already present, nothing to import; starting warm-up"));
             } else if (runtime_boot_status && ![seed[@"failed"] boolValue]) runtime_boot_status(TOTK_UI("着色器缓存已就绪","Shader cache ready"),TOTK_UI("没有内置着色器种子，继续初始化图形","No bundled shader seed; continuing graphics setup"));
         }
@@ -97,14 +123,56 @@ NSString *totk_rt_dir(void) {
     return g_dir;
 }
 
-static void service_start(void) {
-    if (g_svc_in) return;
+/* PR #84 (part A): the seed's shader-keys.json names every shader of this game version; the background warm-up only
+   warms cache entries of those shaders (and of shaders this Mac has seen the game use), not other versions' leftovers in
+   the same cache. Read once from the seed folder, checked against seed-manifest.json; not in use on iOS (its warm-up and
+   memory were not measured with it). nil = no valid scope: warm everything, as before. */
+static NSDictionary *shader_scope(void) {
+#if TARGET_OS_IPHONE
+    return nil;
+#else
+    static NSDictionary *scope; static dispatch_once_t once;
+    dispatch_once(&once, ^{ scope = totk_shader_scope_metadata(seed_dir(), @DMSH_CHAIN); });
+    return scope;
+#endif
+}
+static NSMutableDictionary *observed_keys_state(void) {
+    static NSMutableDictionary *state; static dispatch_once_t once;
+    // Finish cache/seed initialization before entering this once token. Keeping
+    // this outside totk_rt_dir's token prevents recursive initialization.
+    NSString *cache = totk_rt_dir();
+    dispatch_once(&once, ^{ state = totk_shader_observed_open(shader_scope(), cache, @DMSH_CHAIN); });
+    return state;
+}
+
+NSSet<NSString *> *totk_rt_observed_shader_keys(void) {
+    return totk_shader_observed_keys(observed_keys_state());
+}
+
+NSSet<NSString *> *totk_rt_shader_scope(void) {
+    const char *all = getenv("TOTK_WARM_ALL");
+    NSDictionary *scope = shader_scope();
+    if (!scope || (all && atoi(all))) return nil;
+    return [[NSSet setWithArray:scope[@"keys"]] setByAddingObjectsFromSet:totk_rt_observed_shader_keys()];
+}
+
+/* Several services can start at once (async shaders): one at a time, and each child keeps only its own stdin / stdout and
+   the shared stderr (POSIX_SPAWN_CLOEXEC_DEFAULT). A child holding another's pipe ends would keep that service alive after
+   the game exits and hide its crash from the reader (fgets would wait instead of seeing EOF). */
+static pthread_mutex_t g_svc_start_lock = PTHREAD_MUTEX_INITIALIZER;
+static void service_start(rt_svc *svc) {
+    if (svc->in) return;
+    pthread_mutex_lock(&g_svc_start_lock);
     NSString *r = root_dir();
     int to[2], from[2];
     if (pipe(to) || pipe(from)) die("shader service pipes");
     posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, to[0], 0); posix_spawn_file_actions_adddup2(&fa, from[1], 1);
-    posix_spawn_file_actions_addclose(&fa, to[1]); posix_spawn_file_actions_addclose(&fa, from[0]);
+    posix_spawn_file_actions_adddup2(&fa, 2, 2);   // the same descriptor: only clears close-on-exec
+    /* An empty signal mask: a child inherits the spawning thread's, and a GCD worker (bg_translate) blocks SIGCHLD among
+       others. The .NET translator then never learns that its spirv-cross child exited and waits forever (2026-10-21). */
+    posix_spawnattr_t sa; posix_spawnattr_init(&sa); sigset_t none; sigemptyset(&none); posix_spawnattr_setsigmask(&sa, &none);
+    posix_spawnattr_setflags(&sa, POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK);
     NSString *sc = [r stringByAppendingString:@"/build/spirv-cross/spirv-cross"];
     // TOTK_SHADER_XLATE=<totk_xlate.dll> runs a trial translator build (e.g. build/totk_xlate-opt) without replacing the
     // shared one (through shader_service.py); TOTK_SHADER_DEBUGMODE=0|1 reaches either service through the environment.
@@ -118,22 +186,23 @@ static void service_start(void) {
     if (use_native) {
         const char *argv[] = {native.UTF8String, "--service", "--spirv-cross", sc.UTF8String, "--out", totk_rt_dir().UTF8String,
                               "--chain", DMSH_CHAIN, NULL};
-        if (posix_spawn(&pid, argv[0], &fa, NULL, (char *const *)argv, environ)) die("start shader service %s", argv[0]);
+        if (posix_spawn(&pid, argv[0], &fa, &sa, (char *const *)argv, environ)) die("start shader service %s", argv[0]);
         if (dm) LOG("[shader] native translator, DebugMode %s", dm);
     } else {
         NSString *script = [r stringByAppendingString:@"/scripts/shader_service.py"], *dotnet = [r stringByAppendingString:@"/tooling/dotnet/dotnet"];
         NSString *xlate = xe && *xe ? @(xe) : [r stringByAppendingString:@"/build/totk_xlate/totk_xlate.dll"];
         const char *argv[] = {"python3", "-I", script.UTF8String, "--dotnet", dotnet.UTF8String, "--xlate", xlate.UTF8String,
                               "--spirv-cross", sc.UTF8String, "--out", totk_rt_dir().UTF8String, "--chain", DMSH_CHAIN, NULL};
-        if (posix_spawnp(&pid, "python3", &fa, NULL, (char *const *)argv, environ)) die("start shader service");
+        if (posix_spawnp(&pid, "python3", &fa, &sa, (char *const *)argv, environ)) die("start shader service");
         if (xe || dm) LOG("[shader] translator %s, DebugMode %s", xlate.UTF8String, dm ? dm : "default");
     }
-    posix_spawn_file_actions_destroy(&fa);
+    posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&sa);
     close(to[0]); close(from[1]);
-    g_svc_in = fdopen(to[1], "w"); g_svc_out = fdopen(from[0], "r");
-    if (!g_svc_in || !g_svc_out) die("shader service streams");
+    svc->in = fdopen(to[1], "w"); svc->out = fdopen(from[0], "r");
+    if (!svc->in || !svc->out) die("shader service streams");
     LOG("[shader] runtime translation service started (pid %d, %s), cache %s", pid,
         use_native ? "native build/shader-service/totk_xlate" : "python3 scripts/shader_service.py + .NET", totk_rt_dir().UTF8String);
+    pthread_mutex_unlock(&g_svc_start_lock);
 }
 
 static NSString *hex(const uint8_t *p, size_t n) {
@@ -146,14 +215,36 @@ static NSString *json_string(id obj) {
     if (!d) die("shader request JSON");
     return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
 }
+NSString *totk_rt_file(NSString *name) {
+    NSString *dir = totk_rt_dir();
+    return g_seed_dir && [g_seed_names containsObject:name] ? [g_seed_dir stringByAppendingPathComponent:name]
+                                                             : [dir stringByAppendingPathComponent:name];
+}
+NSArray<NSString *> *totk_rt_list(void) {
+    NSArray<NSString *> *cached = [NSFileManager.defaultManager contentsOfDirectoryAtPath:totk_rt_dir() error:nil] ?: @[];
+    if (!g_seed_dir) return [cached sortedArrayUsingSelector:@selector(compare:)];
+    NSMutableSet<NSString *> *all = [g_seed_names mutableCopy]; [all addObjectsFromArray:cached];
+    return [all.allObjects sortedArrayUsingSelector:@selector(compare:)];
+}
 static NSString *index_path(NSString *shader) { return [totk_rt_dir() stringByAppendingFormat:@"/%@.variants", shader]; }
+static NSMutableArray *variants_of(NSString *shader);
+static NSArray *variants_file(NSString *path) {
+    NSData *d = [NSData dataWithContentsOfFile:path];
+    NSArray *a = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    return [a isKindOfClass:[NSArray class]] ? a : @[];
+}
 static NSMutableArray *variants_of(NSString *shader) {
     if (!g_variants) g_variants = [NSMutableDictionary dictionary];
     NSMutableArray *v = g_variants[shader];
     if (v) return v;
-    NSData *d = [NSData dataWithContentsOfFile:index_path(shader)];
-    NSArray *a = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
-    v = [NSMutableArray arrayWithArray:[a isKindOfClass:[NSArray class]] ? a : @[]];
+    v = [NSMutableArray arrayWithArray:variants_file(index_path(shader))];
+    NSString *seedIndex = [shader stringByAppendingString:@".variants"];
+    if (g_seed_dir && [g_seed_names containsObject:seedIndex]) {   // the cache's own rows (fill packs) first, then the seed's
+        NSMutableSet *known = [NSMutableSet set];
+        for (NSDictionary *row in v) if ([row isKindOfClass:NSDictionary.class] && row[@"variant"]) [known addObject:row[@"variant"]];
+        for (NSDictionary *row in variants_file([g_seed_dir stringByAppendingPathComponent:seedIndex]))
+            if ([row isKindOfClass:NSDictionary.class] && row[@"variant"] && ![known containsObject:row[@"variant"]]) [v addObject:row];
+    }
     g_variants[shader] = v;
     return v;
 }
@@ -177,9 +268,11 @@ static int no_translator(void) {
     return v;
 #endif
 }
-NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local) {
-    uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    pthread_mutex_lock(&g_rt_lock);
+int totk_rt_can_translate(void) { return !no_translator(); }
+
+/* The cached variant whose deps match the answers, or nil (g_rt_lock held). A variant whose Metal source is missing or
+   could not be compiled before is dropped from the index, so it is translated again. */
+static NSString *variant_lookup(NSString *shader, NSDictionary *answers) {
     NSMutableArray *vs = variants_of(shader);
     for (NSUInteger i = 0; i < vs.count; i++) {
         NSDictionary *v = vs[i];
@@ -188,77 +281,167 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
         if (!g_msl_checked) g_msl_checked = [NSMutableSet set];
         BOOL checked = [g_msl_checked containsObject:found];
         NSString *msl = checked ? nil :
-            [NSString stringWithContentsOfFile:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.metal", found]
+            [NSString stringWithContentsOfFile:totk_rt_file([found stringByAppendingString:@"_b.metal"])
                                              encoding:NSUTF8StringEncoding error:nil];
         if (!checked && (!msl || [msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"])) {
             [vs removeObjectAtIndex:i];  /* regenerate missing or previously un-compilable Metal variant */
-            break;
+            return nil;
         }
         [g_msl_checked addObject:found];
-        pthread_mutex_unlock(&g_rt_lock);
         return found;
     }
+    return nil;
+}
+static NSString *stage_name(int stage) { return stage == 0 ? @"vs" : stage == 1 ? @"ps" : stage == 5 ? @"cs" : nil; }
+/* The translation request for these answers; the guest code is written to <variant>.code (the translator reads it there). */
+static NSMutableDictionary *variant_request(NSString *shader, int stage, const uint8_t *control, const uint8_t *code,
+                                            NSDictionary *answers, NSArray *local) {
     uint32_t c1o, c1t; memcpy(&c1o, control + 0x700, 4); memcpy(&c1t, control + 0x704, 4);
     if (!c1t || c1t > 16u << 20 || c1o > c1t || (stage != 5 && c1o < 0x30)) die("shader %s: code area %#x / c1 %#x", shader.UTF8String, c1t, c1o);
-    NSString *stage_name = stage == 0 ? @"vs" : stage == 1 ? @"ps" : stage == 5 ? @"cs" : nil;
-    if (!stage_name) die("shader %s: NVN stage %d has no translation chain (tessellation/geometry)", shader.UTF8String, stage);
+    if (!stage_name(stage)) die("shader %s: NVN stage %d has no translation chain (tessellation/geometry)", shader.UTF8String, stage);
     uint8_t md[32]; NSData *ad = [json_string(answers) dataUsingEncoding:NSUTF8StringEncoding]; CC_SHA256(ad.bytes, (CC_LONG)ad.length, md);
     NSString *variant = [NSString stringWithFormat:@"%@-%@", shader, hex(md, 6)];
     NSString *code_path = [totk_rt_dir() stringByAppendingFormat:@"/%@.code", variant];
     // Graphics code drops the 0x30-byte NVN header (the translator wants SPH + instructions); compute keeps it, as in D2R's build.
     size_t skip = stage == 5 ? 0 : 0x30;
     if (![[NSData dataWithBytes:code + skip length:c1t - skip] writeToFile:code_path atomically:YES]) die("write shader code %s", code_path.UTF8String);
-    NSMutableDictionary *rq = [NSMutableDictionary dictionaryWithDictionary:@{@"variant": variant, @"stage": stage_name, @"code": code_path, @"c1": hex(code + c1o, c1t - c1o)}];
+    NSMutableDictionary *rq = [NSMutableDictionary dictionaryWithDictionary:@{@"variant": variant, @"stage": stage_name(stage), @"code": code_path, @"c1": hex(code + c1o, c1t - c1o)}];
     [rq addEntriesFromDictionary:answers];
     if (local) rq[@"local"] = local;
     rq[@"depth_minus_w"] = totk_depth_near_minus_w() ? @YES : @NO;   // nvnDeviceSetDepthMode: NEAR_IS_MINUS_W needs the GL -> Metal clip-z conversion in every vertex shader
-    if (no_translator()) {
-    // No translator on the phone (Python + .NET + SPIRV-Cross): the variant cache is translated on the Mac and copied over.
-    // A miss records the complete request (with the guest code bytes) under shader-requests/ for ios/tools/fill_shaders.py.
-    rq[@"code_hex"] = hex(code + skip, c1t - skip);
+    if (no_translator()) rq[@"code_hex"] = hex(code + skip, c1t - skip);
+    return rq;
+}
+/* No translator on the phone (Python + .NET + SPIRV-Cross): the variant cache is translated on the Mac and copied over.
+   A miss records the complete request (with the guest code bytes) under shader-requests/ for ios/tools/fill_shaders.py.
+   A miss no longer stops the game: the caller skips the draws / dispatches that need this variant (draw-skip reason
+   "shader-missing"). The request is written once per variant; after fill_shaders.py pushed the translation, the next
+   start compiles it in the background (totk_rt_warm_filled) and moves the request to shader-requests/done/. */
+static void record_miss(NSString *shader, NSDictionary *rq, NSDictionary *answers) {   // g_rt_lock held
+    NSString *variant = rq[@"variant"];
     [NSFileManager.defaultManager createDirectoryAtPath:@"shader-requests" withIntermediateDirectories:YES attributes:nil error:nil];
-    /* A miss no longer stops the game: the caller skips the draws / dispatches that need this variant (draw-skip reason
-       "shader-missing"). The request is written once per variant; after fill_shaders.py pushed the translation, the next
-       start compiles it in the background (totk_rt_warm_filled) and moves the request to shader-requests/done/. */
     static NSMutableSet<NSString *> *missed; if (!missed) missed = [NSMutableSet set];
-    if (![missed containsObject:variant]) {
-        [missed addObject:variant];
-        [[json_string(rq) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:[NSString stringWithFormat:@"shader-requests/%@.json", variant] atomically:YES];
-        totk_contrib_add(shader, answers);   // not in the prepared seed, so not in the shared shader list yet
-        LOG("[shader-miss] %s %s 不在手机的翻译缓存里：跳过用到它的绘制，请求已存 shader-requests/（第 %lu 个；在 Mac 上 ios/tools/fill_shaders.py 补上后下次启动预热）",
-            stage_name.UTF8String, variant.UTF8String, (unsigned long)missed.count);
-    }
-    pthread_mutex_unlock(&g_rt_lock);
-    return nil;
-    }
-    BOOL existed = [NSFileManager.defaultManager fileExistsAtPath:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.metal", variant]];   // a re-translation of a broken variant is not a new one
-    service_start();
-    fprintf(g_svc_in, "%s\n", json_string(rq).UTF8String); fflush(g_svc_in);
+    if ([missed containsObject:variant]) return;
+    [missed addObject:variant];
+    [[json_string(rq) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:[NSString stringWithFormat:@"shader-requests/%@.json", variant] atomically:YES];
+    totk_contrib_add(shader, answers);   // not in the prepared seed, so not in the shared shader list yet
+    LOG("[shader-miss] %s %s 不在手机的翻译缓存里：跳过用到它的绘制，请求已存 shader-requests/（第 %lu 个；在 Mac 上 ios/tools/fill_shaders.py 补上后下次启动预热）",
+        [rq[@"stage"] UTF8String], variant.UTF8String, (unsigned long)missed.count);
+}
+/* One request through a translator service; the reflection of the new variant. */
+static NSDictionary *translate(rt_svc *svc, NSDictionary *rq, uint64_t started) {
+    NSString *variant = rq[@"variant"]; const char *stage = [rq[@"stage"] UTF8String];
+    service_start(svc);
+    atomic_store(&g_last_translation_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));   // the shared list's preparation waits while the game meets new shaders
+    fprintf(svc->in, "%s\n", json_string(rq).UTF8String); fflush(svc->in);
     char line[2048];
-    if (!fgets(line, sizeof line, g_svc_out)) die("shader service exited while translating %s", variant.UTF8String);
+    if (!fgets(line, sizeof line, svc->out)) die("shader service exited while translating %s", variant.UTF8String);
+    atomic_store(&g_last_translation_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     NSDictionary *reply = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:line length:strlen(line)] options:0 error:nil];
     if (![reply[@"ok"] boolValue]) {
         LOG("[survey-shader] frame %llu translation FAILED %s %s after %.2f ms: %s",
-            (unsigned long long)dm_nvn_frame_count(), stage_name.UTF8String, variant.UTF8String,
+            (unsigned long long)dm_nvn_frame_count(), stage, variant.UTF8String,
             (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started) / 1e6, [[reply[@"error"] description] UTF8String]);
-        die("shader %s (%s) translation failed: %s", variant.UTF8String, stage_name.UTF8String, [[reply[@"error"] description] UTF8String]);
+        die("shader %s (%s) translation failed: %s", variant.UTF8String, stage, [[reply[@"error"] description] UTF8String]);
     }
     NSData *jd = [NSData dataWithContentsOfFile:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.json", variant]];
     NSDictionary *refl = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
     if (![refl isKindOfClass:[NSDictionary class]]) die("shader %s: reflection missing", variant.UTF8String);
+    return refl;
+}
+/* A translated variant into the shader's index, the counters and the contribution file (g_rt_lock held). */
+static void variant_record(NSString *shader, NSDictionary *rq, NSDictionary *refl, BOOL existed, uint64_t started, uint64_t queued) {   // queued: 0, or when a background job was queued
+    NSString *variant = rq[@"variant"];
+    NSMutableArray *vs = variants_of(shader);
     [vs addObject:@{@"variant": variant, @"deps": refl[@"deps"] ?: @{}}];
+    if (!g_msl_checked) g_msl_checked = [NSMutableSet set];
     [g_msl_checked addObject:variant];
     [[json_string(vs) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:index_path(shader) atomically:YES];
     g_translated++;
     if (!existed) { atomic_fetch_add(&g_new_variants, 1); atomic_store(&g_new_variant_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); }   // discovered, translated, in the cache
     if (!existed) totk_contrib_add(shader, refl[@"deps"] ?: @{});   // the seed would have had it if the shared list named it
-    if (getenv("TOTK_SURVEY_SHADER_LOG")) LOG("[survey-shader] frame %llu translated %s %s in %.2f ms%s",
-        (unsigned long long)dm_nvn_frame_count(), stage_name.UTF8String, variant.UTF8String,
+    if (getenv("TOTK_SURVEY_SHADER_LOG")) LOG("[survey-shader] frame %llu translated %s %s in %.2f ms%s%s",
+        (unsigned long long)dm_nvn_frame_count(), [rq[@"stage"] UTF8String], variant.UTF8String,
         (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started) / 1e6,
-        [refl[@"softfloat64"] boolValue] ? " (FP64 fallback)" : "");
-    if (g_translated <= 8 || g_translated % 100 == 0) LOG("[shader] translated %llu: %s %s", (unsigned long long)g_translated, stage_name.UTF8String, variant.UTF8String);
+        [refl[@"softfloat64"] boolValue] ? " (FP64 fallback)" : "",
+        queued ? [NSString stringWithFormat:@" (background, with its Metal library; queued %.2f ms before)", (started - queued) / 1e6].UTF8String : "");
+    if (g_translated <= 8 || g_translated % 100 == 0) LOG("[shader] translated %llu: %s %s", (unsigned long long)g_translated, [rq[@"stage"] UTF8String], variant.UTF8String);
+}
+
+/* Background translation (Mac, user 2026-10-21: new shaders are prepared the way games stream their content): a variant
+   the caller does not wait for (may_defer) goes to one of RT_BG_WORKERS translator services of their own, and nil is
+   returned; nvn_mtl.m skips the draws that need it. One job per shader at a time: while it is queued or running, a
+   request for the same shader defers again. One that may not wait for long (may_defer 0) takes a job still queued back
+   and translates on the spot (a new area can queue dozens before it), or waits for a running one and looks again, since
+   its deps may already cover these answers. The worker also compiles the Metal library (g_rt_ready_hook), then records
+   the variant and moves g_rt_gen. */
+#define RT_BG_WORKERS 2
+enum { RT_JOB_QUEUED, RT_JOB_RUNNING, RT_JOB_TAKEN };
+static NSMutableDictionary<NSString *, NSMutableArray *> *g_rt_pending;   // shader -> its job's state, @[@RT_JOB_*] (g_rt_lock)
+static pthread_cond_t g_rt_done = PTHREAD_COND_INITIALIZER;
+static _Atomic uint64_t g_rt_gen;
+static void (*g_rt_ready_hook)(NSString *variant, int stage);
+void totk_rt_set_ready_hook(void (*hook)(NSString *variant, int stage)) { g_rt_ready_hook = hook; }
+uint64_t totk_rt_ready_gen(void) { return atomic_load(&g_rt_gen); }
+static _Atomic int64_t g_rt_bg_pending;
+int64_t totk_rt_bg_pending(void) { return atomic_load(&g_rt_bg_pending); }
+static void bg_translate(NSString *shader, int stage, NSDictionary *rq, BOOL existed) {   // g_rt_lock held
+    static rt_svc svc[RT_BG_WORKERS]; static dispatch_queue_t queue[RT_BG_WORKERS]; static unsigned next;
+    if (!queue[0]) for (int i = 0; i < RT_BG_WORKERS; i++)
+        queue[i] = dispatch_queue_create("totk.shader.background", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+    if (!g_rt_pending) g_rt_pending = [NSMutableDictionary dictionary];
+    NSMutableArray *job = [NSMutableArray arrayWithObject:@(RT_JOB_QUEUED)];
+    g_rt_pending[shader] = job;
+    rt_svc *own = &svc[next % RT_BG_WORKERS]; dispatch_queue_t q = queue[next++ % RT_BG_WORKERS];
+    uint64_t queued = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    atomic_fetch_add(&g_rt_bg_pending, 1);
+    dispatch_async(q, ^{ @autoreleasepool {
+        pthread_mutex_lock(&g_rt_lock);
+        int taken = [job[0] intValue] == RT_JOB_TAKEN;
+        if (!taken) job[0] = @(RT_JOB_RUNNING);
+        pthread_mutex_unlock(&g_rt_lock);
+        if (taken) { atomic_fetch_sub(&g_rt_bg_pending, 1); return; }   // translated on the spot by a draw that could not wait
+        uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        NSDictionary *refl = translate(own, rq, started);
+        if (g_rt_ready_hook) g_rt_ready_hook(rq[@"variant"], stage);   // the Metal library too, off the submit thread
+        pthread_mutex_lock(&g_rt_lock);
+        variant_record(shader, rq, refl, existed, started, queued);
+        [g_rt_pending removeObjectForKey:shader];
+        atomic_fetch_add(&g_rt_gen, 1);
+        atomic_fetch_sub(&g_rt_bg_pending, 1);
+        pthread_cond_broadcast(&g_rt_done);
+        pthread_mutex_unlock(&g_rt_lock);
+    } });
+}
+
+NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local, int may_defer) {
+    uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    pthread_mutex_lock(&g_rt_lock);
+    // Called for the game's actual shader bytes, including when a prepared
+    // variant already exists. Old cache files alone never become observed keys.
+    totk_shader_observed_note(observed_keys_state(), shader);
+    NSString *found = variant_lookup(shader, answers);
+    for (NSMutableArray *job; !found && !may_defer && (job = g_rt_pending[shader]); found = variant_lookup(shader, answers)) {
+        if ([job[0] intValue] == RT_JOB_QUEUED) { job[0] = @(RT_JOB_TAKEN); [g_rt_pending removeObjectForKey:shader]; break; }
+        pthread_cond_wait(&g_rt_done, &g_rt_lock);
+    }
+    if (found || g_rt_pending[shader]) { pthread_mutex_unlock(&g_rt_lock); return found; }
+    NSMutableDictionary *rq = variant_request(shader, stage, control, code, answers, local);
+    if (no_translator()) { record_miss(shader, rq, answers); pthread_mutex_unlock(&g_rt_lock); return nil; }
+    BOOL existed = [NSFileManager.defaultManager fileExistsAtPath:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.metal", rq[@"variant"]]];   // a re-translation of a broken variant is not a new one
+    if (may_defer) { bg_translate(shader, stage, rq, existed); pthread_mutex_unlock(&g_rt_lock); return nil; }
+    variant_record(shader, rq, translate(&g_svc, rq, started), existed, started, 0);
     pthread_mutex_unlock(&g_rt_lock);
-    return variant;
+    return rq[@"variant"];
+}
+
+NSArray<NSString *> *totk_rt_known_variants(NSString *shader) {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    pthread_mutex_lock(&g_rt_lock);
+    for (NSDictionary *v in variants_of(shader))
+        if ([v isKindOfClass:NSDictionary.class] && [v[@"variant"] isKindOfClass:NSString.class]) [out addObject:v[@"variant"]];
+    pthread_mutex_unlock(&g_rt_lock);
+    return out;
 }
 
 void totk_rt_counts(uint64_t *fresh, int64_t *total, uint64_t *last_new_ns) {
@@ -267,13 +450,128 @@ void totk_rt_counts(uint64_t *fresh, int64_t *total, uint64_t *last_new_ns) {
         NSString *dir = totk_rt_dir();
         atomic_store(&g_new_at_count, atomic_load(&g_new_variants));
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{   // ~45,000 directory entries: not on the present thread
-            int64_t n = 0; DIR *d = opendir(dir.fileSystemRepresentation); struct dirent *e;
-            if (d) { while ((e = readdir(d))) { size_t l = strlen(e->d_name); if (l > 8 && !strcmp(e->d_name + l - 8, "_b.metal")) n++; } closedir(d); }
+            int64_t n = 0;
+            if (g_seed_dir) { for (NSString *name in totk_rt_list()) if ([name hasSuffix:@"_b.metal"]) n++; }
+            else { DIR *d = opendir(dir.fileSystemRepresentation); struct dirent *e;
+                   if (d) { while ((e = readdir(d))) { size_t l = strlen(e->d_name); if (l > 8 && !strcmp(e->d_name + l - 8, "_b.metal")) n++; } closedir(d); } }
             atomic_store(&g_cached_variants, n);
         });
     });
     uint64_t f = atomic_load(&g_new_variants); int64_t t = atomic_load(&g_cached_variants);
     if (fresh) *fresh = f;
-    if (total) *total = t < 0 ? -1 : t + (int64_t)(f - atomic_load(&g_new_at_count));
+    if (total) *total = t < 0 ? -1 : t + (int64_t)(f - atomic_load(&g_new_at_count)) + (int64_t)atomic_load(&g_prepared_variants);
     if (last_new_ns) *last_new_ns = atomic_load(&g_new_variant_ns);
 }
+
+#if !TARGET_OS_IPHONE
+/* The shared list's translator: the same native service as the game's, a process of its own at utility priority. */
+static FILE *g_prep_in, *g_prep_out;
+static pid_t g_prep_pid;
+static void prep_stop(void) {
+    if (g_prep_in) fclose(g_prep_in);
+    if (g_prep_out) fclose(g_prep_out);
+    g_prep_in = g_prep_out = NULL;
+    if (g_prep_pid > 0) { int st; waitpid(g_prep_pid, &st, 0); }
+    g_prep_pid = 0;
+}
+static int prep_start(NSString **why) {
+    if (g_prep_in) return 1;
+    NSString *r = root_dir(), *native = [r stringByAppendingString:@"/build/shader-service/totk_xlate"];
+    NSString *sc = [r stringByAppendingString:@"/build/spirv-cross/spirv-cross"];
+    if (access(native.fileSystemRepresentation, X_OK)) { *why = @"no native translator (build/shader-service/totk_xlate)"; return 0; }
+    int to[2], from[2];
+    if (pipe(to)) { *why = @"pipe"; return 0; }
+    if (pipe(from)) { close(to[0]); close(to[1]); *why = @"pipe"; return 0; }
+    posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, to[0], 0); posix_spawn_file_actions_adddup2(&fa, from[1], 1);
+    posix_spawn_file_actions_addclose(&fa, to[1]); posix_spawn_file_actions_addclose(&fa, from[0]);
+    posix_spawnattr_t at; posix_spawnattr_init(&at);
+    posix_spawnattr_set_qos_class_np(&at, QOS_CLASS_UTILITY);
+    /* Spawned from a dispatch worker, whose signals are blocked: the child would inherit that mask, and the translator
+       (.NET) then never sees SIGCHLD from its SPIRV-Cross runs and waits forever. Start it with no signal blocked. */
+    sigset_t none, all; sigemptyset(&none); sigfillset(&all); sigdelset(&all, SIGKILL); sigdelset(&all, SIGSTOP);
+    posix_spawnattr_setsigmask(&at, &none); posix_spawnattr_setsigdefault(&at, &all);
+    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+    const char *argv[] = {native.UTF8String, "--service", "--spirv-cross", sc.UTF8String, "--out", totk_rt_dir().UTF8String,
+                          "--chain", DMSH_CHAIN, NULL};
+    int err = posix_spawn(&g_prep_pid, argv[0], &fa, &at, (char *const *)argv, environ);
+    posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&at);
+    close(to[0]); close(from[1]);
+    if (err) { close(to[1]); close(from[0]); g_prep_pid = 0; *why = [NSString stringWithFormat:@"cannot start the translator (%s)", strerror(err)]; return 0; }
+    g_prep_in = fdopen(to[1], "w"); g_prep_out = fdopen(from[0], "r");
+    if (!g_prep_in || !g_prep_out) { prep_stop(); *why = @"translator streams"; return 0; }
+    LOG("[shader-list] background translator started (pid %d, utility priority)", g_prep_pid);
+    return 1;
+}
+NSString *totk_rt_prepare(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, size_t code_len,
+                          NSDictionary *answers, int *fresh, NSString **why) {
+    __autoreleasing NSString *dummy; if (!why) why = &dummy;
+    *fresh = 0;
+    uint32_t c1o, c1t; memcpy(&c1o, control + 0x700, 4); memcpy(&c1t, control + 0x704, 4);
+    NSString *stage_name = stage == 0 ? @"vs" : stage == 1 ? @"ps" : stage == 5 ? @"cs" : nil;
+    if (!stage_name) { *why = [NSString stringWithFormat:@"stage %d has no translation chain", stage]; return nil; }
+    if (!c1t || c1t > 16u << 20 || c1t > code_len || c1o > c1t || (stage != 5 && c1o < 0x30)) { *why = @"code area out of range"; return nil; }
+    NSArray *local = nil;
+    if (stage == 5) {
+        uint32_t l[3]; memcpy(l, control + 0x748, 12);
+        if (!l[0] || !l[1] || !l[2] || l[0] > 1024 || l[1] > 1024 || l[2] > 64 || (uint64_t)l[0] * l[1] * l[2] > 1024) { *why = @"implausible thread group size"; return nil; }
+        local = @[@(l[0]), @(l[1]), @(l[2])];
+    }
+    uint8_t md[32]; NSData *ad = [json_string(answers) dataUsingEncoding:NSUTF8StringEncoding]; CC_SHA256(ad.bytes, (CC_LONG)ad.length, md);
+    NSString *variant = [NSString stringWithFormat:@"%@-%@", shader, hex(md, 6)], *dir = totk_rt_dir();
+    NSString *msl = [dir stringByAppendingFormat:@"/%@_b.metal", variant], *json = [dir stringByAppendingFormat:@"/%@_b.json", variant];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    BOOL existed = [fm fileExistsAtPath:msl] && [fm fileExistsAtPath:json];   // translated before (an index this run will add it to)
+    if (!existed) {
+        if (!prep_start(why)) return nil;
+        NSString *code_path = [dir stringByAppendingFormat:@"/%@.list.code", variant];
+        size_t skip = stage == 5 ? 0 : 0x30;   // graphics code drops the 0x30-byte NVN header, as totk_rt_variant does
+        if (![[NSData dataWithBytes:code + skip length:c1t - skip] writeToFile:code_path atomically:YES]) { *why = @"cannot write the shader code"; return nil; }
+        NSMutableDictionary *rq = [NSMutableDictionary dictionaryWithDictionary:@{@"variant": variant, @"stage": stage_name, @"code": code_path, @"c1": hex(code + c1o, c1t - c1o)}];
+        [rq addEntriesFromDictionary:answers];
+        if (local) rq[@"local"] = local;
+        rq[@"depth_minus_w"] = totk_depth_near_minus_w() ? @YES : @NO;
+        fprintf(g_prep_in, "%s\n", json_string(rq).UTF8String); fflush(g_prep_in);
+        char line[4096];
+        struct pollfd pf = {fileno(g_prep_out), POLLIN, 0};   // one reply line per request; a hung translator is replaced
+        char *got = poll(&pf, 1, 60000) > 0 ? fgets(line, sizeof line, g_prep_out) : NULL;
+        if (!got && g_prep_pid > 0) kill(g_prep_pid, SIGKILL);
+        [fm removeItemAtPath:code_path error:nil];
+        if (!got) { prep_stop(); [fm removeItemAtPath:msl error:nil]; [fm removeItemAtPath:json error:nil]; *why = @"the translator exited or did not answer in 60 s"; return nil; }
+        NSDictionary *reply = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:line length:strlen(line)] options:0 error:nil];
+        if (![reply isKindOfClass:[NSDictionary class]] || ![reply[@"ok"] boolValue]) {
+            [fm removeItemAtPath:msl error:nil]; [fm removeItemAtPath:json error:nil];
+            *why = [NSString stringWithFormat:@"translation failed: %@", [reply isKindOfClass:[NSDictionary class]] ? reply[@"error"] : @"no reply"];
+            return nil;
+        }
+    }
+    NSData *jd = [NSData dataWithContentsOfFile:json];
+    NSDictionary *refl = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
+    if (![refl isKindOfClass:[NSDictionary class]] || ![refl[@"chain"] isEqual:@DMSH_CHAIN] || ![refl[@"stage"] isEqual:stage_name]) {
+        if (!existed) { [fm removeItemAtPath:msl error:nil]; [fm removeItemAtPath:json error:nil]; }
+        *why = @"reflection missing or of another chain"; return nil;
+    }
+    NSDictionary *deps = [refl[@"deps"] isKindOfClass:[NSDictionary class]] ? refl[@"deps"] : @{};
+    pthread_mutex_lock(&g_rt_lock);
+    NSMutableArray *vs = variants_of(shader);
+    for (NSDictionary *v in vs) if ([v[@"deps"] isEqual:deps]) {   // the same deps as a cached variant: keep that one
+        NSString *have = v[@"variant"];
+        pthread_mutex_unlock(&g_rt_lock);
+        if (![have isEqualToString:variant] && !existed) { [fm removeItemAtPath:msl error:nil]; [fm removeItemAtPath:json error:nil]; }
+        return have;
+    }
+    [vs addObject:@{@"variant": variant, @"deps": deps}];
+    BOOL ok = [[json_string(vs) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:index_path(shader) atomically:YES];
+    pthread_mutex_unlock(&g_rt_lock);
+    if (!ok) { *why = @"cannot write the variant index"; return nil; }
+    atomic_fetch_add(&g_prepared_variants, 1);
+    *fresh = 1;
+    return variant;
+}
+#else
+NSString *totk_rt_prepare(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, size_t code_len,
+                          NSDictionary *answers, int *fresh, NSString **why) {
+    (void)shader; (void)stage; (void)control; (void)code; (void)code_len; (void)answers;
+    *fresh = 0; if (why) *why = @"no translator on iOS"; return nil;
+}
+#endif

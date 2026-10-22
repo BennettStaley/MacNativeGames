@@ -140,7 +140,11 @@ def main():
     if output.exists():
         raise ValueError('use a new output directory; existing evidence is preserved')
     output.mkdir(parents=True)
-    seed = json.loads((app/'Contents/Resources/totk/build/shader-seed/seed-manifest.json').read_text())
+    seed_dir = app/'Contents/Resources/totk/build/shader-seed'
+    pointer = app/'Contents/Resources/totk/game-data.json'
+    if pointer.is_file():   # the default Mac app: the prepared shaders are in its game-data folder (build_app.py step_store)
+        seed_dir = Path(json.loads(pointer.read_text())['shaders']['path'])/'shader-seed'
+    seed = json.loads((seed_dir/'seed-manifest.json').read_text())
     os.environ['TOTK_GAME_SLOT_DIR'] = str(DATA/'game-slot')
     reports = []
     for name, mode, cache, profile in [

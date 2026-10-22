@@ -17,6 +17,7 @@ static NSView *bootOverlay;
 static NSTextField *bootStage,*bootDetail;
 static NSProgressIndicator *bootProgress;
 static NSView *shortcutHelp;
+int taa_enabled(void);   /* third_party/d2r_gfx/gfx/nvn/totk_taa.m: key 5 */
 static uint64_t bootStartNS;
 static _Atomic uint64_t presentedFrames;
 static _Atomic int warmPending;
@@ -88,7 +89,11 @@ uint64_t front_game_res(int docked){(void)docked;return (720ULL<<32)|1280;}
 /* TOTK_ASSUME_FOCUS=1: unattended test runs. macOS refuses to activate an app launched from the background while the user is working in
    another one; the window then never becomes key, GetCurrentFocusState stays 0 and the game waits before its first frame. In this mode the
    game is told it is focused, and the window is shown without taking the keyboard from the user (scripted input does not need it). */
-static int assume_focus(void){static int v=-1;if(v<0){const char *e=getenv("TOTK_ASSUME_FOCUS");v=e&&atoi(e);}return v;}
+/* TOTK_BACKGROUND=1: a test run that stays out of the user's way: the window is invisible and lets clicks through (see
+   where it is shown), never takes focus, has no Dock icon or app-switcher entry, and the game is muted (TOTK_AUDIO_OFF).
+   Implies TOTK_ASSUME_FOCUS. */
+static int background_run(void){static int v=-1;if(v<0){const char *e=getenv("TOTK_BACKGROUND");v=e&&atoi(e);if(v)setenv("TOTK_AUDIO_OFF","1",1);}return v;}
+static int assume_focus(void){static int v=-1;if(v<0){const char *e=getenv("TOTK_ASSUME_FOCUS");v=(e&&atoi(e))||background_run();}return v;}
 /* Keep the guest active when the macOS window loses key status. Native input is still cleared
    in windowDidResignKey so a held key cannot remain stuck while another app has focus. */
 int runtime_front_focus(void){return 1;}
@@ -96,13 +101,51 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
  (void)link;(void)now;(void)output;(void)flags;(void)out;(void)ctx;
  pthread_mutex_lock(&vsyncLock);for(unsigned i=0;i<vsyncCount;i++)hle_signal_system_event(vsyncEvents[i]);pthread_mutex_unlock(&vsyncLock);return kCVReturnSuccess;
 }
+#include "settings_panel_mac.h"
+static NSWindow *settings_window(void){return window;}
+/* gamepad.m: a controller's Home button, or Options and Menu pressed together. */
+void runtime_front_settings_toggle(void){dispatch_async(dispatch_get_main_queue(),^{[TOTKSettingsPanel toggle];});}
+void runtime_front_settings_key(unsigned code){dispatch_async(dispatch_get_main_queue(),^{
+ NSEvent *e=[NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:window.windowNumber context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:(unsigned short)code];
+ [TOTKSettingsPanel key:e];});}
+void runtime_front_settings_shot(const char *path){NSString *p=@(path);dispatch_async(dispatch_get_main_queue(),^{
+ fprintf(stderr,"[settings] panel snapshot %s: %s\n",p.fileSystemRepresentation,[TOTKSettingsPanel snapshotTo:p]?"written":"FAILED");});}
 @interface TOTKInputView:NSView
+@property(strong) NSTimer *cursorHideTimer;
+@property BOOL cursorAutoHideActive;
+@property BOOL cursorIsHidden;
+-(void)setCursorAutoHideEnabled:(BOOL)enabled;
 @end
 @implementation TOTKInputView
 -(BOOL)acceptsFirstResponder{return YES;}
--(void)keyDown:(NSEvent *)e{runtime_input_key(e.keyCode,1);}
+-(void)keyDown:(NSEvent *)e{if(e.keyCode==122&&!e.isARepeat){[TOTKSettingsPanel toggle];return;}
+ if(e.keyCode==120){if(!e.isARepeat)settings_set("interface.hide_hud",!settings_get("interface.hide_hud"));return;}runtime_input_key(e.keyCode,1);}   /* F1: settings; F2: hide the HUD (the setting follows) */
 -(void)keyUp:(NSEvent *)e{runtime_input_key(e.keyCode,0);}
 -(void)flagsChanged:(NSEvent *)e{if(e.keyCode==56)runtime_input_key(56,!!(e.modifierFlags&NSEventModifierFlagShift));if(e.keyCode==58)runtime_input_key(58,!!(e.modifierFlags&NSEventModifierFlagOption));}
+/* The game has no mouse controls. In native full screen, keep the pointer out of the picture while idle, but show it again
+   as soon as it moves; restore it when the window loses focus or leaves full screen. */
+-(void)hideCursorIfIdle:(NSTimer *)timer{
+ (void)timer;self.cursorHideTimer=nil;
+ if(!self.cursorAutoHideActive||!self.window.isKeyWindow||!(self.window.styleMask&NSWindowStyleMaskFullScreen))return;
+ if(!self.cursorIsHidden){[NSCursor hide];self.cursorIsHidden=YES;}
+}
+-(void)mouseMoved:(NSEvent *)e{
+ (void)e;if(!self.cursorAutoHideActive)return;
+ [self.cursorHideTimer invalidate];self.cursorHideTimer=nil;
+ if(self.cursorIsHidden){[NSCursor unhide];self.cursorIsHidden=NO;}
+ self.cursorHideTimer=[NSTimer scheduledTimerWithTimeInterval:1.5 target:self selector:@selector(hideCursorIfIdle:) userInfo:nil repeats:NO];
+}
+-(void)setCursorAutoHideEnabled:(BOOL)enabled{
+ self.cursorAutoHideActive=enabled;
+ [self.cursorHideTimer invalidate];self.cursorHideTimer=nil;
+ if(enabled){
+  self.window.acceptsMouseMovedEvents=YES;
+  self.cursorHideTimer=[NSTimer scheduledTimerWithTimeInterval:1.5 target:self selector:@selector(hideCursorIfIdle:) userInfo:nil repeats:NO];
+ }else{
+  if(self.cursorIsHidden){[NSCursor unhide];self.cursorIsHidden=NO;}
+  self.window.acceptsMouseMovedEvents=NO;
+ }
+}
 @end
 @interface TOTKShortcutHelp:NSView
 @property(strong) NSTextField *label;
@@ -112,24 +155,13 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
 -(void)refresh;
 @end
 /* Compact HUD (default): one small box in the window's top-right corner with the FPS, shader and load lines (published by
-   gfx/nvn/fps_overlay.c, refreshed twice a second) above the shortcuts. TOTK_HUD=corners: the lines stay in the picture's
-   corners and this is the larger centred shortcut box. */
+   gfx/nvn/fps_overlay.c, refreshed twice a second) above a line pointing at the settings menu. TOTK_HUD=corners: the lines stay in
+   the picture's corners and this is the larger centred box with that line. */
 @implementation TOTKShortcutHelp
+/* The keys 1-5 predate the settings menu, which now covers what they do (they still work), so the box no longer lists
+   them: one line points at the menu instead. */
 static NSString *shortcut_text(void){
- const char *interp;
- switch(mfx_enabled()){
-  case MFX_30:interp="30+30";break;
-  case MFX_HALF:interp=TOTK_UI("刷新率一半","half refresh rate");break;
-  case MFX_MAX:interp=TOTK_UI("不限帧","unlimited");break;
-  default:interp=TOTK_UI("关闭","off");break;
- }
- uint64_t size=runtime_output_size_current();unsigned w=(uint32_t)size,h=(uint32_t)(size>>32);
- NSString *picture;
- if(mfxup_output_enabled())picture=@"MetalFX 2K";
- else if(w==2560&&h==1440)picture=@(TOTK_UI("原生 2K","native 2K"));
- else if(w!=1920||h!=1080)picture=[NSString stringWithFormat:@(TOTK_UI("原生 %u×%u","native %u×%u")),w,h];
- else picture=@(TOTK_UI("关闭","off"));
- return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  显示 / 隐藏所有提示\n2  补帧：当前 %@（按键切换）\n3  画质：当前 %@（按键切换）\n4  21:9 宽屏：开 / 关","Shortcuts\n1  Show / hide all overlays\n2  Interpolation: %@ (current; press to cycle)\n3  Picture: %@ (current; press to cycle)\n4  Ultrawide 21:9: on / off")),[NSString stringWithUTF8String:interp],picture];
+ return @(TOTK_UI("⌘, / F1  设置    F2  隐藏 HUD","⌘, / F1  Settings    F2  Hide HUD"));
 }
 -(instancetype)initWithFrame:(NSRect)frame{if((self=[super initWithFrame:frame])){int compact=hud_compact();self.wantsLayer=YES;self.layer.backgroundColor=[NSColor colorWithCalibratedWhite:0.04 alpha:compact?0.72:0.86].CGColor;self.layer.cornerRadius=compact?7:14;self.layer.borderWidth=1;self.layer.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:compact?0.14:0.2].CGColor;
  self.label=[NSTextField labelWithString:shortcut_text()];self.label.font=[NSFont systemFontOfSize:17 weight:NSFontWeightMedium];self.label.textColor=NSColor.whiteColor;self.label.alignment=NSTextAlignmentCenter;self.label.maximumNumberOfLines=0;self.label.lineBreakMode=NSLineBreakByWordWrapping;self.label.frame=NSInsetRect(self.bounds,20,18);self.label.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;[self addSubview:self.label];
@@ -140,9 +172,12 @@ static NSString *shortcut_text(void){
  NSFont *mono=[NSFont monospacedSystemFontOfSize:10.5 weight:NSFontWeightMedium],*small=[NSFont systemFontOfSize:10];
  NSColor *green=[NSColor colorWithCalibratedRed:80/255.0 green:1 blue:120/255.0 alpha:1],*yellow=[NSColor colorWithCalibratedRed:1 green:230/255.0 blue:40/255.0 alpha:1];
  NSMutableAttributedString *a=[NSMutableAttributedString new];
- for(int i=0;i<3;i++){char t[128];int hl=0;if(!hud_snapshot(i,t,sizeof t,&hl))continue;
+ int full=fps_overlay_full_hud();   // key 1 minimal: the FPS line (line 0) only; the others keep their last text, so skip them
+ for(int i=0;i<3;i++){char t[128];int hl=0;if((!full&&i!=0)||!hud_snapshot(i,t,sizeof t,&hl))continue;
   [a appendAttributedString:[[NSAttributedString alloc] initWithString:[([NSString stringWithUTF8String:t] ?: @"") stringByAppendingString:@"\n"] attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:hl?yellow:green}]];}
- if(a.length){NSMutableParagraphStyle *gap=[NSMutableParagraphStyle new];gap.paragraphSpacingBefore=4;
+ if(!full){if(a.length)[a deleteCharactersInRange:NSMakeRange(a.length-1,1)];   // no empty line under the single FPS line
+  else [a appendAttributedString:[[NSAttributedString alloc] initWithString:@"FPS --" attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:green}]];}
+ else if(a.length){NSMutableParagraphStyle *gap=[NSMutableParagraphStyle new];gap.paragraphSpacingBefore=4;
   [a appendAttributedString:[[NSAttributedString alloc] initWithString:shortcut_text() attributes:@{NSFontAttributeName:small,NSForegroundColorAttributeName:[NSColor colorWithCalibratedWhite:0.75 alpha:1],NSParagraphStyleAttributeName:gap}]];}
  else [a appendAttributedString:[[NSAttributedString alloc] initWithString:shortcut_text() attributes:@{NSFontAttributeName:small,NSForegroundColorAttributeName:[NSColor colorWithCalibratedWhite:0.75 alpha:1]}]];
  if([a isEqualToAttributedString:self.label.attributedStringValue])return;
@@ -152,10 +187,45 @@ static NSString *shortcut_text(void){
 -(void)layout{[super layout];[self position];}
 -(void)position{if(!self.superview)return;NSRect f,in;
  if(hud_compact()){CGFloat w=self.textSize.width+16,h=self.textSize.height+10,m=10;f=NSMakeRect(floor(self.superview.bounds.size.width-w-m),floor(self.superview.bounds.size.height-h-m),w,h);in=NSMakeRect(8,5,self.textSize.width,self.textSize.height);}
- else{CGFloat w=MIN(560,MAX(280,self.superview.bounds.size.width-40)),h=168;f=NSMakeRect(floor((self.superview.bounds.size.width-w)/2),floor((self.superview.bounds.size.height-h)/2),w,h);in=NSInsetRect(NSMakeRect(0,0,w,h),20,18);}
+ else{CGFloat w=MIN(560,MAX(280,self.superview.bounds.size.width-40)),h=192;f=NSMakeRect(floor((self.superview.bounds.size.width-w)/2),floor((self.superview.bounds.size.height-h)/2),w,h);in=NSInsetRect(NSMakeRect(0,0,w,h),20,18);}
  if(!NSEqualRects(self.frame,f))self.frame=f;self.label.frame=in;}
 @end
-void runtime_shortcut_help_toggle(void){int show=fps_overlay_toggle_hints();dispatch_async(dispatch_get_main_queue(), ^{shortcutHelp.hidden=!show;});}
+/* The live FPS in the menu bar: a menu of the game's own, after its app menu on the left, whose title is the frame rate
+   ("60 FPS", "50+50 FPS" while frame interpolation shows generated frames), refreshed twice a second with the value the
+   overlay uses. Part of the app's own menu bar, so macOS shows it whenever the game is in front (a status item next to
+   the clock can be hidden by System Settings > Menu Bar). Independent of key 1; hidden in full screen with the menu bar.
+   TOTK_MENUBAR_FPS=0 leaves the menu bar alone. */
+extern int dm_gfx_fps_now(int *generated) __attribute__((weak_import));   // gfx/nvn/nvn_mtl.m (absent in tests)
+static NSMenu *fpsMenu;static NSMenuItem *fpsMenuItem;static NSTimer *fpsTimer;
+static int menubar_fps_enabled(void){const char *e=getenv("TOTK_MENUBAR_FPS");return !(e&&!strcmp(e,"0"));}
+static void front_menubar_fps_add(NSMenu *bar){   // from front_install_menu
+ if(!menubar_fps_enabled())return;
+ fpsMenu=[[NSMenu alloc] initWithTitle:@"FPS --"];
+ NSMenuItem *about=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("实时帧率（TOTK_MENUBAR_FPS=0 可隐藏）","Live frame rate (TOTK_MENUBAR_FPS=0 hides it)")) action:nil keyEquivalent:@""];
+ about.enabled=NO;[fpsMenu addItem:about];fpsMenu.autoenablesItems=NO;
+ fpsMenuItem=[[NSMenuItem alloc] initWithTitle:@"FPS --" action:nil keyEquivalent:@""];fpsMenuItem.submenu=fpsMenu;[bar addItem:fpsMenuItem];
+}
+/* TOTK_TITLE_FPS=1: the window title also ends in the frame rate ("Tears of the Kingdom  Mac — Ver. 1.4.3 — 60 FPS"),
+   kept after whatever title the game set. Off by default: the menu bar already shows it. */
+static int title_fps_enabled(void){const char *e=getenv("TOTK_TITLE_FPS");return e&&!strcmp(e,"1");}
+static NSString *titleBase,*titleShown;
+static void front_title_fps(NSString *fps){
+ if(!title_fps_enabled()||!window)return;
+ NSString *now=window.title;
+ if(!titleShown||![now isEqualToString:titleShown])titleBase=now;   // the game changed its title: keep that one as the base
+ titleShown=[NSString stringWithFormat:@"%@ — %@",titleBase,fps];
+ if(![now isEqualToString:titleShown])window.title=titleShown;
+}
+static void front_menubar_fps(void){   // starts the refresh once the window exists
+ if((!fpsMenu&&!title_fps_enabled())||fpsTimer)return;
+ fpsTimer=[NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t){(void)t;
+  int gen=0,fps=dm_gfx_fps_now?dm_gfx_fps_now(&gen):-1;
+  NSString *title=fps<0?@"FPS --":gen>0?[NSString stringWithFormat:@"%d+%d FPS",fps,gen]:[NSString stringWithFormat:@"%d FPS",fps];
+  if(fpsMenu&&![fpsMenu.title isEqualToString:title]){fpsMenu.title=title;fpsMenuItem.title=title;}
+  front_title_fps(title);}];
+}
+void runtime_shortcut_help_toggle(void){int mode=fps_overlay_toggle_hints();dispatch_async(dispatch_get_main_queue(), ^{   // key 1: all -> minimal (FPS only) -> off
+ shortcutHelp.hidden=mode==0||(mode==2&&!hud_compact());[(TOTKShortcutHelp *)shortcutHelp refresh];});}   // mode 0 off, 2 minimal (fps_overlay.h HUD_MODE_*)
 /* The drawable follows the window's pixel size; the present pass scales the game picture (1920x1080 docked) into it and
    keeps 16:9 (black bars on other shapes), so a larger window or full screen shows the game at its own resolution instead
    of a fixed small drawable that the compositor stretches. */
@@ -167,16 +237,49 @@ static void front_sync_drawable(void){
  NSView *v=window.contentView;if(!v||!metalLayer)return;
  CGFloat s=window.backingScaleFactor>0?window.backingScaleFactor:1,ts=drawable_scale();CGSize px=CGSizeMake(round(v.bounds.size.width*s*ts),round(v.bounds.size.height*s*ts));
  if(px.width<1||px.height<1||CGSizeEqualToSize(metalLayer.drawableSize,px))return;
- metalLayer.contentsScale=s;metalLayer.drawableSize=px;fprintf(stderr,"[totk] window drawable %.0fx%.0f (scale %.0f)\n",px.width,px.height,s);
+ metalLayer.contentsScale=s;metalLayer.drawableSize=px;fprintf(stderr,"[totk] window drawable %.0fx%.0f (scale %.0f)\n",px.width,px.height,s);runtime_aspect_view(px.width,px.height);
+ /* The settings' window-following sizes (settings_display_size), once the size has settled: each output change rebuilds
+    the game's canvas, which a live resize must not do every frame. */
+ static unsigned generation;unsigned mine=++generation;
+ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,400*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
+  if(mine!=generation)return;
+  NSScreen *screen=window.screen?:NSScreen.mainScreen;unsigned native=0;
+  CGDirectDisplayID display=[screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+  /* The panel's own pixels (3456 on a 16" MacBook Pro), not the current mode's backing size ("More Space" is bigger):
+     the widest mode drawn one pixel per point. */
+  NSArray *modes=display?CFBridgingRelease(CGDisplayCopyAllDisplayModes(display,(__bridge CFDictionaryRef)@{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes:@YES})):nil;
+  for(id m in modes){CGDisplayModeRef mode=(__bridge CGDisplayModeRef)m;size_t pw=CGDisplayModeGetPixelWidth(mode);
+   if(pw==CGDisplayModeGetWidth(mode)&&pw>native)native=(unsigned)pw;}
+  if(!native)native=(unsigned)(screen.frame.size.width*screen.backingScaleFactor);
+  settings_display_size((unsigned)metalLayer.drawableSize.width,(unsigned)metalLayer.drawableSize.height,native);
+ });
+}
+/* The display the game window is on (its CGDirectDisplayID; 0 = not known yet, the renderer then asks about the main
+   display) and a count that goes up whenever the window moves to another display or a display's mode changes (System
+   Settings' refresh rate, a display plugged in). The renderer (nvn_mtl.m mtl_display_hz) reads both on its own threads,
+   so the refresh rate, the 120 Hz pacing and the Auto frame rate limit follow the window's display on multi-monitor
+   setups, not the main display's. */
+static _Atomic uint32_t windowDisplay;
+static _Atomic unsigned displayChanges;
+uint32_t runtime_front_display_id(void){return atomic_load(&windowDisplay);}
+unsigned runtime_front_display_changes(void){return atomic_load(&displayChanges);}
+static void note_screen(const char *why){
+ NSScreen *s=window.screen;NSNumber *n=s?s.deviceDescription[@"NSScreenNumber"]:nil;uint32_t d=n?n.unsignedIntValue:0;
+ uint32_t old=atomic_exchange(&windowDisplay,d);int params=!strcmp(why,"display settings changed");
+ if(old==d&&!params)return;
+ atomic_fetch_add(&displayChanges,1);
+ CGDisplayModeRef m=d?CGDisplayCopyDisplayMode(d):NULL;double hz=m?CGDisplayModeGetRefreshRate(m):0;if(m)CGDisplayModeRelease(m);
+ fprintf(stderr,"[totk] window display %u (%s, %.0f Hz): %s\n",d,s?s.localizedName.UTF8String:"?",hz,why);
 }
 @interface TOTKWindowDelegate:NSObject<NSWindowDelegate>
 @end
 @implementation TOTKWindowDelegate
--(void)windowDidBecomeKey:(NSNotification *)n{(void)n;atomic_store(&focused,1);runtime_oe_push_message(15);fprintf(stderr,"[totk] window gained focus\n");}
--(void)windowDidResignKey:(NSNotification *)n{(void)n;atomic_store(&focused,0);runtime_input_clear();runtime_oe_push_message(15);fprintf(stderr,"[totk] window lost focus\n");}
+-(void)windowDidBecomeKey:(NSNotification *)n{(void)n;atomic_store(&focused,1);if(window.styleMask&NSWindowStyleMaskFullScreen)[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:YES];runtime_oe_push_message(15);fprintf(stderr,"[totk] window gained focus\n");}
+-(void)windowDidResignKey:(NSNotification *)n{(void)n;atomic_store(&focused,0);[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:NO];runtime_input_clear();runtime_oe_push_message(15);fprintf(stderr,"[totk] window lost focus\n");}
 /* The process ends with the window. Save writes go straight to the files (runtime/fs_host.c), so a close in the middle of a
    save waits (up to 15 s, the window already gone) until the game has written and committed it (runtime_fs_save_busy). */
 -(void)windowWillClose:(NSNotification *)n{(void)n;
+ [(TOTKInputView *)window.contentView setCursorAutoHideEnabled:NO];
  if(!runtime_fs_save_busy()){fprintf(stderr,"[totk] window closed; graceful guest shutdown pending\n");_exit(0);}
  fprintf(stderr,"[totk] window closed while the game is saving: quitting when the save is done\n");
  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
@@ -184,6 +287,8 @@ static void front_sync_drawable(void){
   fprintf(stderr,"[totk] save %s after %.2f s; quitting\n",runtime_fs_save_busy()?"still in progress (gave up)":"done",(runtime_now_ns()-t0)/1e9);_exit(0);});
 }
 -(void)windowDidResize:(NSNotification *)n{(void)n;front_sync_drawable();}
+-(void)windowDidEnterFullScreen:(NSNotification *)n{(void)n;[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:window.isKeyWindow];}
+-(void)windowDidExitFullScreen:(NSNotification *)n{(void)n;[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:NO];}
 /* Whether any part of the window can be seen (TOTK, 2026-10-16 night): macOS stops the display link's callbacks for a
    fully covered window, so presents stop and per-picture measurements of that stretch are void; a test session's log
    says when (the user working in other apps covered the test windows of the frame interpolation tests). */
@@ -192,23 +297,57 @@ static void note_occlusion(const char *when){int v=(window.occlusionState&NSWind
  fprintf(stderr,"[totk] window %s%s (frame %llu)\n",v?"visible":"covered (or on another Space): no presents until it is visible again",when,(unsigned long long)dm_nvn_frame_count());}
 -(void)windowDidChangeOcclusionState:(NSNotification *)n{(void)n;note_occlusion("");}
 -(void)windowDidChangeBackingProperties:(NSNotification *)n{(void)n;front_sync_drawable();}
+-(void)windowDidChangeScreen:(NSNotification *)n{(void)n;note_screen("moved to another display");}
 @end
 static TOTKWindowDelegate *windowDelegate;
+/* A save package (.totksave, runtime/save_package.h) opened while the game runs (a double-click, or AirDrop's Open): the
+   launcher imports one before the game starts (app/launcher.m), never into a running game, which would save over it. */
+@interface TOTKAppDelegate:NSObject<NSApplicationDelegate>
+@end
+@implementation TOTKAppDelegate
+-(void)application:(NSApplication *)app openURLs:(NSArray<NSURL *> *)urls{(void)app;
+ fprintf(stderr,"[saves] %lu file(s) opened while the game runs: refused (quit the game first)\n",(unsigned long)urls.count);
+ NSAlert *a=[NSAlert new];a.messageText=@"Quit the game to use these saves";
+ a.informativeText=[NSString stringWithFormat:@"%@ can only be brought in while the game is closed: the running game would save over it. "
+  "Save in the game if you need to, quit it (⌘Q), then open the file again (it stays in %@).",urls.firstObject.lastPathComponent,urls.firstObject.URLByDeletingLastPathComponent.path];
+ if(window.visible)[a beginSheetModalForWindow:window completionHandler:nil];else [a runModal];}
+@end
+static TOTKAppDelegate *appDelegate;
 int runtime_front_window_visible(void){return atomic_load(&windowVisible);}
 void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(), ^{[window performClose:nil];});}
+/* The menu's Restart now (mods and after-restart settings): a detached shell waits for this process to end, then opens the
+   app again (TOTK_APP_BUNDLE, set by the launcher); the window closes the usual way, so a save in progress finishes first.
+   0 when there is no app to reopen (a test run of the bare binary). */
+#include <spawn.h>
+extern char **environ;
+int runtime_front_can_restart(void){const char *a=getenv("TOTK_APP_BUNDLE");return a&&*a;}
+void runtime_front_restart(void){
+ const char *app=getenv("TOTK_APP_BUNDLE");if(!app||!*app){fprintf(stderr,"[totk] restart: no app to reopen (TOTK_APP_BUNDLE unset)\n");return;}
+ char script[4600];snprintf(script,sizeof script,"while kill -0 %d 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open \"$0\"",(int)getpid());
+ char *const argv[]={"/bin/sh","-c",script,(char *)app,NULL};pid_t pid;posix_spawnattr_t at;posix_spawnattr_init(&at);posix_spawnattr_setflags(&at,POSIX_SPAWN_SETSID);
+ int err=posix_spawn(&pid,"/bin/sh",NULL,&at,argv,environ);posix_spawnattr_destroy(&at);
+ if(err){fprintf(stderr,"[totk] restart: could not start the helper (%d)\n",err);return;}
+ fprintf(stderr,"[totk] restart: the app opens again once this game has closed\n");runtime_front_request_close();
+}
 /* Use the window-close path, not terminate:, so Command-Q also waits for active saves. */
 static void front_install_menu(void){
  NSMenu *menu=[NSMenu new],*appMenu=[NSMenu new];
  NSMenuItem *appItem=[NSMenuItem new];appItem.submenu=appMenu;[menu addItem:appItem];
- NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("退出 Tears of the Kingdom","Quit Tears of the Kingdom")) action:@selector(performClose:) keyEquivalent:@"q"];
+ NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("退出 " GAME_NAME,"Quit " GAME_NAME)) action:@selector(performClose:) keyEquivalent:@"q"];
  quit.keyEquivalentModifierMask=NSEventModifierFlagCommand;quit.target=window;
- [appMenu addItem:quit];NSApp.mainMenu=menu;
+ NSMenuItem *prefs=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("设置…","Settings…")) action:@selector(toggle) keyEquivalent:@","];
+ prefs.keyEquivalentModifierMask=NSEventModifierFlagCommand;prefs.target=TOTKSettingsPanel.class;
+ [appMenu addItem:prefs];
+ NSMenuItem *cheats=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("作弊码…","Cheats…")) action:@selector(showCheats) keyEquivalent:@""];   /* the settings menu's Cheats tab */
+ cheats.target=TOTKSettingsPanel.class;[appMenu addItem:cheats];[appMenu addItem:NSMenuItem.separatorItem];
+ [appMenu addItem:quit];front_menubar_fps_add(menu);NSApp.mainMenu=menu;
 }
 static void *guest_main(void *callback){@autoreleasepool{((void(*)(void))callback)();}return NULL;}
 void runtime_front_run(void(*callback)(void)){
  @autoreleasepool{
   bootStartNS=runtime_now_ns();
-  [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+  [NSApplication sharedApplication];[NSApp setActivationPolicy:background_run()?NSApplicationActivationPolicyAccessory:NSApplicationActivationPolicyRegular];
+  appDelegate=[TOTKAppDelegate new];NSApp.delegate=appDelegate;
   runtime_gamepad_start();
   /* Default window: the docked output size, 1920x1080, scaled down (16:9 kept) when the screen's visible area is smaller. */
   /* TOTK_WINDOW_SIZE=<w>x<h> (test scripts only, e.g. the 2K output test; the desktop launcher never sets it): another starting size. */
@@ -219,12 +358,12 @@ void runtime_front_run(void(*callback)(void)){
   window.releasedWhenClosed=NO;   /* a close that waits for a save (windowWillClose) must not free the window the static pointer still holds */
   /* An agent's test game (TOTK_SLOT_OWNER other than user) says so in its title: it plays a save copy and its script closes it. */
   const char *owner=getenv("TOTK_SLOT_OWNER"),*purpose=getenv("TOTK_SLOT_PURPOSE");
-  window.title=owner&&*owner&&strcmp(owner,"user")?[NSString stringWithFormat:@(TOTK_UI("测试局（%s）Ver. %s：%s — 存档副本，进度不会存进你的存档，脚本会自己关闭","Test session (%s) Ver. %s: %s — save copy, progress is not saved to your save, the script closes it")),owner,TOTK_GAME_VERSION,purpose&&*purpose?purpose:TOTK_UI("代理测试","agent test")]:[NSString stringWithFormat:@"Tears of the Kingdom  Mac — Ver. %s",TOTK_GAME_VERSION];
+  window.title=owner&&*owner&&strcmp(owner,"user")?[NSString stringWithFormat:@(TOTK_UI("测试局（%s）Ver. %s：%s — 存档副本，进度不会存进你的存档，脚本会自己关闭","Test session (%s) Ver. %s: %s — save copy, progress is not saved to your save, the script closes it")),owner,TOTK_GAME_VERSION,purpose&&*purpose?purpose:TOTK_UI("代理测试","agent test")]:[NSString stringWithFormat:@GAME_NAME "  Mac — Ver. %s",TOTK_GAME_VERSION];
   windowDelegate=[TOTKWindowDelegate new];window.delegate=windowDelegate;
   front_install_menu();
   window.collectionBehavior|=NSWindowCollectionBehaviorFullScreenPrimary;
   window.contentView=[[TOTKInputView alloc] initWithFrame:NSMakeRect(0,0,ww,wh)];
-  metalLayer=[CAMetalLayer layer];metalLayer.device=MTLCreateSystemDefaultDevice();metalLayer.pixelFormat=MTLPixelFormatBGRA8Unorm;metalLayer.drawableSize=CGSizeMake(ww,wh);
+  metalLayer=[CAMetalLayer layer];metalLayer.device=MTLCreateSystemDefaultDevice();metalLayer.pixelFormat=MTLPixelFormatBGRA8Unorm;metalLayer.drawableSize=CGSizeMake(ww,wh);runtime_aspect_view(ww,wh);
   metalLayer.framebufferOnly=NO;window.contentView.wantsLayer=YES;window.contentView.layer=metalLayer;
   bootOverlay=[[NSView alloc] initWithFrame:window.contentView.bounds];bootOverlay.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
   bootOverlay.wantsLayer=YES;bootOverlay.layer.backgroundColor=[NSColor colorWithCalibratedRed:0.035 green:0.075 blue:0.09 alpha:1].CGColor;
@@ -238,6 +377,7 @@ void runtime_front_run(void(*callback)(void)){
   bootProgress.minValue=0;bootProgress.maxValue=100;bootProgress.indeterminate=YES;bootProgress.autoresizingMask=NSViewMinXMargin|NSViewMaxXMargin|NSViewMinYMargin|NSViewMaxYMargin;
   [bootOverlay addSubview:bootStage];[bootOverlay addSubview:bootDetail];[bootOverlay addSubview:bootProgress];
   [window.contentView addSubview:bootOverlay];[bootProgress startAnimation:nil];
+  front_menubar_fps();
   shortcutHelp=[[TOTKShortcutHelp alloc] initWithFrame:NSZeroRect];shortcutHelp.autoresizingMask=hud_compact()?NSViewMinXMargin|NSViewMinYMargin:NSViewMinXMargin|NSViewMaxXMargin|NSViewMinYMargin|NSViewMaxYMargin;
   /* Keep discovery/warm-up visible; the help appears after the opaque boot
      overlay is hidden. Key 1 still controls its requested visibility. */
@@ -245,8 +385,14 @@ void runtime_front_run(void(*callback)(void)){
   [(TOTKShortcutHelp *)shortcutHelp position];
   /* The FPS, shader and load lines: in the corner panel above (compact HUD), or with TOTK_HUD=corners drawn into the game picture's corners by the present encoder (gfx/nvn/fps_overlay.c). */
   [window makeFirstResponder:window.contentView];[window center];front_sync_drawable();
-  if(assume_focus()){[window orderFrontRegardless];}else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
+  /* Background runs: macOS pauses the display link of a fully covered window, so a window behind the user's would never
+     present. Instead it floats on top almost transparent (alpha 0.01) and lets every click through: visible to macOS,
+     invisible and untouchable for the user; the game's own "shot" command still captures the full picture. */
+  if(background_run()){window.alphaValue=0.01;window.ignoresMouseEvents=YES;window.level=NSFloatingWindowLevel;[window orderFrontRegardless];}else if(assume_focus()){[window orderFrontRegardless];}else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
+  note_screen("opened");
+  [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){(void)n;note_screen("display settings changed");}];
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{note_occlusion(" 3 s after opening");});
+  [TOTKCheatDb boot];   /* the community cheat list for the Cheats tab, in the background (runtime/cheat_db_fetch.h) */
   atomic_store(&focused,1);
   if(CVDisplayLinkCreateWithActiveCGDisplays(&displayLink)||CVDisplayLinkSetOutputCallback(displayLink,vsync_callback,NULL)||CVDisplayLinkStart(displayLink))runtime_fail("native display link initialization");
   pthread_t guest;pthread_attr_t attr;pthread_attr_init(&attr);pthread_attr_setstacksize(&attr,8*1024*1024);int err=pthread_create(&guest,&attr,guest_main,(void *)callback);pthread_attr_destroy(&attr);if(err)runtime_fail("native game thread creation");
@@ -351,10 +497,17 @@ static uint32_t vi_vsync(void *ev,void *display){
  if(!ev||display!=&displayIdentity)return 0xf601;hle_bind_system_event(ev,1);
  pthread_mutex_lock(&vsyncLock);if(vsyncCount>=16)runtime_fail("VI display event limit");vsyncEvents[vsyncCount++]=ev;pthread_mutex_unlock(&vsyncLock);return 0;
 }
+#ifdef GAME_BOTW
+static uint32_t vi_scaling_mode(void *layer,int mode){(void)layer;(void)mode;return 0;}
+#endif
 void *runtime_front_override(const char *name){
  static const struct{const char *name;void *fn;} entries[]={
  {"_ZN2nn2vi10InitializeEv",vi_initialize},{"_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE",vi_open},
  {"_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE",vi_layer},{"_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE",vi_window},
- {"_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE",vi_vsync}};
+ {"_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE",vi_vsync}
+#ifdef GAME_BOTW
+ ,{"_ZN2nn2vi19SetLayerScalingModeEPNS0_5LayerENS0_11ScalingModeE",vi_scaling_mode}   /* SDK 7: the window scales itself */
+#endif
+ };
  for(unsigned i=0;i<sizeof(entries)/sizeof(*entries);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;
 }

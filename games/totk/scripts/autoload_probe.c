@@ -22,6 +22,7 @@ void dm_gfx_texdump_next(const char *path){(void)path;runtime_fail("unexpected t
 void runtime_shortcut_help_toggle(void){}
 int runtime_output_mode_cycle(void){return 0;}
 int runtime_aspect_toggle(void){return 0;}
+void taa_toggle(void){}   /* key 5 (MetalFX temporal anti-aliasing) */
 void dm_gfx_set_flag(const char *name,int v){(void)name;(void)v;runtime_fail("unexpected runtime flag in unit probe");}
 void dm_gfx_querylog_next(long n){(void)n;runtime_fail("unexpected query log in unit probe");}
 void dm_gfx_anomdump(void){runtime_fail("unexpected anomaly dump in unit probe");}
@@ -91,3 +92,12 @@ int main(int argc,char **argv){
     printf("{\"probe\":\"autoload\",\"scenario\":\"%s\",\"checks\":%d,\"ok\":true}\n",sc,checks);
     return 0;
 }
+
+/* Test-command targets input.c calls (game_patches*.c, frontend.m), not linked into this probe. */
+void runtime_fov_set(int percent) { (void)percent; }
+int runtime_render_request(unsigned w, unsigned h) { (void)w; (void)h; return -1; }
+void runtime_front_settings_shot(const char *path) { (void)path; }
+void runtime_front_settings_toggle(void) {}
+void runtime_front_restart(void) {}
+void runtime_front_settings_key(unsigned code) { (void)code; }
+int runtime_setting_test(const char *key, const char *word, int *value) { (void)key; (void)word; (void)value; return -1; }

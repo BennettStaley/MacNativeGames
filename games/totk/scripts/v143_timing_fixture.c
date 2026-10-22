@@ -2,6 +2,7 @@
  * emulation. No guest entry, graphics, services, or user saves are executed. */
 #include "runtime.h"
 #include "game_patches.h"
+#include "world_survey.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -9,6 +10,8 @@
 #include <string.h>
 _Noreturn void runtime_fail(const char *s){fprintf(stderr,"%s\n",s);exit(1);}
 int mfxup_output_enabled(void){return 0;}
+int runtime_handheld_mode(void){return 0;}
+void runtime_survey_init(Module *m){(void)m;}
 void runtime_oe_push_message(uint32_t m){(void)m;}
 void dm_gfx_set_flag(const char *s,int v){(void)s;(void)v;}
 int main(int argc,char **argv){
@@ -22,6 +25,9 @@ int main(int argc,char **argv){
  runtime_game_patches(&m);runtime_frame_step_pin(10.0);
  float values[3];memcpy(values,base+data,sizeof values);
  printf("{\"pin\":[%.9g,%.9g,%.9g]",values[0],values[1],values[2]);
+ const char *ask=getenv("FIXTURE_RENDER_REQUEST");unsigned rw,rh;   /* a live scene size, latched by the next present */
+ if(ask&&sscanf(ask,"%ux%u",&rw,&rh)==2&&runtime_render_request(rw,rh))return 3;
+ const char *fog=getenv("FIXTURE_FOG");if(fog)runtime_fog_set(atoi(fog));   /* the settings menu's live fog density */
  runtime_frame_step_pin(0);runtime_frame_step_update(1000000000ULL);runtime_frame_step_update(1025000000ULL);
  memcpy(values,base+data,sizeof values);printf(",\"sample\":[%.9g,%.9g,%.9g]}\n",values[0],values[1],values[2]);
  f=fopen(argv[2],"wb");if(!f||fwrite(base,1,size,f)!=size||fclose(f))return 2;

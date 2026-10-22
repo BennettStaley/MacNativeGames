@@ -4,14 +4,36 @@
 #pragma once
 #define GAME_ADDR_JOIN(x) GAME_ADDR_##x
 #define GAME_ADDR(x) GAME_ADDR_JOIN(x)
-#if defined(TOTK_GAME_V143)
+#if defined(GAME_BOTW160)
+/* The Legend of Zelda: Breath of the Wild 1.6.0 (botw.md). The TOTK patch sites do not exist here: game_patches_botw.c replaces
+   game_patches.c, and the shared code that uses TOTK addresses is compiled out with GAME_BOTW. */
+#ifndef GAME_BOTW
+#define GAME_BOTW 1
+#endif
+#define TOTK_GAME_VERSION "1.6.0"
+#define GAME_NAME "Breath of the Wild"
+#define GAME_TITLE_ID "01007EF00011E000"   /* the community cheat list's file name (runtime/cheat_db_fetch.h) */
+#define GAME_FOLDER "BotW"   /* ~/Library/Application Support/MacNativeGames/<GAME_FOLDER> (app/launcher.m) */
+#define GAME_LOG "botw"      /* ~/Library/Logs/MacNativeGames/<GAME_LOG>.log */
+#define GAME_CONTRIB_TEMPLATE "shader-list-botw.yml"   /* the issue form for this game's shared shader list (totk_shader_contrib.h) */
+#define GAME_CONTRIB_TITLE "Shader list (Breath of the Wild):"   /* the title prefix of an automatically submitted contribution */
+#define TOTK_GAME_DIR "botw160"
+#define GAME_ADDR_0xe995c4 0xe53f8c   /* return address of nnMain's only call to nn::oe::SetFocusHandlingMode */
+#define GAME_ADDR_0x2aa4fa0 0x2128690 /* nn::swkbd::ShowKeyboard: main's PLT stub */
+#define GAME_ADDR_0x453f648 0x2c7ef90 /* nn::swkbd::ShowKeyboard: main's GOT slot */
+#elif defined(TOTK_GAME_V143)
 #define TOTK_GAME_VERSION "1.4.3"
+#define GAME_BUILD_ID "277178B7DBA1B6D4"   /* main's build ID (NSO header +0x40): the name of its Atmosphère cheat file */
 #define TOTK_GAME_DIR "v143"
 /* Survey only (world_survey.c): forceSetMatrix found through three 1.2.1 callers that match, the scene slot through its
    singleton getter (same 0x490-byte object); setTransform writes +0x2b4 / +0x2c0 as in 1.2.1. */
 #define GAME_ACTOR_NAME 0x218
 #define GAME_ACTOR_POS 0x2b4
 #define GAME_ACTOR_ROT 0x2c0
+/* Spawner only (actor_spawn.c, how they were found): engine::actor::ActorMgr::requestCreateActorAsync (1.0.0 0xa5fdf8) and
+   ActorMgr::sInstance (1.0.0 0x46479e0). Named, not GAME_ADDR: no other version uses them yet. */
+#define GAME_SPAWN_REQUEST_CREATE 0x599670
+#define GAME_SPAWN_ACTOR_MGR 0x3ad7450
 #define GAME_ADDR_0x69a18c 0x45ce70
 #define GAME_ADDR_0x4663f08 0x3add238
 #define GAME_ADDR_0x15ecb0c 0x1bd01c4
@@ -21,6 +43,7 @@
 #define GAME_ADDR_0x453f648 0x398b348
 #elif defined(TOTK_GAME_V112)
 #define TOTK_GAME_VERSION "1.1.2"
+#define GAME_BUILD_ID "9A10ED9435C06733"   /* from the cheat databases, not checked against the NSO */
 #define TOTK_GAME_DIR "v112"
 #define GAME_ACTOR_NAME 0x218
 #define GAME_ACTOR_POS 0x2b4
@@ -57,10 +80,12 @@
 #define GAME_ADDR_0x2aa4fa0 0x2b16100
 #define GAME_ADDR_0x453f648 0x46129e0
 #define GAME_ADDR_0x8f6cbc 0x8f6740
+#define GAME_ADDR_0xce3fec 0xbbb4c0   /* trampoline slow-motion check (game_patches.c patch_slowmo_bounce) */
 #define GAME_OUTPUT_CALL_WORD 0x94000083u
 #elif defined(TOTK_GAME_V121)
 /* Found from 1.1.2 by scripts/map_version_sites.py --from v112 --to v121 (every original word unchanged). */
 #define TOTK_GAME_VERSION "1.2.1"
+#define GAME_BUILD_ID "9B4E43650501A4D4"   /* from the cheat databases, not checked against the NSO */
 #define TOTK_GAME_DIR "v121"
 #define GAME_ACTOR_NAME 0x218
 #define GAME_ACTOR_POS 0x2b4
@@ -97,9 +122,11 @@
 #define GAME_ADDR_0x2aa4fa0 0x2b18000
 #define GAME_ADDR_0x453f648 0x4615d78
 #define GAME_ADDR_0x8f6cbc 0x8f2798
+#define GAME_ADDR_0xce3fec 0xbda798
 #define GAME_OUTPUT_CALL_WORD 0x94000083u
 #else
 #define TOTK_GAME_VERSION "1.0.0"
+#define GAME_BUILD_ID "082CE09B06E33A12"
 #define TOTK_GAME_DIR "v0"
 #define GAME_ACTOR_NAME 0x210
 #define GAME_ACTOR_POS 0x2ac
@@ -136,5 +163,16 @@
 #define GAME_ADDR_0x2aa4fa0 0x2aa4fa0
 #define GAME_ADDR_0x453f648 0x453f648
 #define GAME_ADDR_0x8f6cbc 0x8f6cbc
+#define GAME_ADDR_0xce3fec 0xce3fec
 #define GAME_OUTPUT_CALL_WORD 0x94000082u
+#endif
+#ifndef GAME_NAME
+#define GAME_NAME "Tears of the Kingdom"   /* window title and menu (game_version.h is per binary) */
+#endif
+#ifndef GAME_TITLE_ID
+#define GAME_TITLE_ID "0100F2C0115B6000"   /* the community cheat list's file name (runtime/cheat_db_fetch.h) */
+#endif
+#ifndef GAME_FOLDER
+#define GAME_FOLDER "TOTK"   /* the player's data folder under ~/Library/Application Support/MacNativeGames (app/launcher.m) */
+#define GAME_LOG "totk"
 #endif

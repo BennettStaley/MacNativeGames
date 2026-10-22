@@ -12,10 +12,12 @@ targets:
     platform: iOS
     sources:
       - Sources
+      - Settings.bundle   # the Settings app pane (game language picker); stored in NSUserDefaults, applied in main.m
       - path: ../runtime
         excludes:
           - frontend.m
           - loader.c
+          - game_patches_botw.c
       - path: ../third_party/d2r_gfx/gfx/nvn
       - path: ../third_party/d2r_gfx/gfx/tex
       - path: Gen/embed.S
@@ -32,6 +34,23 @@ targets:
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # Save packages (.totksave, runtime/save_package.h): AirDrop and Files open them with the app (saves_menu.m);
+        # the Mac app declares the same type (build_app.py).
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: org.macnativegames.totk.save
+            UTTypeDescription: Tears of the Kingdom saves
+            UTTypeConformsTo:
+              - public.zip-archive
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - totksave
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Tears of the Kingdom saves
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - org.macnativegames.totk.save
         UIRequiresFullScreen: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationLandscapeLeft
@@ -43,6 +62,12 @@ targets:
         GCSupportedGameControllers:
           - ProfileName: ExtendedGamepad
         CADisableMinimumFrameDurationOnPhone: true
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: Default
+                UISceneDelegateClassName: TOTKSceneDelegate
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: ${TOTK_BUNDLE_ID}
       PRODUCT_NAME: TOTK

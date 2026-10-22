@@ -37,9 +37,30 @@ static const Glyph FONT[] = {
     {' ', {0, 0, 0, 0, 0, 0, 0}},
 };
 
-static _Atomic int g_hints_visible = 1;
-int fps_overlay_hints_enabled(void) { return atomic_load_explicit(&g_hints_visible, memory_order_relaxed); }
-int fps_overlay_toggle_hints(void) { return !atomic_fetch_xor_explicit(&g_hints_visible, 1, memory_order_relaxed); }
+/* Key 1 cycles all -> minimal (FPS only) -> off -> all. TOTK_HINTS=0 starts off; the settings menu's "Performance
+   readout" switches between all and off (fps_overlay_set_hints). */
+static _Atomic int g_hud_mode = -1;
+static int hud_mode_now(void) {
+    int v = atomic_load_explicit(&g_hud_mode, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("TOTK_HINTS"); int start = e && !strcmp(e, "0") ? HUD_MODE_OFF : HUD_MODE_ALL;
+        atomic_compare_exchange_strong(&g_hud_mode, &v, start); v = atomic_load(&g_hud_mode); }
+    return v;
+}
+int fps_overlay_hud_mode(void) { return hud_mode_now(); }
+int fps_overlay_hints_enabled(void) { return fps_overlay_hud_mode() != HUD_MODE_OFF; }
+int fps_overlay_full_hud(void) { return fps_overlay_hud_mode() == HUD_MODE_ALL; }
+void fps_overlay_set_hints(int visible) { (void)hud_mode_now(); atomic_store(&g_hud_mode, visible ? HUD_MODE_ALL : HUD_MODE_OFF); }
+int fps_overlay_toggle_hints(void) {
+    int mode = hud_mode_now(), next;
+    do next = mode == HUD_MODE_ALL ? HUD_MODE_MINIMAL : mode == HUD_MODE_MINIMAL ? HUD_MODE_OFF : HUD_MODE_ALL;
+    while (!atomic_compare_exchange_weak_explicit(&g_hud_mode, &mode, next, memory_order_relaxed, memory_order_relaxed));
+    return next;
+}
+
+/* The settings menu's "Readout detail": 1 adds the average and the 1% low of the last seconds to the FPS line. */
+static _Atomic int g_detail;
+void fps_overlay_set_detail(int detailed) { atomic_store(&g_detail, detailed ? 1 : 0); }
+int fps_overlay_detail(void) { return atomic_load(&g_detail); }
 
 int fps_overlay_enabled(void) {
     static int on = -1;
@@ -153,7 +174,14 @@ void fps_overlay_text(const fps_overlay_info *info, char *text, size_t n) {
     if (info->gen > 0 && info->fps >= 0) snprintf(gen, sizeof gen, "+%d", info->gen > 999 ? 999 : info->gen);   // interpolated frames a second (key 2)
     // MetalFX did the upscale in the last frames (key 3 selects the manual MetalFX mode); 2K: true 2K output.
     // The whole line in the system font, so switching MetalFX does not switch the font.
-    snprintf(text, n, "FPS %s%s  %s%s%s", fps, gen, ss, info->mfx ? TOTK_UI("  MetalFX已开启", "  MetalFX on") : "", info->big ? "  2K" : "");
+    char detail[48] = "";
+    if (info->detail) {   // "avg 59  1% low 48" over the last FPS_STATS_SECONDS (settings: Readout detail)
+        char avg[8], low[8];
+        if (info->avg < 0) snprintf(avg, sizeof avg, "--"); else snprintf(avg, sizeof avg, "%d", info->avg > 999 ? 999 : info->avg);
+        if (info->low < 0) snprintf(low, sizeof low, "--"); else snprintf(low, sizeof low, "%d", info->low > 999 ? 999 : info->low);
+        snprintf(detail, sizeof detail, TOTK_UI("  平均 %s  1%%低帧 %s", "  avg %s  1%% low %s"), avg, low);
+    }
+    snprintf(text, n, "FPS %s%s%s  %s%s%s", fps, gen, detail, ss, info->mfx ? TOTK_UI("  MetalFX已开启", "  MetalFX on") : "", info->big ? "  2K" : "");
 }
 
 void fps_overlay_raster(const fps_overlay_info *info, int scale, uint8_t *out, int *box_w, int *box_h) {
@@ -191,7 +219,14 @@ int hud_snapshot(int line, char *out, size_t n, int *highlight) {
     return set;
 }
 
+/* The settings menu's Shader counter, live: on / off now; off also takes its line out of the corner panel. */
+static _Atomic int g_shader_overlay = -1;
+void shader_overlay_set(int on) {
+    atomic_store(&g_shader_overlay, on ? 1 : 0);
+    if (!on) { pthread_mutex_lock(&g_hud_mu); g_hud_set[HUD_SHADER] = 0; pthread_mutex_unlock(&g_hud_mu); }
+}
 int shader_overlay_enabled(void) {
+    int set = atomic_load(&g_shader_overlay); if (set >= 0) return set;
     static int on = -1;
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
     const int def = 0;   // the phone translates nothing (misses go to shader-requests/)
@@ -202,11 +237,14 @@ int shader_overlay_enabled(void) {
     return on;
 }
 
-void shader_overlay_text(char *out, size_t n, uint64_t fresh, int64_t total, uint64_t pipelines) {
+/* "Shaders 2 compiling / 10 new / 18074 total" (user, 2026-10-20): what Metal is building right now (pipelines, the
+   warm-up's remaining items), shaders translated for the first time this session, and every shader in the cache. */
+void shader_overlay_text(char *out, size_t n, uint64_t compiling, uint64_t fresh, int64_t total, uint64_t pipelines) {
     char t[16];
     (void)pipelines;   // user 2026-10-17: the pipeline count is not shown
     if (total < 0) snprintf(t, sizeof t, "--"); else snprintf(t, sizeof t, "%lld", (long long)(total > 999999 ? 999999 : total));
-    snprintf(out, n, TOTK_UI("新着色器 %llu / 总计 %s", "New shaders %llu / total %s"), (unsigned long long)(fresh > 99999 ? 99999 : fresh), t);
+    snprintf(out, n, TOTK_UI("着色器 编译中 %llu / 本次新增 %llu / 总计 %s", "Shaders %llu compiling / %llu new / %s total"),
+             (unsigned long long)(compiling > 99999 ? 99999 : compiling), (unsigned long long)(fresh > 99999 ? 99999 : fresh), t);
 }
 
 /* A count's rate, re-measured every half second (game presents; interpolated frames shown). stale_s > 0: a gap longer
@@ -223,7 +261,45 @@ static void rate_note(rate_meter *m, uint64_t k, double now_s) {
     pthread_mutex_unlock(&m->mu);
 }
 
-void fps_overlay_note(uint64_t ticket, double now_s) { rate_note(&g_game, ticket, now_s); }
+/* Average and 1% low over the last FPS_STATS_SECONDS of game presents: a ring of (present number, time); a present that
+   carries several game frames (merged by the display link) counts each of them at its share of the interval. Re-measured
+   every half second. 1% low: the frame rate of the slowest 1% of those frames (their mean frame time), at least one. */
+enum { STATS_RING = 2048 };
+static struct { pthread_mutex_t mu; double t[STATS_RING]; uint64_t k[STATS_RING]; unsigned head, n; double last_calc; _Atomic int avg, low; }
+    g_stats = {PTHREAD_MUTEX_INITIALIZER, {0}, {0}, 0, 0, -1, -1, -1};
+static int cmp_desc(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? 1 : x > y ? -1 : 0; }
+static void stats_note(uint64_t k, double now_s) {
+    pthread_mutex_lock(&g_stats.mu);
+    if (g_stats.n && k < g_stats.k[(g_stats.head + STATS_RING - 1) % STATS_RING]) g_stats.n = 0;   // the count started again
+    g_stats.t[g_stats.head] = now_s; g_stats.k[g_stats.head] = k; g_stats.head = (g_stats.head + 1) % STATS_RING;
+    if (g_stats.n < STATS_RING) g_stats.n++;
+    while (g_stats.n > 1 && now_s - g_stats.t[(g_stats.head + STATS_RING - g_stats.n) % STATS_RING] > FPS_STATS_SECONDS) g_stats.n--;
+    if (g_stats.last_calc < 0 || now_s - g_stats.last_calc >= 0.5 || now_s < g_stats.last_calc) {
+        g_stats.last_calc = now_s;
+        unsigned first = (g_stats.head + STATS_RING - g_stats.n) % STATS_RING;
+        double span = now_s - g_stats.t[first]; uint64_t frames = k - g_stats.k[first];
+        if (g_stats.n >= 2 && span >= 1.0 && frames > 0) {
+            static double ft[STATS_RING * 4]; size_t m = 0;
+            for (unsigned i = 1; i < g_stats.n; i++) {
+                unsigned a = (first + i - 1) % STATS_RING, b = (first + i) % STATS_RING;
+                uint64_t dk = g_stats.k[b] - g_stats.k[a]; double dt = g_stats.t[b] - g_stats.t[a];
+                for (uint64_t j = 0; j < dk && m < sizeof ft / sizeof *ft; j++) ft[m++] = dt / (double)dk;
+            }
+            atomic_store(&g_stats.avg, (int)lround((double)frames / span));
+            if (m) {
+                qsort(ft, m, sizeof *ft, cmp_desc);
+                size_t worst = m / 100 ? m / 100 : 1; double sum = 0;
+                for (size_t i = 0; i < worst; i++) sum += ft[i];
+                atomic_store(&g_stats.low, sum > 0 ? (int)lround((double)worst / sum) : -1);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_stats.mu);
+}
+int fps_overlay_avg_value(void) { return atomic_load(&g_stats.avg); }
+int fps_overlay_low_value(void) { return atomic_load(&g_stats.low); }
+
+void fps_overlay_note(uint64_t ticket, double now_s) { rate_note(&g_game, ticket, now_s); stats_note(ticket, now_s); }
 int fps_overlay_value(void) { return atomic_load(&g_game.value); }
 void fps_overlay_note_gen(uint64_t n, double now_s) { rate_note(&g_gen, n, now_s); }
 int fps_overlay_gen_value(void) { return atomic_load(&g_gen.value); }
