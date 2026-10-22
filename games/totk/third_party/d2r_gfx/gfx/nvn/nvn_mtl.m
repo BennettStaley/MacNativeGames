@@ -295,6 +295,8 @@ static uint64_t gpu_budget_bytes(void) {
     }
     return b;
 }
+/* For the settings menu's memory meter: what the GPU has allocated and the budget the game stops at (0: none). */
+void mtl_gpu_memory(uint64_t *used, uint64_t *budget) { *used = g_dev ? (uint64_t)g_dev.currentAllocatedSize : 0; *budget = gpu_budget_bytes(); }
 static void gpu_budget_check(const char *where) {
     uint64_t budget = gpu_budget_bytes(); if (!budget) return;
     uint64_t cur = (uint64_t)g_dev.currentAllocatedSize; if (cur <= budget) return;

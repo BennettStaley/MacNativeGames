@@ -58,6 +58,13 @@ softer world, crisp HUD. The line at the top of the menu shows both sizes as the
 (`Display 3840×2160 · Render 2560×1432 (1440p, the most it can be)`). The 3D world stops at 1440p (see below), so at a
 4K display resolution anything from 67 % up draws it at 1440p.
 
+**Maximum render resolution** (Display, after a restart): 1440p, 1800p or 4K, the biggest the 3D world can be drawn
+at; it needs the 4K maximum output. Above 1440p the game's texture heap passes 1 GiB, so memory pools may reach 2 GiB
+and the GPU memory budget becomes 40 % of the Mac's memory. Measured on an 18 GB M3 Pro (2026-10-21): 1800p at a 4K
+display resolution held 60 fps and used 5.4–6.1 GB of GPU memory against a 7.2 GB budget; 4K needs about 1.5 GB more.
+The menu's second line shows **GPU memory** against that budget, orange above 80 % and red above 90 %: past it the game
+stops on purpose instead of risking a system crash.
+
 Limits and why:
 
 - The 3D scene stops at 2560×1440. The game keeps its render targets in one fixed texture heap sized at start; a 4K

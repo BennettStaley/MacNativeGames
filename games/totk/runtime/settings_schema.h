@@ -115,7 +115,7 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_CHOICE, SET_LIVE, SET_MAC, 1, 1, 0, 0, 0, NULL, SET_ASPECT, SET_N(SET_ASPECT), "Not on iPhone and iPad yet.", NULL, 0},
     {"display.headroom", "Display", "Maximum output", "The biggest output resolution you can switch to while playing. Higher sets more memory aside; takes effect after a restart.",
      "TOTK_OUTPUT_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_HEADROOM, SET_N(SET_HEADROOM), "Fixed on iPhone and iPad.", NULL, 0},
-    {"display.render_max", "Display", "Maximum render resolution", "The biggest the 3D world can be drawn at. Above 1440p needs the 4K maximum output and uses much more memory (about 1 GB more at 4K); for Macs with 16 GB or more. Experimental.",
+    {"display.render_max", "Display", "Maximum render resolution", "The biggest the 3D world can be drawn at; set Render resolution to reach it. Above 1440p needs the 4K maximum output and costs memory and speed: on an 18 GB M3 Pro, 1800p ran at 60 fps and used about 6 of 7.2 GB of GPU memory; 4K needs about 1.5 GB more and runs slower. The top of the menu shows GPU memory against the limit the game stops at. Experimental.",
      "TOTK_RENDER_RESERVE", SET_CHOICE, SET_RESTART, SET_MAC, 1440, 1440, 0, 0, 0, NULL, SET_RENDER_MAX, SET_N(SET_RENDER_MAX), "Fixed on iPhone and iPad.", NULL, 0},
     {"graphics.fov", "World detail", "Field of view", "How wide the camera sees, against the game's own (version 1.4.3).",
      "TOTK_FOV", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 70, 140, 5, "%", NULL, 0, NULL, NULL, 0},
