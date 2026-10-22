@@ -511,9 +511,9 @@ static void keepalive_start(void) {
         __block uint32_t n = 40000; dispatch_semaphore_t sem = dispatch_semaphore_create(1);   // ~1 ms on the M4 at full clock
         for (;;) @autoreleasepool {
             int target_us = atomic_load(&g_ka_target_us);
-            if (!target_us || atomic_load(&g_ka_paused)) { usleep(2000); continue; }
+            if (!target_us || atomic_load(&g_ka_paused)) { usleep(TARGET_OS_IPHONE ? 100000 : 2000); continue; }   // iOS: 10 wakeups a second while idle, not 500
             uint64_t last = atomic_load(&g_last_sub_ns);
-            if (!last || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - last > 100000000ull) { usleep(10000); continue; }   // the game is not rendering
+            if (!last || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - last > 100000000ull) { usleep(TARGET_OS_IPHONE ? 100000 : 10000); continue; }   // the game is not rendering
             if (atomic_load(&g_q4_inflight) > 0) { dispatch_semaphore_wait(g_ka_idle, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC)); continue; }   // the game's own GPU work keeps the clock up
             dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
             if (atomic_load(&g_q4_inflight) > 0) { dispatch_semaphore_signal(sem); continue; }
