@@ -11,9 +11,23 @@ changes within a frame or two, except the few settings marked *after restart*. S
 | iPad / iPhone | the **gear** at the top of the screen, a **three-finger tap**, a controller's **Home** button, **− and +** held together, or **Esc** / **⌘,** on a keyboard |
 
 On the Mac the menu is a sidebar inside the game window, so it works in full screen and the picture stays in view beside
-it while you change things. Navigate with the mouse, the keyboard (↑ ↓ choose, ← → change, Return toggles, Q / E or Tab
-switch tabs, Esc closes) or a controller (D-pad or left stick, A, B, the shoulder buttons switch tabs). While the menu is
-open the game receives no input.
+it while you change things. While the menu is open the game receives no input.
+
+The menu has four tabs, each a bar of sections:
+
+| Tab | Sections |
+|---|---|
+| **Game** | Display · Frame rate (with frame interpolation) · Controls · Audio · Interface |
+| **Graphics** | Image (anti-aliasing, sharpening, anisotropic filtering, texture detail) · Effects (bloom, depth of field, lens flare, cave fog) · World detail (field of view, render distance, shadow resolution) |
+| **Content** | Mods · Saves (Send saves) · Downloads (shader list, cheat list) |
+| **Tools** | Cheats · Spawn · World (time of day) · Camera (hide the HUD) |
+
+Navigation has two levels. On the **section bar**, ← → (D-pad) choose a section and ↓, Return or A opens it; in a
+section ↑ ↓ choose (the list stops at its ends), ← → change, Page Up / Down or LT / RT page. Esc or B goes back one level
+and closes the menu only from the section bar. Q / E, Tab or LB / RB switch tabs. **Reset this tab** (R, or X on the
+section bar) and **Reset everything…** (Shift-R, or Y on the section bar, then Return / A to confirm) set settings back
+to their defaults; cheats, mods, saves and spawn favorites are never reset. On iPhone and iPad the same sections are one
+list ("Game · Display" …). Setting keys did not change, so `settings.txt` files keep working.
 
 A setting marked *(after restart)*, a change in the Mods tab, or a code cheat switched in the Cheats tab shows **Restart now** at the bottom of the menu (and on
 the Mods tab's banner): the game closes the usual way (a save in progress finishes first) and the app opens again. Mac only;
@@ -108,6 +122,22 @@ reimplements them independently for 1.4.3 and contains none of their code.
 |---|---|
 | **Time of day speed** | *Paused*, 0.25×, 0.5×, *Normal* (the game's own), 2×, 4× or 8×: how fast the day passes, the clock, the sun, the sky and the shadows with it. *Paused* stops the time of day where it is. Events that set the time (sleeping, cutscenes) still do, and where the game holds the clock itself (the opening beneath Hyrule Castle stays at 7:00) the setting has nothing to speed up. |
 
+## Spawn
+
+Tools › Spawn creates actors a few metres in front of you, by calling the game's own
+`ActorMgr::requestCreateActorAsync` on its frame-end thread (no game code is patched). **Version 1.4.3 only**; elsewhere the
+tab says "Spawning needs 1.4.3 for now". Mac, iPad and iPhone.
+
+- **Categories**: Favorites, Recents, Creatures, NPCs, Items, Weapons, Armor, Zonai, Objects, from the actor list the build
+  makes from your own game files (`build/actor_list.tsv`, `scripts/prepare_actor_list.py`). System actors are left out;
+  actors without a found name are hidden unless **Show unnamed** (U, X) is on. Each row shows the name and, dimmed, the
+  internal name.
+- **Search** (/ or ⌘F) looks through every category while a query is typed.
+- **Amount** 1–20 (← →, − +). A, Return or a click spawns; Y or F marks a favorite. Every spawn goes to Recents.
+  Favorites and recents are kept in `spawn-picks.txt` beside the profile (next to `cheats-enabled.txt`).
+- A toast in the window's corner says "Spawned Apple ×5" or why it failed. A spawn asked for during loading waits for the
+  world. Test runs: the input file's `spawn <name> [count]` works only with `TOTK_SURVEY=1` on a test profile.
+
 ## Cheats
 
 Mac only for now (iPhone and iPad cannot change the game's code while it runs; their menu has no Cheats section). The
@@ -127,7 +157,7 @@ database and to the cheat authors it credits.
   and when the Cheats tab is opened after the day is over. **Update** in the tab's **Cheat list** row checks now; the row
   says how many cheats there are, when the list was checked and changed, and why the last check failed. Offline, the
   cached list keeps working.
-- **Setting.** Settings › Interface › *Download cheat list* (also in the Cheats tab; on by default; live). Off: nothing
+- **Setting.** Settings › Content › Downloads › *Download cheat list* (also in the Cheats tab; on by default; live). Off: nothing
   is fetched, the cached list stays. Download only: the game never uploads anything.
 - **Check.** The download is untrusted: strict JSON, 16 MB at most, https only (redirects too), 20 s timeout; anything
   else keeps the previous list. The file is rewritten only when this version's cheats changed.
@@ -205,7 +235,7 @@ Master codes (`{...}` sections) are always on with their file and shown without 
 sections (one `20000000` or `20000001` word, opening and closing a group) are shown as headings in your own files. **Turn off all cheats** switches every cheat off (code patches at
 the next start). The choices are saved in `cheats-enabled.txt` next to the profile, one line per cheat: the source and
 the name (`db<TAB>[name]` for the cheat list, `folder<TAB>[name]`, `mod:<folder><TAB>[name]`; the app's own file just the name, as before), so equal names
-in two files are separate cheats. **Reset all** leaves cheats alone. The first cheat turned on copies the profile to
+in two files are separate cheats. **Reset this tab** and **Reset everything…** leave cheats alone. The first cheat turned on copies the profile to
 `profile-before-cheats` first.
 
 ## The file
@@ -221,4 +251,4 @@ runtime, the iOS app and `tests/test_settings.c`.
 
 Test runs drive the menu's own code path through `TOTK_INPUT_FILE`: `set <key> <value>` changes a setting as the menu
 does (`set display.scale 50`, `set graphics.aa smaa`), `menu` opens or closes the Mac menu, `menukey <Mac key code>`
-presses a key in it (`menukey 12`, Q, from the first tab opens the last one, Cheats), and `settings-shot <png>` saves the Mac menu as a picture.
+presses a key in it (`menukey 12`, Q, from the first tab opens the last one, Tools), and `settings-shot <png>` saves the Mac menu as a picture.
