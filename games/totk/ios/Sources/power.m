@@ -1,6 +1,9 @@
 #import "power.h"
+#include <os/proc.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "settings.h"
 
 NSNotificationName const TOTKPowerCapChangedNotification = @"TOTKPowerCapChanged";
@@ -34,6 +37,32 @@ static void power_update(void) {
     } else fprintf(stderr, "[power] frame rate still held at 30 fps: %s\n", why);
     g_reason = why;
     [NSNotificationCenter.defaultCenter postNotificationName:TOTKPowerCapChangedNotification object:nil];
+}
+
+/* The entitlements the app was signed with, as the kernel holds them (CS_OPS_ENTITLEMENTS_BLOB: an 8-byte big-endian
+   magic / length header, then the XML). signkit signs with the profile's entitlements, so a capability the App ID
+   lacks is missing here even though TOTK.entitlements asks for it. */
+int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+static int has_entitlement(const char *blob, const char *key) {
+    if (!blob) return -1;
+    const char *k = strstr(blob, key); if (!k) return 0;
+    const char *v = strstr(k, "</key>"); if (!v) return 0;
+    v += 6; while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
+    return !strncmp(v, "<true/>", 7);
+}
+void power_memory_report(void) {
+    char *blob = NULL; uint32_t head[2] = {0, 0};
+    if (csops(getpid(), 7, head, sizeof head) != 0 || head[1]) {   /* ERANGE with the length in the header */
+        uint32_t len = __builtin_bswap32(head[1]);
+        if (len > 8 && len < (1u << 20) && (blob = calloc(1, len + 1)) && csops(getpid(), 7, blob, len) != 0) { free(blob); blob = NULL; }
+    }
+    const char *xml = blob ? blob + 8 : NULL;
+    int inc = has_entitlement(xml, "com.apple.developer.kernel.increased-memory-limit");
+    int ext = has_entitlement(xml, "com.apple.developer.kernel.extended-virtual-addressing");
+    static const char *yn[] = {"unknown", "no", "yes"};
+    fprintf(stderr, "[memory] available to the app %.2f GB; entitlements: increased-memory-limit %s, extended-virtual-addressing %s\n",
+            os_proc_available_memory() / 1e9, yn[inc + 1], yn[ext + 1]);
+    free(blob);
 }
 
 void power_observe(void) {

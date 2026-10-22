@@ -6,3 +6,4 @@
 extern NSNotificationName const TOTKPowerCapChangedNotification;   /* posted on the main queue when the hold starts or ends */
 void power_observe(void);              /* once, after settings_init */
 const char *power_cap_reason(void);    /* NULL, or why the frame rate is held at 30 ("the device is hot", ...) */
+void power_memory_report(void);        /* logs the memory left to the app and the memory entitlements it was signed with */
