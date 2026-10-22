@@ -377,6 +377,19 @@ static int h_send_input(void *obj, int index, int offset, int size, int64_t time
     Signals s = {0};
     pthread_mutex_lock(&m->mu);
     if (!m->started) { pthread_mutex_unlock(&m->mu); return ST_ERROR; }
+    /* An index the client acquired before a Flush and sends after it: the flush (reset_queues) put it back in the free
+       list, so claim it from there. Otherwise it could be handed out twice (two packets in one buffer), and returning it
+       to the free list again, or a fifth pending packet, wrote past in_free[] / pending[] into the counts after them.
+       The same guard as seedds/nxnative dm/host/hle_movie.c (MIT, Copyright (c) 2026 jhaizhou), rewritten for this file. */
+    for (int k = 0; k < m->nin_free; k++) if (m->in_free[k] == index) {
+        memmove(m->in_free + k, m->in_free + k + 1, (size_t)(--m->nin_free - k) * sizeof m->in_free[0]);
+        static int once; if (!once++) LOG("input index %d sent after a flush returned it: claimed from the free list (first case)", index);
+        break;
+    }
+    for (int k = 0; k < m->npending; k++) if (m->pending[k].index == index) {
+        pthread_mutex_unlock(&m->mu); static int red; if (!red++) LOG("【红】input index %d sent twice, the second packet is dropped (first case)", index); return ST_ERROR;
+    }
+    if (m->npending == IN_BUFS) { pthread_mutex_unlock(&m->mu); static int red; if (!red++) LOG("【红】more packets pending than input buffers, one dropped (first case)"); return ST_ERROR; }
     Pending p = {index, offset, size, time, flags};
     if (m->eos_in) { m->in_free[m->nin_free++] = index; note(m, &s, EV_INPUT); }   /* after end of stream: hand the buffer back */
     else if (m->npending || !decode_one(m, &s, &p)) m->pending[m->npending++] = p;
