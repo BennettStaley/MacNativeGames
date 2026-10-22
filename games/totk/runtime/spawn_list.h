@@ -200,3 +200,52 @@ static inline int spawn_list_filter(const SpawnList *l, const SpawnPicks *p, int
     }
     return n;
 }
+
+/* ---- files (the menus; tests use the parts above) ---- */
+
+/* spawn-picks.txt beside the profile (TOTK_PROFILE_DIR's folder, like cheats-enabled.txt); TOTK_SPAWN_PICKS overrides. */
+static inline int spawn_picks_path(char *out, size_t n) {
+    const char *e = getenv("TOTK_SPAWN_PICKS"), *p = getenv("TOTK_PROFILE_DIR");
+    if (e && *e) return snprintf(out, n, "%s", e) < (int)n;
+    if (!p || !*p) return 0;
+    size_t len = strlen(p);
+    while (len > 1 && p[len - 1] == '/') len--;
+    while (len > 0 && p[len - 1] != '/') len--;   /* the folder that holds the profile */
+    if (!len) return snprintf(out, n, "spawn-picks.txt") < (int)n;
+    return snprintf(out, n, "%.*sspawn-picks.txt", (int)len, p) < (int)n;
+}
+static inline char *spawn_read_file(const char *path, size_t limit, size_t *len) {
+    FILE *f = path ? fopen(path, "rb") : NULL;
+    if (!f) return NULL;
+    char *buf = malloc(limit + 1); size_t n = buf ? fread(buf, 1, limit + 1, f) : 0;
+    fclose(f);
+    if (!buf || n > limit) { free(buf); return NULL; }
+    buf[n] = 0; if (len) *len = n;
+    return buf;
+}
+static inline void spawn_picks_load(SpawnPicks *p) {
+    char path[1024]; char *text = spawn_picks_path(path, sizeof path) ? spawn_read_file(path, 1u << 20, NULL) : NULL;
+    spawn_picks_parse(p, text);
+    free(text);
+}
+/* Written through a temporary file, so a crash leaves the old one. 0 on success. */
+static inline int spawn_picks_save(const SpawnPicks *p) {
+    char path[1024], tmp[1040];
+    if (!spawn_picks_path(path, sizeof path)) return -1;
+    int len = spawn_picks_format(p, NULL, 0);
+    char *text = malloc((size_t)len + 1); if (!text) return -1;
+    spawn_picks_format(p, text, (size_t)len + 1);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb"); int ok = f && fwrite(text, 1, (size_t)len, f) == (size_t)len;
+    if (f && fclose(f)) ok = 0;
+    free(text);
+    if (!ok || rename(tmp, path)) { remove(tmp); return -1; }
+    return 0;
+}
+/* The app's actor list (Mac: build/actor_list.tsv in the game folder; iOS: GameData/actor_list.tsv). */
+static inline int spawn_list_load(SpawnList *l, const char *path) {
+    size_t len = 0; char *text = spawn_read_file(path, 16u << 20, &len);
+    int n = spawn_list_parse(l, text, len);
+    free(text);
+    return n;
+}

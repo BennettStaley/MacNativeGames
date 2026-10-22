@@ -3,6 +3,7 @@
 #include "../games/totk/runtime/spawn_list.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 static unsigned checks;
 static void check(int ok, const char *what) { checks++; if (!ok) { fprintf(stderr, "FAIL: %s\n", what); exit(1); } }
@@ -98,6 +99,24 @@ int main(void) {
     spawn_picks_parse(&again, "# c\nfavorite Item_Fruit_A\r\nfavorite Item_Fruit_A\nfavorite ../etc\nrecent Obj_Rock\nrecent Obj_Rock\nbogus line\nrecent\n");
     check(again.nfav == 1 && again.nrecent == 1 && !strcmp(again.fav[0], "Item_Fruit_A"), "bad, repeated and CRLF lines");
     spawn_picks_parse(&again, NULL); check(!again.nfav && !again.nrecent, "no file: nothing picked");
+
+    /* the files: spawn-picks.txt beside the profile, the actor list */
+    char path[1024];
+    unsetenv("TOTK_SPAWN_PICKS"); setenv("TOTK_PROFILE_DIR", "/x/data/profile/", 1);
+    check(spawn_picks_path(path, sizeof path) && !strcmp(path, "/x/data/spawn-picks.txt"), "beside the profile");
+    char dir[] = "/tmp/totk-spawn-XXXXXX"; check(mkdtemp(dir) != NULL, "temporary folder");
+    snprintf(path, sizeof path, "%s/picks.txt", dir); setenv("TOTK_SPAWN_PICKS", path, 1);
+    SpawnPicks none; spawn_picks_load(&none); check(!none.nfav && !none.nrecent, "no file yet");
+    check(spawn_picks_save(&p) == 0, "saved");
+    SpawnPicks back; spawn_picks_load(&back);
+    check(back.nfav == p.nfav && back.nrecent == p.nrecent && !strcmp(back.recent[0], p.recent[0]), "loaded back");
+    remove(path);
+    snprintf(path, sizeof path, "%s/actor_list.tsv", dir);
+    FILE *f = fopen(path, "wb"); check(f && fwrite(LIST, 1, sizeof LIST - 1, f) == sizeof LIST - 1 && !fclose(f), "list written");
+    SpawnList fromfile; check(spawn_list_load(&fromfile, path) == 11, "list read from its file");
+    spawn_list_free(&fromfile); remove(path); rmdir(dir);
+    SpawnList missing; check(spawn_list_load(&missing, "/nonexistent/actor_list.tsv") == 0, "no list file"); spawn_list_free(&missing);
+    unsetenv("TOTK_SPAWN_PICKS");
 
     spawn_list_free(&l);
     printf("spawn list: %u checks passed\n", checks);
