@@ -431,6 +431,7 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
 // ---------- 锁 ----------
 // ---------- Locks ----------
 static inline uint32_t ld32(uint64_t a) { return __atomic_load_n((uint32_t *)a, __ATOMIC_SEQ_CST); }
+static inline uint64_t ld64(uint64_t a) { return __atomic_load_n((uint64_t *)a, __ATOMIC_SEQ_CST); }
 static inline void st32(uint64_t a, uint32_t v) { __atomic_store_n((uint32_t *)a, v, __ATOMIC_SEQ_CST); }
 static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic_compare_exchange_n((uint32_t *)a, exp, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
 
@@ -795,11 +796,13 @@ int svc_thread(int num, uint64_t *regs) {
         regs[0] = 0; return 1;
     }
 
-    case 0x34: {  // WaitForAddress(x0 地址, w1 类型, w2 值, x3 超时)：0 小于则等、1 小于则减一再等、2 相等则等 | WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 wait if less than, 1 decrement if less than then wait, 2 wait if equal
+    case 0x34: {  // WaitForAddress(x0 地址, w1 类型, w2 值, x3 超时)：0 小于则等、1 小于则减一再等、2 相等则等、3 64 位相等则等 | WaitForAddress(x0 address, w1 type, x2 value, x3 timeout): 0 wait if less than, 1 decrement if less than then wait, 2 wait if equal, 3 wait if the 64-bit value is equal
+        // Type 3 is Horizon 18's 64-bit form (SDK 19+ nn::os::WaitForAddress(const long*, long)); it used to fall into the 32-bit less-than test.
+        // From seedds/nxnative dm/host/hle_thread.c (MIT, Copyright (c) 2026 jhaizhou)
         thr_t *t = cur(); uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2];
         pthread_mutex_lock(&G);
         int64_t r; uint32_t v = ld32(addr);
-        int ok = type == 2 ? (int32_t)v == val : (int32_t)v < val;
+        int ok = type == 3 ? ld64(addr) == regs[2] : type == 2 ? (int32_t)v == val : (int32_t)v < val;
         if (ok && type == 1) { while (!cas32(addr, &v, v - 1)) if (!((int32_t)v < val)) { ok = 0; break; } }
         if (!ok) r = R_BAD_STATE;
         else { t->waddr = addr; r = block(t, 3, (int64_t)regs[3]); }
