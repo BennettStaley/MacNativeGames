@@ -4,6 +4,7 @@
    or queues a next transform, unlike merely changing the actor's displayed position.
    Only called after the actual game frame-end GPU wait, never from the input file thread. */
 #include "world_survey.h"
+#include "actor_spawn.h"
 #include "game_version.h"
 #include <ctype.h>
 #include <limits.h>
@@ -274,6 +275,7 @@ void runtime_survey_init(Module *m) {
     survey_force = (void (*)(void *, const float *, uint32_t))(m->base + FORCE_MATRIX);
     survey_enabled = 1;
     fprintf(stderr, "[survey] enabled: test profile, game frame-end commands, original forceSetMatrix\n");
+    runtime_spawn_init(m);   /* the spawner runs on the same frame-end tick (actor_spawn.c) */
 }
 static void report(const char *tag, const char *status, uint64_t frame, uintptr_t actor) {
     float xyz[3];
@@ -307,6 +309,7 @@ void runtime_survey_cancel_user(void) {
     if (!atomic_load_explicit(&runtime_survey_pending, memory_order_relaxed)) return;
     pthread_mutex_lock(&survey_lock);
     request.kind = 0; hold_left = 0; atomic_store(&runtime_survey_pending, 0);
+    if (atomic_load(&runtime_spawn_waiting)) atomic_store(&runtime_survey_pending, 1);   /* spawns are not cancelled */
     fprintf(stderr, "[survey] cancelled: user input\n");
     pthread_mutex_unlock(&survey_lock);
 }
@@ -315,7 +318,9 @@ void runtime_survey_tick(uint64_t frame) {
     in_tick = 1;
     pthread_mutex_lock(&survey_lock);
     uintptr_t actor = player_actor();
-    if (!actor) {
+    if (!request.kind && !hold_left) {
+        /* only spawns waiting (actor_spawn.c) */
+    } else if (!actor) {
         report(request.kind ? request.tag : hold_tag, "no_player", frame, 0);
         request.kind = 0; hold_left = 0;
     } else if (request.kind == 1) {
@@ -340,8 +345,13 @@ void runtime_survey_tick(uint64_t frame) {
             } else { report(hold_tag, "invalid_rotation", frame, actor); hold_left = 0; }
         }
     }
-    atomic_store_explicit(&runtime_survey_pending, request.kind || hold_left, memory_order_release);
+    int survey_left = request.kind || hold_left;
     pthread_mutex_unlock(&survey_lock);
+    runtime_spawn_tick(actor, frame);   /* outside the survey lock: it calls into the game */
+    /* cleared before the spawn queue is looked at again, so a spawn queued meanwhile (it sets waiting, then pending) is
+       never lost */
+    atomic_store(&runtime_survey_pending, survey_left);
+    if (atomic_load(&runtime_spawn_waiting)) atomic_store(&runtime_survey_pending, 1);
     in_tick = 0;
 }
 #endif   /* GAME_BOTW */

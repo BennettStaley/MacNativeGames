@@ -55,3 +55,7 @@ jobs:
         run: |
           cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all tests/test_cheat_catalog.c -o "$RUNNER_TEMP/test-cheat-catalog"
           "$RUNNER_TEMP/test-cheat-catalog"
+      - name: Check the actor spawner queue and name check with the undefined-behavior sanitizer
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all tests/test_actor_spawn.c -o "$RUNNER_TEMP/test-actor-spawn"
+          "$RUNNER_TEMP/test-actor-spawn"

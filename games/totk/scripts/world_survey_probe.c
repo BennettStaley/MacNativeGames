@@ -3,6 +3,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 static unsigned checks, moves;
+_Atomic int runtime_spawn_waiting;   /* the spawner (actor_spawn.c) is not part of this probe */
+void runtime_spawn_init(Module *m) { (void)m; }
+void runtime_spawn_tick(uintptr_t player, uint64_t frame) { (void)player; (void)frame; }
 _Noreturn void runtime_fail(const char *why) { fprintf(stderr, "probe runtime failure: %s\n", why); _exit(2); }
 static void check(int ok, const char *why) { checks++; if (!ok) { fprintf(stderr, "FAIL: %s\n", why); exit(1); } }
 static void pointer(void *base, size_t off, void *value) { memcpy((char *)base + off, &value, sizeof value); }
