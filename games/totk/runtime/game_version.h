@@ -12,6 +12,7 @@
 #endif
 #define TOTK_GAME_VERSION "1.6.0"
 #define GAME_NAME "Breath of the Wild"
+#define GAME_TITLE_ID "01007EF00011E000"   /* the community cheat list's file name (runtime/cheat_db_fetch.h) */
 #define GAME_FOLDER "BotW"   /* ~/Library/Application Support/MacNativeGames/<GAME_FOLDER> (app/launcher.m) */
 #define GAME_LOG "botw"      /* ~/Library/Logs/MacNativeGames/<GAME_LOG>.log */
 #define GAME_CONTRIB_TEMPLATE "shader-list-botw.yml"   /* the issue form for this game's shared shader list (totk_shader_contrib.h) */
@@ -163,6 +164,9 @@
 #endif
 #ifndef GAME_NAME
 #define GAME_NAME "Tears of the Kingdom"   /* window title and menu (game_version.h is per binary) */
+#endif
+#ifndef GAME_TITLE_ID
+#define GAME_TITLE_ID "0100F2C0115B6000"   /* the community cheat list's file name (runtime/cheat_db_fetch.h) */
 #endif
 #ifndef GAME_FOLDER
 #define GAME_FOLDER "TOTK"   /* the player's data folder under ~/Library/Application Support/MacNativeGames (app/launcher.m) */

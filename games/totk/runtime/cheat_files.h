@@ -2,7 +2,9 @@
    only and without game state, so tests/test_cheat_files.c builds it together with runtime/mods.c.
 
    Atmosphère cheat files are named after the main module's build ID (<BID>.txt, any case: the cheat databases spell it
-   both ways). Three places, read in this order, each file a group of its own in the Cheats tab:
+   both ways). Four places, read in this order, each file a group of its own in the Cheats tab:
+     0. the community cheat list the game downloads (cheat_db.h): <BID>.txt in the cheats-db folder (TOTK_CHEATS_DB_DIR),
+        shown through cheat_catalog.h (clean names in groups, choices, the junk left out);
      1. the app's own file, cheats/cheats.txt in the game folder (build_app.py --cheats, which already checked its build
         ID; TOTK_CHEATS_FILE overrides);
      2. the cheats folder: <BID>.txt in ~/Library/Application Support/MacNativeGames/TOTK/cheats (TOTK_CHEATS_DIR; 0 = none);
@@ -18,11 +20,11 @@
 #include <strings.h>
 #include <sys/stat.h>
 
-enum { CHEAT_SRC_APP, CHEAT_SRC_FOLDER, CHEAT_SRC_MOD };
+enum { CHEAT_SRC_APP, CHEAT_SRC_FOLDER, CHEAT_SRC_MOD, CHEAT_SRC_DB };
 enum { CHEAT_SOURCES_MAX = 64 };
 typedef struct {
     int kind;                 /* CHEAT_SRC_* */
-    char id[300];             /* "app", "folder", "mod:<folder>": the first half of a cheat's key */
+    char id[300];             /* "db", "app", "folder", "mod:<folder>": the first half of a cheat's key */
     char label[300];          /* what the Cheats tab calls the group */
     char path[4096];
     long long mtime, size;    /* when read, to notice a file that changed since (restart to load it) */
@@ -56,9 +58,12 @@ static inline int cheat_source_add(CheatSource *out, int n, int max, int kind, c
     s->mtime = (long long)st.st_mtime; s->size = (long long)st.st_size;
     return n + 1;
 }
-/* The files to read now, in order (mods as the last mods_scan saw them); returns the count. */
-static inline int cheat_sources(const char *app_file, const char *folder, const char *build_id, CheatSource *out, int max) {
+/* The files to read now, in order (mods as the last mods_scan saw them); returns the count. db_dir: the downloaded list's
+   folder, or NULL. */
+static inline int cheat_sources_all(const char *db_dir, const char *app_file, const char *folder, const char *build_id, CheatSource *out, int max) {
     int n = 0; char path[4096];
+    if (db_dir && *db_dir && strcmp(db_dir, "0") && cheat_file_in(db_dir, build_id, path, sizeof path))
+        n = cheat_source_add(out, n, max, CHEAT_SRC_DB, "db", "Cheat list", path);
     if (app_file && *app_file) n = cheat_source_add(out, n, max, CHEAT_SRC_APP, "app", "Built into the app", app_file);
     if (folder && *folder && strcmp(folder, "0") && cheat_file_in(folder, build_id, path, sizeof path))
         n = cheat_source_add(out, n, max, CHEAT_SRC_FOLDER, "folder", "From the cheats folder", path);
@@ -71,11 +76,17 @@ static inline int cheat_sources(const char *app_file, const char *folder, const 
     }
     return n;
 }
-/* 1 when both lists name the same files, unchanged. */
+static inline int cheat_sources(const char *app_file, const char *folder, const char *build_id, CheatSource *out, int max) {
+    return cheat_sources_all(NULL, app_file, folder, build_id, out, max);
+}
+/* 1 when both lists name the same files, unchanged (in any order: a cheat list downloaded after the launch is read last). */
 static inline int cheat_sources_same(const CheatSource *a, int na, const CheatSource *b, int nb) {
     if (na != nb) return 0;
-    for (int i = 0; i < na; i++)
-        if (strcmp(a[i].id, b[i].id) || strcmp(a[i].path, b[i].path) || a[i].mtime != b[i].mtime || a[i].size != b[i].size) return 0;
+    for (int i = 0; i < na; i++) {
+        int j = 0;
+        while (j < nb && strcmp(a[i].id, b[j].id)) j++;
+        if (j == nb || strcmp(a[i].path, b[j].path) || a[i].mtime != b[j].mtime || a[i].size != b[j].size) return 0;
+    }
     return 1;
 }
 
