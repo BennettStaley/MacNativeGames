@@ -1415,6 +1415,10 @@ def step_app(tree, out, logs, *, version="v0", store=None, game='totk', cheats=N
             continue
         files += [f'extracted/{version}/aoc/{index}/romfs.bin', f'extracted/{version}/aoc/{index}/runtime-index.bin']
     actors = tree / f'build/{version}/actor_list.tsv'   # the spawner's actor list (scripts/prepare_actor_list.py), when built
+    if (version == 'v143' and not actors.is_file() and (tree / f'extracted/{version}/romfs').is_dir()
+            and (tree / '.venv/bin/python').exists()):
+        # a work folder whose update step was cached before the list existed: make it now (about 2 s)
+        run([tree/'.venv/bin/python', 'scripts/prepare_actor_list.py', '--version', version], logs/f'{version}-prepare_actor_list.py.log', cwd=tree)
     if actors.is_file():
         clone(actors, res / 'build/actor_list.tsv')
     for rel in files:
