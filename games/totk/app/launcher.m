@@ -315,6 +315,7 @@ int main(int argc, char **argv) {
            TOTK_GAME_SLOT_DIR shares one game slot with another build of the game: one game at a time on the Mac). */
         NSString *(^env_or)(const char *, NSString *) = ^NSString *(const char *name, NSString *fallback) {
             const char *v = getenv(name); return v && *v ? @(v) : fallback; };
+        BOOL test_profile = getenv("TOTK_PROFILE_DIR") && *getenv("TOTK_PROFILE_DIR");   // a test on a save copy may autoload it
         NSString *profile = env_or("TOTK_PROFILE_DIR", [data stringByAppendingPathComponent:@"profile"]);
         NSString *slot = env_or("TOTK_GAME_SLOT_DIR", [data stringByAppendingPathComponent:@"game-slot"]);
         NSString *cache = env_or("TOTK_SHADER_CACHE", [data stringByAppendingPathComponent:[NSString stringWithFormat:@"shader-cache/rt-%s", DMSH_CHAIN]]);
@@ -422,7 +423,7 @@ int main(int argc, char **argv) {
            totk_shader_list.m; Interface > Download new shaders). Download only; the game never uploads anything. */
         setenv("TOTK_SHADER_LIST_DIR", env_or("TOTK_SHADER_LIST_DIR", [data stringByAppendingPathComponent:@"shader-list"]).fileSystemRepresentation, 1);
         contrib_reminder(contrib);
-        unsetenv("TOTK_AUTOLOAD");   // the game starts at its title screen, as on the console
+        if (!test_profile) unsetenv("TOTK_AUTOLOAD");   // the game starts at its title screen, as on the console (a test on a save copy may skip it)
         setenv("TOTK_APP_BUNDLE", NSBundle.mainBundle.bundlePath.fileSystemRepresentation, 1);   // the menu's Restart now opens it again
         /* runtime command channel (runtime/input.c): echo "shot ~/Desktop/shot.png" >> "<data>/input.txt" */
         { NSString *cmds = env_or("TOTK_INPUT_FILE", [data stringByAppendingPathComponent:@"input.txt"]);
