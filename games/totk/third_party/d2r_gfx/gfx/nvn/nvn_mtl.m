@@ -6728,10 +6728,16 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
 // ---- Parallel precompile: pipelines met for the first time used to be compiled synchronously one by one on the submit thread; 9 misses in a row in one frame = 284 ms (heavy scene on a real device).
 // Now: on the first pipeline miss in a submission, scan ahead once along the remaining commands (replaying state only, no drawing) and kick all the normal-pass pipelines that will also miss later to the background to compile in parallel;
 // when the submit thread reaches that draw it only waits for 'the remaining time not yet compiled'. The compiled pipelines are identical to synchronously compiled ones (same descriptor). Pipeline keys of merged passes / specialized fragments depend on the planning result at replay time, are not predicted, and are compiled synchronously as before.
-#define PSO_PEND_MAX 384
+#define PSO_PEND_MAX 768
 static struct { pso_key k; id<MTLRenderPipelineState> ps; uint64_t submit; int used, done; } g_pp[PSO_PEND_MAX];
 static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pp_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // 本次提交是否已预测过（按提交序号）；累计丢出 / 领用条数 | Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
+/* TOTK: a scan that stopped at a budget leaves the rest of the submission unscanned; the next miss of the submission scans
+   again from there (keys already compiling are skipped, so each scan moves on), up to PSO_RESCANS times. A burst of new
+   pipelines (265 in one frame on entering a new area) then compiles in parallel instead of mostly one after another.
+   TOTK_PSO_RESCANS sets the limit (0: one scan per submission, as before). */
+static int pso_rescans(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PSO_RESCANS"); v = e ? atoi(e) : 32; if (v < 0) v = 0; } return v; }
+static int g_pp_more, g_pp_rescans; static uint64_t g_pp_sync;   // last scan stopped at a budget; scans after the first; pipelines compiled on the submission thread
 // Statistics line (pso_predict_rest, every 100 scans): guesses refused because the table was full, stale guesses freed,
 // time draws waited for a background compile, scans and which budget ended them.
 static uint64_t g_pp_full, g_pp_reclaimed, g_pp_waits, g_pp_wait_ns, g_pp_scans, g_pp_scan_ns, g_pp_stop[3];
@@ -6872,9 +6878,10 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     ps = g_pso_lmap ? nil : pso_pend_take(&k);
     if (ps) g_pp_taken++;
     else {
-        if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
+        if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; g_pp_rescans = 0; g_pp_more = 0; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
+        else if (g_pp_more && g_pp_rescans < pso_rescans()) { g_pp_rescans++; pso_predict_rest(); }   // TOTK: the last scan stopped early: go on from here
         MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, bfn ? bfn : g_pso_fsfn, g_pso_lmap != NULL);
-        ps = pso_new(d, pso_archive_key(&k, vs, fs, g_pso_lmap != NULL), &e);
+        ps = pso_new(d, pso_archive_key(&k, vs, fs, g_pso_lmap != NULL), &e); g_pp_sync++;
     }
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
     if (!ps) { static int said; if (said++ < 12) MLOG("【红】建渲染管线失败：%s（vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d）", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("【红】建渲染管线失败：后续不再逐条打印"); return nil; }
@@ -7016,9 +7023,61 @@ static void warm_load_rows(NSArray<NSString *> *rows, NSMutableDictionary<NSStri
 }
 static void warm_enqueue(WarmItem *item) {
     os_unfair_lock_lock(&g_warm_lock);
+    if (!g_warm_items) g_warm_items = [NSMutableArray array];
     [g_warm_items addObject:item];
     atomic_store_explicit(&g_warm_ready, 1, memory_order_release);
     os_unfair_lock_unlock(&g_warm_lock);
+}
+/* TOTK_SHADER_PREFETCH=1 (off by default): when the game hands a program its shaders (nvnProgramSetShaders, usually while
+   it loads, before the first draw), the variants of those shaders that the translation cache already holds are compiled
+   into Metal libraries on background threads and handed to the submission thread like the warm-up's (warm_claim at the
+   next submission). The first draw then finds the library instead of compiling it itself: on the starting sky island
+   the frames that stalled for a new library (65 of them, 181 libraries, 29 s in a 21-minute run) were all variants
+   already in the cache, compiled from their MSL at the draw. Variants not in the cache, and pipelines, are still made
+   at the draw as before. Nothing is translated here and no draw is skipped. */
+static int prefetch_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_SHADER_PREFETCH"); on = e && !strcmp(e, "1"); } return on; }
+static _Atomic uint64_t g_pf_progs, g_pf_queued, g_pf_built, g_pf_ns, g_pf_last;
+void mtl_prog_prefetch(const prog_t *p) {
+    if (!prefetch_on() || !p || !p->nstage) return;
+    static NSMutableSet<NSString *> *seen; static dispatch_queue_t q; static dispatch_semaphore_t slots; static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+    static dispatch_once_t once; dispatch_once(&once, ^{
+        seen = [NSMutableSet set];
+        q = dispatch_queue_create("totk.shader-prefetch", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0));
+        slots = dispatch_semaphore_create(4);   // the system compiler service runs requests side by side; 4 leaves cores to the game
+        MLOG("[prefetch] 着色器预编已开（TOTK_SHADER_PREFETCH=1）：游戏设着色器时，后台编翻译缓存里已有的变体，最多 4 个同时编");
+    });
+    atomic_fetch_add(&g_pf_progs, 1);
+    for (unsigned i = 0; i < p->nstage && i < 6; i++) {
+        const uint8_t *control = p->sd[i].control; uint32_t length = 0, st = 0;
+        if (!control || !p->sd[i].data) continue;
+        memcpy(&length, control + 0x704, 4); memcpy(&st, control + 0x714, 4);
+        if (!length || length > 16 * 1024 * 1024 || (st != 0 && st != 1 && st != 5)) continue;
+        /* the same key prog_get computes: control section, then the code */
+        uint8_t md[32]; CC_SHA256_CTX ctx; CC_SHA256_Init(&ctx); CC_SHA256_Update(&ctx, control, ctl_key_len(control));
+        CC_SHA256_Update(&ctx, (const void *)(uintptr_t)p->sd[i].data, length); CC_SHA256_Final(md, &ctx);
+        char key[65]; for (unsigned j = 0; j < 32; j++) snprintf(key + 2 * j, 3, "%02x", md[j]);
+        NSString *shader = @(key);
+        os_unfair_lock_lock(&lk); BOOL fresh = ![seen containsObject:shader]; if (fresh) [seen addObject:shader]; os_unfair_lock_unlock(&lk);
+        if (!fresh) continue;
+        int stage = (int)st;
+        dispatch_async(q, ^{ @autoreleasepool {
+            for (NSString *v in totk_rt_known_variants(shader)) {
+                NSString *pc = [v stringByAppendingString:@"_b"];
+                if (warm_failed(pc)) continue;
+                atomic_fetch_add(&g_pf_queued, 1);
+                dispatch_semaphore_wait(slots, DISPATCH_TIME_FOREVER);
+                uint64_t t0 = bp_now(); NvShader *sh = warm_shader_load(pc, stage); uint64_t dt = bp_now() - t0;
+                dispatch_semaphore_signal(slots);
+                if (!sh) { warm_fail(pc); continue; }
+                WarmItem *item = [WarmItem new]; item->kind = 0; item->key = pc; item->shader = sh; warm_enqueue(item);
+                atomic_fetch_add(&g_pf_built, 1); atomic_fetch_add(&g_pf_ns, dt);
+            }
+            uint64_t now = bp_now(), last = atomic_load(&g_pf_last);
+            if (now - last > 5000000000ull && atomic_compare_exchange_strong(&g_pf_last, &last, now))
+                MLOG("[prefetch] 累计：程序 %llu 个，排队编着色器 %llu 个，编好 %llu 个，后台共 %.0f ms",
+                     (unsigned long long)g_pf_progs, (unsigned long long)g_pf_queued, (unsigned long long)g_pf_built, g_pf_ns / 1e6);
+        } });
+    }
 }
 /* Count the exact manifest rows and cached variants this run will visit before
    displaying a determinate bar. Shader/PSO counts are separate: one pipeline
@@ -8313,7 +8372,7 @@ static void pso_predict_rest(void) {
     enum { QN = 160 }; static int max_ops = -1, max_keys, max_us;
     if (max_ops < 0) {
         const char *e = getenv("TOTK_PSO_PREDICT_SCAN"); int ops = e ? atoi(e) : 8192;
-        e = getenv("TOTK_PSO_PREDICT_KEYS"); max_keys = e ? atoi(e) : 32; if (max_keys < 1) max_keys = 1; if (max_keys > QN) max_keys = QN;
+        e = getenv("TOTK_PSO_PREDICT_KEYS"); max_keys = e ? atoi(e) : 64; if (max_keys < 1) max_keys = 1; if (max_keys > QN) max_keys = QN;
         e = getenv("TOTK_PSO_PREDICT_US"); max_us = e ? atoi(e) : 2000; if (max_us < 1) max_us = 1;
         max_ops = ops < 1 ? 1 : ops;
         MLOG("[totk] pipeline prediction: after a submission's first pipeline miss, scans at most %d commands, %d keys, %d us", max_ops, max_keys, max_us);
@@ -8352,6 +8411,8 @@ static void pso_predict_rest(void) {
                 if (!pred_guess_wanted(v, dfull, sfull, fs)) continue;
                 pso_key k; pso_key_fill(&k, vs, fs, cf, PRED_DEPTH[v] ? dfull : 0, PRED_STENCIL[v] ? sfull : 0, samples, 0);
                 if (hm_get_id(&g_pso, &k)) continue;
+                pthread_mutex_lock(&g_pp_mu); int pending = pso_pend_find(&k) >= 0; pthread_mutex_unlock(&g_pp_mu);
+                if (pending) continue;   // kicked by an earlier scan of this submission: not a key of this scan's budget
                 int dup = 0; for (int i = 0; i < (v ? nb : na) && !dup; i++) dup = !memcmp(&(v ? qb : qa)[i].k, &k, sizeof k);
                 if (dup) continue;
                 if (!v && na < max_keys) { qa[na].k = k; qa[na].vs = (__bridge void *)vs; qa[na].fs = (__bridge void *)fs; na++;
@@ -8368,14 +8429,15 @@ static void pso_predict_rest(void) {
     memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty;
     static int logged; if (g_pp_kicked > (uint64_t)kicked0 && logged++ < 20) MLOG("并行预编：本次提交余下 %d 次绘制，丢给后台 %d 条管线", draws, (int)g_pp_kicked - kicked0);
     g_pp_scans++; g_pp_scan_ns += bp_now() - started; if (stop) g_pp_stop[stop - 1]++;
+    g_pp_more = stop != 0;
     if (g_pp_scans % 100 == 0) {
         pthread_mutex_lock(&g_pp_mu); uint64_t full = g_pp_full, freed = g_pp_reclaimed, waits = g_pp_waits, wait_ns = g_pp_wait_ns; int busy = 0;
         for (int i = 0; i < PSO_PEND_MAX; i++) busy += g_pp[i].used; pthread_mutex_unlock(&g_pp_mu);
-        MLOG("并行预编 至提交 %llu：扫描 %llu 次（平均 %.2f ms；到上限：命令 %llu、键 %llu、时间 %llu），后台开编 %llu 条，绘制领用 %llu 条（等后台 %llu 次共 %.1f ms），表满没收 %llu 条，回收没用上的 %llu 条，表里现有 %d 条",
+        MLOG("并行预编 至提交 %llu：扫描 %llu 次（平均 %.2f ms；到上限：命令 %llu、键 %llu、时间 %llu），后台开编 %llu 条，绘制领用 %llu 条（等后台 %llu 次共 %.1f ms），提交线程同步编 %llu 条，表满没收 %llu 条，回收没用上的 %llu 条，表里现有 %d 条",
              (unsigned long long)g_sub_serial, (unsigned long long)g_pp_scans, g_pp_scan_ns / 1e6 / (double)g_pp_scans,
              (unsigned long long)g_pp_stop[0], (unsigned long long)g_pp_stop[1], (unsigned long long)g_pp_stop[2],
              (unsigned long long)g_pp_kicked, (unsigned long long)g_pp_taken, (unsigned long long)waits, wait_ns / 1e6,
-             (unsigned long long)full, (unsigned long long)freed, busy);
+             (unsigned long long)g_pp_sync, (unsigned long long)full, (unsigned long long)freed, busy);
     }
 }
 
@@ -12173,11 +12235,23 @@ static _Atomic uint64_t g_drawable_ns;   // 出图里等 nextDrawable 的累计�
 uint64_t mtl_drawable_ns_take(void) { return atomic_exchange(&g_drawable_ns, 0); }
 // 有窗口时屏幕的最高刷新率（Hz）；无窗口返回 0。Mac 用 CoreGraphics 显示模式（线程安全的 C 接口，出图配置在游戏线程上读）
 // Maximum refresh rate (Hz) of the screen when there is a window; returns 0 without a window. Mac uses CoreGraphics display modes (thread-safe C interface; the present configuration is read on the game thread)
+/* TOTK: the display the game window is on (runtime/frontend.m; 0 = not known: the main display) and a count that goes up
+   when the window moves to another display or a display's mode changes. The rate used to be the main display's, so a
+   window on a 120 Hz monitor next to a 60 Hz main display ran at 60 (and the Auto limit chose from 60's steps). The rate is
+   kept until the count changes, so callers may ask every frame. Weak: the graphics unit tests and iOS have no window. */
+__attribute__((weak)) uint32_t runtime_front_display_id(void) { return 0; }
+__attribute__((weak)) unsigned runtime_front_display_changes(void) { return 0; }
+unsigned mtl_display_changes(void) { return runtime_front_display_changes(); }
 int mtl_display_hz(void) {
     if (!front_metal_layer()) return 0;
 #if TARGET_OS_OSX
-    CGDisplayModeRef m = CGDisplayCopyDisplayMode(CGMainDisplayID());
+    static _Atomic int cached; static _Atomic unsigned cached_for;   // cached_for: the change count + 1 the rate is of
+    unsigned now = runtime_front_display_changes() + 1;
+    if (atomic_load(&cached_for) == now) return atomic_load(&cached);
+    CGDirectDisplayID d = runtime_front_display_id(); if (!d) d = CGMainDisplayID();
+    CGDisplayModeRef m = CGDisplayCopyDisplayMode(d);
     double hz = m ? CGDisplayModeGetRefreshRate(m) : 0; if (m) CGDisplayModeRelease(m);
+    atomic_store(&cached, (int)(hz + 0.5)); atomic_store(&cached_for, now);
     return (int)(hz + 0.5);
 #else
     Class c = NSClassFromString(@"UIScreen"); id s = c ? [c valueForKey:@"mainScreen"] : nil;
@@ -12645,7 +12719,7 @@ static void cadence_note(double tt, int interp, double expect_ms) {
     if (tt <= 0) dropped++;
     else { if (last > 0 && tt > last && n < N) { ex[n] = last_expect; iv[n++] = (tt - last) * 1e3; ni += interp; } if (tt > last) { last = tt; last_expect = expect_ms; } }
     if (n == N) {
-        if (!hz) { hz = mtl_display_hz(); if (hz <= 0) hz = 60; }
+        hz = mtl_display_hz(); if (hz <= 0) hz = 60;   // TOTK: asked each report, so a move to another display is followed
         double tick = 1000.0 / hz; int beyond = 0; for (int i = 0; i < N; i++) beyond += iv[i] > (ex[i] > tick ? ex[i] : tick) + 0.5 * tick;
         double a[N]; memcpy(a, iv, sizeof a); qsort(a, N, sizeof *a, dcmp_mtl);
         int held = 0; for (int i = 0; i < N; i++) held += a[i] > 1.5 * tick;
@@ -13058,7 +13132,7 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
         /* TOTK_MFX: the game frame goes up at the refresh nearest to half a game frame after its interpolated one, so the
            two pictures share the frame's time evenly (30+30 on a 100 Hz display: two refreshes later, not one; half the
            refresh rate and uncapped: the next refresh). Until then the interpolated picture stays up. */
-        static double tick; if (!tick) { int hz = mtl_display_hz(); tick = 1.0 / (hz > 0 ? hz : 60); }
+        int hz = mtl_display_hz(); double tick = 1.0 / (hz > 0 ? hz : 60);   // TOTK: the window's display, followed when it moves
         if (tts < ip->interp_ts + ip->period / 2 - tick / 2) { pthread_mutex_unlock(&g_pq_mu); return; }
     }
     if (interp >= 0) { ip->interp_shown = 1; ip->interp_ts = tts; }
@@ -13116,7 +13190,15 @@ static void link_sync(void) {   // 游戏出图线程每帧调：把节拍对象
     int want = g_dm_present_link;
     if (want < 0 || want > 2) { g_dm_present_link = applied == 3 ? 1 : applied; return; }
     if (want && mtl_fps_target() == 30) want = 3;   // 省电模式：显示节拍 30 Hz | Power-saving mode: display link at 30 Hz
+    /* TOTK: the window moved to another display (or its mode changed): mode 1 asks for that display's rate. */
+    static unsigned display_seen;
+    if (want == applied && want == 1 && g_link && display_seen != mtl_display_changes()) {
+        display_seen = mtl_display_changes(); CAMetalDisplayLink *link = g_link;
+        if (link) { link.preferredFrameRateRange = link_range(1); MLOG("[totk] display link: the window's display is now %d Hz", mtl_display_hz()); }
+        return;
+    }
     if (want == applied) return;
+    display_seen = mtl_display_changes();
     g_link_mode = want;
     if (!g_link_started) {
         if (!want) { applied = 0; return; }
@@ -13166,7 +13248,7 @@ static void *present_main(void *arg) {
            the game frame for at least half a game frame (30+30 at 100 Hz: 1 + 2 refreshes within the 3.3 a frame lasts). When
            a newer game frame is already queued (uncapped interpolation above half the refresh rate) the interpolated
            picture is skipped: two pictures per game frame would fall further and further behind. */
-        static double tick; if (!tick) { int hz = mtl_display_hz(); tick = 1.0 / (hz > 0 ? hz : 60); }
+        int hz = mtl_display_hz(); double tick = 1.0 / (hz > 0 ? hz : 60);   // TOTK: the window's display, followed when it moves
         pthread_mutex_lock(&g_pq_mu); int behind = g_pq_read < g_pq_in; pthread_mutex_unlock(&g_pq_mu);
         int show_interp = it.interp >= 0 && !behind;
         if (show_interp) { @autoreleasepool { (void)present_now(&it.t, fmin(it.period / 2, tick), it.frame, ticket, it.crop, nil, 0, it.interp); } }

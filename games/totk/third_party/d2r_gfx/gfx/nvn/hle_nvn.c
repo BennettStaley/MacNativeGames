@@ -550,6 +550,7 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("【红】ProgramSetShaders 阶段数 %d", n); return 0; }
     mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
+    mtl_prog_prefetch(o);
     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
 }
@@ -2696,7 +2697,8 @@ static int uncapped_cap(int scr) {
     int v = !e ? UNCAPPED_HZ : !strcmp(e, "display") || !strcmp(e, "auto") ? (scr > 0 ? scr : 60) : atoi(e);   /* auto starts at the display rate */
     return v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
 }
-void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; }
+static int g_follow_display;   /* the pacing rate came from the window's display (present_cfg): follow it when it changes */
+void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; g_follow_display = 0; }
 /* The settings menu's frame rate limit at run time: the uncapped clock's ceiling (hz 30..120, 0 = the display's refresh
    rate), as TOTK_UNCAPPED_HZ sets it at start. Before the first present only the variable changes; with fixed pacing
    (TOTK_UNCAPPED=0, frame interpolation) there is no ceiling to move and the value waits for the next start. */
@@ -2801,6 +2803,7 @@ static void present_cfg(const win_t *o) {
     const char *e = getenv("DM_PRESENT_HZ"), *rt = getenv("TOTK_REALTIME");
     int realtime = !(rt && !strcmp(rt, "0"));
     g_hz = g_paced_hz = e ? atoi(e) : (realtime && scr > 0 ? scr : 60);
+    g_follow_display = !e && realtime && scr > 0;
     { const char *l = getenv("TOTK_UNCAPPED_HZ"); atomic_store(&g_fps_limit, l && atoi(l) > 0 ? atoi(l) : 0); atomic_store(&g_fps_auto, l && !strcmp(l, "auto")); }
     { const char *u = getenv("TOTK_UNCAPPED"), *f60 = getenv("TOTK_FPS60");   // the original 30-frame mode needs fixed pacing; MetalFX interpolation suspends it while on (uncapped_now)
       g_uncapped = !e && realtime && !(u && !strcmp(u, "0")) && !(f60 && !strcmp(f60, "0")) && g_hz < UNCAPPED_HZ; }
@@ -2822,8 +2825,24 @@ static void present_cfg(const win_t *o) {
     LOG("[nvn] 出图节拍 %d Hz，间隔模式 %s（游戏设的出图间隔 %d；%s）", g_hz, g_display_mode ? "display（每节拍一帧，剪口）" : "game（原版语义）", o->interval,
         e ? "显式指定" : g_uncapped ? "不限帧率" : realtime && scr > 0 ? "跟随显示器" : "固定 60 Hz");
 }
+/* TOTK: the window moved to another display (or the display's mode changed, frontend.m note_screen): the pacing follows
+   its refresh rate. Uncapped, the own clock's ceiling is worked out again from the frame rate limit (a fixed limit stays,
+   Auto starts over at the new rate: acap_tick sees g_paced_hz change); paced by display refreshes, the rate is the new
+   display's. Whether the game runs uncapped is still decided once at start (a window opened on a 120 Hz display stays
+   paced by refreshes on a 60 Hz one). */
+static void display_follow(void) {
+    static unsigned seen; unsigned c = mtl_display_changes();
+    if (c == seen || !g_follow_display) return;
+    seen = c; int scr = mtl_display_hz();
+    if (scr <= 0 || scr == g_paced_hz) return;
+    int old = g_paced_hz; g_paced_hz = scr;
+    if (g_uncapped) g_hz = uncapped_cap(scr);   /* Auto: starts at the new rate here, acap_tick then starts over (g_acap.hz differs) */
+    else g_hz = scr;
+    LOG("[nvn] the window's display changed: %d Hz -> %d Hz; pacing %d Hz%s", old, scr, g_hz, g_uncapped ? " (uncapped clock ceiling)" : " (by display refreshes)");
+}
 static unsigned present_ticks(const win_t *o) {   /* display ticks per game frame */
     present_cfg(o);
+    display_follow();
     /* TOTK_MFX / key 2: MetalFX makes the frame between two game frames. Half the refresh rate: the game presents every
        second display tick (50 + 50 on a 100 Hz display); 30+30: hz / 30 ticks (2 at 60 Hz; at 100 Hz the own clock paces,
        mfx_own_clock). Held here and not only by the game's controller, because the code carries the 60 FPS patch (the
