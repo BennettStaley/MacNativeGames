@@ -50,14 +50,14 @@ static int display_apply(const char *changed) {
         cw = want; ch = want * 9 / 16;
         if (runtime_output_request(cw, ch)) r = -1;
     }
-    unsigned sw = 0, sh = 0, rw, rh; runtime_render_reserve(&rw, &rh);
+    unsigned sw = 0, sh = 0, rw, rh; int capped = 0; runtime_render_reserve(&rw, &rh);
     /* The game's own scene grows with the output (1600 x 900 for each 1920 of width); above the reserve it is asked for
        explicitly, at the most the reserve holds. */
     int own_fits = !rw || cw <= 1920 || (uint64_t)(1600 * cw / 1920) * (900 * cw / 1920) <= (uint64_t)rw * rh;
     if (scale || !own_fits) {
         unsigned pct = scale ? (unsigned)scale : 83;
         sw = cw * pct / 100; sh = ch * pct / 100;
-        if ((uint64_t)sw * sh > (uint64_t)rw * rh) { double f = sqrt((double)rw * rh / ((double)sw * sh)); sw = (unsigned)(sw * f); sh = (unsigned)(sh * f); }
+        if ((uint64_t)sw * sh > (uint64_t)rw * rh) { capped = 1; double f = sqrt((double)rw * rh / ((double)sw * sh)); sw = (unsigned)(sw * f); sh = (unsigned)(sh * f); }
         sw &= ~7u; sh &= ~7u; if (sw < 64) sw = 64; if (sh < 64) sh = 64;
     }
     if (runtime_render_request(sw, sh)) r = -1;
@@ -68,8 +68,10 @@ static int display_apply(const char *changed) {
         runtime_aspect_set(aspect_ratios[aspect >= 0 && aspect < 5 ? aspect : 1]);
     }
     pthread_mutex_lock(&lock);
-    if (sw) snprintf(display_status, sizeof display_status, "Output %u x %u, 3D scene %u x %u", cw, ch, sw, sh);
-    else snprintf(display_status, sizeof display_status, "Output %u x %u, 3D scene the game's own", cw, ch);
+    /* What the two settings make together: the picture (text and icons drawn at it) and the 3D world stretched to it. */
+    if (sw) snprintf(display_status, sizeof display_status, "Picture %u×%u · 3D world %u×%u (%u%%%s)", cw, ch, sw, sh,
+                     sw * 100 / cw, capped ? ", the most it can be" : "");
+    else snprintf(display_status, sizeof display_status, "Picture %u×%u · 3D world %u×%u (the game's own)", cw, ch, 1600 * cw / 1920 & ~7u, 900 * cw / 1920 & ~7u);
     pthread_mutex_unlock(&lock);
     fprintf(stderr, "[settings] display: %s%s\n", display_status, r ? " (a size waits for the next start)" : "");
     return r;

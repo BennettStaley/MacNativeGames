@@ -51,7 +51,11 @@ on iPhone and iPad close the app from the app switcher and open it again.
 | **Aspect ratio** | *16:9* (the game's own) or *Fill the screen*, 16:10, 21:9, 32:9. A wider shape shows more at the sides; a taller one (16:10, a MacBook in full screen) keeps the game's view across and shows more above and below. Nothing is stretched: the HUD keeps its shape in the middle 16:9 of the screen. Mac only. |
 | **Maximum output** | The biggest output you can switch to while playing; a bigger one sets more memory aside. *Auto* is 4K on a Mac with 16 GB or more, else 1440p. Applies after a restart. |
 
-The status line at the top of the menu shows what the game was last asked for (`Output 3456 x 1944, 3D scene 1728 x 968`).
+How the two fit together: the **output** is the finished picture, and the game's text, icons and menus are drawn at it,
+so they are always sharp at that size. The **3D world** is drawn separately at the render scale's share of it and then
+stretched to fill the picture. A 4K output with a 50 % scale draws the world at 1920×1080 behind 4K text: faster, a
+softer world, crisp HUD. The line at the top of the menu shows both sizes as they are now
+(`Picture 3840×2160 · 3D world 2560×1432 (66%, the most it can be)`).
 
 Limits and why:
 
