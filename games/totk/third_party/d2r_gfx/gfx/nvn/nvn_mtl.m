@@ -4571,6 +4571,15 @@ static void uw_ui_squeeze(const char *vs, const p_draw *dw, const p_draw_idx *di
        canvas is also learned for the picture settings and Hide the HUD; without the ratio check a 16:9 window squeezed
        every UI quad to nothing once it was known (the HUD and menus vanished). */
     static int off = -1; if (off < 0) { const char *e = getenv("TOTK_UI_SQUEEZE"); off = e && !strcmp(e, "0"); }
+    /* Menu flash (docs/settings.md, Known issues): a UI quad drawn before this frame's first TOTK_MFX UI shader (g_uw_ui
+       still 0) is left unsqueezed, so it comes out stretched for that frame. Suspected while a menu opens or closes,
+       when the game may draw the menu's own quads (uw_ui_vs's extra shaders: tab labels, map icons) first. Logged (the
+       first 40, frame and shader) to confirm; TOTK_UI_SQUEEZE_EARLY=1 squeezes them as well (unverified, off). */
+    static int early = -1; if (early < 0) { const char *e = getenv("TOTK_UI_SQUEEZE_EARLY"); early = e && !strcmp(e, "1"); }
+    if (!off && !g_uw_ui && vs && uw_ui_vs(vs) && (dw ? dw->count : di ? di->count : 0) == 6 && uw_on_canvas() && tw && th && uw_ratio() > 0) {
+        static int n; if (n < 40) { n++; MLOG("[uw] F%llu: UI quad (vs %.8s) before the UI began: %s", (unsigned long long)atomic_load(&g_cur_frame), vs, early ? "squeezed (TOTK_UI_SQUEEZE_EARLY=1)" : "not squeezed"); }
+        if (early) { totk_ui_squeeze(uw_ratio(), ux, uy); return; }
+    }
     if (off || !g_uw_ui || !vs || !uw_ui_vs(vs) || (dw ? dw->count : di ? di->count : 0) != 6 || !uw_on_canvas() || !tw || !th) return;
     /* The game lays its UI out for 16:9 and maps it onto the canvas; the picture is shown at the ratio of key 4 (on a
        16:9 canvas: the present stretches it there) or at the canvas's own shape (a canvas as wide as the screen,

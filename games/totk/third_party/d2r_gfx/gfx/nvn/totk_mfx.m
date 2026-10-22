@@ -266,6 +266,13 @@ int mfx_frame_prepare(double frame_s) {
 void mfx_frame_abort(void) { g.enc_depth = nil; g.prev_ok = g.hist_ok = 0; g.skip_busy++; }
 NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> heap, NSUInteger stamp) {
     id<MTLTexture> depth = g.enc_depth; g.enc_depth = nil; g.last_depth = depth; g.last_slot = s;
+    /* Our scene / UI / motion / output textures also made resident on this command buffer itself (the caller has just
+       begun it), not only through the queue (mfx_snapshot_scene adds g.rs to the queue once): an Apple developer forum
+       report (thread 840795) has MTL4FXFrameInterpolator writing nothing unless a residency set holding its textures is
+       attached to the command buffer after beginCommandBufferWithAllocator:. Harmless where the queue's set already
+       works (TOTK); TOTK_MFX_CB_RESIDENCY=0 leaves it to the queue alone, as before. */
+    static int cb_rs = -1; if (cb_rs < 0) { const char *e = getenv("TOTK_MFX_CB_RESIDENCY"); cb_rs = !e || strcmp(e, "0"); }
+    if (cb_rs && g.rs) [cb useResidencySet:g.rs];
     [g.mv_args[s] setTexture:depth.gpuResourceID atIndex:0]; [g.mv_args[s] setTexture:g.mv.gpuResourceID atIndex:1]; [g.mv_args[s] setAddress:g.mv_par[s].gpuAddress atIndex:0];
     id<MTL4ComputeCommandEncoder> e = [cb computeCommandEncoder];
     [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];   // the game's frame is done

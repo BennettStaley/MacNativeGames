@@ -259,7 +259,13 @@ in two files are separate cheats. **Reset this tab** and **Reset everything…**
 ## Known issues
 
 - With *Aspect ratio* filling a screen that is not 16:9, the game's pause menu, inventory and map (drawn at 16:9, outside
-  the extended view) sometimes flash for a frame while opening or closing. Seen on a Mac (2026-10-21); not yet looked into.
+  the extended view) sometimes flash for a frame while opening or closing. Seen on a Mac (2026-10-21), frame
+  interpolation off. Ruled out from that session's log: the canvas the UI is squeezed in changes only when the output
+  resolution changes, not with menus, and the aspect ratio and its field-of-view factor are set once, not per frame.
+  Suspects, not yet confirmed in game: (1) a UI quad drawn before the frame's first main UI shader is left unsqueezed
+  (`nvn_mtl.m` `uw_ui_squeeze`; the log now says `UI quad ... before the UI began`, and `TOTK_UI_SQUEEZE_EARLY=1`
+  squeezes those too); (2) a full-screen fade or dimming quad of the menu is squeezed into the middle 16:9 like the
+  rest of the UI, so the bands outside it miss the fade for those frames.
 
 ## The file
 
