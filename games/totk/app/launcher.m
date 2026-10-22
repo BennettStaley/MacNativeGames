@@ -388,6 +388,8 @@ int main(int argc, char **argv) {
         setenv("TOTK_ROMFS_MODS", [data stringByAppendingPathComponent:@"mods/" TOTK_GAME_DIR].fileSystemRepresentation, 0);
         /* Cheats (runtime/cheat_files.h): <build ID>.txt files in <data>/cheats, read at every start; a test's own folder wins. */
         setenv("TOTK_CHEATS_DIR", [data stringByAppendingPathComponent:@"cheats"].fileSystemRepresentation, 0);
+        /* The community cheat list the game downloads (runtime/cheat_db_fetch.h): <data>/cheats-db; a test's own folder wins. */
+        setenv("TOTK_CHEATS_DB_DIR", [data stringByAppendingPathComponent:@"cheats-db"].fileSystemRepresentation, 0);
         /* The game's language (runtime/services.c): the app's first preferred language, which also follows a per-app
            language (defaults write org.macnativegames.totk AppleLanguages -array pt-BR). TOTK_LANG still overrides it. */
         NSString *preferred = NSLocale.preferredLanguages.firstObject;

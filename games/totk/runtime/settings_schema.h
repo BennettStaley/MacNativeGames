@@ -119,6 +119,10 @@ static const SettingDef SETTINGS[] = {
        is downloaded and the new ones are prepared from the player's own game files in the background. Download only. */
     {"interface.download_shaders", "Interface", "Download new shaders", "Once a day, gets the shared list of shaders other players met and prepares the new ones from your game files in the background, so you do not stutter there. Download only: nothing is uploaded.",
      NULL, SET_BOOL, SET_LIVE, SET_MAC, 1, 0, 0, 1, 1, NULL, NULL, 0, "iPhone and iPad cannot prepare shaders while playing; their app carries the list from its build.", NULL, 0},
+    /* The community cheat list (runtime/cheat_db_fetch.h): once a day this game version's part of sthetix/nx-cheats-db is
+       downloaded for the Cheats tab. Download only. */
+    {"interface.download_cheats", "Interface", "Download cheat list", "Once a day, gets the community cheat list for this game version, so the Cheats tab offers its cheats without any files. Download only: nothing is uploaded.",
+     NULL, SET_BOOL, SET_LIVE, SET_MAC, 1, 0, 0, 1, 1, NULL, NULL, 0, "Cheats are on the Mac only for now.", NULL, 0},
     {"interface.touch_controls", "Interface", "Touch controls", "When the on-screen controller shows.",
      NULL, SET_CHOICE, SET_LIVE, SET_IOS, 1, 1, 0, 0, 0, NULL, SET_TOUCH, SET_N(SET_TOUCH), "Only on iPhone and iPad.", NULL, 0},
     {"interface.touch_opacity", "Interface", "Touch control opacity", NULL,

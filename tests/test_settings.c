@@ -100,7 +100,7 @@ int main(void) {
     for (int p = 0; p < SETTINGS_NPAGES; p++)
         expect(strcmp(SETTINGS_PAGES[p], "Mods") && strcmp(SETTINGS_PAGES[p], "Cheats"), "Mods and Cheats are the Mac's own tabs, not settings pages (Reset all leaves them alone)");
     for (int i = 0; i < SETTINGS_COUNT; i++) expect(strncmp(SETTINGS[i].key, "cheats.", 7) != 0, "cheats are not settings: settings.txt and Reset all never hold them");
-    expect(SETTINGS_COUNT == 35, "35 settings");
+    expect(SETTINGS_COUNT == 36, "36 settings");
     {
         const SettingDef *ds = &SETTINGS[settings_index("interface.download_shaders")];
         expect(ds->type == SET_BOOL && ds->def_mac == 1 && ds->def_ios == 0 && ds->apply == SET_LIVE && ds->platforms == SET_MAC &&
@@ -108,6 +108,14 @@ int main(void) {
                "download new shaders: on by default on the Mac, live, no start variable, greyed on iPhone and iPad");
         settings_defaults(v, 0);
         expect(settings_parse_text("interface.download_shaders = off\n", v) == 1 && value(v, "interface.download_shaders") == 0, "download new shaders off parses");
+    }
+    {
+        const SettingDef *dc = &SETTINGS[settings_index("interface.download_cheats")];
+        expect(dc->type == SET_BOOL && dc->def_mac == 1 && dc->def_ios == 0 && dc->apply == SET_LIVE && dc->platforms == SET_MAC &&
+               !dc->env && !strcmp(dc->page, "Interface") && dc->unavailable,
+               "download cheat list: on by default on the Mac, live, no start variable, greyed on iPhone and iPad");
+        settings_defaults(v, 0);
+        expect(settings_parse_text("interface.download_cheats = off\n", v) == 1 && value(v, "interface.download_cheats") == 0, "download cheat list off parses");
     }
     {
         const SettingDef *lf = &SETTINGS[settings_index("graphics.lens_flare")];

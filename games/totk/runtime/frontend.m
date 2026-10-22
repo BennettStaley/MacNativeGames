@@ -372,6 +372,7 @@ void runtime_front_run(void(*callback)(void)){
      invisible and untouchable for the user; the game's own "shot" command still captures the full picture. */
   if(background_run()){window.alphaValue=0.01;window.ignoresMouseEvents=YES;window.level=NSFloatingWindowLevel;[window orderFrontRegardless];}else if(assume_focus()){[window orderFrontRegardless];}else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{note_occlusion(" 3 s after opening");});
+  [TOTKCheatDb boot];   /* the community cheat list for the Cheats tab, in the background (runtime/cheat_db_fetch.h) */
   atomic_store(&focused,1);
   if(CVDisplayLinkCreateWithActiveCGDisplays(&displayLink)||CVDisplayLinkSetOutputCallback(displayLink,vsync_callback,NULL)||CVDisplayLinkStart(displayLink))runtime_fail("native display link initialization");
   pthread_t guest;pthread_attr_t attr;pthread_attr_init(&attr);pthread_attr_setstacksize(&attr,8*1024*1024);int err=pthread_create(&guest,&attr,guest_main,(void *)callback);pthread_attr_destroy(&attr);if(err)runtime_fail("native game thread creation");
