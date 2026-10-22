@@ -96,15 +96,41 @@ int main(void) {
     expect(value(v, "graphics.shadow_res") == 2, "TOTK_SHADOW_RES=2 shows as 2x");
     unsetenv("TOTK_FOG"); unsetenv("TOTK_SHADOW_RES");
     /* World page (runtime/world_patch.h): the time of day in percent, paused included; the render distance in 25 % steps. */
-    expect(SETTINGS_NPAGES == 7 && !strcmp(SETTINGS_PAGES[SETTINGS_NPAGES - 1], "World"), "World is the last settings page (the Mac adds Mods and Cheats after it, settings_panel_mac.h)");
-    for (int p = 0; p < SETTINGS_NPAGES; p++)
-        expect(strcmp(SETTINGS_PAGES[p], "Mods") && strcmp(SETTINGS_PAGES[p], "Cheats"), "Mods and Cheats are the Mac's own tabs, not settings pages (Reset all leaves them alone)");
+    /* The menu: Game, Graphics, Content, Tools; every settings page is exactly one section of them, in the same order. */
+    expect(SETTINGS_NTABS == 4 && !strcmp(SETTINGS_TABS[0], "Game") && !strcmp(SETTINGS_TABS[3], "Tools"), "four top tabs");
+    {
+        int seen = 0, last_tab = 0;
+        for (int k = 0; k < SETTINGS_NSECTIONS; k++) {
+            const SettingsSection *sec = &SETTINGS_SECTIONS[k];
+            expect(sec->tab >= last_tab && sec->tab < SETTINGS_NTABS, "sections are grouped by tab, in tab order");
+            last_tab = sec->tab;
+            if (sec->kind != MENU_SETTINGS) {
+                for (int p = 0; p < SETTINGS_NPAGES; p++) expect(strcmp(SETTINGS_PAGES[p], sec->name) != 0, "Mods, Saves, Cheats and Spawn hold no settings (Reset leaves them alone)");
+                continue;
+            }
+            expect(seen < SETTINGS_NPAGES && !strcmp(SETTINGS_PAGES[seen], sec->name), "settings pages follow the menu's order");
+            seen++;
+        }
+        expect(seen == SETTINGS_NPAGES, "every settings page is a section");
+        for (int t = 0; t < SETTINGS_NTABS; t++) expect(settings_tab_sections(t) >= 3 && settings_tab_sections(t) <= 5, "three to five sections a tab");
+        expect(SETTINGS_SECTIONS[settings_tab_first(3) + 1].kind == MENU_SPAWN, "Tools: Cheats, then Spawn");
+        int tabs_of[SETTINGS_COUNT];
+        for (int i = 0; i < SETTINGS_COUNT; i++) { tabs_of[i] = 0; for (int t = 0; t < SETTINGS_NTABS; t++) tabs_of[i] += settings_in_tab(i, t); }
+        for (int i = 0; i < SETTINGS_COUNT; i++) expect(tabs_of[i] == 1, "every setting is on exactly one tab (Reset this tab)");
+        expect(!strcmp(SETTINGS[settings_index("graphics.interpolation")].page, "Frame rate"), "frame interpolation sits with the frame rate");
+        expect(!strcmp(SETTINGS[settings_index("interface.hide_hud")].page, "Camera") && settings_in_tab(settings_index("interface.hide_hud"), 3),
+               "Hide the HUD: Tools > Camera");
+        expect(!strcmp(SETTINGS[settings_index("world.time_speed")].page, "World") && settings_in_tab(settings_index("world.time_speed"), 3),
+               "time of day: Tools > World");
+        expect(settings_in_tab(settings_index("interface.download_cheats"), 2) && settings_in_tab(settings_index("graphics.bloom"), 1) &&
+               settings_in_tab(settings_index("audio.volume"), 0), "Downloads on Content, effects on Graphics, audio on Game");
+    }
     for (int i = 0; i < SETTINGS_COUNT; i++) expect(strncmp(SETTINGS[i].key, "cheats.", 7) != 0, "cheats are not settings: settings.txt and Reset all never hold them");
     expect(SETTINGS_COUNT == 36, "36 settings");
     {
         const SettingDef *ds = &SETTINGS[settings_index("interface.download_shaders")];
         expect(ds->type == SET_BOOL && ds->def_mac == 1 && ds->def_ios == 0 && ds->apply == SET_LIVE && ds->platforms == SET_MAC &&
-               !ds->env && !strcmp(ds->page, "Interface") && ds->unavailable,
+               !ds->env && !strcmp(ds->page, "Downloads") && ds->unavailable,
                "download new shaders: on by default on the Mac, live, no start variable, greyed on iPhone and iPad");
         settings_defaults(v, 0);
         expect(settings_parse_text("interface.download_shaders = off\n", v) == 1 && value(v, "interface.download_shaders") == 0, "download new shaders off parses");
@@ -112,7 +138,7 @@ int main(void) {
     {
         const SettingDef *dc = &SETTINGS[settings_index("interface.download_cheats")];
         expect(dc->type == SET_BOOL && dc->def_mac == 1 && dc->def_ios == 0 && dc->apply == SET_LIVE && dc->platforms == SET_MAC &&
-               !dc->env && !strcmp(dc->page, "Interface") && dc->unavailable,
+               !dc->env && !strcmp(dc->page, "Downloads") && dc->unavailable,
                "download cheat list: on by default on the Mac, live, no start variable, greyed on iPhone and iPad");
         settings_defaults(v, 0);
         expect(settings_parse_text("interface.download_cheats = off\n", v) == 1 && value(v, "interface.download_cheats") == 0, "download cheat list off parses");

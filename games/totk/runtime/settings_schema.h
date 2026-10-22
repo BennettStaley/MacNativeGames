@@ -30,8 +30,29 @@ typedef struct {
     const char *shown_key; int shown_value;   /* shown only while that setting has that value (NULL: always) */
 } SettingDef;
 
-static const char *const SETTINGS_PAGES[] = {"Display", "Graphics", "Frame rate", "Interface", "Controls", "Audio", "World"};
+/* The menu: four top tabs, each a row of sections. A section either lists the settings whose page is its name
+   (SETTINGS_PAGES, in menu order: settings.txt is grouped the same way) or is a page of its own (Mods, Saves, Cheats,
+   Spawn), which holds no settings, so Reset never touches mods, saves, cheats or the spawner's favorites. */
+static const char *const SETTINGS_PAGES[] = {"Display", "Frame rate", "Controls", "Audio", "Interface", "Image", "Effects",
+                                             "World detail", "Downloads", "World", "Camera"};
 enum { SETTINGS_NPAGES = sizeof SETTINGS_PAGES / sizeof *SETTINGS_PAGES };
+static const char *const SETTINGS_TABS[] = {"Game", "Graphics", "Content", "Tools"};
+enum { SETTINGS_NTABS = sizeof SETTINGS_TABS / sizeof *SETTINGS_TABS };
+enum { MENU_SETTINGS, MENU_MODS, MENU_SAVES, MENU_CHEATS, MENU_SPAWN };
+typedef struct { int tab; const char *name; int kind; } SettingsSection;
+static const SettingsSection SETTINGS_SECTIONS[] = {
+    {0, "Display", MENU_SETTINGS}, {0, "Frame rate", MENU_SETTINGS}, {0, "Controls", MENU_SETTINGS}, {0, "Audio", MENU_SETTINGS},
+    {0, "Interface", MENU_SETTINGS},
+    {1, "Image", MENU_SETTINGS}, {1, "Effects", MENU_SETTINGS}, {1, "World detail", MENU_SETTINGS},
+    {2, "Mods", MENU_MODS}, {2, "Saves", MENU_SAVES}, {2, "Downloads", MENU_SETTINGS},
+    {3, "Cheats", MENU_CHEATS}, {3, "Spawn", MENU_SPAWN}, {3, "World", MENU_SETTINGS}, {3, "Camera", MENU_SETTINGS},
+};
+enum { SETTINGS_NSECTIONS = sizeof SETTINGS_SECTIONS / sizeof *SETTINGS_SECTIONS };
+/* The first section of a tab and how many it has. */
+static inline int settings_tab_first(int tab) { for (int i = 0; i < SETTINGS_NSECTIONS; i++) if (SETTINGS_SECTIONS[i].tab == tab) return i; return 0; }
+static inline int settings_tab_sections(int tab) { int n = 0; for (int i = 0; i < SETTINGS_NSECTIONS; i++) n += SETTINGS_SECTIONS[i].tab == tab; return n; }
+/* 1 when setting i belongs to a section of the tab (Reset this tab). */
+static inline int settings_in_tab(int i, int tab);
 
 /* Auto (steady): the highest rate that divides the display's and that the game holds (totk_autocap.h). */
 static const SettingChoice SET_CAP[] = {{"Auto (steady)", "auto", "auto", -1}, {"30 fps", "30", "30", 30}, {"40 fps", "40", "40", 40},
@@ -70,7 +91,7 @@ static const SettingChoice SET_TIME_SPEED[] = {{"Paused", "paused", "0", 0}, {"0
 #define SET_N(a) (int)(sizeof a / sizeof *a)
 
 static const SettingDef SETTINGS[] = {
-    {"graphics.interpolation", "Graphics", "Frame interpolation", "MetalFX makes a frame between two game frames.",
+    {"graphics.interpolation", "Frame rate", "Frame interpolation", "MetalFX makes a frame between two game frames.",
      "TOTK_MFX", SET_CHOICE, SET_LIVE, SET_MAC | SET_IPAD, 0, 0, 0, 0, 0, NULL, SET_INTERP, SET_N(SET_INTERP),
      "Not tested on iPhone yet.", NULL, 0},
     {"display.output", "Display", "Output resolution", "The picture the game composes, text and icons included. Display native is your screen's pixels.",
@@ -83,27 +104,27 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_CHOICE, SET_LIVE, SET_MAC, 1, 1, 0, 0, 0, NULL, SET_ASPECT, SET_N(SET_ASPECT), "Not on iPhone and iPad yet.", NULL, 0},
     {"display.headroom", "Display", "Maximum output", "The biggest output resolution you can switch to while playing. Higher sets more memory aside; takes effect after a restart.",
      "TOTK_OUTPUT_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_HEADROOM, SET_N(SET_HEADROOM), "Fixed on iPhone and iPad.", NULL, 0},
-    {"graphics.fov", "Graphics", "Field of view", "How wide the camera sees, against the game's own (version 1.4.3).",
+    {"graphics.fov", "World detail", "Field of view", "How wide the camera sees, against the game's own (version 1.4.3).",
      "TOTK_FOV", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 70, 140, 5, "%", NULL, 0, NULL, NULL, 0},
-    {"graphics.fog", "Graphics", "Cave fog", "The fog in caves and other enclosed places, against the game's own: 50% reaches it at twice the distance, 0% has none. The outdoor haze is separate and not changed yet (version 1.4.3).",
+    {"graphics.fog", "Effects", "Cave fog", "The fog in caves and other enclosed places, against the game's own: 50% reaches it at twice the distance, 0% has none. The outdoor haze is separate and not changed yet (version 1.4.3).",
      "TOTK_FOG", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 0, 100, 10, "%", NULL, 0, NULL, NULL, 0},
-    {"graphics.shadow_res", "Graphics", "Shadow resolution", "The sun's shadow map: 2x and 4x give sharper shadow edges and use more memory (version 1.4.3).",
+    {"graphics.shadow_res", "World detail", "Shadow resolution", "The sun's shadow map: 2x and 4x give sharper shadow edges and use more memory (version 1.4.3).",
      "TOTK_SHADOW_RES", SET_CHOICE, SET_LIVE, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_SHADOW, SET_N(SET_SHADOW), "Not on iPhone and iPad yet.", NULL, 0},
-    {"graphics.aa", "Graphics", "Anti-aliasing", "Smooths the 3D scene's edges before the game draws its text and icons on top (version 1.4.3).",
+    {"graphics.aa", "Image", "Anti-aliasing", "Smooths the 3D scene's edges before the game draws its text and icons on top (version 1.4.3).",
      "TOTK_AA", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_AA, SET_N(SET_AA), NULL, NULL, 0},
-    {"graphics.sharpen", "Graphics", "Sharpening", "AMD FidelityFX CAS on the finished picture, under the text and icons.",
+    {"graphics.sharpen", "Image", "Sharpening", "AMD FidelityFX CAS on the finished picture, under the text and icons.",
      "TOTK_SHARPEN", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, 0, 100, 5, "%", NULL, 0, NULL, NULL, 0},
-    {"graphics.aniso", "Graphics", "Anisotropic filtering", "Sharper ground and walls seen at an angle.",
+    {"graphics.aniso", "Image", "Anisotropic filtering", "Sharper ground and walls seen at an angle.",
      "TOTK_ANISO", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_ANISO, SET_N(SET_ANISO), NULL, NULL, 0},
-    {"graphics.dof", "Graphics", "Depth of field", "The game's blur of the distance. Off keeps far away sharp (version 1.4.3).",
+    {"graphics.dof", "Effects", "Depth of field", "The game's blur of the distance. Off keeps far away sharp (version 1.4.3).",
      NULL, SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
-    {"graphics.bloom", "Graphics", "Bloom", "The glow around bright light, against the game's own (version 1.4.3).",
+    {"graphics.bloom", "Effects", "Bloom", "The glow around bright light, against the game's own (version 1.4.3).",
      NULL, SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 0, 100, 10, "%", NULL, 0, NULL, NULL, 0},
-    {"graphics.lens_flare", "Graphics", "Lens flare", "The game's rings and glints across the picture when the sun is in view (version 1.4.3).",
+    {"graphics.lens_flare", "Effects", "Lens flare", "The game's rings and glints across the picture when the sun is in view (version 1.4.3).",
      NULL, SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
-    {"graphics.render_distance", "Graphics", "Render distance", "How far the camera draws before distant land is cut off, against the game's own 25 km (version 1.4.3). It does not change the detail of distant land.",
+    {"graphics.render_distance", "World detail", "Render distance", "How far the camera draws before distant land is cut off, against the game's own 25 km (version 1.4.3). It does not change the detail of distant land.",
      "TOTK_RENDER_DISTANCE", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 50, 300, 25, "%", NULL, 0, NULL, NULL, 0},
-    {"graphics.lod_bias", "Graphics", "Texture detail bias", "Below 0 picks sharper texture levels, in hundredths of a level; too low shimmers.",
+    {"graphics.lod_bias", "Image", "Texture detail bias", "Below 0 picks sharper texture levels, in hundredths of a level; too low shimmers.",
      "TOTK_LOD_BIAS", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, -100, 0, 25, NULL, NULL, 0, NULL, NULL, 0},
     {"framerate.cap", "Frame rate", "Frame rate limit", "The most frames a second the game draws. Auto picks the highest steady rate the game holds (120, 60, 40 or 30 on a 120 Hz display), so frames never alternate between one and two refreshes. 40 needs a 120 Hz display.",
      "TOTK_UNCAPPED_HZ", SET_CHOICE, SET_LIVE, SET_ALL, -1, 0, 0, 0, 0, NULL, SET_CAP, SET_N(SET_CAP), NULL, NULL, 0},
@@ -111,17 +132,17 @@ static const SettingDef SETTINGS[] = {
      "TOTK_HINTS", SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"interface.readout_detail", "Interface", "Readout detail", "Detailed adds the average and the 1% low frame rate over the last 5 seconds.",
      NULL, SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_DETAIL, SET_N(SET_DETAIL), NULL, "interface.readout", 1},
-    {"interface.hide_hud", "Interface", "Hide the HUD", "Hides the game's hearts, map, prompts and menus for clean screenshots (F2 on a Mac keyboard). Turn it off to use menus.",
+    {"interface.hide_hud", "Camera", "Hide the HUD", "Hides the game's hearts, map, prompts and menus for clean screenshots (F2 on a Mac keyboard). Turn it off to use menus.",
      NULL, SET_BOOL, SET_LIVE, SET_ALL, 0, 0, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"interface.shader_counter", "Interface", "Shader counter", "New shaders collected while you play.",
      "TOTK_SHADER_OVERLAY", SET_BOOL, SET_LIVE, SET_ALL, 1, 0, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     /* The shared shader list (third_party/d2r_gfx/gfx/nvn/totk_shader_list.m): once a day the list of variants players met
        is downloaded and the new ones are prepared from the player's own game files in the background. Download only. */
-    {"interface.download_shaders", "Interface", "Download new shaders", "Once a day, gets the shared list of shaders other players met and prepares the new ones from your game files in the background, so you do not stutter there. Download only: nothing is uploaded.",
+    {"interface.download_shaders", "Downloads", "Download new shaders", "Once a day, gets the shared list of shaders other players met and prepares the new ones from your game files in the background, so you do not stutter there. Download only: nothing is uploaded.",
      NULL, SET_BOOL, SET_LIVE, SET_MAC, 1, 0, 0, 1, 1, NULL, NULL, 0, "iPhone and iPad cannot prepare shaders while playing; their app carries the list from its build.", NULL, 0},
     /* The community cheat list (runtime/cheat_db_fetch.h): once a day this game version's part of sthetix/nx-cheats-db is
        downloaded for the Cheats tab. Download only. */
-    {"interface.download_cheats", "Interface", "Download cheat list", "Once a day, gets the community cheat list for this game version, so the Cheats tab offers its cheats without any files. Download only: nothing is uploaded.",
+    {"interface.download_cheats", "Downloads", "Download cheat list", "Once a day, gets the community cheat list for this game version, so the Cheats tab offers its cheats without any files. Download only: nothing is uploaded.",
      NULL, SET_BOOL, SET_LIVE, SET_MAC, 1, 0, 0, 1, 1, NULL, NULL, 0, "Cheats are on the Mac only for now.", NULL, 0},
     {"interface.touch_controls", "Interface", "Touch controls", "When the on-screen controller shows.",
      NULL, SET_CHOICE, SET_LIVE, SET_IOS, 1, 1, 0, 0, 0, NULL, SET_TOUCH, SET_N(SET_TOUCH), "Only on iPhone and iPad.", NULL, 0},
@@ -150,6 +171,11 @@ static const SettingDef SETTINGS[] = {
 };
 enum { SETTINGS_COUNT = sizeof SETTINGS / sizeof *SETTINGS };
 
+static inline int settings_in_tab(int i, int tab) {
+    for (int k = 0; k < SETTINGS_NSECTIONS; k++)
+        if (SETTINGS_SECTIONS[k].tab == tab && SETTINGS_SECTIONS[k].kind == MENU_SETTINGS && !strcmp(SETTINGS[i].page, SETTINGS_SECTIONS[k].name)) return 1;
+    return 0;
+}
 static inline int settings_index(const char *key) {
     for (int i = 0; i < SETTINGS_COUNT; i++) if (!strcmp(SETTINGS[i].key, key)) return i;
     return -1;
