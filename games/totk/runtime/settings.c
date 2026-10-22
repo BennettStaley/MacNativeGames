@@ -27,11 +27,30 @@ int settings_ios(void) { return TARGET_OS_IPHONE ? 1 : 0; }
 static unsigned disp_w, disp_h, native_w;
 static const float aspect_ratios[] = {-1, 0, 16.0f / 10, 21.0f / 9, 32.0f / 9};   /* display.aspect's choices, as runtime_aspect_set takes them */
 static char display_status[160];
+static unsigned display_cw = 1920, display_ch = 1080;   /* the display resolution last asked for */
+extern void runtime_render_reserve(unsigned *w, unsigned *h);
+/* The render resolution a scale gives at a display resolution: 0 = the game's own (1600 x 900 for each 1920 of width,
+   while that fits the reserve); otherwise the share of each side, at most what the render target heaps sized at start
+   hold (the reserve, 2560 x 1440). *own: 1 while the game picks the size itself. Returns 1 when the reserve capped it. */
+static int render_size(unsigned cw, unsigned ch, int scale, unsigned *sw, unsigned *sh, int *own) {
+    unsigned rw, rh; runtime_render_reserve(&rw, &rh);
+    int own_fits = !rw || cw <= 1920 || (uint64_t)(1600 * cw / 1920) * (900 * cw / 1920) <= (uint64_t)rw * rh, capped = 0;
+    *own = !scale && own_fits;
+    if (*own) { *sw = 1600 * cw / 1920 & ~7u; *sh = 900 * cw / 1920 & ~7u; return 0; }
+    unsigned pct = scale ? (unsigned)scale : 83;
+    *sw = cw * pct / 100; *sh = ch * pct / 100;
+    if (rw && (uint64_t)*sw * *sh > (uint64_t)rw * rh) { capped = 1; double f = sqrt((double)rw * rh / ((double)*sw * *sh)); *sw = (unsigned)(*sw * f); *sh = (unsigned)(*sh * f); }
+    *sw &= ~7u; *sh &= ~7u; if (*sw < 64) *sw = 64; if (*sh < 64) *sh = 64;
+    return capped;
+}
+int settings_render_size(int scale, unsigned *w, unsigned *h) {
+    int own; pthread_mutex_lock(&lock); unsigned cw = display_cw, ch = display_ch; pthread_mutex_unlock(&lock);
+    return render_size(cw, ch, scale, w, h, &own);
+}
 static int display_apply(const char *changed) {
     extern int runtime_output_request(unsigned w, unsigned h);
     extern void runtime_output_max(unsigned *w, unsigned *h);
     extern int runtime_render_request(unsigned w, unsigned h);
-    extern void runtime_render_reserve(unsigned *w, unsigned *h);
     extern void runtime_aspect_set(float ratio);
     extern void mtl_rt_size_changed(void);   /* old-size render targets may be released once idle (nvn_mtl.m stor_sweep) */
     mtl_rt_size_changed();
@@ -50,17 +69,9 @@ static int display_apply(const char *changed) {
         cw = want; ch = want * 9 / 16;
         if (runtime_output_request(cw, ch)) r = -1;
     }
-    unsigned sw = 0, sh = 0, rw, rh; int capped = 0; runtime_render_reserve(&rw, &rh);
-    /* The game's own scene grows with the output (1600 x 900 for each 1920 of width); above the reserve it is asked for
-       explicitly, at the most the reserve holds. */
-    int own_fits = !rw || cw <= 1920 || (uint64_t)(1600 * cw / 1920) * (900 * cw / 1920) <= (uint64_t)rw * rh;
-    if (scale || !own_fits) {
-        unsigned pct = scale ? (unsigned)scale : 83;
-        sw = cw * pct / 100; sh = ch * pct / 100;
-        if ((uint64_t)sw * sh > (uint64_t)rw * rh) { capped = 1; double f = sqrt((double)rw * rh / ((double)sw * sh)); sw = (unsigned)(sw * f); sh = (unsigned)(sh * f); }
-        sw &= ~7u; sh &= ~7u; if (sw < 64) sw = 64; if (sh < 64) sh = 64;
-    }
-    if (runtime_render_request(sw, sh)) r = -1;
+    unsigned sw, sh; int own, capped = render_size(cw, ch, scale, &sw, &sh, &own);
+    unsigned ask_w = own ? 0 : sw, ask_h = own ? 0 : sh;   /* 0 x 0: leave the game its own size */
+    if (runtime_render_request(ask_w, ask_h)) r = -1;
     if (!settings_ios() && (!changed || !strcmp(changed, "display.aspect"))) {
         /* The shape is key 4's engine (aspect_patch.h): "Fill the screen" is its fit step, which follows the window
            (frontend.m runtime_aspect_view); a fixed shape is its wide step, 16:9 the game's own. Vert+ (a screen taller
@@ -69,9 +80,9 @@ static int display_apply(const char *changed) {
     }
     pthread_mutex_lock(&lock);
     /* What the two settings make together: the picture (text and icons drawn at it) and the 3D world stretched to it. */
-    if (sw) snprintf(display_status, sizeof display_status, "Picture %u×%u · 3D world %u×%u (%u%%%s)", cw, ch, sw, sh,
-                     sw * 100 / cw, capped ? ", the most it can be" : "");
-    else snprintf(display_status, sizeof display_status, "Picture %u×%u · 3D world %u×%u (the game's own)", cw, ch, 1600 * cw / 1920 & ~7u, 900 * cw / 1920 & ~7u);
+    display_cw = cw; display_ch = ch;
+    snprintf(display_status, sizeof display_status, "Display %u×%u · Render %u×%u%s", cw, ch, sw, sh,
+             own ? " (the game's own)" : capped ? " (1440p, the most it can be)" : "");
     pthread_mutex_unlock(&lock);
     fprintf(stderr, "[settings] display: %s%s\n", display_status, r ? " (a size waits for the next start)" : "");
     return r;

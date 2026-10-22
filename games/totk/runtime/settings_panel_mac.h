@@ -193,7 +193,12 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
     if (d->type == SET_BOOL) { NSSwitch *s = [NSSwitch new]; s.state = v ? NSControlStateValueOn : NSControlStateValueOff; c = s; }
     else if (d->type == SET_CHOICE) {
         NSPopUpButton *p = [NSPopUpButton new];
-        for (int k = 0; k < d->nchoices; k++) { [p addItemWithTitle:@(d->choices[k].label)]; if (d->choices[k].value == v) [p selectItemAtIndex:k]; }
+        BOOL render = !strcmp(d->key, "display.scale");   /* each render resolution with the size it gives at this display resolution */
+        for (int k = 0; k < d->nchoices; k++) {
+            NSString *t = @(d->choices[k].label); unsigned w, h;
+            if (render) { int capped = settings_render_size(d->choices[k].value, &w, &h); t = [NSString stringWithFormat:@"%@ · %u×%u%@", t, w, h, capped ? @" (max)" : @""]; }
+            [p addItemWithTitle:t]; if (d->choices[k].value == v) [p selectItemAtIndex:k];
+        }
         [p.widthAnchor constraintEqualToConstant:190].active = YES; c = p;
     } else {
         NSSlider *s = [NSSlider sliderWithValue:v minValue:d->min maxValue:d->max target:nil action:nil];

@@ -46,16 +46,17 @@ on iPhone and iPad close the app from the app switcher and open it again.
 
 | Setting | What it does |
 |---|---|
-| **Output resolution** | The picture the game composes, its text and icons included: *Match the window*, *Display native* (your screen's panel pixels, 3456 wide on a 16" MacBook Pro, whatever scaling macOS uses), 4K, 1440p, 1080p (the game's own), 900p, 720p or a *Custom width* (height at 16:9). Live, up to the maximum output. Mac only: iPhone and iPad show 720p. |
-| **3D render scale** | The 3D scene against the output: *The game's own* (about 83 %), or 25–200 %. 50 % of a 3456-wide output renders 1728×972; above 100 % renders more pixels than the output (supersampling). The scene is capped at 2560×1440 (see below). |
+| **Display resolution** | The finished picture, its text and icons included: *Match the window*, *Display native* (your screen's panel pixels, 3456 wide on a 16" MacBook Pro, whatever scaling macOS uses), 4K, 1440p, 1080p (the game's own), 900p, 720p or a *Custom width* (height at 16:9). Live, up to the maximum output. Mac only: iPhone and iPad show 720p. |
+| **Render resolution** | The size the 3D world is drawn at, as a share of the display resolution (each choice shows the size it gives): *The game's own* (about 83 %), or 25–200 %. 50 % of a 3456-wide output renders 1728×972; above 100 % renders more pixels than the output (supersampling). The scene is capped at 2560×1440 (see below). |
 | **Aspect ratio** | *16:9* (the game's own) or *Fill the screen*, 16:10, 21:9, 32:9. A wider shape shows more at the sides; a taller one (16:10, a MacBook in full screen) keeps the game's view across and shows more above and below. Nothing is stretched: the HUD keeps its shape in the middle 16:9 of the screen. Mac only. |
 | **Maximum output** | The biggest output you can switch to while playing; a bigger one sets more memory aside. *Auto* is 4K on a Mac with 16 GB or more, else 1440p. Applies after a restart. |
 
-How the two fit together: the **output** is the finished picture, and the game's text, icons and menus are drawn at it,
-so they are always sharp at that size. The **3D world** is drawn separately at the render scale's share of it and then
-stretched to fill the picture. A 4K output with a 50 % scale draws the world at 1920×1080 behind 4K text: faster, a
+How the two fit together: the **display resolution** is the finished picture, and the game's text, icons and menus are drawn at it,
+so they are always sharp at that size. The **3D world** is drawn separately at the **render resolution**, a share of it, and then
+stretched to fill the picture. A 4K display resolution with a 50 % render resolution draws the world at 1920×1080 behind 4K text: faster, a
 softer world, crisp HUD. The line at the top of the menu shows both sizes as they are now
-(`Picture 3840×2160 · 3D world 2560×1432 (66%, the most it can be)`).
+(`Display 3840×2160 · Render 2560×1432 (1440p, the most it can be)`). The 3D world stops at 1440p (see below), so at a
+4K display resolution anything from 67 % up draws it at 1440p.
 
 Limits and why:
 
