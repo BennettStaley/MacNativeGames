@@ -2,6 +2,7 @@
 #import "mods_menu.h"
 #import "saves_menu.h"
 #import "spawn_menu.h"
+#import "power.h"
 #import <GameController/GameController.h>
 #import <Metal/Metal.h>
 #include <os/proc.h>
@@ -53,6 +54,7 @@ static unsigned device_mask(void) { return UIDevice.currentDevice.userInterfaceI
               @[@"Memory free for the game", [NSString stringWithFormat:@"%.1f GB", os_proc_available_memory() / 1e9]],
               @[@"Display", [NSString stringWithFormat:@"%ld Hz", (long)UIScreen.mainScreen.maximumFramesPerSecond]],
               @[@"Settings file", @"Files › Tears of the Kingdom › settings.txt"]];
+    [NSNotificationCenter.defaultCenter addObserver:self.tableView selector:@selector(reloadData) name:TOTKPowerCapChangedNotification object:nil];
     link = [CADisplayLink displayLinkWithTarget:self selector:@selector(poll:)];
     [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 }
@@ -131,6 +133,8 @@ static NSString *value_text(const SettingDef *d, int v) {
 
 - (NSString *)detailFor:(const SettingDef *)d {
     if (![self available:d]) return @(d->unavailable ? d->unavailable : "Not on this device.");
+    if (!strcmp(d->key, "framerate.cap") && power_cap_reason())
+        return [NSString stringWithFormat:@"Held at 30 fps while %s; your limit returns afterwards.", power_cap_reason()];
     if (settings_pending_restart(d->key)) return @"Applies the next time the game starts.";
     return d->help ? @(d->help) : nil;
 }

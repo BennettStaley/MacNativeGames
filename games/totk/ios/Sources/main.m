@@ -13,6 +13,7 @@
 #import "touch_pad.h"
 #import "settings_menu.h"
 #import "saves_menu.h"
+#import "power.h"
 #include "controller_map.h"
 #include "settings.h"
 
@@ -231,6 +232,7 @@ static void audio_observe(void) {
     /* The player's settings (runtime/settings.c): the app is its own launcher, so the start-time ones become variables here. */
     settings_init([docs stringByAppendingPathComponent:@"settings.txt"].fileSystemRepresentation);
     settings_observe(settings_changed);
+    power_observe();   // heat and Low Power Mode hold the frame rate at 30 (power.m)
     chdir(docs.fileSystemRepresentation);
     host_argv[0] = strdup("TOTK"); host_argv[1] = strdup(res.fileSystemRepresentation); host_argv[2] = strdup("boot");
     return YES;   // the window is made when the window scene connects (TOTKSceneDelegate)
