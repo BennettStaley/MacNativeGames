@@ -138,9 +138,9 @@ reimplements them independently for 1.4.3 and contains none of their code.
 
 ## Spawn
 
-Tools › Spawn creates actors a few metres in front of you, by calling the game's own
-`ActorMgr::requestCreateActorAsync` on its frame-end thread (no game code is patched). **Version 1.4.3 only**; elsewhere the
-tab says "Spawning needs 1.4.3 for now". Mac, iPad and iPhone.
+Tools › Spawn creates actors next to you, by calling the game's own `ActorMgr::requestCreateActorAsync` on its
+frame-end thread (no game code is patched). **Versions 1.0.0 and 1.4.3**; elsewhere the tab says "Spawning needs game
+version 1.0.0 or 1.4.3 for now" (1.2.1 needs its main checked first). Mac, iPad and iPhone.
 
 - **Categories**: Favorites, Recents, Creatures, NPCs, Items, Weapons, Armor, Zonai, Objects, from the actor list the build
   makes from your own game files (`build/actor_list.tsv`, `scripts/prepare_actor_list.py`). System actors are left out;
@@ -149,8 +149,12 @@ tab says "Spawning needs 1.4.3 for now". Mac, iPad and iPhone.
 - **Search** (/ or ⌘F) looks through every category while a query is typed.
 - **Amount** 1–20 (← →, − +). A, Return or a click spawns; Y or F marks a favorite. Every spawn goes to Recents.
   Favorites and recents are kept in `spawn-picks.txt` beside the profile (next to `cheats-enabled.txt`).
+- **Place**, the popup next to Amount: **In front** (3 m ahead, the default), **Above** (8 m up, so things drop in),
+  **Far** (15 m ahead) or **At Link's feet**. P, or ← on the category column with a controller, picks the next one; on
+  iPhone and iPad it is a menu in the bar. It is kept in `spawn-picks.txt` (`place above`).
+- There is no Undo yet: the game's delete call has not been matched to 1.4.3.
 - A toast in the window's corner says "Spawned Apple ×5" or why it failed. A spawn asked for during loading waits for the
-  world. Test runs: the input file's `spawn <name> [count]` works only with `TOTK_SURVEY=1` on a test profile.
+  world. Test runs: the input file's `spawn <name> [count [front|above|far|feet]]` works only with `TOTK_SURVEY=1` on a test profile.
 
 ## Cheats
 

@@ -57,7 +57,7 @@ static void spawn_observed(const char *name, int requested, int created, const c
 
 NSString *TOTKSpawnSummary(void) {
     int a = runtime_spawn_available();
-    if (a == SPAWN_ERR_UNSUPPORTED) return @"Spawning needs 1.4.3 for now.";
+    if (a == SPAWN_ERR_UNSUPPORTED) return @"Spawning needs game version 1.0.0 or 1.4.3 for now.";
     if (a != SPAWN_OK) return @"The spawner is off on this game (the log says why).";
     return @"Items, weapons, creatures and Zonai devices next to you.";
 }
@@ -72,7 +72,7 @@ NSString *TOTKSpawnSummary(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    spawn_load(); runtime_spawn_observe(spawn_observed);
+    spawn_load(); runtime_spawn_observe(spawn_observed); runtime_spawn_set_placement(spawnPicks.place);
     category = SPAWN_CAT_ITEMS; amount = 1; query = @""; cursor = -1;
     shown = malloc(sizeof *shown * (size_t)(spawnList.count ? spawnList.count : 1));
     self.title = @"Spawn";
@@ -101,11 +101,22 @@ NSString *TOTKSpawnSummary(void) {
         a.state = n == amount ? UIMenuElementStateOn : UIMenuElementStateOff; [counts addObject:a];
     }
     UIBarButtonItem *amountItem = [[UIBarButtonItem alloc] initWithTitle:[NSString stringWithFormat:@"× %d", amount] menu:[UIMenu menuWithChildren:counts]];
-    self.navigationItem.rightBarButtonItems = @[amountItem, catItem];
+    NSMutableArray *places = [NSMutableArray array];
+    for (int i = 0; i < SPAWN_PLACE_COUNT; i++) {
+        UIAction *a = [UIAction actionWithTitle:@(SPAWN_PLACE_NAMES[i]) image:nil identifier:nil handler:^(UIAction *x) { (void)x; [weak setPlace:i]; }];
+        a.state = i == spawnPicks.place ? UIMenuElementStateOn : UIMenuElementStateOff; [places addObject:a];
+    }
+    UIBarButtonItem *placeItem = [[UIBarButtonItem alloc] initWithTitle:@(SPAWN_PLACE_NAMES[spawnPicks.place]) menu:[UIMenu menuWithChildren:places]];
+    self.navigationItem.rightBarButtonItems = @[amountItem, placeItem, catItem];
 }
 - (void)choose:(int)c { category = c; cursor = -1; searchController.searchBar.text = @""; query = @""; [self rebuildMenus]; [self filter]; }
 - (void)toggleUnnamed { unnamed = !unnamed; [self rebuildMenus]; [self filter]; }
 - (void)setAmount:(int)n { amount = MAX(1, MIN(SPAWN_COUNT_MAX, n)); [self rebuildMenus]; }
+/* Where spawns go (spawn-picks.txt "place"), like the Mac tab's Place popup. */
+- (void)setPlace:(int)p {
+    spawnPicks.place = ((p % SPAWN_PLACE_COUNT) + SPAWN_PLACE_COUNT) % SPAWN_PLACE_COUNT;
+    runtime_spawn_set_placement(spawnPicks.place); spawn_picks_save(&spawnPicks); [self rebuildMenus];
+}
 - (void)updateSearchResultsForSearchController:(UISearchController *)s { query = s.searchBar.text ?: @""; cursor = -1; [self filter]; }
 
 - (void)filter {
@@ -162,7 +173,7 @@ NSString *TOTKSpawnSummary(void) {
     int r = runtime_spawn_actor(a->name, amount);
     if (r != SPAWN_OK) {
         spawn_toast([NSString stringWithFormat:@"Could not spawn %s: %@", a->display,
-                     r == SPAWN_ERR_UNSUPPORTED ? @"spawning needs 1.4.3 for now" : @(runtime_spawn_error(r))], YES);
+                     r == SPAWN_ERR_UNSUPPORTED ? @"spawning needs game version 1.0.0 or 1.4.3" : @(runtime_spawn_error(r))], YES);
         return;
     }
     spawn_picks_add_recent(&spawnPicks, a->name); spawn_picks_save(&spawnPicks);

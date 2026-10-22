@@ -61,6 +61,27 @@ int main(void) {
             check(dx * dx + dz * dz > 1.0f, "at least a metre apart");
         }
     }
+
+    /* the Place choices: in front 3 m, above 8 m up, far 15 m, at the feet; the request keeps the one it was queued with */
+    const float want[SPAWN_PLACE_COUNT][2] = {{3, 1}, {1, 8}, {15, 2}, {0, 0.3f}};   /* ahead, up */
+    for (int pl = 0; pl < SPAWN_PLACE_COUNT; pl++) {
+        spawn_place_offset(0, 1, 0, 1, pl, o);
+        check(fabsf(o[0]) < 1e-6f && fabsf(o[2] - want[pl][0]) < 1e-5f && fabsf(o[1] - want[pl][1]) < 1e-6f, "place distance and height");
+        check(spawn_place_parse(SPAWN_PLACE_WORDS[pl]) == pl && SPAWN_PLACE_NAMES[pl][0], "place word round trip");
+    }
+    spawn_place_offset(0, 1, 0, 1, 99, o);
+    check(fabsf(o[2] - 3) < 1e-6f, "an unknown place is in front");
+    check(spawn_place_parse("behind") == -1 && spawn_place_parse(NULL) == -1 && spawn_place_parse("") == -1, "unknown place words");
+    spawn_place_offset(0, 1, 0, 1, SPAWN_PLACE_FRONT, o); float front[3] = {o[0], o[1], o[2]};
+    spawn_offset(0, 1, 0, 1, 3, o);
+    check(!memcmp(front, o, sizeof front), "in front is the old placement");
+    SpawnQueue pq; memset(&pq, 0, sizeof pq); SpawnRequest pr;
+    check(spawn_queue_push_at(&pq, "Item_Fruit_A", 2, SPAWN_PLACE_FAR, NULL) == SPAWN_OK &&
+          spawn_queue_push_at(&pq, "Item_Fruit_A", 1, 42, NULL) == SPAWN_OK &&
+          spawn_queue_push(&pq, "Item_Fruit_A", 1, NULL) == SPAWN_OK, "queued with places");
+    check(spawn_queue_pop(&pq, &pr) && pr.place == SPAWN_PLACE_FAR && pr.count == 2, "the request keeps its place");
+    check(spawn_queue_pop(&pq, &pr) && pr.place == SPAWN_PLACE_FRONT, "a bad place is queued as in front");
+    check(spawn_queue_pop(&pq, &pr) && pr.place == SPAWN_PLACE_FRONT, "spawn_queue_push is in front");
     printf("actor spawn queue: %u checks passed\n", checks);
     return 0;
 }
