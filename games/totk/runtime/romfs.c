@@ -571,6 +571,7 @@ unsigned runtime_romfs_read_options(uint64_t *out,uint64_t h,int64_t off,void *b
    bytes are what the game itself reads (a mod's copy where one replaces a file). */
 const char *runtime_game_dir(void) {return TOTK_GAME_DIR;}   /* the game's modules are rewritten/<this>/ (relative to the game folder) */
 size_t runtime_romfs_file_count(void) {return image_fd<0?0:(size_t)file_count;}
+int runtime_romfs_has_file(const char *p) {return image_fd>=0&&p&&file_index(p)!=UINT64_MAX;}   /* a RomFS path (no mount name), the image's or a mod's added file */
 const char *runtime_romfs_file_name(size_t i) {return image_fd>=0&&i<file_count?entry_name(entry(i)):NULL;}
 uint8_t *runtime_romfs_host_read(const char *p,size_t *n) {
  if(image_fd<0||!p||!n||!path_ok(p))return NULL;uint64_t i=file_index(p);if(i==UINT64_MAX)return NULL;

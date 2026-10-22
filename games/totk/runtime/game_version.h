@@ -29,6 +29,10 @@
 #define GAME_ACTOR_NAME 0x218
 #define GAME_ACTOR_POS 0x2b4
 #define GAME_ACTOR_ROT 0x2c0
+/* Spawner only (actor_spawn.c, how they were found): engine::actor::ActorMgr::requestCreateActorAsync (1.0.0 0xa5fdf8) and
+   ActorMgr::sInstance (1.0.0 0x46479e0). Named, not GAME_ADDR: no other version uses them yet. */
+#define GAME_SPAWN_REQUEST_CREATE 0x599670
+#define GAME_SPAWN_ACTOR_MGR 0x3ad7450
 #define GAME_ADDR_0x69a18c 0x45ce70
 #define GAME_ADDR_0x4663f08 0x3add238
 #define GAME_ADDR_0x15ecb0c 0x1bd01c4

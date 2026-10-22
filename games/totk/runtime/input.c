@@ -3,6 +3,7 @@
 #include "runtime.h"
 #include "autoload.h"
 #include "world_survey.h"
+#include "actor_spawn.h"
 #include "settings.h"
 #include <stdbool.h>
 #include <stdio.h>
@@ -171,7 +172,7 @@ static void *input_file(void *arg) {
     char line[1200];
     for (;;) {
         if (!fgets(line, sizeof line, f)) { if (ferror(f)) runtime_fail("diagnostic input read"); clearerr(f); usleep(100000); continue; }
-        if (runtime_survey_command(line)) continue;
+        if (runtime_survey_command(line) || runtime_spawn_command(line)) continue;
         unsigned code, ms; int used = 0;
         if (sscanf(line, "down %u %n", &code, &used) == 1 && used && !line[used] && code < 128) {
             fprintf(stderr,"[totk-input] file: key %u down\n",code);runtime_input_key_synthetic(code,1);
