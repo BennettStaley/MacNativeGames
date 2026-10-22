@@ -57,7 +57,7 @@ static void spawn_observed(const char *name, int requested, int created, const c
 
 NSString *TOTKSpawnSummary(void) {
     int a = runtime_spawn_available();
-    if (a == SPAWN_ERR_UNSUPPORTED) return @"Spawning needs 1.4.3 for now.";
+    if (a == SPAWN_ERR_UNSUPPORTED) return @"Spawning needs game version 1.0.0 or 1.4.3 for now.";
     if (a != SPAWN_OK) return @"The spawner is off on this game (the log says why).";
     return @"Items, weapons, creatures and Zonai devices next to you.";
 }
@@ -173,7 +173,7 @@ NSString *TOTKSpawnSummary(void) {
     int r = runtime_spawn_actor(a->name, amount);
     if (r != SPAWN_OK) {
         spawn_toast([NSString stringWithFormat:@"Could not spawn %s: %@", a->display,
-                     r == SPAWN_ERR_UNSUPPORTED ? @"spawning needs 1.4.3 for now" : @(runtime_spawn_error(r))], YES);
+                     r == SPAWN_ERR_UNSUPPORTED ? @"spawning needs game version 1.0.0 or 1.4.3" : @(runtime_spawn_error(r))], YES);
         return;
     }
     spawn_picks_add_recent(&spawnPicks, a->name); spawn_picks_save(&spawnPicks);

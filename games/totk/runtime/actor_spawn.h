@@ -16,7 +16,7 @@ const char *runtime_spawn_error(int code);
    profiles with TOTK_SURVEY=1 (runtime_spawn_allow_commands) run it; in normal play the menu's Spawn tab is the way in. */
 int runtime_spawn_command(const char *line);
 void runtime_spawn_allow_commands(void);
-/* 1.4.3 at startup (world_survey.c runtime_survey_init, every session): checks the call's entry and turns the spawner on.
+/* 1.0.0 and 1.4.3 at startup (world_survey.c runtime_survey_init, every session): checks the call's entry and turns the spawner on.
    Returns 1 when it is on. */
 int runtime_spawn_init(Module *main_module);
 /* SPAWN_OK when the spawner is on, SPAWN_ERR_UNSUPPORTED on a game version without it, SPAWN_ERR_DISABLED when the

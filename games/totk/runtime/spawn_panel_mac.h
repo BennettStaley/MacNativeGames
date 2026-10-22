@@ -172,7 +172,7 @@ static void spawn_observed(const char *name, int requested, int created, const c
     nshown = list.count && shown ? spawn_list_filter(&list, &picks, category, query.UTF8String, unnamedBox.state == NSControlStateValueOn, shown, list.count) : 0;
     [table reloadData];
     int a = self.availability;
-    NSString *why = a == SPAWN_ERR_UNSUPPORTED ? @"Spawning needs 1.4.3 for now."
+    NSString *why = a == SPAWN_ERR_UNSUPPORTED ? @"Spawning needs game version 1.0.0 or 1.4.3 for now."
                   : a == SPAWN_ERR_DISABLED ? @"The spawner is off: this game's create call did not match the one it was made for (the log says more)."
                   : !list.count ? @"This app has no actor list. Rebuild it (build_app.py makes build/actor_list.tsv from your game files)."
                   : nshown ? nil
@@ -330,7 +330,7 @@ static void spawn_observed(const char *name, int requested, int created, const c
     NSString *display = @(a->display);
     int r = runtime_spawn_actor(a->name, amount);
     if (r != SPAWN_OK) {
-        NSString *why = r == SPAWN_ERR_UNSUPPORTED ? @"spawning needs 1.4.3 for now" : @(runtime_spawn_error(r));
+        NSString *why = r == SPAWN_ERR_UNSUPPORTED ? @"spawning needs game version 1.0.0 or 1.4.3" : @(runtime_spawn_error(r));
         status.stringValue = [NSString stringWithFormat:@"Spawn failed: %@", why];
         [TOTKSpawnToast show:[NSString stringWithFormat:@"Could not spawn %@: %@", display, why] failed:YES in:settings_window().contentView];
         return;

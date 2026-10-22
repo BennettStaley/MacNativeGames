@@ -31,7 +31,7 @@
 #define GAME_ACTOR_POS 0x2b4
 #define GAME_ACTOR_ROT 0x2c0
 /* Spawner only (actor_spawn.c, how they were found): engine::actor::ActorMgr::requestCreateActorAsync (1.0.0 0xa5fdf8) and
-   ActorMgr::sInstance (1.0.0 0x46479e0). Named, not GAME_ADDR: no other version uses them yet. */
+   ActorMgr::sInstance (1.0.0 0x46479e0). Named, not GAME_ADDR: only 1.0.0 and 1.4.3 have them. */
 #define GAME_SPAWN_REQUEST_CREATE 0x599670
 #define GAME_SPAWN_ACTOR_MGR 0x3ad7450
 #define GAME_ADDR_0x69a18c 0x45ce70
@@ -131,6 +131,10 @@
 #define GAME_ACTOR_NAME 0x210
 #define GAME_ACTOR_POS 0x2ac
 #define GAME_ACTOR_ROT 0x2b8
+/* Spawner (actor_spawn.c): the public 1.0.0 symbols (totk-lotuskit ActorMgr.py); the entry is the same seven
+   instructions as 1.4.3's, 105 direct callers. */
+#define GAME_SPAWN_REQUEST_CREATE 0xa5fdf8
+#define GAME_SPAWN_ACTOR_MGR 0x46479e0
 #define GAME_ADDR_0x8f6c60 0x8f6c60
 #define GAME_ADDR_0x8f6c64 0x8f6c64
 #define GAME_ADDR_0x8f6c88 0x8f6c88

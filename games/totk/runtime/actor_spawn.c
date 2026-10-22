@@ -5,7 +5,8 @@
    in every 1.4.3 session (loader.c runtime_frame_controller_return_pc); the survey's own commands stay test-only, and in
    normal play only the menu's Spawn tab queues requests (the input file's "spawn" needs TOTK_SURVEY=1).
 
-   1.4.3 addresses (game_version.h, GAME_SPAWN_*), found from 1.0.0, whose symbols are public (totk-lotuskit
+   1.0.0 uses the public symbols directly (same entry check, 105 callers). 1.2.1 (lotuskit: 0xab92cc, sInstance 0x4722920)
+   waits for a 1.2.1 main to check against. 1.4.3 addresses (game_version.h, GAME_SPAWN_*), found from 1.0.0, whose symbols are public (totk-lotuskit
    syms/exking/engine/actor/ActorMgr.py, from dt-12345/totk_syms):
      requestCreateActorAsync 1.0.0 0xa5fdf8 -> 1.4.3 0x599670: the only target that the mapped callers agree on
        (scripts/map_version_sites.py, by callers), 108 direct callers in 1.4.3 against 105 in 1.0.0, the same 12 calls
@@ -28,7 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(TOTK_GAME_V143) && !defined(GAME_BOTW)
+#if defined(GAME_SPAWN_REQUEST_CREATE) && !defined(GAME_BOTW)
 #define SPAWN_SUPPORTED 1
 #endif
 
@@ -147,7 +148,7 @@ static const char *result_text(uint32_t r) {
     return r < sizeof names / sizeof *names ? names[r] : "?";
 }
 
-/* Every 1.4.3 session: the call is only made for requests the player (the Spawn tab) or a test queued. */
+/* Every 1.0.0 and 1.4.3 session (the same entry check for both): the call is only made for requests the player (the Spawn tab) or a test queued. */
 int runtime_spawn_init(Module *m) {
     static const uint32_t entry[] = {0xa9ba7bfd, 0xa9016ffc, 0x910003fd, 0xa90267fa, 0xa9035ff8, 0xa90457f6, 0xa9054ff4};
     if (strcmp(m->name, "main") || GAME_SPAWN_REQUEST_CREATE + sizeof entry > m->text_end || GAME_SPAWN_ACTOR_MGR + 8u > m->size ||
