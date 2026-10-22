@@ -1,13 +1,17 @@
 /* The settings menu on the Mac (included by runtime/frontend.m only): a sidebar drawn inside the game window, so it works
    in full screen and leaves the picture beside it in view while a change takes effect. Built from the shared settings
-   table (runtime/settings_schema.h), one tab per page. Opened with Command-comma, F1, the app menu's Settings item, or a
-   controller's Home button (or Options and Menu together). Mouse, keyboard (arrows choose and change, Return toggles,
-   Q / E or Tab switch tabs, Escape closes) and controller (D-pad or left stick, A, B, shoulder buttons) all work. While it
-   is open the game reads a neutral controller (runtime_input_hold). After the settings pages, Mods is runtime/mods_panel_mac.h
-   (the installed mods and the GameBanana browser; the sidebar widens while it shows), and Cheats lists the community
+   table (runtime/settings_schema.h): four tabs (Game, Graphics, Content, Tools), each a bar of sections. Opened with
+   Command-comma, F1, the app menu's Settings item, or a controller's Home button (or Options and Menu together).
+   Two levels: the section bar (← → or the D-pad choose a section, ↓ / Return / A open it) and the section's rows (↑ ↓
+   choose, ← → change, Page Up / Down or LT / RT page, never wrapping round); Escape or B goes back one level and closes
+   the menu only from the section bar. Q / E, Tab or the shoulder buttons switch tabs. Reset this tab (R, X on the bar)
+   and Reset everything… (Shift-R, Y on the bar, then confirm) set settings back; cheats, mods, saves and the spawner's
+   favorites are never reset. While it is open the game reads a neutral controller (runtime_input_hold). Content › Mods is
+   runtime/mods_panel_mac.h (the installed mods and the GameBanana browser; the sidebar widens while it shows), Tools ›
+   Spawn is runtime/spawn_panel_mac.h, and Tools › Cheats lists the community
    cheat list the game downloads (cheat_db_fetch.h; shown by group through cheat_catalog.h, variants as one choice, the ones
    this port cannot run folded away) and then the cheat files of the player's own (runtime/cheats.c, cheat_files.h), with
-   the folder, Turn off all and Restart now; it is built here like the settings pages, and Reset all leaves cheats alone. The Interface tab ends with Send saves:
+   the folder, Turn off all and Restart now; it is built here like the settings pages. Content › Saves is Send saves:
    the profile's saves as one .totksave file (runtime/save_package.h) for AirDrop, Messages, Mail or Finder; the other
    device opens it to bring them in (docs/save-sync.md). The iPhone / iPad menu is ios/Sources/settings_menu.m. */
 #pragma once
@@ -25,37 +29,46 @@
 - (BOOL)isFlipped { return YES; }
 @end
 #include "mods_panel_mac.h"
+#include "spawn_panel_mac.h"
 
 @interface TOTKSettingsPanel : NSView
 + (void)toggle;
 + (BOOL)snapshotTo:(NSString *)path;   /* the menu as a PNG (test runs, TOTK_INPUT_FILE "settings-shot") */
 + (void)key:(NSEvent *)event;          /* a key for the open menu (test runs, TOTK_INPUT_FILE "menukey") */
-+ (void)showCheats;                    /* opens the menu on the Cheats tab (the app menu's Cheats… item) */
++ (void)showCheats;                    /* opens the menu on Tools › Cheats (the app menu's Cheats… item) */
 @end
 
 static NSWindow *settings_window(void);   /* frontend.m: the game window */
 
 @interface TOTKSettingsPanel () <NSSharingServicePickerDelegate> @end
 @implementation TOTKSettingsPanel {
-    NSSegmentedControl *tabs;
+    NSSegmentedControl *tabs, *sectionBar;   /* the four tabs; the sections of the tab shown */
     NSScrollView *scroll;
     NSStackView *list;
     NSTextField *status, *hint;
-    NSButton *reset, *restartNow;   /* restartNow: shown while a setting or the mods wait for a restart */
-    TOTKModsPane *mods;                   /* the Mods tab (page MODS_PAGE) */
+    NSButton *resetTab, *resetAll, *resetCancel, *restartNow;   /* restartNow: shown while a setting or the mods wait for a restart */
+    TOTKModsPane *mods;                   /* Content › Mods */
+    TOTKSpawnPane *spawn;                 /* Tools › Spawn (spawn_panel_mac.h) */
     NSMutableArray<NSView *> *rows;       /* the rows of the page shown, in order */
     NSMutableArray<NSNumber *> *rowSetting;   /* the setting of each row; SAVES_ROW: Send saves (Interface tab); CHEAT_ROW...: the Cheats tab */
     NSButton *sendButton; NSTextField *savesNote;
-    NSInteger page, focus;
+    NSInteger section, focus;             /* SETTINGS_SECTIONS index; the focused row */
+    NSInteger lastSection[SETTINGS_NTABS];   /* each tab opens on the section it showed last */
+    BOOL onBar, confirmReset;             /* the focus is on the section bar (the top level); Reset everything… asks */
     NSTimer *pollTimer;
     uint64_t padPrev; double padRepeatAt; int padDir;
     BOOL cheatsUnavailableShown, cheatDbAsked;   /* the Cheats tab: the folded list is open; the list was checked this run */
 }
 static TOTKSettingsPanel *settingsPanel;
-enum { PANEL_WIDTH = 480, PANEL_MARGIN = 16, MODS_PAGE = SETTINGS_NPAGES, CHEATS_PAGE = SETTINGS_NPAGES + 1, NPAGES = SETTINGS_NPAGES + 2,
+enum { PANEL_WIDTH = 480, PANEL_MARGIN = 16, PAGE_STEP = 8 /* rows per LT / RT on a pane without row frames */,
        SAVES_ROW = -1, CHEATS_FOLDER_ROW = -2, CHEATS_OFF_ROW = -3, CHEATS_RESTART_ROW = -4, CHEATS_DB_ROW = -5, CHEATS_UNAVAILABLE_ROW = -6,
        CHEAT_ROW = -1000 /* - k: cheat k, or the choice whose first variant is k */ };
-static NSString *const SETTINGS_HINT = @"↑↓ choose   ←→ change   Q E tabs   Esc close\nController: D-pad, A, B, shoulder buttons";
+static NSString *const BAR_HINT = @"←→ sections   ↓ open   Q E tabs   R reset tab   ⇧R reset all   Esc close\n"
+                                   "Controller: D-pad, A open, LB RB tabs, X reset tab, Y reset all, B close";
+static NSString *const SETTINGS_HINT = @"↑↓ choose   ←→ change   PgUp PgDn page   Q E tabs   Esc back\n"
+                                       "Controller: D-pad, A, LT RT page, LB RB tabs, B back";
+static NSString *const RESET_CONFIRM_HINT = @"Reset every setting to its default? Cheats, mods, saves and spawn favorites stay.\n"
+                                            "Return or A: reset everything   Esc or B: cancel";
 
 static BOOL settings_row_shown(const SettingDef *d) {
     if (!(d->platforms & SET_MAC)) return NO;
@@ -94,12 +107,15 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
     status.font = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular]; status.textColor = NSColor.secondaryLabelColor;
 
     NSMutableArray *labels = [NSMutableArray array];
-    for (int p = 0; p < SETTINGS_NPAGES; p++) [labels addObject:@(SETTINGS_PAGES[p])];
-    [labels addObject:@"Mods"]; [labels addObject:@"Cheats"];
+    for (int t = 0; t < SETTINGS_NTABS; t++) [labels addObject:@(SETTINGS_TABS[t])];
     tabs = [NSSegmentedControl segmentedControlWithLabels:labels trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(tabClicked:)];
     tabs.segmentStyle = NSSegmentStyleAutomatic; tabs.selectedSegment = 0; tabs.refusesFirstResponder = YES;
-    tabs.segmentDistribution = NSSegmentDistributionFit; tabs.controlSize = NSControlSizeMini;   /* nine tabs, widths after their names */
-    tabs.font = [NSFont systemFontOfSize:10];
+    tabs.segmentDistribution = NSSegmentDistributionFillEqually;
+    sectionBar = [NSSegmentedControl segmentedControlWithLabels:@[@""] trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(sectionClicked:)];
+    sectionBar.segmentStyle = NSSegmentStyleRoundRect; sectionBar.refusesFirstResponder = YES; sectionBar.controlSize = NSControlSizeSmall;
+    sectionBar.font = [NSFont systemFontOfSize:11]; sectionBar.wantsLayer = YES; sectionBar.layer.cornerRadius = 6;
+    for (int t = 0; t < SETTINGS_NTABS; t++) lastSection[t] = settings_tab_first(t);
+    onBar = YES;
 
     list = [NSStackView new]; list.orientation = NSUserInterfaceLayoutOrientationVertical;
     list.alignment = NSLayoutAttributeLeading; list.spacing = 4; list.translatesAutoresizingMaskIntoConstraints = NO;
@@ -110,32 +126,41 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
 
     hint = [NSTextField wrappingLabelWithString:SETTINGS_HINT];
     hint.font = [NSFont systemFontOfSize:10.5]; hint.textColor = NSColor.tertiaryLabelColor;
-    reset = [NSButton buttonWithTitle:@"Reset all" target:self action:@selector(reset)];
+    resetTab = [NSButton buttonWithTitle:@"Reset this tab" target:self action:@selector(resetThisTab)];
+    resetAll = [NSButton buttonWithTitle:@"Reset everything…" target:self action:@selector(resetEverything)];
+    resetCancel = [NSButton buttonWithTitle:@"Cancel" target:self action:@selector(cancelReset)]; resetCancel.hidden = YES;
     restartNow = [NSButton buttonWithTitle:@"Restart now" target:self action:@selector(restartGame)];
     restartNow.controlSize = NSControlSizeSmall; restartNow.refusesFirstResponder = YES; restartNow.hidden = YES;
     restartNow.bezelColor = NSColor.systemOrangeColor; restartNow.translatesAutoresizingMaskIntoConstraints = NO;
-    reset.controlSize = NSControlSizeSmall; reset.refusesFirstResponder = YES; reset.bezelStyle = NSBezelStyleRounded;
+    for (NSButton *b in @[resetTab, resetAll, resetCancel]) { b.controlSize = NSControlSizeSmall; b.refusesFirstResponder = YES; b.bezelStyle = NSBezelStyleRounded; }
+    NSStackView *resets = [NSStackView stackViewWithViews:@[resetTab, resetAll, resetCancel]]; resets.spacing = 6;
 
     mods = [[TOTKModsPane alloc] initWithMenu:self]; mods.hidden = YES;
+    spawn = [self makeSpawnPane]; spawn.hidden = YES;
     [NSNotificationCenter.defaultCenter addObserverForName:TOTKCheatDbChanged object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
-        (void)n; if (self.superview && self->page == CHEATS_PAGE) [self rebuildKeepingPlace];
+        (void)n; if (self.superview && self.kind == MENU_CHEATS) [self rebuildKeepingPlace];
     }];
-    for (NSView *v in @[title, status, tabs, scroll, mods, hint, reset, restartNow]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v]; }
+    for (NSView *v in @[title, status, tabs, sectionBar, scroll, mods, spawn, hint, resets, restartNow]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v]; }
     [NSLayoutConstraint activateConstraints:@[
         [title.topAnchor constraintEqualToAnchor:self.topAnchor constant:18], [title.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20],
         [status.firstBaselineAnchor constraintEqualToAnchor:title.firstBaselineAnchor], [status.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-20],
         [status.leadingAnchor constraintGreaterThanOrEqualToAnchor:title.trailingAnchor constant:12],
         [tabs.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:14],
         [tabs.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16], [tabs.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
-        [scroll.topAnchor constraintEqualToAnchor:tabs.bottomAnchor constant:10],
+        [sectionBar.topAnchor constraintEqualToAnchor:tabs.bottomAnchor constant:8],
+        [sectionBar.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [sectionBar.trailingAnchor constraintLessThanOrEqualToAnchor:self.trailingAnchor constant:-16],
+        [scroll.topAnchor constraintEqualToAnchor:sectionBar.bottomAnchor constant:10],
         [scroll.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:8], [scroll.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-8],
-        [scroll.bottomAnchor constraintEqualToAnchor:hint.topAnchor constant:-10],
+        [scroll.bottomAnchor constraintEqualToAnchor:resets.topAnchor constant:-8],
         [mods.topAnchor constraintEqualToAnchor:scroll.topAnchor], [mods.bottomAnchor constraintEqualToAnchor:scroll.bottomAnchor],
         [mods.leadingAnchor constraintEqualToAnchor:scroll.leadingAnchor], [mods.trailingAnchor constraintEqualToAnchor:scroll.trailingAnchor],
+        [spawn.topAnchor constraintEqualToAnchor:scroll.topAnchor], [spawn.bottomAnchor constraintEqualToAnchor:scroll.bottomAnchor],
+        [spawn.leadingAnchor constraintEqualToAnchor:scroll.leadingAnchor constant:8], [spawn.trailingAnchor constraintEqualToAnchor:scroll.trailingAnchor constant:-8],
         [hint.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20], [hint.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-14],
-        [hint.trailingAnchor constraintLessThanOrEqualToAnchor:restartNow.leadingAnchor constant:-10],
-        [reset.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16], [reset.centerYAnchor constraintEqualToAnchor:hint.centerYAnchor],
-        [restartNow.trailingAnchor constraintEqualToAnchor:reset.leadingAnchor constant:-6], [restartNow.centerYAnchor constraintEqualToAnchor:hint.centerYAnchor],
+        [hint.trailingAnchor constraintLessThanOrEqualToAnchor:self.trailingAnchor constant:-16],
+        [resets.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16], [resets.bottomAnchor constraintEqualToAnchor:hint.topAnchor constant:-8],
+        [restartNow.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16], [restartNow.centerYAnchor constraintEqualToAnchor:resets.centerYAnchor],
         [list.topAnchor constraintEqualToAnchor:doc.topAnchor], [list.leadingAnchor constraintEqualToAnchor:doc.leadingAnchor],
         [list.trailingAnchor constraintEqualToAnchor:doc.trailingAnchor], [list.bottomAnchor constraintEqualToAnchor:doc.bottomAnchor],
         [doc.widthAnchor constraintEqualToAnchor:scroll.contentView.widthAnchor]]];
@@ -470,7 +495,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     [self rebuildKeepingPlace];
 }
 - (void)cheatSwitched:(NSSwitch *)toggle {
-    NSUInteger at = [rowSetting indexOfObject:@(CHEAT_ROW - (int)toggle.tag)]; if (at != NSNotFound) focus = at;
+    NSUInteger at = [rowSetting indexOfObject:@(CHEAT_ROW - (int)toggle.tag)]; if (at != NSNotFound) { focus = at; onBar = NO; }
     [self setCheat:(int)toggle.tag on:toggle.state == NSControlStateValueOn];
     [self.window makeFirstResponder:self];
 }
@@ -486,7 +511,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     [self rebuildKeepingPlace];
 }
 - (void)cheatChoiceChanged:(NSPopUpButton *)menu {
-    NSUInteger at = [rowSetting indexOfObject:@(CHEAT_ROW - (int)menu.tag)]; if (at != NSNotFound) focus = at;
+    NSUInteger at = [rowSetting indexOfObject:@(CHEAT_ROW - (int)menu.tag)]; if (at != NSNotFound) { focus = at; onBar = NO; }
     [self setCheatChoice:(int)menu.tag to:(int)menu.selectedItem.tag];
     [self.window makeFirstResponder:self];
 }
@@ -511,26 +536,68 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
 }
 + (void)showCheats {
     TOTKSettingsPanel *p = [self shared];
-    p->page = CHEATS_PAGE; p->focus = 0;
+    for (int k = 0; k < SETTINGS_NSECTIONS; k++) if (SETTINGS_SECTIONS[k].kind == MENU_CHEATS) p->section = k;
+    p->focus = 0; p->onBar = NO;
     if (p.superview) [p buildPage]; else [p show];
 }
 
+/* ---- tabs and sections ---- */
+
+/* Tools › Spawn: spawn_panel_mac.h does the work; the menu keeps the levels above it. */
+- (TOTKSpawnPane *)makeSpawnPane { return [[TOTKSpawnPane alloc] initWithMenu:self]; }
+- (void)refreshSpawn { [spawn refresh]; }
+- (void)spawnShowFocus { [spawn showFocus:!onBar]; }
+- (NSString *)spawnHint { return spawn.hint; }
+- (void)spawnEnter { [spawn enter]; }
+- (BOOL)spawnBack { return [spawn back]; }
+- (void)spawnMove:(int)dir { [spawn moveFocus:dir]; }
+- (void)spawnStep:(int)dir { [spawn step:dir]; }
+- (void)spawnPage:(int)dir { [spawn page:dir]; }
+- (BOOL)spawnKey:(NSEvent *)e { return [spawn key:e]; }
+- (void)spawnButton:(char)b { [spawn button:b]; }
+
+- (int)kind { return SETTINGS_SECTIONS[section].kind; }
+- (int)tab { return SETTINGS_SECTIONS[section].tab; }
+- (void)loadSectionBar {
+    int first = settings_tab_first(self.tab), n = settings_tab_sections(self.tab);
+    sectionBar.segmentCount = n;
+    for (int k = 0; k < n; k++) { [sectionBar setLabel:@(SETTINGS_SECTIONS[first + k].name) forSegment:k]; [sectionBar setWidth:0 forSegment:k]; }
+    sectionBar.selectedSegment = section - first;
+    tabs.selectedSegment = self.tab;
+}
+- (void)showSection:(NSInteger)k {
+    if (k < 0 || k >= SETTINGS_NSECTIONS) return;
+    section = k; lastSection[self.tab] = k; focus = 0; confirmReset = NO;
+    [self buildPage];
+}
+
+- (void)refreshHint {
+    int kind = self.kind;
+    hint.stringValue = confirmReset ? RESET_CONFIRM_HINT : onBar ? BAR_HINT : kind == MENU_MODS ? MODS_HINT : kind == MENU_SPAWN ? [self spawnHint] : SETTINGS_HINT;
+    hint.textColor = confirmReset ? NSColor.systemOrangeColor : NSColor.tertiaryLabelColor;
+    resetTab.hidden = confirmReset; resetCancel.hidden = !confirmReset;
+    resetAll.title = confirmReset ? @"Reset everything" : @"Reset everything…";
+    resetAll.bezelColor = confirmReset ? NSColor.systemRedColor : nil;
+    resetTab.title = [NSString stringWithFormat:@"Reset %s", SETTINGS_TABS[self.tab]];
+}
 - (void)buildPage {
-    BOOL modsPage = page == MODS_PAGE;
-    scroll.hidden = modsPage; mods.hidden = !modsPage; reset.hidden = modsPage || page == CHEATS_PAGE;   /* Reset all: settings only */
-    hint.stringValue = modsPage ? MODS_HINT : SETTINGS_HINT;
+    int kind = self.kind;
+    BOOL modsPage = kind == MENU_MODS, spawnPage = kind == MENU_SPAWN;
+    scroll.hidden = modsPage || spawnPage; mods.hidden = !modsPage; spawn.hidden = !spawnPage;
+    [self loadSectionBar]; [self refreshHint];
     if (self.superview) [self place];
-    if (modsPage) { tabs.selectedSegment = page; [mods refresh]; [self refreshStatus]; return; }
+    if (modsPage) { [mods refresh]; [self refreshStatus]; [self showFocus]; return; }
+    if (spawnPage) { [self refreshSpawn]; [self refreshStatus]; [self showFocus]; return; }
     for (NSView *v in list.arrangedSubviews.copy) { [list removeArrangedSubview:v]; [v removeFromSuperview]; }
     [rows removeAllObjects]; [rowSetting removeAllObjects];
-    for (int i = 0; i < SETTINGS_COUNT && page < SETTINGS_NPAGES; i++) {
+    for (int i = 0; i < SETTINGS_COUNT && kind == MENU_SETTINGS; i++) {
         const SettingDef *d = &SETTINGS[i];
-        if (strcmp(d->page, SETTINGS_PAGES[page]) || !settings_row_shown(d)) continue;
+        if (strcmp(d->page, SETTINGS_SECTIONS[section].name) || !settings_row_shown(d)) continue;
         NSView *row = [self rowFor:d index:i];
         [list addArrangedSubview:row]; [rows addObject:row]; [rowSetting addObject:@(i)];
     }
-    if (page == CHEATS_PAGE) [self buildCheats];
-    else if (!strcmp(SETTINGS_PAGES[page], "Interface")) {
+    if (kind == MENU_CHEATS) [self buildCheats];
+    else if (kind == MENU_SAVES) {
         NSView *saves = [self savesRow];
         [list addArrangedSubview:saves]; [rows addObject:saves]; [rowSetting addObject:@(SAVES_ROW)];
     }
@@ -539,7 +606,6 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
         [list addArrangedSubview:none];
     }
     if (focus >= (NSInteger)rows.count) focus = rows.count ? rows.count - 1 : 0;
-    tabs.selectedSegment = page;
     [self refreshStatus]; [self showFocus];
 }
 
@@ -554,9 +620,12 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
 - (void)restartGame { [self hide]; runtime_front_restart(); }
 
 - (void)showFocus {
+    sectionBar.layer.borderWidth = onBar ? 2 : 0;   /* the top level: the section bar has the focus */
+    sectionBar.layer.borderColor = NSColor.controlAccentColor.CGColor;
+    if (self.kind == MENU_SPAWN) { [self spawnShowFocus]; return; }
     for (NSUInteger k = 0; k < rows.count; k++)
-        rows[k].layer.backgroundColor = (NSInteger)k == focus ? panel_color(1, 0.10).CGColor : NSColor.clearColor.CGColor;
-    if (focus < (NSInteger)rows.count) {
+        rows[k].layer.backgroundColor = !onBar && (NSInteger)k == focus ? panel_color(1, 0.10).CGColor : NSColor.clearColor.CGColor;
+    if (!onBar && focus < (NSInteger)rows.count) {
         [list layoutSubtreeIfNeeded];
         [rows[focus] scrollRectToVisible:NSInsetRect(rows[focus].bounds, 0, -8)];
     }
@@ -580,7 +649,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     if ([control isKindOfClass:NSSwitch.class]) v = ((NSSwitch *)control).state == NSControlStateValueOn;
     else if ([control isKindOfClass:NSPopUpButton.class]) v = d->choices[((NSPopUpButton *)control).indexOfSelectedItem].value;
     else v = d->min + (int)lround((((NSSlider *)control).doubleValue - d->min) / d->step) * d->step;
-    NSUInteger at = [rowSetting indexOfObject:@(i)]; if (at != NSNotFound) focus = at;
+    NSUInteger at = [rowSetting indexOfObject:@(i)]; if (at != NSNotFound) { focus = at; onBar = NO; [self refreshHint]; }
     if (d->type == SET_RANGE) {   /* a drag: change the value and its text, keep the slider (rebuilding would end the drag) */
         for (NSView *v2 in control.superview.subviews) if ([v2.identifier isEqual:@"value"]) ((NSTextField *)v2).stringValue = settings_value_text(d, v);
         if (v != settings_get(d->key)) settings_set(d->key, v);
@@ -591,9 +660,19 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     [self.window makeFirstResponder:self];
 }
 
-/* One step left (-1) or right (+1) on the focused row; 0 = activate (toggle, next choice). */
+/* One step left (-1) or right (+1) on the focused row; 0 = activate (toggle, next choice). On the section bar: the
+   previous / next section, or 0 to open it. */
 - (void)step:(int)dir {
-    if (page == MODS_PAGE) { [mods step:dir]; return; }
+    if (confirmReset) { if (!dir) [self confirmResetEverything]; return; }
+    if (onBar) {
+        if (!dir) { [self enter]; return; }
+        NSInteger first = settings_tab_first(self.tab), next = section + dir;
+        if (next >= first && next < first + settings_tab_sections(self.tab)) { [self showSection:next]; }
+        return;
+    }
+    int kind = self.kind;
+    if (kind == MENU_MODS) { [mods step:dir]; return; }
+    if (kind == MENU_SPAWN) { [self spawnStep:dir]; return; }
     if (focus >= (NSInteger)rows.count) return;
     int i = rowSetting[focus].intValue;
     if (i == SAVES_ROW) { if (!dir) [self sendSaves]; return; }
@@ -620,30 +699,98 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     [self apply:i value:v];
 }
 
-- (void)moveFocus:(int)dir {
-    if (page == MODS_PAGE) { [mods moveFocus:dir]; return; }
-    if (!rows.count) return;
-    focus = (focus + dir + (NSInteger)rows.count) % (NSInteger)rows.count; [self showFocus];
+/* From the section bar into the section's rows (the first one). */
+- (void)enter {
+    if (!onBar) return;
+    onBar = NO; focus = 0; [self refreshHint];
+    if (self.kind == MENU_SPAWN) [self spawnEnter];
+    [self showFocus];
 }
-- (void)movePage:(int)dir { page = (page + dir + NPAGES) % NPAGES; focus = 0; [self buildPage]; }
-- (void)tabClicked:(NSSegmentedControl *)s { page = s.selectedSegment; focus = 0; [self buildPage]; [self.window makeFirstResponder:self]; }
+/* B / Escape: one level up; the menu closes only from the section bar. */
+- (void)back {
+    if (confirmReset) { [self cancelReset]; return; }
+    if (onBar) { [self hide]; return; }
+    if (self.kind == MENU_SPAWN && [self spawnBack]) return;   /* the spawn list goes back to its categories first */
+    onBar = YES; [self refreshHint]; [self showFocus];
+}
 
-- (void)reset {
-    for (int i = 0; i < SETTINGS_COUNT; i++) if (SETTINGS[i].platforms & SET_MAC) settings_set(SETTINGS[i].key, SETTINGS[i].def_mac);
-    [self buildPage];
+/* Up / down: the rows never wrap round; up from the first row goes back to the section bar, down from it opens it. */
+- (void)moveFocus:(int)dir {
+    if (confirmReset) return;
+    if (onBar) { if (dir > 0) [self enter]; return; }
+    int kind = self.kind;
+    if (kind == MENU_MODS) { [mods moveFocus:dir]; return; }
+    if (kind == MENU_SPAWN) { [self spawnMove:dir]; return; }
+    if (!rows.count) { if (dir < 0) [self back]; return; }
+    if (focus + dir < 0) { if (dir == -1) [self back]; else { focus = 0; [self showFocus]; } return; }
+    focus = MIN((NSInteger)rows.count - 1, focus + dir); [self showFocus];
 }
+/* LT / RT, Page Up / Down: about one screen of rows. */
+- (void)pageFocus:(int)dir {
+    if (confirmReset || onBar) return;
+    int kind = self.kind;
+    if (kind == MENU_MODS) { [mods moveFocus:dir * PAGE_STEP]; return; }
+    if (kind == MENU_SPAWN) { [self spawnPage:dir]; return; }
+    if (!rows.count) return;
+    NSView *doc = scroll.documentView;
+    CGFloat height = scroll.contentView.bounds.size.height, at = NSMinY([rows[focus] convertRect:rows[focus].bounds toView:doc]);
+    CGFloat target = at + dir * MAX(40, height - 40);
+    NSInteger k = focus;
+    if (dir > 0) while (k + 1 < (NSInteger)rows.count && NSMinY([rows[k + 1] convertRect:rows[k + 1].bounds toView:doc]) <= target) k++;
+    else while (k > 0 && NSMinY([rows[k - 1] convertRect:rows[k - 1].bounds toView:doc]) >= target) k--;
+    if (k == focus) k = MAX(0, MIN((NSInteger)rows.count - 1, focus + dir));
+    focus = k; [self showFocus];
+}
+- (void)movePage:(int)dir {   /* the tabs (Q / E, LB / RB): round and round, each on the section it showed last */
+    int tab = (self.tab + dir + SETTINGS_NTABS) % SETTINGS_NTABS;
+    section = lastSection[tab]; focus = 0; onBar = YES; confirmReset = NO; [self buildPage];
+}
+- (void)tabClicked:(NSSegmentedControl *)s {
+    section = lastSection[s.selectedSegment]; focus = 0; onBar = YES; confirmReset = NO; [self buildPage];
+    [self.window makeFirstResponder:self];
+}
+- (void)sectionClicked:(NSSegmentedControl *)s {
+    onBar = YES; [self showSection:settings_tab_first(self.tab) + s.selectedSegment];
+    [self.window makeFirstResponder:self];
+}
+
+/* ---- reset: settings only (cheats, mods, saves and the spawner's lists are not settings) ---- */
+
+- (void)resetThisTab {
+    int tab = self.tab;
+    for (int i = 0; i < SETTINGS_COUNT; i++)
+        if ((SETTINGS[i].platforms & SET_MAC) && settings_in_tab(i, tab)) settings_set(SETTINGS[i].key, SETTINGS[i].def_mac);
+    fprintf(stderr, "[settings] reset tab %s\n", SETTINGS_TABS[tab]);
+    confirmReset = NO; [self rebuildKeepingPlace];
+}
+- (void)resetEverything {
+    if (confirmReset) { [self confirmResetEverything]; return; }
+    confirmReset = YES; [self refreshHint];
+}
+- (void)confirmResetEverything {
+    for (int i = 0; i < SETTINGS_COUNT; i++) if (SETTINGS[i].platforms & SET_MAC) settings_set(SETTINGS[i].key, SETTINGS[i].def_mac);
+    fprintf(stderr, "[settings] reset everything\n");
+    confirmReset = NO; [self rebuildKeepingPlace];
+}
+- (void)cancelReset { confirmReset = NO; [self refreshHint]; }
 
 - (void)keyDown:(NSEvent *)e {
-    if (page == MODS_PAGE && [mods key:e]) return;
+    BOOL shift = (e.modifierFlags & NSEventModifierFlagShift) != 0;
+    if (!confirmReset && !onBar && self.kind == MENU_MODS && e.keyCode != 53 && [mods key:e]) return;
+    if (!confirmReset && !onBar && self.kind == MENU_SPAWN && [self spawnKey:e]) return;
     switch (e.keyCode) {
     case 126: [self moveFocus:-1]; return;   /* up */
     case 125: [self moveFocus:1]; return;    /* down */
     case 123: [self step:-1]; return;        /* left */
     case 124: [self step:1]; return;         /* right */
+    case 116: [self pageFocus:-1]; return;   /* Page Up */
+    case 121: [self pageFocus:1]; return;    /* Page Down */
     case 36: case 76: case 49: if (!e.isARepeat) [self step:0]; return;   /* Return, Enter, Space */
-    case 12: [self movePage:-1]; return;     /* Q */
-    case 14: case 48: [self movePage:(e.modifierFlags & NSEventModifierFlagShift) ? -1 : 1]; return;   /* E, Tab */
-    case 53: case 122: if (!e.isARepeat) [self hide]; return;   /* Escape, F1 */
+    case 12: if (!confirmReset) [self movePage:-1]; return;     /* Q */
+    case 14: case 48: if (!confirmReset) [self movePage:shift ? -1 : 1]; return;   /* E, Tab */
+    case 15: if (!e.isARepeat && !confirmReset) { if (shift) [self resetEverything]; else [self resetThisTab]; } return;   /* R */
+    case 53: if (!e.isARepeat) [self back]; return;   /* Escape: one level up */
+    case 122: if (!e.isARepeat) [self hide]; return;  /* F1 */
     default: return;   /* every other key stays with the menu, away from the game */
     }
 }
@@ -662,40 +809,53 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
         if (p.leftShoulder.isPressed) now |= 64; if (p.rightShoulder.isPressed) now |= 128;
         if (p.buttonMenu.isPressed) now |= 256;
         if (p.buttonX.isPressed) now |= 512; if (p.buttonY.isPressed) now |= 1024;
+        if (p.leftTrigger.value > 0.5f) now |= 2048; if (p.rightTrigger.value > 0.5f) now |= 4096;
         if (fabsf(p.leftThumbstick.yAxis.value) > fabsf(ly)) ly = p.leftThumbstick.yAxis.value;
         if (fabsf(p.leftThumbstick.xAxis.value) > fabsf(lx)) lx = p.leftThumbstick.xAxis.value;
     }
     if (ly > 0.6f) now |= 1; if (ly < -0.6f) now |= 2; if (lx < -0.6f) now |= 4; if (lx > 0.6f) now |= 8;
     uint64_t edge = now & ~padPrev; padPrev = now;
     double t = CACurrentMediaTime();
-    int dir = now & 1 ? 1 : now & 2 ? 2 : now & 4 ? 3 : now & 8 ? 4 : 0;   /* held direction, repeated */
+    /* held direction or trigger, repeated */
+    int dir = now & 1 ? 1 : now & 2 ? 2 : now & 4 ? 3 : now & 8 ? 4 : now & 2048 ? 12 : now & 4096 ? 13 : 0;
+    uint64_t bit = dir ? 1ull << (dir - 1) : 0, repeating = 15 | 2048 | 4096;
     if (!dir) padDir = 0;
-    else if (dir != padDir) { padDir = dir; padRepeatAt = t + 0.35; edge |= 1u << (dir - 1); }
-    else if (t >= padRepeatAt) { padRepeatAt = t + 0.09; edge |= 1u << (dir - 1); }
-    else edge &= ~15u;
+    else if (dir != padDir) { padDir = dir; padRepeatAt = t + 0.35; edge |= bit; }
+    else if (t >= padRepeatAt) { padRepeatAt = t + 0.09; edge |= bit; }
+    else edge &= ~repeating;
+    edge &= ~(repeating & ~bit);   /* only the direction that repeats */
     if (edge & 1) [self moveFocus:-1];
     if (edge & 2) [self moveFocus:1];
     if (edge & 4) [self step:-1];
     if (edge & 8) [self step:1];
+    if (edge & 2048) [self pageFocus:-1];
+    if (edge & 4096) [self pageFocus:1];
     if (edge & 16) [self step:0];
-    if (edge & 64) [self movePage:-1];
-    if (edge & 128) [self movePage:1];
-    if (page == MODS_PAGE && (edge & 512)) [mods moveMod:-1];   /* X / Y: the mod's place in the load order */
-    if (page == MODS_PAGE && (edge & 1024)) [mods moveMod:1];
-    if (edge & (32 | 256)) [self hide];
+    if (!confirmReset && (edge & 64)) [self movePage:-1];
+    if (!confirmReset && (edge & 128)) [self movePage:1];
+    if (onBar && !confirmReset && (edge & 512)) [self resetThisTab];   /* X / Y on the section bar: the resets */
+    else if (onBar && !confirmReset && (edge & 1024)) [self resetEverything];
+    else if (!onBar && self.kind == MENU_MODS && (edge & 512)) [mods moveMod:-1];   /* X / Y: the mod's place in the load order */
+    else if (!onBar && self.kind == MENU_MODS && (edge & 1024)) [mods moveMod:1];
+    else if (!onBar && self.kind == MENU_SPAWN && (edge & (512 | 1024))) [self spawnButton:(edge & 1024) ? 'Y' : 'X'];
+    if (edge & 32) [self back];
+    if (edge & 256) [self hide];
 }
 
 /* ---- showing ---- */
 
 - (void)place {
     NSView *host = settings_window().contentView;
-    CGFloat width = page == MODS_PAGE ? MIN(MODS_PANEL_WIDTH, MAX(PANEL_WIDTH, host.bounds.size.width - 2 * PANEL_MARGIN)) : PANEL_WIDTH;
+    int kind = self.kind;
+    CGFloat wide = kind == MENU_MODS ? MODS_PANEL_WIDTH : kind == MENU_SPAWN ? SPAWN_PANEL_WIDTH : PANEL_WIDTH;
+    CGFloat width = MIN(wide, MAX(PANEL_WIDTH, host.bounds.size.width - 2 * PANEL_MARGIN));
     self.frame = NSMakeRect(PANEL_MARGIN, PANEL_MARGIN, width, MAX(320, host.bounds.size.height - 2 * PANEL_MARGIN));
     self.autoresizingMask = NSViewHeightSizable | NSViewMaxXMargin;
 }
 
 - (void)show {
     NSWindow *w = settings_window(); if (!w || self.superview) return;
+    confirmReset = NO;
     [self place]; [self buildPage];
     [w.contentView addSubview:self positioned:NSWindowAbove relativeTo:nil];
     [w makeFirstResponder:self];
@@ -707,6 +867,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
 
 - (void)hide {
     if (!self.superview) return;
+    onBar = YES; confirmReset = NO;   /* the next open starts at the top level */
     [pollTimer invalidate]; pollTimer = nil;
     NSWindow *w = self.window;
     [self removeFromSuperview];

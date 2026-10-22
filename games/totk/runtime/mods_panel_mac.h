@@ -11,8 +11,8 @@
 #import "mod_browser.h"
 
 enum { MODS_PANEL_WIDTH = 760 };
-static NSString *const MODS_HINT = @"↑↓ choose   Return on / off   ⌘↑↓ move   ⌫ remove   ←→ Installed / Browse   / search   Esc close\n"
-                                   "Controller: D-pad, A on / off, X Y move, B close";
+static NSString *const MODS_HINT = @"↑↓ choose   Return on / off   ⌘↑↓ move   ⌫ remove   ←→ Installed / Browse   / search   Esc back\n"
+                                   "Controller: D-pad, A on / off, X Y move, LT RT page, B back";
 static NSString *const MODS_CONFLICT_TEXT = @"Two mods change the same file: the first in the list wins. Merging is coming later";
 
 @interface TOTKModsClickView : NSView
