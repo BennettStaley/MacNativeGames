@@ -12183,11 +12183,23 @@ static _Atomic uint64_t g_drawable_ns;   // 出图里等 nextDrawable 的累计�
 uint64_t mtl_drawable_ns_take(void) { return atomic_exchange(&g_drawable_ns, 0); }
 // 有窗口时屏幕的最高刷新率（Hz）；无窗口返回 0。Mac 用 CoreGraphics 显示模式（线程安全的 C 接口，出图配置在游戏线程上读）
 // Maximum refresh rate (Hz) of the screen when there is a window; returns 0 without a window. Mac uses CoreGraphics display modes (thread-safe C interface; the present configuration is read on the game thread)
+/* TOTK: the display the game window is on (runtime/frontend.m; 0 = not known: the main display) and a count that goes up
+   when the window moves to another display or a display's mode changes. The rate used to be the main display's, so a
+   window on a 120 Hz monitor next to a 60 Hz main display ran at 60 (and the Auto limit chose from 60's steps). The rate is
+   kept until the count changes, so callers may ask every frame. Weak: the graphics unit tests and iOS have no window. */
+__attribute__((weak)) uint32_t runtime_front_display_id(void) { return 0; }
+__attribute__((weak)) unsigned runtime_front_display_changes(void) { return 0; }
+unsigned mtl_display_changes(void) { return runtime_front_display_changes(); }
 int mtl_display_hz(void) {
     if (!front_metal_layer()) return 0;
 #if TARGET_OS_OSX
-    CGDisplayModeRef m = CGDisplayCopyDisplayMode(CGMainDisplayID());
+    static _Atomic int cached; static _Atomic unsigned cached_for;   // cached_for: the change count + 1 the rate is of
+    unsigned now = runtime_front_display_changes() + 1;
+    if (atomic_load(&cached_for) == now) return atomic_load(&cached);
+    CGDirectDisplayID d = runtime_front_display_id(); if (!d) d = CGMainDisplayID();
+    CGDisplayModeRef m = CGDisplayCopyDisplayMode(d);
     double hz = m ? CGDisplayModeGetRefreshRate(m) : 0; if (m) CGDisplayModeRelease(m);
+    atomic_store(&cached, (int)(hz + 0.5)); atomic_store(&cached_for, now);
     return (int)(hz + 0.5);
 #else
     Class c = NSClassFromString(@"UIScreen"); id s = c ? [c valueForKey:@"mainScreen"] : nil;
@@ -12655,7 +12667,7 @@ static void cadence_note(double tt, int interp, double expect_ms) {
     if (tt <= 0) dropped++;
     else { if (last > 0 && tt > last && n < N) { ex[n] = last_expect; iv[n++] = (tt - last) * 1e3; ni += interp; } if (tt > last) { last = tt; last_expect = expect_ms; } }
     if (n == N) {
-        if (!hz) { hz = mtl_display_hz(); if (hz <= 0) hz = 60; }
+        hz = mtl_display_hz(); if (hz <= 0) hz = 60;   // TOTK: asked each report, so a move to another display is followed
         double tick = 1000.0 / hz; int beyond = 0; for (int i = 0; i < N; i++) beyond += iv[i] > (ex[i] > tick ? ex[i] : tick) + 0.5 * tick;
         double a[N]; memcpy(a, iv, sizeof a); qsort(a, N, sizeof *a, dcmp_mtl);
         int held = 0; for (int i = 0; i < N; i++) held += a[i] > 1.5 * tick;
@@ -13068,7 +13080,7 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
         /* TOTK_MFX: the game frame goes up at the refresh nearest to half a game frame after its interpolated one, so the
            two pictures share the frame's time evenly (30+30 on a 100 Hz display: two refreshes later, not one; half the
            refresh rate and uncapped: the next refresh). Until then the interpolated picture stays up. */
-        static double tick; if (!tick) { int hz = mtl_display_hz(); tick = 1.0 / (hz > 0 ? hz : 60); }
+        int hz = mtl_display_hz(); double tick = 1.0 / (hz > 0 ? hz : 60);   // TOTK: the window's display, followed when it moves
         if (tts < ip->interp_ts + ip->period / 2 - tick / 2) { pthread_mutex_unlock(&g_pq_mu); return; }
     }
     if (interp >= 0) { ip->interp_shown = 1; ip->interp_ts = tts; }
@@ -13126,7 +13138,15 @@ static void link_sync(void) {   // 游戏出图线程每帧调：把节拍对象
     int want = g_dm_present_link;
     if (want < 0 || want > 2) { g_dm_present_link = applied == 3 ? 1 : applied; return; }
     if (want && mtl_fps_target() == 30) want = 3;   // 省电模式：显示节拍 30 Hz | Power-saving mode: display link at 30 Hz
+    /* TOTK: the window moved to another display (or its mode changed): mode 1 asks for that display's rate. */
+    static unsigned display_seen;
+    if (want == applied && want == 1 && g_link && display_seen != mtl_display_changes()) {
+        display_seen = mtl_display_changes(); CAMetalDisplayLink *link = g_link;
+        if (link) { link.preferredFrameRateRange = link_range(1); MLOG("[totk] display link: the window's display is now %d Hz", mtl_display_hz()); }
+        return;
+    }
     if (want == applied) return;
+    display_seen = mtl_display_changes();
     g_link_mode = want;
     if (!g_link_started) {
         if (!want) { applied = 0; return; }
@@ -13176,7 +13196,7 @@ static void *present_main(void *arg) {
            the game frame for at least half a game frame (30+30 at 100 Hz: 1 + 2 refreshes within the 3.3 a frame lasts). When
            a newer game frame is already queued (uncapped interpolation above half the refresh rate) the interpolated
            picture is skipped: two pictures per game frame would fall further and further behind. */
-        static double tick; if (!tick) { int hz = mtl_display_hz(); tick = 1.0 / (hz > 0 ? hz : 60); }
+        int hz = mtl_display_hz(); double tick = 1.0 / (hz > 0 ? hz : 60);   // TOTK: the window's display, followed when it moves
         pthread_mutex_lock(&g_pq_mu); int behind = g_pq_read < g_pq_in; pthread_mutex_unlock(&g_pq_mu);
         int show_interp = it.interp >= 0 && !behind;
         if (show_interp) { @autoreleasepool { (void)present_now(&it.t, fmin(it.period / 2, tick), it.frame, ticket, it.crop, nil, 0, it.interp); } }

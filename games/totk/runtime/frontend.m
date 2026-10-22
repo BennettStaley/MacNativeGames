@@ -254,6 +254,23 @@ static void front_sync_drawable(void){
   settings_display_size((unsigned)metalLayer.drawableSize.width,(unsigned)metalLayer.drawableSize.height,native);
  });
 }
+/* The display the game window is on (its CGDirectDisplayID; 0 = not known yet, the renderer then asks about the main
+   display) and a count that goes up whenever the window moves to another display or a display's mode changes (System
+   Settings' refresh rate, a display plugged in). The renderer (nvn_mtl.m mtl_display_hz) reads both on its own threads,
+   so the refresh rate, the 120 Hz pacing and the Auto frame rate limit follow the window's display on multi-monitor
+   setups, not the main display's. */
+static _Atomic uint32_t windowDisplay;
+static _Atomic unsigned displayChanges;
+uint32_t runtime_front_display_id(void){return atomic_load(&windowDisplay);}
+unsigned runtime_front_display_changes(void){return atomic_load(&displayChanges);}
+static void note_screen(const char *why){
+ NSScreen *s=window.screen;NSNumber *n=s?s.deviceDescription[@"NSScreenNumber"]:nil;uint32_t d=n?n.unsignedIntValue:0;
+ uint32_t old=atomic_exchange(&windowDisplay,d);int params=!strcmp(why,"display settings changed");
+ if(old==d&&!params)return;
+ atomic_fetch_add(&displayChanges,1);
+ CGDisplayModeRef m=d?CGDisplayCopyDisplayMode(d):NULL;double hz=m?CGDisplayModeGetRefreshRate(m):0;if(m)CGDisplayModeRelease(m);
+ fprintf(stderr,"[totk] window display %u (%s, %.0f Hz): %s\n",d,s?s.localizedName.UTF8String:"?",hz,why);
+}
 @interface TOTKWindowDelegate:NSObject<NSWindowDelegate>
 @end
 @implementation TOTKWindowDelegate
@@ -280,6 +297,7 @@ static void note_occlusion(const char *when){int v=(window.occlusionState&NSWind
  fprintf(stderr,"[totk] window %s%s (frame %llu)\n",v?"visible":"covered (or on another Space): no presents until it is visible again",when,(unsigned long long)dm_nvn_frame_count());}
 -(void)windowDidChangeOcclusionState:(NSNotification *)n{(void)n;note_occlusion("");}
 -(void)windowDidChangeBackingProperties:(NSNotification *)n{(void)n;front_sync_drawable();}
+-(void)windowDidChangeScreen:(NSNotification *)n{(void)n;note_screen("moved to another display");}
 @end
 static TOTKWindowDelegate *windowDelegate;
 /* A save package (.totksave, runtime/save_package.h) opened while the game runs (a double-click, or AirDrop's Open): the
@@ -371,6 +389,8 @@ void runtime_front_run(void(*callback)(void)){
      present. Instead it floats on top almost transparent (alpha 0.01) and lets every click through: visible to macOS,
      invisible and untouchable for the user; the game's own "shot" command still captures the full picture. */
   if(background_run()){window.alphaValue=0.01;window.ignoresMouseEvents=YES;window.level=NSFloatingWindowLevel;[window orderFrontRegardless];}else if(assume_focus()){[window orderFrontRegardless];}else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
+  note_screen("opened");
+  [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){(void)n;note_screen("display settings changed");}];
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{note_occlusion(" 3 s after opening");});
   [TOTKCheatDb boot];   /* the community cheat list for the Cheats tab, in the background (runtime/cheat_db_fetch.h) */
   atomic_store(&focused,1);
