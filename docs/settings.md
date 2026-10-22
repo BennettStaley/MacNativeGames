@@ -131,6 +131,31 @@ Each cheat has a switch (mouse, Return / A, or ← off and → on) and a line th
 | *Code patch* | writes the game's code, which is only possible before the game starts: *applies after restart* / *turns off after restart* until then |
 | *Can't be used here* | refused, with the reason (it would overwrite code this port rewrites, jump out of the game's code, or patch code only while a button is held) |
 
+How a cheat is split: the words it writes into the game's code (and into its read-only data, which is sealed with the
+code) are written once, at the start, before the game runs; everything else in the same cheat (pointer chains into the
+game's memory, button conditions, values in its data) runs live on the cheat thread. A cheat with both parts shows
+*Code patch* and needs a restart to switch; once applied, the live part only compares the code words, it never writes
+them again. Code or read-only data can therefore not be written under a condition, in a loop, or only while a button is
+held: those cheats are refused. A cheat that writes the game's ordinary data or heap is *Live*.
+
+Reasons you may see under *Can't be used here*:
+
+| | |
+|---|---|
+| *overlaps the game runtime's own patch at main+…* | the port already patches that instruction (frame rate, time of day, aspect ratio and so on) |
+| *code (or read-only data) patch … is under a condition or in a loop* | a button-held or conditional code patch, see above |
+| *patches main+…, an instruction the Apple-silicon rewrite changed* | the port runs a different instruction there, so the cheat's word would not do what it says |
+| *branches out of the game's code*, *into an instruction window the Apple-silicon rewrite moved*, *into unused padding* | a code cave or jump the port cannot follow |
+| *writes part of a word …*, *stores a register into the game's code …*, *refers to main+…, outside the game's module* | instructions the code-patch path does not support |
+| *this build has no map of the instructions the Apple-silicon rewrite changed* | the app was built without the map the checks need (`prepare_runtime.py` makes it); every code patch is refused rather than applied blind |
+| *conflicts with "…"; turn one off* | two cheats that are on write different values to the same code word (shown on the second; the first one wins) |
+
+A section that does not parse (a malformed line, a bad instruction) is refused on its own with the reason; the other
+cheats of the file still load. A file that cannot be read at all (larger than 1 MB, not a cheat file) shows its reason
+under the file's heading. At most 1024 cheats are read from all files together; the rest of a file is left out with a
+note. Two cheats with the same name in one file are kept apart as `name (#2)`, `name (#3)`, which is also how they are
+saved in `cheats-enabled.txt`.
+
 Master codes (`{...}` sections) are always on with their file and shown without a switch. The cheat databases' group
 sections (one `20000000` or `20000001` word, opening and closing a group) are shown as headings. **Turn off all cheats** switches every cheat off (code patches at
 the next start). The choices are saved in `cheats-enabled.txt` next to the profile, one line per cheat: the source and
