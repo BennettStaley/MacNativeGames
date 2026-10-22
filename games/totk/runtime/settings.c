@@ -24,6 +24,7 @@ int settings_ios(void) { return TARGET_OS_IPHONE ? 1 : 0; }
    window's drawable and the screen's native pixels (settings_display_size), which "Match the window", "Display native"
    and "Fill the screen" follow. Returns -1 when the game cannot take a size now. */
 static unsigned disp_w, disp_h, native_w;
+static const float aspect_ratios[] = {-1, 0, 16.0f / 10, 21.0f / 9, 32.0f / 9};   /* display.aspect's choices, as runtime_aspect_set takes them */
 static char display_status[160];
 static int display_apply(const char *changed) {
     extern int runtime_output_request(unsigned w, unsigned h);
@@ -63,8 +64,7 @@ static int display_apply(const char *changed) {
         /* The shape is key 4's engine (aspect_patch.h): "Fill the screen" is its fit step, which follows the window
            (frontend.m runtime_aspect_view); a fixed shape is its wide step, 16:9 the game's own. Vert+ (a screen taller
            than 16:9 keeps the sides and sees more above and below) comes with it. */
-        static const float ratios[] = {-1, 0, 16.0f / 10, 21.0f / 9, 32.0f / 9};
-        runtime_aspect_set(ratios[aspect >= 0 && aspect < 5 ? aspect : 1]);
+        runtime_aspect_set(aspect_ratios[aspect >= 0 && aspect < 5 ? aspect : 1]);
     }
     pthread_mutex_lock(&lock);
     if (sw) snprintf(display_status, sizeof display_status, "Output %u x %u, 3D scene %u x %u", cw, ch, sw, sh);
@@ -74,6 +74,21 @@ static int display_apply(const char *changed) {
     return r;
 }
 const char *settings_display_status(void) { return display_status; }
+/* Key 4 (input.c) changed the picture's shape: the setting follows it, so the menu and settings.txt show what is on. The
+   engine already has it, so it is not applied again. A wide ratio the menu does not list (TOTK_ASPECT=3440x1440) leaves
+   the setting as it was. */
+void settings_aspect_follow(float ratio) {
+    int i = settings_index("display.aspect"), v = -1;
+    for (int j = 0; j < 5 && v < 0; j++) if (ratio < 0 ? aspect_ratios[j] < 0 : fabsf(aspect_ratios[j] - ratio) < 0.001f) v = j;
+    if (i < 0 || v < 0) return;
+    pthread_mutex_lock(&lock);
+    int was = values[i]; values[i] = v;
+    pthread_mutex_unlock(&lock);
+    if (was == v) return;
+    fprintf(stderr, "[settings] display.aspect = %d (was %d; key 4)\n", v, was);
+    if (settings_save()) fprintf(stderr, "[settings] could not write %s\n", *path ? path : "(no settings file)");
+    if (observer) observer("display.aspect", v);
+}
 void settings_display_size(unsigned drawable_w, unsigned drawable_h, unsigned screen_w) {
     pthread_mutex_lock(&lock);
     int same = drawable_w == disp_w && drawable_h == disp_h && screen_w == native_w, ready = loaded;

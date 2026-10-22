@@ -3,6 +3,7 @@
 #include "runtime.h"
 #include "autoload.h"
 #include "world_survey.h"
+#include "settings.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +38,7 @@ void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pth
  if(press&&code==18){extern void runtime_shortcut_help_toggle(void);runtime_shortcut_help_toggle();}
  if(press&&code==KEY_INTERP_TOGGLE){extern void dm_gfx_set_flag(const char *name,int v);dm_gfx_set_flag("mfx_interp",-1);}
  if(press&&code==KEY_OUTPUT_MODE_CYCLE)runtime_output_mode_cycle();
- if(press&&code==KEY_ASPECT_TOGGLE)runtime_aspect_toggle();
+ if(press&&code==KEY_ASPECT_TOGGLE&&runtime_aspect_toggle())settings_aspect_follow(runtime_aspect_choice());   /* the menu shows the shape key 4 picked */
  if(press&&code==KEY_TAA_TOGGLE){extern void taa_toggle(void);taa_toggle();}}
 void runtime_input_key(unsigned code,int down){if(down&&code<128)user_input("keyboard");runtime_input_key_synthetic(code,down);}
 /* While the settings menu is open the game reads a neutral controller: nothing the player presses there reaches it. */

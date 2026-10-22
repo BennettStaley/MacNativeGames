@@ -121,6 +121,7 @@ int runtime_aspect_toggle(void);   /* runtime/aspect_patch.h: key 4, 16:9 -> fit
 int runtime_aspect_step(void);     /* key 4's step: 0 16:9, 1 fit to the window, 2 21:9 / TOTK_ASPECT; -1 where unavailable */
 void runtime_aspect_view(double w, double h);   /* frontend.m: the window's drawable size, which key 4 follows */
 float runtime_aspect_now(void);     /* the ratio in force, 0 = the game's own 16:9 */
+float runtime_aspect_choice(void);  /* key 4's step as the settings menu gives it: -1 fit, 0 16:9, else the wide ratio */
 void runtime_fov_set(int percent);
 void runtime_fog_set(int percent);   /* aspect_patch.h: fog density 0..100 % live (1.4.3, Mac and iOS), 100 = the game's own */
 int runtime_shadow_res(void);        /* aspect_patch.h: the shadow map factor in force from the start (TOTK_SHADOW_RES), 0 = the game's own */

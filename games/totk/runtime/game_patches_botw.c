@@ -537,3 +537,4 @@ void runtime_output_max(unsigned *w, unsigned *h) { *w = 1920; *h = 1080; }
 int runtime_output_request(unsigned w, unsigned h) { return w == 1920 && h == 1080 ? 0 : -1; }
 void runtime_aspect_view(double w, double h) { (void)w; (void)h; }
 int runtime_aspect_step(void) { return -1; }
+float runtime_aspect_choice(void) { return 0; }

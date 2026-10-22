@@ -102,6 +102,13 @@ void runtime_aspect_set(float ratio) {
     aspect_choose(ratio);
 }
 
+/* Key 4's step the way the settings menu hands it to runtime_aspect_set: -1 fit, 0 16:9, above 0 the wide ratio. Key 4
+   writes it through to the setting (input.c, settings_aspect_follow), so the menu shows what is on. */
+float runtime_aspect_choice(void) {
+    int step = atomic_load(&g_aspect_step);
+    return step == ASPECT_STEP_FIT ? -1 : step == ASPECT_STEP_WIDE ? g_aspect_wide : 0;
+}
+
 /* Key 4 (runtime/input.c). Returns 0 where it is not available (iPhone / iPad, other game versions). */
 int runtime_aspect_toggle(void) {
     if (!g_aspect_slot) return 0;
