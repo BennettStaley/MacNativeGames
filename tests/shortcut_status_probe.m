@@ -27,6 +27,11 @@ static void tick(void) {
     [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
     [((TOTKShortcutHelp *)shortcutHelp).timer fire];
 }
+/* Key 3's picture mode as the box used to name it: off is 1080p without MetalFX, "native" any other size. */
+static int picture(unsigned w, unsigned h) {
+    uint64_t size = runtime_output_size_current();
+    return !mfxup_output_enabled() && (uint32_t)size == w && (uint32_t)(size >> 32) == h;
+}
 static void expect(TOTKShortcutHelp *panel, NSString *text) {
     if (![panel.label.stringValue containsString:text]) {
         fprintf(stderr, "expected %s in:\n%s\n", text.UTF8String, panel.label.stringValue.UTF8String);
@@ -45,40 +50,39 @@ int main(int argc, const char **argv) { @autoreleasepool {
     assert(panel.timer && panel.timer.valid);
     assert(panel.timer.timeInterval == 0.5);
     [panel refresh];
-    expect(panel, initial ? @"half refresh rate" : @"off");
-    expect(panel, mfxup_output_enabled() ? @"MetalFX 2K" : @"Picture: off");
+    expect(panel, @"Settings");   /* the box points at the menu; keys 1-5 are no longer listed, so their modes are read directly */
 
     /* A request is not the current frame's interpolation mode until latched. */
     mfx_set(MFX_OFF); mfx_latch();
     [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.6]];
-    expect(panel, @"Interpolation: off");
-    press(19); tick(); expect(panel, @"Interpolation: off");
-    mfx_latch(); tick(); expect(panel, @"Interpolation: 30+30");
+    assert(mfx_enabled() == MFX_OFF);
+    press(19); tick(); assert(mfx_enabled() == MFX_OFF);
+    mfx_latch(); tick(); assert(mfx_enabled() == MFX_30);
     runtime_input_key_synthetic(19, 1); runtime_input_key_synthetic(19, 1);
     runtime_input_key_synthetic(19, 0); mfx_latch(); tick();
-    expect(panel, @"Interpolation: half refresh rate");
-    press(19); mfx_latch(); tick(); expect(panel, @"Interpolation: unlimited");
-    press(19); mfx_latch(); tick(); expect(panel, @"Interpolation: off");
+    assert(mfx_enabled() == MFX_HALF);
+    press(19); mfx_latch(); tick(); assert(mfx_enabled() == MFX_MAX);
+    press(19); mfx_latch(); tick(); assert(mfx_enabled() == MFX_OFF);
 
-    mfxup_output_set(0); tick(); expect(panel, @"Picture: off");
-    press(20); tick(); expect(panel, @"Picture: MetalFX 2K");
-    press(20); tick(); expect(panel, @"Picture: native 2K");
-    press(20); tick(); expect(panel, @"Picture: off");
-    expect(panel, @"Edge smoothing (MetalFX Temporal): off");
-    press(23); tick(); expect(panel, @"Edge smoothing (MetalFX Temporal): on");
-    press(23); tick(); expect(panel, @"Edge smoothing (MetalFX Temporal): off");
-    expect(panel, @"Aspect ratio: 16:9");
+    mfxup_output_set(0); tick(); assert(picture(1920, 1080));
+    press(20); tick(); assert(mfxup_output_enabled());
+    press(20); tick(); assert(picture(2560, 1440));
+    press(20); tick(); assert(picture(1920, 1080));
+    assert(!taa_enabled());
+    press(23); tick(); assert(taa_enabled());
+    press(23); tick(); assert(!taa_enabled());
+    assert(!runtime_aspect_now());
     shortcut_test_aspect_init(1.6);   /* key 4 becomes available; a 16:10 window */
     extern float shortcut_test_aspect_followed;   /* what key 4 wrote through to the setting (-1 fit, 0 16:9, a ratio) */
-    press(21); tick(); expect(panel, @"Aspect ratio: fit to window 1.60:1"); assert(shortcut_test_aspect_followed == -1);
-    press(21); tick(); expect(panel, @"Aspect ratio: 21:9"); assert(fabsf(shortcut_test_aspect_followed - 21.0f / 9) < 1e-4f);
-    press(21); tick(); expect(panel, @"Aspect ratio: 16:9"); assert(shortcut_test_aspect_followed == 0);
+    press(21); tick(); assert(runtime_aspect_step() == 1); assert(shortcut_test_aspect_followed == -1);
+    press(21); tick(); assert(runtime_aspect_step() == 2); assert(fabsf(shortcut_test_aspect_followed - 21.0f / 9) < 1e-4f);
+    press(21); tick(); assert(!runtime_aspect_now()); assert(shortcut_test_aspect_followed == 0);
     /* Startup/diagnostic paths can set the canvas without a key press. */
-    shortcut_test_output_size(3840, 2160); tick(); expect(panel, @"Picture: native 3840×2160");
+    shortcut_test_output_size(3840, 2160); tick(); assert(picture(3840, 2160));
     shortcut_test_output_size(2560, 1440);
     mfx_set(MFX_HALF); mfx_latch();
     setenv("TOTK_UI_LANG", "zh", 1); tick();
-    expect(panel, @"补帧：当前 刷新率一半"); expect(panel, @"画质：当前 原生 2K");
+    expect(panel, @"设置");
 
     if (hud_compact()) {
         assert(panel.frame.size.width < host.bounds.size.width - 20);
@@ -94,12 +98,12 @@ int main(int argc, const char **argv) { @autoreleasepool {
     press(18); tick(); assert(fps_overlay_hints_enabled() && !fps_overlay_full_hud());
     if (hud_compact()) {
         assert(!panel.hidden); expect(panel, @"FPS 60  2560x1440");
-        assert(![panel.label.stringValue containsString:@"New shaders"] && ![panel.label.stringValue containsString:@"快捷键"]);
+        assert(![panel.label.stringValue containsString:@"New shaders"] && ![panel.label.stringValue containsString:@"设置"]);
     } else assert(panel.hidden);   // corners: the FPS corner stays in the picture, the shortcut box goes
     press(18); tick(); assert(panel.hidden && !fps_overlay_hints_enabled());
     mfx_set(MFX_MAX); mfx_latch(); tick();
     press(18); tick(); assert(!panel.hidden && fps_overlay_full_hud());
-    expect(panel, @"补帧：当前 不限帧");
+    expect(panel, @"设置");
     hud_publish(0, "60 FPS (30 + 30)", 0); tick();
     if (hud_compact()) expect(panel, @"60 FPS (30 + 30)");
 
