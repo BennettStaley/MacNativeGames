@@ -203,6 +203,7 @@ static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_done;                         // 已完成的最大栅栏值（完成回调写） | Highest completed fence value (written by the completion callback)
 static _Atomic int g_last_commit_error;
 static _Atomic int g_up_pending;
+static void up_pending_wait(useconds_t poll_us);   // until every committed upload command buffer has completed (see g_up_slot_cv)
 
 static pthread_mutex_t g_res_mu = PTHREAD_MUTEX_INITIALIZER;   // 驻留集专用锁：res_add 会在持 g_mu 的路径里调用（arena_new），不能共用 g_mu | Dedicated lock for the residency set: res_add is called on paths that hold g_mu (arena_new), so it cannot share g_mu
 static NSHashTable *g_res_objects;
@@ -1013,7 +1014,7 @@ static void up_owner_check(const char *where) {
 // other threads (the present thread etc.) creating a command buffer do not touch the batch: they do not read or write textures uploaded in this batch; commands that need these textures all come after this replay submission (the batch is flushed before it)
 // Old-queue command buffers (readback / diagnostics / present; to be deleted once M4-4 and M4-5 are migrated away): uploads are already on the Metal 4 queue, and there is no ordering guarantee between the two queues -
 // wait for the upload to complete after flushing it, and only then can the old queue read the upload result (mtl_read_texels waited first and flushed afterwards, the readback beat the upload, 4 failures on t_nvn upload content)
-static id<MTLCommandBuffer> q_cb(void) { if (on_sub_thread()) { up_flush(); while (atomic_load(&g_up_pending)) usleep(200); } return [g_q commandBuffer]; }
+static id<MTLCommandBuffer> q_cb(void) { if (on_sub_thread()) { up_flush(); up_pending_wait(200); } return [g_q commandBuffer]; }
 static post_op *g_post; static int g_npost, g_postcap;
 // 每次提交一个自动释放池：提交跑在客体线程上（长驻、无运行循环、从不排空隐式池），Metal 回放里自动释放的对象
 // （命令缓冲、编码器、通道描述等）不放池就永远不释放。iOS 真机选角页实测宿主堆每帧涨约 47 个对象、0.22 MiB/s。
@@ -1113,26 +1114,42 @@ static int bar_start_on(void) { static int v = -1; if (v < 0) { const char *e = 
 static MTL4VisibilityOptions bar_vis(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_BARRIER_VIS"); v = !(e && !strcmp(e, "0")); if (!v) fprintf(stderr, "[dm] [nvn-mtl] 【实验】TOTK_BARRIER_VIS=0：回放编码器开头屏障不带缓存可见性\n"); } return v ? MTL4VisibilityOptionDevice : MTL4VisibilityOptionNone; }
 static MTL4VisibilityOptions blit_vis(void) { return bar_vis() | (g_blit_alias ? MTL4VisibilityOptionResourceAlias : 0); }
 static inline void m4_end(id e) {
-    if (e == g_blit && g_blit_alias) {
-        [g_blit barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionResourceAlias];
-        g_blit_alias = 0;
-    }
-    if (bar_end_on() && [e conformsToProtocol:@protocol(MTL4CommandEncoder)]) [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+    /* A copy encoder that touched aliased buffer storage needs ResourceAlias visibility at its end; it rides on the device
+       barrier (one barrier with both options) instead of a separate barrier before it. TOTK_BARRIER_END=0 keeps the alias one. */
+    int alias = e == g_blit && g_blit_alias; if (alias) g_blit_alias = 0;
+    if (bar_end_on() && [e conformsToProtocol:@protocol(MTL4CommandEncoder)]) [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice | (alias ? MTL4VisibilityOptionResourceAlias : 0)];
+    else if (alias) [g_blit barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionResourceAlias];
     [e endEncoding];
 }
-/* TOTK_BARRIER_NARROW (2026-10-16): 2 = between render passes order only what the next pass can actually depend on: copies and
+/* TOTK_BARRIER_NARROW (2026-10-16): between render passes order only what the next pass can actually depend on: copies and
    compute before every stage, earlier render work before the fragment stage -- so the next pass's vertex stage (binning) overlaps
-   the previous pass's fragment work instead of waiting for it. MEASUREMENT ONLY until the vertex-stage hazard scan (1) exists:
-   a vertex shader sampling a texture rendered just before would read it too early. 0 (default): full barriers both ways.
-   Dropping every barrier (TOTK_BARRIER_START=0 END=0, races) took the frame from 11.82 to 10.66 ms at the Lookout fixture. */
+   the previous pass's fragment work instead of waiting for it. Dropping every barrier (TOTK_BARRIER_START=0 END=0, races) took
+   the frame from 11.82 to 10.66 ms at the Lookout fixture; the DavidZande/MacNativeGames fork measured 10-13 % of the GPU time
+   in the world on 1.0.0 the same way.
+   1 (default, 2026-10-21, ported from tvc97 12ca537): with the vertex-stage check. A pass starts with the narrow barriers;
+   before its first draw whose vertex-side stages (vertex, tessellation, geometry) read textures, images or storage buffers,
+   or while an earlier render pass may have written storage or images (their bytes could be this draw's vertex, index or
+   uniform data), the pass waits for all earlier vertex and fragment work (bar_draw). Render targets are private textures,
+   never buffer memory, so a vertex fetch sees only bytes written by copies / compute (ordered before every stage) or by
+   storage / image writes (g_bar_prior). Copies, compute, MetalFX and the helper passes start with full barriers of their own;
+   the present path is on its own queue.
+   2: no vertex-stage check (MEASUREMENT ONLY: a vertex shader sampling a texture rendered just before reads it too early).
+   0: full barriers both ways, as before. */
 static int bar_narrow(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_BARRIER_NARROW"); v = e ? atoi(e) : 0;
-        if (v) MLOG("【实验】TOTK_BARRIER_NARROW=%d：渲染通道之间只按片元阶段排序（顶点阶段可与上一通道的片元重叠）%s", v, v == 2 ? "，不查顶点阶段依赖，只供测量" : ""); }
+    if (v < 0) { const char *e = getenv("TOTK_BARRIER_NARROW"); v = e ? atoi(e) : 1;
+        if (v != 1) MLOG("【实验】TOTK_BARRIER_NARROW=%d：%s", v, v == 2 ? "渲染通道之间只按片元阶段排序，不查顶点阶段依赖，只供测量" : "渲染通道之间全屏障（旧行为）"); }
     return v;
 }
-static int bar_start_mode(void) { return bar_start_on() ? (bar_narrow() == 2 ? 2 : 1) : 0; }
-static int bar_end_mode(void) { return bar_end_on() ? (bar_narrow() == 2 ? 2 : 1) : 0; }
+static int bar_start_mode(void) { return bar_start_on() ? (bar_narrow() ? 2 : 1) : 0; }   // render passes; others always full
+static int bar_end_mode(void) { return bar_end_on() ? (bar_narrow() ? 2 : 1) : 0; }
+/* The vertex-stage check (TOTK_BARRIER_NARROW=1): g_bar_waited, the open render encoder already waits for all earlier work
+   (it started with full barriers, or bar_draw added the wait); g_bar_prior, an earlier render pass may have written storage
+   or images that no later full wait has ordered yet; g_bar_cur, the open render pass may write them. */
+static int g_bar_waited = 1, g_bar_prior, g_bar_cur; static uint64_t g_bar_waits, g_bar_passes;
+static void bar_render_begun(int mode) { g_bar_passes++; g_bar_cur = 0; g_bar_waited = mode != 2; if (g_bar_waited) g_bar_prior = 0; }
+static void bar_render_ended(void) { g_bar_prior |= g_bar_cur; g_bar_cur = 0; g_bar_waited = 1; }
+static void bar_full_begun(void) { if (bar_start_on()) g_bar_prior = 0; }   // a copy / compute encoder waits for everything before it
 static inline void m4_end_render(id<MTL4RenderCommandEncoder> e) {   // end of a render encoder the replay thread encoded itself
     int m = bar_end_mode();
     if (m == 2) [e barrierAfterStages:MTLStageVertex | MTLStageFragment beforeQueueStages:MTLStageFragment | MTLStageBlit | MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
@@ -1240,15 +1257,15 @@ static inline void es_begin(id e);   // render state cache, defined with the sta
 static inline void blit_close(void) { if (g_blit) { m4_end(g_blit); g_blit = nil; } }
 #include "nvn_render_stream.h"
 static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) { blit_close();
-    if (rs_stream_pass()) { id e = rs_pass_begin(d, g_vt, g_ft, g_cb, bar_start_mode(), (uint64_t)bar_vis()); es_begin(e); return e; }   // TOTK: encode stage (nvn_render_stream.h)
+    if (rs_stream_pass()) { int m = bar_start_mode(); bar_render_begun(m); id e = rs_pass_begin(d, g_vt, g_ft, g_cb, m, (uint64_t)bar_vis()); es_begin(e); return e; }   // TOTK: encode stage (nvn_render_stream.h)
     rs_sync();   // a pass encoded by A itself (stream off, or a diagnostic frame): B must have finished the previous pass on this command buffer
     pt_mark(g_cb, 'R', d); id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; es_begin(e);
-    { int m = bar_start_mode();
+    { int m = bar_start_mode(); bar_render_begun(m);
       if (m == 2) { [e barrierAfterQueueStages:MTLStageBlit | MTLStageDispatch beforeStages:MTLStageVertex | MTLStageFragment visibilityOptions:bar_vis()];
                     [e barrierAfterQueueStages:MTLStageVertex | MTLStageFragment beforeStages:MTLStageFragment visibilityOptions:bar_vis()]; }
       else if (m) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; }
     [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; return e; }
-static inline void enc_r_end(id e) { if (rs_using(e)) rs_pass_end(e, bar_end_mode(), (uint64_t)MTL4VisibilityOptionDevice); else m4_end_render(e); }
+static inline void enc_r_end(id e) { bar_render_ended(); if (rs_using(e)) rs_pass_end(e, bar_end_mode(), (uint64_t)MTL4VisibilityOptionDevice); else m4_end_render(e); }
 static inline void enc_r_pso(id<MTL4RenderCommandEncoder> e, id<MTLRenderPipelineState> p) { if (rs_using(e)) rs_object(RS_PSO, p); else [e setRenderPipelineState:p]; }
 static inline void enc_r_dss(id<MTL4RenderCommandEncoder> e, id<MTLDepthStencilState> s) { if (rs_using(e)) rs_object(RS_DSS, s); else [e setDepthStencilState:s]; }
 /* TOTK: render state already set on the current encoder. The replay sets viewport, scissor, cull, winding, fill, depth bias,
@@ -1291,7 +1308,7 @@ static inline void enc_r_draw(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p
 static inline void enc_r_draw_instanced(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n, NSUInteger i, NSUInteger b) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INSTANCED,.u={p,v,n,i,b}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n instanceCount:i baseInstance:b]; }
 static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INDEXED,.u={p,n,t,gpu,len,i,(uint64_t)bv,bi}},1); else [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi]; }
 static inline void enc_r_store(id<MTL4RenderCommandEncoder> e, int depth, MTLStoreAction action, NSUInteger index) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_STORE,.u={(uint64_t)depth,action,index}},0); else if (depth == 1) [e setDepthStoreAction:action]; else if (depth == 2) [e setStencilStoreAction:action]; else [e setColorStoreAction:action atIndex:index]; }
-static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; blit_close(); rs_sync(); pt_mark(g_cb, 'C', nil); id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; if (bar_start_on()) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; [e setArgumentTable:g_ct]; return e; }
+static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; blit_close(); rs_sync(); pt_mark(g_cb, 'C', nil); id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; if (bar_start_on()) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; bar_full_begun(); [e setArgumentTable:g_ct]; return e; }
 static inline id<MTLComputeCommandEncoder> enc_c_begin_concurrent(id<MTLCommandBuffer> cb) { return [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]; }
 static inline void enc_c_end(id e) { m4_end(e); }
 static inline void enc_c_pso(id e, id<MTLComputePipelineState> p) { [e setComputePipelineState:p]; }
@@ -1315,7 +1332,7 @@ static uint64_t g_blit_opens, g_blit_splits, g_upd_n, g_upd_split, g_copy_n, g_c
 static int blit_bar_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_BLIT_BAR"); v = !e || atoi(e); } return v; }
 static id<MTL4ComputeCommandEncoder> blit_kind(int buffer_alias) { blit_note(); if (!g_blit) { g_blit_opens++; g_blit_splits += g_enc != nil; } rp_end();
     if (buffer_alias && !g_copy_probe_no_alias) g_blit_alias = 1; // rp_end may itself open and close a copy encoder
-    if (!g_blit) { rs_sync(); ser_gate(); pt_mark(g_cb, 'B', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; }
+    if (!g_blit) { rs_sync(); ser_gate(); pt_mark(g_cb, 'B', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; g_bar_prior = 0; }
     else if (blit_bar_on()) [g_blit barrierAfterEncoderStages:MTLStageBlit | MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:blit_vis()];
     return g_blit; }
 static id<MTL4ComputeCommandEncoder> blit(void) { return blit_kind(0); }
@@ -2104,7 +2121,7 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
 
 static void mtl_finish_gpu(void) {
     if (g_fence) mtl_wait(g_fence, UINT64_MAX);
-    while (atomic_load(&g_up_pending)) usleep(1000);
+    up_pending_wait(1000);
 }
 void mtl_present_flush(void);
 void mtl_finish(void) { mtl_present_flush(); mtl_finish_gpu(); }   // 队列语义：已入队的出图也算队列工作 | Queue semantics: already-enqueued presents also count as queue work
@@ -3049,6 +3066,15 @@ static id<MTL4ComputeCommandEncoder> g_up_ce;
 static _Atomic int g_up_alloc_busy[3];
 // TOTK: the submit thread sleeps on this until an upload allocator slot's GPU feedback arrives (was a 1 ms usleep poll).
 static pthread_mutex_t g_up_slot_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_up_slot_cv = PTHREAD_COND_INITIALIZER;
+/* TOTK_UP_WAIT_CV (upstream #159, default on): waits for all committed uploads (q_cb on the submit thread, mtl_finish) sleep on
+   g_up_slot_cv until the completion handler drops g_up_pending to 0, instead of polling it every 200 us / 1 ms -- the poll
+   added up to one period of latency to every QueueFinish and helper command buffer. =0: the old polling. */
+static void up_pending_wait(useconds_t poll_us) {
+    static int cv = -1; if (cv < 0) { const char *e = getenv("TOTK_UP_WAIT_CV"); cv = !(e && !strcmp(e, "0")); if (!cv) MLOG("TOTK_UP_WAIT_CV=0：等上传完成改回轮询（旧行为）"); }
+    if (!cv) { while (atomic_load(&g_up_pending)) usleep(poll_us); return; }
+    if (!atomic_load(&g_up_pending)) return;
+    pthread_mutex_lock(&g_up_slot_mu); while (atomic_load(&g_up_pending)) pthread_cond_wait(&g_up_slot_cv, &g_up_slot_mu); pthread_mutex_unlock(&g_up_slot_mu);
+}
 static _Atomic uint64_t g_up_slot_waits, g_up_slot_wait_ns;
 static unsigned g_up_seq;
 #define UP_BLOCK_SIZE (32u * 1024u * 1024u)
@@ -3240,8 +3266,8 @@ static void up_flush(void) {
         [staging removeAllObjects];
         for (int i = 0; i < UP_POOL; i++) if (pool_mask >> i & 1) atomic_store(&g_up_pool_busy[i], 0);
         for (int i = 0; i < UP_SPOOL; i++) if (spool_mask >> i & 1) atomic_store(&g_up_spool_busy[i], 0);
-        pthread_mutex_lock(&g_up_slot_mu); atomic_store(&g_up_alloc_busy[slot], 0); pthread_cond_broadcast(&g_up_slot_cv); pthread_mutex_unlock(&g_up_slot_mu);
-        atomic_fetch_sub(&g_up_pending, 1);
+        // g_up_pending drops under the mutex, before the broadcast: up_pending_wait checks it under the same mutex, so no wakeup is lost
+        pthread_mutex_lock(&g_up_slot_mu); atomic_store(&g_up_alloc_busy[slot], 0); atomic_fetch_sub(&g_up_pending, 1); pthread_cond_broadcast(&g_up_slot_cv); pthread_mutex_unlock(&g_up_slot_mu);
     }];
     res_commit();
     [cb endCommandBuffer];
@@ -4871,6 +4897,7 @@ static int sh_has_src(NvShader *s) { return s && (s->src || s->src_path); }
     // TOTK: translation inputs and the variant per bound-state signature (prog_fit)
     const uint8_t *ctl[6], *code[6]; NSString *key[6]; uint64_t sig[6]; NSMutableDictionary<NSNumber *, NvShader *> *alt[6];
     void *udc_sh[6]; uint8_t udc_ok, udc_img, udc_imgw; uint32_t udc_cmask;   // udc_*: udc_note_draw's summary of sh[] (valid while sh[] is the same)
+    void *bar_sh[6]; uint8_t bar_vs, bar_wr;   // bar_*: bar_draw's view of sh[] (valid while sh[] is the same): vertex-side stages read textures / images / storage; a stage may write storage / images
     void *ar_sh[6]; uint8_t ar_n, ar_st[32], ar_reg[32], ar_img[32];   // ar_*: draw_att_reads' sampled texture / image slots of sh[] (valid while sh[] is the same; ar_n 255 = more than 32, scan the bindings)
     int missing, miss_has[2]; uint64_t miss_sig[2]; int exp_skip;
     int keeps; uint64_t miss_gen; } @end   // TOTK (iOS, Mac async shaders): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip); keeps: a stage stores to memory or streams out (sph_keeps_memory), its draws are never skipped; miss_gen: totk_rt_ready_gen() when a stage was last found missing
@@ -8706,6 +8733,31 @@ static void ar_learn(NvProg *pr) {
     pr->ar_n = (uint8_t)n;
     for (int st = 0; st < 6; st++) pr->ar_sh[st] = (__bridge void *)pr->sh[st];
 }
+/* TOTK_BARRIER_NARROW=1: the wait for earlier vertex and fragment work, before the first draw of a narrow-started pass that
+   needs it (see bar_narrow). Unknown stages or bindings count as needing it. */
+static void bar_learn(NvProg *pr) {
+    pr->bar_vs = pr->bar_wr = 0;
+    for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; pr->bar_sh[st] = (__bridge void *)sh; if (!sh) continue;
+        int vertex_side = sh->stage != 1;   // 0 vertex, 2-4 geometry / tessellation; 1 fragment
+        for (int i = 0; i < sh->rf.nb; i++) { int k = sh->rf.b[i].kind;
+            int reads = k == NVN_RB_TEX || k == NVN_RB_IMG || k == NVN_RB_TBUF || k == NVN_RB_SBUFP || k == NVN_RB_SBUFU || k == NVN_RB_SAMPT;
+            int writes = k == NVN_RB_IMG || ((k == NVN_RB_SBUFP || k == NVN_RB_SBUFU) && sh->rf.b[i].rw);   // rw: read_write / write / device access
+            if (vertex_side && reads) pr->bar_vs = 1;
+            if (writes) pr->bar_wr = 1; } }
+}
+static void bar_draw(id<MTL4RenderCommandEncoder> en, NvProg *pr) {
+    if (bar_narrow() != 1) return;
+    if (!pr) { if (!g_bar_waited) goto wait; return; }
+    { int same = 1; for (int st = 0; st < 6; st++) if (pr->bar_sh[st] != (__bridge void *)pr->sh[st]) { same = 0; break; }
+      if (!same) bar_learn(pr); }
+    if (pr->bar_wr) g_bar_cur = 1;
+    if (g_bar_waited || !(pr->bar_vs || g_bar_prior)) return;
+wait:
+    g_bar_waited = 1; g_bar_prior = 0; g_bar_waits++;
+    if (rs_using(en)) rs_put((nvn_encode_packet){.op = RS_VERTEX_WAIT, .u = {(uint64_t)bar_vis()}}, 0);
+    else [en barrierAfterQueueStages:MTLStageVertex | MTLStageFragment beforeStages:MTLStageVertex visibilityOptions:bar_vis()];
+    if (g_bar_waits == 1 || g_bar_waits % 20000 == 0) MLOG("[barrier] narrow passes: %llu of %llu render passes waited for earlier work before a vertex-side read", (unsigned long long)g_bar_waits, (unsigned long long)g_bar_passes);
+}
 static int draw_att_reads(NvProg *pr, uint64_t out[ATT_READS_MAX]) {
     uint64_t cand[18]; int nc = 0, n = 0;
     if (R.has_rt) { for (int k = 0; k < R.rt.n && k < 8; k++) if (R.rt.color[k]) cand[nc++] = R.rt.color[k]->serial;
@@ -10905,6 +10957,7 @@ frz_plain:;
     rr_snap(dw,di);
 #endif
     udc_note_draw(pr);
+    bar_draw(en, pr);
     if (!att_n) for (int i = 0; i < g_nsd; i++) if (g_sd[i].wrote) g_sd_plain |= 1u << i;   // att_unstored_read: draws of a sampling run do not count
     // 0 个图元的绘制（游戏会发 count=0）不画任何像素，跳过编码；Metal 规定计数必须非零，校验层否则当场中止（营地 / 野外 / 战斗页实测）
     // A draw with 0 primitives (the game does send count=0) draws no pixels, so skip encoding; Metal requires the count to be non-zero, otherwise the validation layer aborts on the spot (measured on the camp / wilderness / combat pages)
@@ -11033,7 +11086,7 @@ static int g_disp_probe_nobar;   // probe-gpu-dispatch-chain negative control: n
 static id<MTL4ComputeCommandEncoder> disp_enc(void) {
     int open = g_blit != nil;
     g_disp_n++; g_disp_shared += open;
-    if (!open) { rs_sync(); ser_gate(); pt_mark(g_cb, 'C', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; }
+    if (!open) { rs_sync(); ser_gate(); pt_mark(g_cb, 'C', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; g_bar_prior = 0; }
     else if (!g_disp_probe_nobar) [g_blit barrierAfterEncoderStages:MTLStageBlit | MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:bar_vis()];
     [g_blit setArgumentTable:g_ct]; args_dirty_all();
     if (g_disp_n % 20000 == 0) MLOG("[nvn] 计算派发 至 %llu 次：其中 %llu 次（%.0f%%）接在已开的计算编码器里，没有另开编码器", (unsigned long long)g_disp_n, (unsigned long long)g_disp_shared, 100.0 * (double)g_disp_shared / (double)g_disp_n);
@@ -13807,6 +13860,71 @@ int mtl_probe_ds_clear(void) {
 
 /* Keep a game submission open while more than one staging batch is uploaded. Check both payload
    ordering and bounded batch memory, including retirement before the game fence is committed. */
+/* TOTK_BARRIER_NARROW=1 (bar_draw), from tvc97 12ca537: pass A spends ~10 ms in its fragment shader before writing 7 into a
+   1x1 texture; pass B, started with the narrow barriers, has a vertex shader that reads that texture and places its point on
+   screen only when it reads 7. With the vertex-side read in B's program reflection, bar_draw makes B wait, and every round must
+   light B's pixel. TOTK_PROBE_NEGATIVE: B's program has no vertex-side read, so B does not wait; the probe then reports
+   whether the race showed (it depends on timing, so it is reported, not required). */
+int mtl_probe_vertex_wait(void) {
+    mtl_init();
+    if (bar_narrow() != 1 || !bar_start_on()) MDIE("vertex wait probe: needs TOTK_BARRIER_NARROW=1 and the start barriers");
+    atomic_store(&g_rs_on, 0);   // the probe sets its own argument tables on the encoder: encoders on this thread (RS_VERTEX_WAIT is the same barrier)
+    /* 4M steps (~10 ms) and no more: the GPU is shared with the window server, and a producer running for seconds stalls the
+       whole Mac's drawing. Ordering is checked by bar_draw's state below, not by timing. */
+    char msl[1400]; const unsigned loops = 4000000u;
+    snprintf(msl, sizeof msl, "#include <metal_stdlib>\nusing namespace metal;\nstruct V { float4 p [[position]]; float size [[point_size]]; };\n"
+        "vertex V vs_full(uint id [[vertex_id]]) { float2 q[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)}; V o; o.p = float4(q[id], 0, 1); o.size = 1; return o; }\n"
+        "fragment float4 fs_slow() { float x = 1; for (uint i = 0; i < %uu; i++) x = fma(x, 1.0000001f, 1e-7f); return float4(7 + step(1e30f, x), 0, 0, 1); }\n"
+        "vertex V vs_read(texture2d<float> t [[texture(0)]]) { V o; o.p = t.read(uint2(0, 0)).x == 7 ? float4(0, 0, 0, 1) : float4(4, 4, 0, 1); o.size = 4; return o; }\n"
+        "fragment float4 fs_white() { return float4(1, 1, 1, 1); }\n", loops);
+    NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(msl) options:nil error:&e]; if (!lib) MDIE("vertex wait probe library: %s", e.localizedDescription.UTF8String);
+    MTLRenderPipelineDescriptor *pa = [MTLRenderPipelineDescriptor new]; pa.vertexFunction = [lib newFunctionWithName:@"vs_full"]; pa.fragmentFunction = [lib newFunctionWithName:@"fs_slow"]; pa.colorAttachments[0].pixelFormat = MTLPixelFormatR32Float;
+    MTLRenderPipelineDescriptor *pb = [MTLRenderPipelineDescriptor new]; pb.vertexFunction = [lib newFunctionWithName:@"vs_read"]; pb.fragmentFunction = [lib newFunctionWithName:@"fs_white"]; pb.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> psa = [g_dev newRenderPipelineStateWithDescriptor:pa error:&e], psb = psa ? [g_dev newRenderPipelineStateWithDescriptor:pb error:&e] : nil;
+    if (!psb) MDIE("vertex wait probe pso: %s", e.localizedDescription.UTF8String);
+    MTL4ArgumentTableDescriptor *atd = [MTL4ArgumentTableDescriptor new]; atd.maxBufferBindCount = 1; atd.maxTextureBindCount = 1;
+    id<MTL4ArgumentTable> vb = [g_dev newArgumentTableWithDescriptor:atd error:&e];
+    if (!vb) MDIE("vertex wait probe argument table");
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:1 height:1 mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate;
+    MTLTextureDescriptor *ud = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];
+    ud.usage = MTLTextureUsageRenderTarget; ud.storageMode = MTLStorageModePrivate;
+    int negative = getenv("TOTK_PROBE_NEGATIVE") != NULL, rounds = 12, wrong = 0, checked = 0;
+    NvProg *pr = [NvProg new]; NvShader *vsh = [NvShader new]; vsh->stage = 0;
+    if (!negative) { vsh->rf.nb = 1; vsh->rf.b[0].kind = NVN_RB_TEX; vsh->rf.b[0].reg = 0; }
+    pr->sh[0] = vsh;
+    for (int r = 0; r < rounds; r++) {
+        id<MTLTexture> t = [g_dev newTextureWithDescriptor:td], u = [g_dev newTextureWithDescriptor:ud]; res_add(t); res_add(u);
+        id<MTLBuffer> rb = probe_buf(8 * 8 * 4);
+        mtl_sub_begin();   // t starts at 0 (its own finished submission)
+        MTL4RenderPassDescriptor *rz = [MTL4RenderPassDescriptor new]; rz.colorAttachments[0].texture = t; rz.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rz.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0); rz.colorAttachments[0].storeAction = MTLStoreActionStore; enc_r_end(enc_r_begin(rz));
+        mtl_sub_commit(); mtl_finish();
+        mtl_sub_begin();
+        MTL4RenderPassDescriptor *ra = [MTL4RenderPassDescriptor new]; ra.colorAttachments[0].texture = t; ra.colorAttachments[0].loadAction = MTLLoadActionDontCare; ra.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTL4RenderCommandEncoder> ea = enc_r_begin(ra); enc_r_pso(ea, psa); enc_r_viewport(ea, (MTLViewport){0, 0, 1, 1, 0, 1}); enc_r_scissor(ea, (MTLScissorRect){0, 0, 1, 1});
+        enc_r_draw(ea, MTLPrimitiveTypeTriangle, 0, 3); enc_r_end(ea);
+        MTL4RenderPassDescriptor *rbp = [MTL4RenderPassDescriptor new]; rbp.colorAttachments[0].texture = u; rbp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rbp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1); rbp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTL4RenderCommandEncoder> eb = enc_r_begin(rbp);
+        if (g_bar_waited) MDIE("vertex wait probe: pass B did not start with the narrow barriers");
+        enc_r_pso(eb, psb); enc_r_viewport(eb, (MTLViewport){0, 0, 8, 8, 0, 1}); enc_r_scissor(eb, (MTLScissorRect){0, 0, 8, 8});
+        [vb setTexture:t.gpuResourceID atIndex:0]; [eb setArgumentTable:vb atStages:MTLRenderStageVertex];
+        bar_draw(eb, pr);
+        if (g_bar_waited != !negative) MDIE("vertex wait probe: bar_draw %s", negative ? "waited without a vertex-side read" : "did not wait for a vertex-side read");
+        enc_r_draw(eb, MTLPrimitiveTypePoint, 0, 1); enc_r_end(eb);
+        enc_b_copy_texture_buffer(blit(), u, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(8, 8, 1), rb, 0, 8 * 4, 8 * 8 * 4);
+        enc_b_end(g_blit); g_blit = nil;
+        mtl_sub_commit(); mtl_finish();
+        int lit = 0; const uint8_t *px = rb.contents; for (int i = 0; i < 64; i++) lit += px[i * 4] > 128;
+        if (!lit) wrong++;
+        checked++; res_remove(t); res_remove(u);
+    }
+    MLOG("vertex wait probe: %d of %d rounds read pass A's value too early (%s)", wrong, rounds, negative ? "no wait: the race" : "with the wait");
+    if (!negative && wrong) MDIE("vertex wait probe: %d of %d rounds read pass A's value before A wrote it, despite the wait", wrong, rounds);
+    if (negative && !wrong) MLOG("vertex wait probe (negative): the race did not show this time (timing); the wait itself is checked above");
+    return checked;
+}
 int mtl_probe_upload_batch(void) {
     mtl_init(); const int N = 12; const size_t cap = 2u * UP_BLOCK_SIZE; int checked = 0;
     g_up_batch_limit = getenv("TOTK_PROBE_NEGATIVE") ? SIZE_MAX : cap;
