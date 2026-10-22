@@ -26,3 +26,7 @@ void shortcut_test_aspect_init(double view) {
     g_aspect_slot = &slot;
     runtime_aspect_view(view * 1080, 1080);
 }
+/* Key 4 writes its step through to the Aspect ratio setting (runtime/settings.c, not linked here): the last one asked. */
+float shortcut_test_aspect_followed = -2;
+void settings_aspect_follow(float ratio);
+void settings_aspect_follow(float ratio) { shortcut_test_aspect_followed = ratio; }

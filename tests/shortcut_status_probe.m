@@ -69,9 +69,10 @@ int main(int argc, const char **argv) { @autoreleasepool {
     press(23); tick(); expect(panel, @"Edge smoothing (MetalFX Temporal): off");
     expect(panel, @"Aspect ratio: 16:9");
     shortcut_test_aspect_init(1.6);   /* key 4 becomes available; a 16:10 window */
-    press(21); tick(); expect(panel, @"Aspect ratio: fit to window 1.60:1");
-    press(21); tick(); expect(panel, @"Aspect ratio: 21:9");
-    press(21); tick(); expect(panel, @"Aspect ratio: 16:9");
+    extern float shortcut_test_aspect_followed;   /* what key 4 wrote through to the setting (-1 fit, 0 16:9, a ratio) */
+    press(21); tick(); expect(panel, @"Aspect ratio: fit to window 1.60:1"); assert(shortcut_test_aspect_followed == -1);
+    press(21); tick(); expect(panel, @"Aspect ratio: 21:9"); assert(fabsf(shortcut_test_aspect_followed - 21.0f / 9) < 1e-4f);
+    press(21); tick(); expect(panel, @"Aspect ratio: 16:9"); assert(shortcut_test_aspect_followed == 0);
     /* Startup/diagnostic paths can set the canvas without a key press. */
     shortcut_test_output_size(3840, 2160); tick(); expect(panel, @"Picture: native 3840×2160");
     shortcut_test_output_size(2560, 1440);
