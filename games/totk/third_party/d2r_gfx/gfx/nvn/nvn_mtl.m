@@ -2124,7 +2124,19 @@ static void mtl_finish_gpu(void) {
     up_pending_wait(1000);
 }
 void mtl_present_flush(void);
-void mtl_finish(void) { mtl_present_flush(); mtl_finish_gpu(); }   // 队列语义：已入队的出图也算队列工作 | Queue semantics: already-enqueued presents also count as queue work
+void mtl_finish(void) { mtl_present_flush(); mtl_finish_gpu(); }
+/* nvnQueueFinish (upstream #159 piece b, nxnative b0a9079): waits for the GPU work submitted so far, not for queued presents to
+   reach the screen (the Switch does not wait for the display either). With a window the display link takes one present per
+   tick, so the wait made every QueueFinish cost one or two ticks; loaders that call it per resource paid that each time.
+   A queued present keeps only a by-value tex_t copy, so before the game frees the memory or texture it presents from
+   (nvnMemoryPoolFinalize / nvnTextureFinalize) mtl_present_flush_mem drains the queued presents that read it; AcquireTexture
+   still waits for the texture's previous present ticket; mtl_drain (suspend / teardown) still flushes every present.
+   TOTK_FINISH_PRESENTS=1: QueueFinish waits for presents again (old behaviour). Internal callers keep mtl_finish. */
+void mtl_queue_finish(void) {
+    static int old = -1; if (old < 0) { const char *e = getenv("TOTK_FINISH_PRESENTS"); old = e && atoi(e); if (old) MLOG("TOTK_FINISH_PRESENTS=1：QueueFinish 也等排队的出图（旧行为）"); }
+    if (old) mtl_present_flush();
+    mtl_finish_gpu();
+}   // 队列语义：已入队的出图也算队列工作 | Queue semantics: already-enqueued presents also count as queue work
 static void present_drop_for_suspend(void);
 void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); mtl_init(); id<MTLCommandBuffer> cb = q_cb(); cb_commit(cb); cb_wait(cb); mtl_finish_gpu(); }
 
@@ -13460,6 +13472,16 @@ void mtl_present_wait(uint64_t tk) {
 // Wait until all queued presents have been processed (used by mtl_finish = nvnQueueFinish etc.): goes through mtl_present_wait, so there is still a fallback when the display link stops (real device: the game called QueueFinish once while the display link was stopped,
 // and this used to wait here without a timeout; nobody took the 3 queued frames and the game stalled; those two runs on Mac did not hit this call)
 void mtl_present_flush(void) { pthread_mutex_lock(&g_pq_mu); uint64_t h = g_pq_in; pthread_mutex_unlock(&g_pq_mu); mtl_present_wait(h); }
+/* Before the game frees [mem, mem + size) or the texture with this serial (0: none): wait for the queued presents not yet
+   handed to the GPU whose texture is in that range or is that texture (see mtl_queue_finish). Nothing queued: no wait. */
+void mtl_present_flush_mem(const void *mem, uint64_t size, uint64_t serial) {
+    uint64_t tk = 0; uintptr_t lo = (uintptr_t)mem, hi = lo + size;
+    pthread_mutex_lock(&g_pq_mu);
+    for (uint64_t i = g_pq_in - g_pq_done > PQ ? g_pq_in - PQ + 1 : g_pq_done + 1; i <= g_pq_in; i++) { const tex_t *t = &g_pq[(i - 1) % PQ].t;
+        if ((serial && t->serial == serial) || (size && (uintptr_t)t->mem >= lo && (uintptr_t)t->mem < hi)) tk = i; }
+    pthread_mutex_unlock(&g_pq_mu);
+    if (tk) mtl_present_wait(tk);
+}
 void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = g_stat_pass; *draws = g_stat_draw; }
 uint64_t mtl_view_stats(void) { return atomic_load_explicit(&g_stat_views, memory_order_relaxed); }   // texture views made so far
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse) { *enc = g_stat_args_enc; *reuse = g_stat_args_reuse;
