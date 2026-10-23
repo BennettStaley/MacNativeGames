@@ -11,7 +11,7 @@ The same archive's anim/AutoBuilder_00_In.bflan exposes C_CaptureBG_00 at frame 
 visibility key to frame 0.0 as well. The available test save does not yet unlock AutoBuilder, so that screen
 still needs an in-game screenshot check.
 
-Event/EventFlow/DmF_SY_GameOver.bfevfl.zs: after 重试 / 结束游戏 the game over flow requests GameOverPause (Event14)
+Event/EventFlow/DmF_SY_GameOver.bfevfl.zs: after "Retry" / "Quit Game" the game over flow requests GameOverPause (Event14)
 and then waits one frame (Event25, EventWait Frames 1) before the event ends and the game reloads or goes to the
 title. Shipping frame steps are one 30 fps frame or more, so that wait ends in the frame it starts; with the native
 real-time step (about 0.35 of a frame at 85 fps, 0.5 with the 60 FPS patch alone) it needs several frames, the pause

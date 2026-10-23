@@ -1,5 +1,5 @@
 /* TOTK_AUTOLOAD=1: load the newest save without pressing through the title. Only the agents' test sessions set it
-   (scripts/diag/start_user_session.sh); the desktop launcher does not (user, 2026-10-16: the title stays part of his game). The title's "继续" loads the newest save, which is also the first entry of its load list.
+   (scripts/diag/start_user_session.sh); the desktop launcher does not (user, 2026-10-16: the title stays part of his game). The title's "Continue" loads the newest save, which is also the first entry of its load list.
    At boot the game reads every slot's caption.sav; once one exists, A (key J) is pressed every 1.5 s. The presses stop
    for good when the game opens a slot's progress.sav (the load has begun), when the user presses a key or a controller
    button (they take over, e.g. to pick another save) or after 3 minutes. Without any save, or with TOTK_INPUT_SCRIPT
