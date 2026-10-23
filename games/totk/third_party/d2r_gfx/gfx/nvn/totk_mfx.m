@@ -51,6 +51,7 @@ static struct {
     uint64_t frames, made, skip_input, skip_first, skip_cut, skip_busy, miss[4];   // miss: scene, camera, depth, UI
     double gpu_ms[300]; int ngpu;   // GPU time of the last interpolations (MetalFX part)
     double last_prepare_s, dt;      // time of the previous game frame's prepare; this pair's interval (MetalFX deltaTime)
+    double near_p, far_p, fov_deg, aspect; int proj_src;   // this frame's projection for MetalFX (cam_projection)
 } g;
 
 /* Reconstructing identical MetalFX interpolators repeatedly grows device
@@ -226,6 +227,37 @@ static int inv4(const double a_[16], double r[16]) {
 static void mul4(const double a[16], const double b[16], double r[16]) {
     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { double s = 0; for (int k = 0; k < 4; k++) s += a[i * 4 + k] * b[k * 4 + j]; r[i * 4 + j] = s; }
 }
+/* MetalFX's near / far plane, vertical field of view and aspect ratio (WWDC25 session 211: wrong values give occlusion
+   artefacts) from the matrices of this frame rather than the block's scalar fields alone: projection = view-projection
+   (floats 12..27) times the inverse view (floats 0..11, 3x4 rows). GL-style clip depth mapped to 0..1, as the motion
+   kernel takes it, is the same function of view depth as Metal's 0..1 projection with the same near / far, so the
+   planes carry over. An infinite far plane (P[2][2] = -1) is given as 1e7 (MetalFX linearises with it; the depth curve
+   differs from the infinite one by near / 1e7). Falls back to the block's floats 56 / 57 / 70 / 62 when the product
+   is not a perspective projection. */
+static void cam_projection(void) {
+    double v[16] = {0}, iv[16], vp[16], p[16];
+    for (int i = 0; i < 12; i++) v[i] = g.cam[i];
+    v[15] = 1;
+    for (int i = 0; i < 16; i++) vp[i] = g.cam[12 + i];
+    int ok = inv4(v, iv);
+    if (ok) mul4(vp, iv, p);
+    double n = 0, f = 0, fov = 0, asp = 0;
+    if (ok && fabs(p[14] + 1) < 1e-3 && fabs(p[15]) < 1e-3 && p[5] != 0 && p[0] != 0) {
+        double a = p[10], b = p[11];
+        n = b / (a - 1); f = fabs(a + 1) < 1e-7 ? INFINITY : b / (a + 1);
+        fov = 2 * atan(1 / fabs(p[5])); asp = fabs(p[5] / p[0]);
+    }
+    static int block_only = -1; if (block_only < 0) { const char *e = getenv("TOTK_MFX_PROJ"); block_only = e && !strcmp(e, "block"); }   // A/B: the old block floats
+    int src = !block_only && n > 0 && f > n && fov > 0 && fov < M_PI && asp > 0;
+    if (src) { g.near_p = n; g.far_p = isinf(f) ? 1e7 : f; g.fov_deg = fov * 180 / M_PI; g.aspect = asp; }
+    else { g.near_p = g.cam[56]; g.far_p = g.cam[57]; g.fov_deg = g.cam[70] * 180 / M_PI; g.aspect = g.cam[62]; }
+    if (src != g.proj_src || !g.made) {
+        static int said; if (said++ < 4)
+            MLOG("MetalFX projection from %s: near %g far %g fov %.3f deg aspect %.4f (block floats: near %g far %g fov %.3f deg aspect %.4f)",
+                 src ? "the matrices" : "the camera block", g.near_p, g.far_p, g.fov_deg, g.aspect, g.cam[56], g.cam[57], g.cam[70] * 180 / M_PI, g.cam[62]);
+    }
+    g.proj_src = src;
+}
 // A camera jump (teleport, cutscene cut) or a turn of more than 25 degrees in one game frame is not interpolated.
 static int camera_cut(void) {
     double dx = g.cam[47] - g.prev_cam[47], dy = g.cam[51] - g.prev_cam[51], dz = g.cam[55] - g.prev_cam[55];
@@ -260,6 +292,7 @@ int mfx_frame_prepare(double frame_s) {
     float *par = g.mv_par[s].contents;
     for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) par[c * 4 + r] = (float)m[r * 4 + c];   // float4x4 is column-major
     par[16] = (float)depth.width; par[17] = (float)depth.height; par[18] = 1.0f / depth.width; par[19] = 1.0f / depth.height; par[20] = (float)g.yflip;
+    cam_projection();
     g.enc_depth = depth;
     return s;
 }
@@ -284,9 +317,14 @@ NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> h
     id<MTL4FXFrameInterpolator> fi = g.fi;
     fi.colorTexture = g.scene[g.cur]; fi.prevColorTexture = g.scene[g.cur ^ 1]; fi.depthTexture = depth; fi.motionTexture = g.mv;
     fi.uiTexture = g.ui; fi.uiTextureComposited = NO; fi.outputTexture = g.out[s]; fi.fence = g.fence;
+    /* Per frame (WWDC25 session 211 lists these as the parameters that cause occlusion artefacts when wrong):
+       motion already in pixels of the motion texture (scale 1); no jitter (the game anti-aliases with FXAA, and with
+       TOTK_TAA the colour given here is the TAA output, which has none either); deltaTime the measured interval between
+       the two game frames; depth not reversed (D32F, 0 near, GL-style clip depth mapped to 0..1); near / far / vertical
+       field of view in degrees / aspect ratio of this frame's projection (cam_projection). */
     fi.motionVectorScaleX = 1; fi.motionVectorScaleY = 1; fi.jitterOffsetX = 0; fi.jitterOffsetY = 0;
-    fi.deltaTime = (float)g.dt; fi.nearPlane = (float)g.cam[56]; fi.farPlane = (float)g.cam[57];
-    fi.fieldOfView = (float)(g.cam[70] * 180.0 / M_PI); fi.aspectRatio = (float)g.cam[62]; fi.depthReversed = NO;
+    fi.deltaTime = (float)g.dt; fi.nearPlane = (float)g.near_p; fi.farPlane = (float)g.far_p;
+    fi.fieldOfView = (float)g.fov_deg; fi.aspectRatio = (float)g.aspect; fi.depthReversed = NO;
     fi.shouldResetHistory = !g.hist_ok;
     [fi encodeToCommandBuffer:cb];
     // Metal 4 work needs explicit resource lifetime. Hold this exact frame's
