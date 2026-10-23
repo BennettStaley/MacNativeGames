@@ -53,6 +53,7 @@ void mfx_debug_view_set(int view);   // < 0 cycles
 NSArray *mfx_debug_encode(id<MTL4CommandBuffer> cb, int slot, id<MTLTexture> present, const int crop[4]);
 id<MTLTexture> mfx_output(int slot);   // RGBA8Unorm view of the sRGB output, like the swapchain textures
 void mfx_stats(char *out, size_t n);
+void mfx_mem_report(char *out, size_t n);   // memreport (diagnostic): textures, cached / retired interpolators
 // At every game present (also while off): releases retired textures / interpolators (an old size or configuration) and
 // pauses interpolation and per-object motion above 95% of the GPU memory budget (resumed under 85%). used / budget:
 // the device's allocated bytes and gpu_budget_bytes (0: no budget).

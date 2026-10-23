@@ -64,6 +64,8 @@ static struct {
     double near_p, far_p, fov_deg, aspect; int proj_src;   // this frame's projection for MetalFX (cam_projection)
     uint64_t obj_frames;
     id<MTLTexture> last_om;         // the per-object motion the last encoded frame used (nil: none), for mfx_debug_encode
+    id<MTLTexture> dz;              // TOTK_MFX_FIXED_INPUT: the G-buffer depth resampled to the output size (dz_resample)
+    id<MTLRenderPipelineState> dz_ps; id<MTLDepthStencilState> dz_ds; id<MTL4ArgumentTable> dz_args[MFX_OUT];
     id<MTLRenderPipelineState> dbg_ps[3]; MTLPixelFormat dbg_fmt[3];   // TOTK_MFX_DEBUG_VIEW, by target format
     id<MTL4ArgumentTable> dbg_args[MFX_OUT];
     id<MTLBuffer> dbg_par[MFX_OUT];
@@ -79,13 +81,15 @@ void mfx_set_mv_dyn(int on) { atomic_store(&g_mv_dyn, on != 0); MLOG("[flag] mfx
  * cache. Once full, new configurations use the previous uncached path. This does not establish or
  * fix every source of long-session memory growth. Diagnostic opt-out below. */
 #define MFX_FI_CACHE 4
-static id<MTL4FXFrameInterpolator> g_fi_cache[MFX_FI_CACHE];
+static id<MTL4FXFrameInterpolator> g_fi_cache[MFX_FI_CACHE];   // least recently used first
+static uint64_t g_fi_bytes[MFX_FI_CACHE];                        // GPU memory each one added when it was made (fi_cache_add)
 static unsigned g_fi_cache_count;
 static int fi_cache_on(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("TOTK_MFX_FI_CACHE"); on = !e || strcmp(e, "0"); }
     return on;
 }
+static void fi_cache_touch(id<MTL4FXFrameInterpolator> fi);
 static id<MTL4FXFrameInterpolator> fi_cached(NSUInteger iw, NSUInteger ih) {
     if (!fi_cache_on()) return nil;
     for (unsigned i = 0; i < g_fi_cache_count; i++) {
@@ -94,12 +98,26 @@ static id<MTL4FXFrameInterpolator> fi_cached(NSUInteger iw, NSUInteger ih) {
             fi.outputHeight == g.out_h && fi.colorTextureFormat == g.scene_fmt) {
             MLOG("reuse cached interpolator %u: %lux%lu -> %lux%lu; reset history", i,
                  (unsigned long)iw, (unsigned long)ih, (unsigned long)g.out_w, (unsigned long)g.out_h);
+            fi_cache_touch(fi);
             return fi;
         }
     }
     return nil;
 }
 
+/* TOTK_MFX_FIXED_INPUT (default 1): the interpolator's input size is the output size, whatever the render size: the
+   G-buffer depth is resampled to it (nearest, one full-screen pass, dz_resample) and the motion kernel runs at it.
+   MetalFX gives no memory back when an interpolator is released (measured 2026-10-23: 19 interpolators made while
+   switching between six render resolutions added 1.66 GB that never came back, about what each added when made, 44-157
+   MB at 2560x1440 output), so one interpolator per render size leaked with every switch the cache could not serve. Now
+   a render resolution change keeps the same interpolator; only an output size change makes a new one.
+   0: input = render size, one interpolator per render size (old). */
+static int mfx_fixed_input(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_MFX_FIXED_INPUT"); on = !e || strcmp(e, "0");
+        MLOG("TOTK_MFX_FIXED_INPUT=%d: %s", on, on ? "depth and motion at the output size, one interpolator per output size" : "depth and motion at the render size, one interpolator per render size (old)"); }
+    return on;
+}
 /* g_on: the mode of this game frame (read by the replay, the present path and the pacing in hle_nvn.c); g_req: what the
    user asked for (key 2 / flag mfx_interp), taken over at the next present. */
 static _Atomic int g_on, g_req;
@@ -164,6 +182,8 @@ static id<MTLTexture> mk(MTLPixelFormat f, NSUInteger w, NSUInteger h, MTLTextur
 #define MFX_RETIRE_MAX 64
 static struct { __strong id obj; uint64_t tick, bytes; } g_ret[MFX_RETIRE_MAX];
 static int g_nret; static uint64_t g_tick;
+static NSHashTable *g_fi_gone;   // released interpolators (weak): memreport shows how many are still alive (held elsewhere)
+static uint64_t g_fi_made, g_fi_made_bytes;   // interpolators made this session, and the GPU allocation they added
 static uint64_t obj_bytes(id o) { return [o conformsToProtocol:@protocol(MTLResource)] ? (uint64_t)((id<MTLResource>)o).allocatedSize : 0; }
 static int is_cached(id<MTL4FXFrameInterpolator> fi);
 static void retire_drain(int all) {
@@ -172,7 +192,7 @@ static void retire_drain(int all) {
         if (!all && g_tick - g_ret[i].tick < MFX_RETIRE_TICKS) { if (k != i) { g_ret[k] = g_ret[i]; g_ret[i].obj = nil; } k++; continue; }
         id o = g_ret[i].obj; g_ret[i].obj = nil;
         if ([o conformsToProtocol:@protocol(MTLAllocation)] && g.rs) [g.rs removeAllocation:(id<MTLAllocation>)o];
-        if ([o conformsToProtocol:@protocol(MTL4FXFrameInterpolator)]) fis++;
+        if ([o conformsToProtocol:@protocol(MTL4FXFrameInterpolator)]) { fis++; if (!g_fi_gone) g_fi_gone = [NSHashTable weakObjectsHashTable]; [g_fi_gone addObject:o]; }
         bytes += g_ret[i].bytes; n++;
     }
     g_nret = k;
@@ -190,6 +210,30 @@ static void retire(id o) {
 // Retire a texture of ours (it leaves the residency set when released, see retire_drain).
 static void drop(id<MTLTexture> __strong *t) { if (*t) { retire(*t); *t = nil; } }
 static int is_cached(id<MTL4FXFrameInterpolator> fi) { for (unsigned i = 0; i < g_fi_cache_count; i++) if (g_fi_cache[i] == fi) return 1; return 0; }
+/* Least recently used first. A new interpolator always joins (it is in use); the least recently used one is retired
+   when the cache is full (before, a fifth configuration was never cached). It is not bounded by memory: releasing an
+   interpolator gives no GPU memory back (TOTK_MFX_FIXED_INPUT), so evicting one only costs a rebuild that allocates
+   again. g_fi_bytes: what each added when made (Metal reports no allocatedSize for it), at least fi_estimate. */
+static uint64_t fi_estimate(NSUInteger iw, NSUInteger ih) { return (uint64_t)iw * ih * 16 + (uint64_t)g.out_w * g.out_h * 16; }
+static void fi_cache_retire_at(unsigned i) {
+    retire(g_fi_cache[i]);
+    for (unsigned j = i + 1; j < g_fi_cache_count; j++) { g_fi_cache[j - 1] = g_fi_cache[j]; g_fi_bytes[j - 1] = g_fi_bytes[j]; }
+    g_fi_cache_count--; g_fi_cache[g_fi_cache_count] = nil; g_fi_bytes[g_fi_cache_count] = 0;
+}
+static uint64_t fi_cache_bytes(void) { uint64_t b = 0; for (unsigned i = 0; i < g_fi_cache_count; i++) b += g_fi_bytes[i]; return b; }
+static void fi_cache_touch(id<MTL4FXFrameInterpolator> fi) {   // most recently used last
+    for (unsigned i = 0; i + 1 < g_fi_cache_count; i++) if (g_fi_cache[i] == fi) {
+        uint64_t b = g_fi_bytes[i];
+        for (unsigned j = i + 1; j < g_fi_cache_count; j++) { g_fi_cache[j - 1] = g_fi_cache[j]; g_fi_bytes[j - 1] = g_fi_bytes[j]; }
+        g_fi_cache[g_fi_cache_count - 1] = fi; g_fi_bytes[g_fi_cache_count - 1] = b; return;
+    }
+}
+static void fi_cache_add(id<MTL4FXFrameInterpolator> fi, uint64_t bytes) {
+    unsigned n = 0;
+    while (g_fi_cache_count >= MFX_FI_CACHE) { fi_cache_retire_at(0); n++; }
+    g_fi_cache[g_fi_cache_count] = fi; g_fi_bytes[g_fi_cache_count] = bytes; g_fi_cache_count++;
+    if (n) MLOG("interpolator cache full: the least recently used one retired for the new one (%u cached, about %llu MB)", g_fi_cache_count, (unsigned long long)(fi_cache_bytes() >> 20));
+}
 /* The cached interpolators of another output size or colour format than the current one: an interpolator holds history
    and intermediate textures of its output size (hundreds of MB at 3456x1944), and a resolution change would otherwise
    keep up to MFX_FI_CACHE of them alongside the new one. all: every cached one (memory released for a pause). */
@@ -197,10 +241,10 @@ static unsigned fi_cache_evict(int all) {
     unsigned k = 0, n = 0;
     for (unsigned i = 0; i < g_fi_cache_count; i++) {
         id<MTL4FXFrameInterpolator> fi = g_fi_cache[i];
-        if (!all && fi.outputWidth == g.out_w && fi.outputHeight == g.out_h && fi.colorTextureFormat == g.scene_fmt) g_fi_cache[k++] = fi;
+        if (!all && fi.outputWidth == g.out_w && fi.outputHeight == g.out_h && fi.colorTextureFormat == g.scene_fmt) { g_fi_bytes[k] = g_fi_bytes[i]; g_fi_cache[k++] = fi; }
         else { retire(fi); n++; }
     }
-    for (unsigned i = k; i < g_fi_cache_count; i++) g_fi_cache[i] = nil;
+    for (unsigned i = k; i < g_fi_cache_count; i++) { g_fi_cache[i] = nil; g_fi_bytes[i] = 0; }
     g_fi_cache_count = k;
     return n;
 }
@@ -216,7 +260,7 @@ static void ensure_out(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFo
     for (int i = 0; i < MFX_OUT; i++) { old += obj_bytes(g.out[i]); drop(&g.out[i]); g.outv[i] = nil; }
     /* The interpolator and motion texture of the old size go too (the new ones are made at the next prepare), and the
        reference mfx_dump keeps to the old depth. The per-object motion target follows the depth size (mfx_obj_target). */
-    old += obj_bytes(g.mv); drop(&g.mv); old += obj_bytes(g.pdepth); drop(&g.pdepth); g.pdepth_frame = 0;
+    old += obj_bytes(g.mv); drop(&g.mv); old += obj_bytes(g.pdepth); drop(&g.pdepth); g.pdepth_frame = 0; old += obj_bytes(g.dz); drop(&g.dz);
     if (g.fi && !is_cached(g.fi)) retire(g.fi);
     g.fi = nil; g.last_depth = nil; g.last_slot = -1; g.in_w = g.in_h = 0;
     MTLTextureUsage rt = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
@@ -275,16 +319,22 @@ static void ensure_fi(NSUInteger iw, NSUInteger ih) {
         id<MTL4Compiler> comp = [g.dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&e];
         if (!comp) MDIE("MTL4 compiler: %s", e.localizedDescription.UTF8String);
         if (![MTLFXFrameInterpolatorDescriptor supportsMetal4FX:g.dev]) MDIE("this GPU has no Metal 4 MetalFX frame interpolation");
+        uint64_t before = (uint64_t)g.dev.currentAllocatedSize;
         g.fi = [d newFrameInterpolatorWithDevice:g.dev compiler:comp];
         if (!g.fi) MDIE("frame interpolator %lux%lu -> %lux%lu not created", (unsigned long)iw, (unsigned long)ih, (unsigned long)g.out_w, (unsigned long)g.out_h);
-        if (fi_cache_on() && g_fi_cache_count < MFX_FI_CACHE) g_fi_cache[g_fi_cache_count++] = g.fi;
+        uint64_t after = (uint64_t)g.dev.currentAllocatedSize, est = fi_estimate(iw, ih), b = after > before + est ? after - before : est;
+        MLOG("new interpolator %lux%lu -> %lux%lu: GPU allocated %+lld MB at creation (counted as %llu MB)", (unsigned long)iw, (unsigned long)ih, (unsigned long)g.out_w, (unsigned long)g.out_h,
+             (long long)(after - before) / 1048576, (unsigned long long)(b >> 20));
+        g_fi_made++; g_fi_made_bytes += after > before ? after - before : 0;
+        if (fi_cache_on()) fi_cache_add(g.fi, b);
     }
     drop(&g.mv); g.mv = mk(MTLPixelFormatRG16Float, iw, ih, MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead);
     drop(&g.pdepth); g.pdepth = mk(MTLPixelFormatDepth32Float, iw, ih, MTLTextureUsageShaderRead); g.pdepth_frame = 0;
+    drop(&g.dz); if (mfx_fixed_input()) g.dz = mk(MTLPixelFormatDepth32Float, iw, ih, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
     if (!g.mv_ps) {
         static const char *src =
             "#include <metal_stdlib>\nusing namespace metal;\n"
-            "struct P { float4x4 reproj; float2 size; float2 inv_size; float yflip; float obj; float dyn, maxpx; };\n"
+            "struct P { float4x4 reproj; float2 size; float2 inv_size; float yflip; float obj; float dyn, maxpx; float2 om_scale; };\n"
             // view distance from a depth value (not reversed, infinite far plane: z = near / (1 - d)), in units of near
             "static float vz(float d) { return 1.0 / max(1.0 - d, 1e-7); }\n"
             // camera motion of each depth pixel: where it was in the previous frame, in pixels of this texture. With
@@ -317,7 +367,7 @@ static void ensure_fi(NSUInteger iw, NSUInteger ih) {
             "    }\n"
             "  }\n"
             "  if (any(isnan(m)) || any(isinf(m))) m = 0.0;\n"
-            "  if (p.obj > 0.5) { float2 o = om.read(g).xy;\n"
+            "  if (p.obj > 0.5) { float2 o = om.read(uint2(float2(g) * p.om_scale)).xy;\n"
             "    if (all(abs(o) < 16.0)) { float2 op = o * float2(0.5, -0.5) * p.size; if (length(op - cm) <= p.maxpx) m = op; } }\n"
             "  mv.write(float4(m, 0.0, 0.0), g);\n"
             "}\n";
@@ -409,7 +459,7 @@ int mfx_frame_prepare(double frame_s) {
         g.skip_input++; g.miss[0] += !g.scene_ok_was; g.miss[1] += !g.cam_ok_was; g.miss[2] += !depth; g.miss[3] += !g.ui;
         g.prev_ok = g.hist_ok = 0; return -1;
     }
-    ensure_fi(depth.width, depth.height);
+    if (mfx_fixed_input()) ensure_fi(g.out_w, g.out_h); else ensure_fi(depth.width, depth.height);
     if (!g.prev_ok || camera_cut()) {
         if (g.prev_ok) g.skip_cut++; else g.skip_first++;
         memcpy(g.prev_cam, g.cam, sizeof g.cam); g.cur ^= 1; g.prev_ok = 1; g.hist_ok = 0;
@@ -422,15 +472,60 @@ int mfx_frame_prepare(double frame_s) {
     int s = g.slot = (g.slot + 1) % MFX_OUT;
     float *par = g.mv_par[s].contents;
     for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) par[c * 4 + r] = (float)m[r * 4 + c];   // float4x4 is column-major
-    par[16] = (float)depth.width; par[17] = (float)depth.height; par[18] = 1.0f / depth.width; par[19] = 1.0f / depth.height; par[20] = (float)g.yflip;
+    NSUInteger mw = g.mv.width, mh = g.mv.height;   // the motion kernel's grid: the render size, or the output size (TOTK_MFX_FIXED_INPUT)
+    par[16] = (float)mw; par[17] = (float)mh; par[18] = 1.0f / mw; par[19] = 1.0f / mh; par[20] = (float)g.yflip;
+    par[24] = (float)depth.width / mw; par[25] = (float)depth.height / mh;   // per-object motion is at the depth size
     par[21] = obj ? 1.0f : 0.0f; g.enc_obj = obj; g.obj_frames += obj;
     par[22] = atomic_load(&g_mv_dyn) && g.pdepth_frame && g.pdepth_frame == g.frames - 1 ? 1.0f : 0.0f;   // the previous game frame's depth is there
     static double maxpct = -1;   // TOTK_OBJ_MOTION_MAXPCT: an object's own motion beyond this % of the width is a mismatch (default 3)
     if (maxpct < 0) { const char *e = getenv("TOTK_OBJ_MOTION_MAXPCT"); maxpct = e ? atof(e) : 3.0; if (maxpct <= 0) maxpct = 1000; }
-    par[23] = (float)(maxpct * 0.01 * depth.width);
+    par[23] = (float)(maxpct * 0.01 * mw);
     cam_projection();
     g.enc_depth = depth;
     return s;
+}
+/* TOTK_MFX_FIXED_INPUT: the game's G-buffer depth (render size) resampled to g.dz (the output size), nearest, by one
+   full-screen triangle writing the depth. 0: the pipeline could not be made. */
+static int dz_resample(id<MTL4CommandBuffer> cb, int s, id<MTLTexture> src) {
+    if (!g.dz_ps) {
+        static int failed; if (failed) return 0;
+        static const char *msl =
+            "#include <metal_stdlib>\nusing namespace metal;\n"
+            "struct V { float4 p [[position]]; };\n"
+            "vertex V vs(uint i [[vertex_id]]) { V o; float2 t = float2((i << 1) & 2, i & 2); o.p = float4(t * 2.0 - 1.0, 0.0, 1.0); return o; }\n"
+            "struct F { float d [[depth(any)]]; };\n"
+            "fragment F fs(V in [[stage_in]], depth2d<float, access::read> d [[texture(0)]], constant float2 &inv [[buffer(0)]]) {\n"
+            "  uint2 sz = uint2(d.get_width(), d.get_height());\n"
+            "  uint2 q = min(uint2(in.p.xy * inv * float2(sz)), sz - 1);\n"
+            "  F f; f.d = d.read(q); return f;\n"
+            "}\n";
+        NSError *e = nil;
+        id<MTLLibrary> lib = [g.dev newLibraryWithSource:@(msl) options:nil error:&e];
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
+        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        g.dz_ps = lib ? [g.dev newRenderPipelineStateWithDescriptor:pd error:&e] : nil;
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new]; dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES;
+        g.dz_ds = [g.dev newDepthStencilStateWithDescriptor:dd];
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1; ad.maxTextureBindCount = 1;
+        for (int i = 0; i < MFX_OUT && g.dz_ps; i++) if (!(g.dz_args[i] = [g.dev newArgumentTableWithDescriptor:ad error:&e])) g.dz_ps = nil;
+        if (!g.dz_ps || !g.dz_ds) { failed = 1; MLOG("[red] depth resample pipeline: %s", e ? e.localizedDescription.UTF8String : "?"); return 0; }
+        MLOG("depth resample pipeline ready (TOTK_MFX_FIXED_INPUT)");
+    }
+    float *inv = (float *)((char *)g.mv_par[s].contents + 128);   // after the motion kernel's parameters (P is 104 bytes)
+    inv[0] = 1.0f / g.dz.width; inv[1] = 1.0f / g.dz.height;
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    rp.depthAttachment.texture = g.dz; rp.depthAttachment.loadAction = MTLLoadActionDontCare; rp.depthAttachment.storeAction = MTLStoreActionStore;
+    id<MTL4RenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!e) return 0;
+    [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageFragment visibilityOptions:MTL4VisibilityOptionDevice];   // the game's frame is done
+    [g.dz_args[s] setTexture:src.gpuResourceID atIndex:0]; [g.dz_args[s] setAddress:g.mv_par[s].gpuAddress + 128 atIndex:0];
+    [e setArgumentTable:g.dz_args[s] atStages:MTLRenderStageFragment];
+    [e setRenderPipelineState:g.dz_ps]; [e setDepthStencilState:g.dz_ds];
+    [e setViewport:(MTLViewport){0, 0, (double)g.dz.width, (double)g.dz.height, 0, 1}];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    return 1;
 }
 void mfx_frame_abort(void) { g.enc_depth = nil; g.prev_ok = g.hist_ok = 0; g.skip_busy++; }
 NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> heap, NSUInteger stamp) {
@@ -442,6 +537,11 @@ NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> h
        works (TOTK); TOTK_MFX_CB_RESIDENCY=0 leaves it to the queue alone, as before. */
     static int cb_rs = -1; if (cb_rs < 0) { const char *e = getenv("TOTK_MFX_CB_RESIDENCY"); cb_rs = !e || strcmp(e, "0"); }
     if (cb_rs && g.rs) [cb useResidencySet:g.rs];
+    id<MTLTexture> game_depth = depth;
+    if (g.dz && (depth.width != g.dz.width || depth.height != g.dz.height)) {
+        if (!dz_resample(cb, s, depth)) { g.prev_ok = g.hist_ok = 0; }   // never expected; the motion kernel then reads past the smaller depth's edge
+        else { depth = g.dz; g.last_depth = depth; }
+    }
     [g.mv_args[s] setTexture:depth.gpuResourceID atIndex:0]; [g.mv_args[s] setTexture:g.mv.gpuResourceID atIndex:1]; [g.mv_args[s] setAddress:g.mv_par[s].gpuAddress atIndex:0];
     id<MTLTexture> om = g.enc_obj && g.obj ? g.obj : g.mv;   // without per-object motion the kernel never reads texture 2; any valid texture
     [g.mv_args[s] setTexture:om.gpuResourceID atIndex:2];
@@ -449,7 +549,7 @@ NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> h
     id<MTL4ComputeCommandEncoder> e = [cb computeCommandEncoder];
     [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];   // the game's frame is done
     [e setComputePipelineState:g.mv_ps]; [e setArgumentTable:g.mv_args[s]];
-    [e dispatchThreads:MTLSizeMake(depth.width, depth.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    [e dispatchThreads:MTLSizeMake(g.mv.width, g.mv.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
     [e updateFence:g.fence afterEncoderStages:MTLStageDispatch];
     // this frame's depth for the next one's still-world test, once the motion has read the previous one
     [e barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
@@ -476,7 +576,8 @@ NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> h
     NSMutableArray *resources = [@[fi, fi.colorTexture, fi.prevColorTexture, depth,
                                    g.mv, g.ui, g.out[s], g.mv_par[s], g.pdepth] mutableCopy];
     [resources addObject:om];   // texture 2: the per-object motion target (TOTK_OBJ_MOTION) or g.mv; always MFX_FRAME_RESOURCES entries
-    g.last_om = g.enc_obj && g.obj ? g.obj : nil;   // mfx_debug_encode
+    if (game_depth != depth) [resources addObject:game_depth];   // read by the resample pass
+    g.last_om = g.enc_obj && g.obj && g.obj.width == g.mv.width && g.obj.height == g.mv.height ? g.obj : nil;   // mfx_debug_encode reads it at the motion size
     fi.colorTexture = nil; fi.prevColorTexture = nil; fi.depthTexture = nil;
     fi.motionTexture = nil; fi.uiTexture = nil; fi.outputTexture = nil;
     if (heap) [cb writeTimestampIntoHeap:heap atIndex:stamp + 1];
@@ -698,6 +799,21 @@ static double gpu_pct(double q) {
     for (int i = 1; i < n; i++) { double v = a[i]; int j = i - 1; while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; } a[j + 1] = v; }
     return a[(int)(q * (n - 1))];
 }
+/* memreport (input file, diagnostic): what interpolation holds now. Interpolators report no allocatedSize, so only their
+   number and output sizes are given. */
+void mfx_mem_report(char *out, size_t n) {
+    uint64_t live = 0; for (int i = 0; i < 2; i++) live += obj_bytes(g.scene[i]);
+    live += obj_bytes(g.ui) + obj_bytes(g.mv) + obj_bytes(g.pdepth) + obj_bytes(g.obj) + obj_bytes(g.dz);
+    for (int i = 0; i < MFX_OUT; i++) live += obj_bytes(g.out[i]);
+    uint64_t rb = 0; int rfi = 0; for (int i = 0; i < g_nret; i++) { rb += g_ret[i].bytes; rfi += [g_ret[i].obj conformsToProtocol:@protocol(MTL4FXFrameInterpolator)]; }
+    char fis[256] = ""; size_t k = 0;
+    for (unsigned i = 0; i < g_fi_cache_count && k < sizeof fis; i++)
+        k += (size_t)snprintf(fis + k, sizeof fis - k, "%s%lux%lu->%lux%lu", i ? ", " : "", (unsigned long)g_fi_cache[i].inputWidth, (unsigned long)g_fi_cache[i].inputHeight,
+                              (unsigned long)g_fi_cache[i].outputWidth, (unsigned long)g_fi_cache[i].outputHeight);
+    snprintf(out, n, "mode %d (paused %d), textures %llu MB at %lux%lu, current interpolator %s, cached interpolators %u (about %llu MB) [%s], retired %d objects %llu MB (%d interpolators); interpolators made %llu (+%llu MB at creation), released but still alive %lu",
+             atomic_load(&g_on), g_bp_paused, (unsigned long long)(live >> 20), (unsigned long)g.out_w, (unsigned long)g.out_h, g.fi ? (is_cached(g.fi) ? "cached" : "uncached") : "none",
+             g_fi_cache_count, (unsigned long long)(fi_cache_bytes() >> 20), fis, g_nret, (unsigned long long)(rb >> 20), rfi, (unsigned long long)g_fi_made, (unsigned long long)(g_fi_made_bytes >> 20), (unsigned long)g_fi_gone.allObjects.count);
+}
 void mfx_stats(char *out, size_t n) {
     snprintf(out, n, "interpolated frames %llu (with per-object motion %llu) / game frames %llu (MetalFX GPU p50 %.2f / p95 %.2f ms; frame interval %.1f ms); not interpolated: missing input %llu (colour %llu camera %llu depth %llu UI %llu), first frame / history reset %llu, camera cut %llu, command buffer busy %llu",
              (unsigned long long)g.made, (unsigned long long)g.obj_frames, (unsigned long long)g.frames, gpu_pct(0.5), gpu_pct(0.95), g.dt * 1e3, (unsigned long long)g.skip_input, (unsigned long long)g.miss[0], (unsigned long long)g.miss[1],
@@ -713,7 +829,7 @@ static void mfx_release(int all) {
     for (int i = 0; i < 2; i++) { b += obj_bytes(g.scene[i]); drop(&g.scene[i]); }
     b += obj_bytes(g.ui); drop(&g.ui);
     for (int i = 0; i < MFX_OUT; i++) { b += obj_bytes(g.out[i]); drop(&g.out[i]); g.outv[i] = nil; }
-    b += obj_bytes(g.mv); drop(&g.mv); b += obj_bytes(g.obj); drop(&g.obj); b += obj_bytes(g.pdepth); drop(&g.pdepth); g.pdepth_frame = 0;
+    b += obj_bytes(g.mv); drop(&g.mv); b += obj_bytes(g.obj); drop(&g.obj); b += obj_bytes(g.pdepth); drop(&g.pdepth); g.pdepth_frame = 0; b += obj_bytes(g.dz); drop(&g.dz);
     if (g.fi && !is_cached(g.fi)) retire(g.fi);
     unsigned n = all ? fi_cache_evict(1) : 0;
     g.fi = nil; g.last_depth = nil; g.last_om = nil; g.last_slot = -1; g.in_w = g.in_h = 0; g.out_w = g.out_h = 0; g.depth = nil; g.enc_depth = nil;

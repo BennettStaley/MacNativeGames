@@ -161,6 +161,9 @@ static int nogpu(void) {
 - (void)addFeedbackHandler:(MTL4CommitFeedbackHandler)block { if (!handlers) handlers = [NSMutableArray array]; [handlers addObject:[block copy]]; [super addFeedbackHandler:block]; }
 @end
 static void gpu_budget_check(const char *where);
+/* Uptime (ns) the budget guard last asked for relief (0: none pending): the optional and releasable memory goes first
+   (old-size render targets in stor_sweep, cached interpolators and retired MetalFX objects at the present). */
+static _Atomic uint64_t g_budget_relief;
 static void dead_put_flush(void);
 static int bc_unpack(uint32_t nvn_fmt, uint32_t *pf, int *bpp);
 static void shot(id<MTLTexture> src, const char *path, int screen, const int crop[4]);
@@ -313,7 +316,15 @@ static uint64_t gpu_budget_bytes(void) {
 void mtl_gpu_memory(uint64_t *used, uint64_t *budget) { *used = g_dev ? (uint64_t)g_dev.currentAllocatedSize : 0; *budget = gpu_budget_bytes(); }
 static void gpu_budget_check(const char *where) {
     uint64_t budget = gpu_budget_bytes(); if (!budget) return;
-    uint64_t cur = (uint64_t)g_dev.currentAllocatedSize; if (cur <= budget) return;
+    uint64_t cur = (uint64_t)g_dev.currentAllocatedSize, now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (cur <= budget) { if (atomic_load_explicit(&g_budget_relief, memory_order_relaxed)) atomic_store(&g_budget_relief, 0); return; }
+    /* What can be released goes before the game is stopped: old-size render targets (stor_sweep, at the end of this
+       submission), cached interpolators of other sizes and retired MetalFX objects (mfx_present_tick). Nothing is released
+       here (callers may hold g_mu); they free once the GPU is done with them, so an overrun of up to 10% is tolerated for
+       up to three seconds after the first request. */
+    uint64_t asked = atomic_load(&g_budget_relief);
+    if (!asked) { atomic_store(&g_budget_relief, now); asked = now; MLOG("%s: GPU allocated %llu MB over the budget of %llu MB: releasing old-size render targets and cached MetalFX objects first", where, (unsigned long long)(cur >> 20), (unsigned long long)(budget >> 20)); }
+    if (cur <= budget / 10 * 11 && now - asked < 3000000000ull) return;
     /* TOTK_MFX: optional frame interpolation / per-object motion go first (paused near the budget at each present,
        mfx_present_tick); an overrun of at most 5% while they are being released does not stop the game. */
     if (cur <= budget / 20 * 21 && mfx_budget_grace(cur, budget)) {
@@ -3375,6 +3386,16 @@ static void stor_collect_drop(int (^pick)(const stor_ent *), uint64_t *counter) 
    them all (A/B). */
 #define STOR_RT_MIN_FRAMES 120
 #define STOR_RT_IDLE_FRAMES 1200
+/* GPU memory tight (above STOR_RT_TIGHT_PCT percent of the budget, or the budget guard asked for relief): targets of an
+   earlier size go after STOR_RT_IDLE_TIGHT frames without a draw. They were last drawn before the size change, so the
+   game draws at another size now; a target the game comes back to is made again and redrawn. */
+#define STOR_RT_TIGHT_PCT 70
+#define STOR_RT_IDLE_TIGHT 60
+static uint64_t stor_rt_idle_frames(void) {
+    uint64_t budget = gpu_budget_bytes();
+    if (atomic_load(&g_budget_relief) || (budget && (uint64_t)g_dev.currentAllocatedSize > budget / 100 * STOR_RT_TIGHT_PCT)) return STOR_RT_IDLE_TIGHT;
+    return STOR_RT_IDLE_FRAMES;
+}
 static uint64_t g_stor_rt_evicted, g_stor_rt_evicted_bytes;
 static _Atomic uint64_t g_rt_size_frame;   /* frame of the latest output / scene size change (0: none yet) */
 /* +120: a size is applied up to 0.4 s after the request (output_latch); targets still drawn afterwards stay newer than the change */
@@ -3395,9 +3416,14 @@ static void stor_sweep(uint64_t fence) {
     if (stor_rt_evict_on()) {
         static uint64_t last_check; uint64_t frame = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
         uint64_t changed = atomic_load(&g_rt_size_frame);
-        if (changed && frame >= last_check + 60 && frame > changed + STOR_RT_IDLE_FRAMES) { last_check = frame;   /* about once a second */
+        /* Each target's own idle time counts, not the time since the latest change: before (2026-10-23), every new size
+           change pushed the release of all older sizes' targets out by another STOR_RT_IDLE_FRAMES, so switching render
+           resolutions every few seconds kept every size's set (1.1-1.8 GB with six sizes at 2560x1440 output) until the
+           budget guard stopped the game. Short idle times when memory is tight (stor_rt_idle_frames). */
+        uint64_t idle = stor_rt_idle_frames(); int tight = idle < STOR_RT_IDLE_FRAMES;
+        if (changed && frame > changed && frame >= last_check + (tight ? 8 : 60)) { last_check = frame;   /* about once a second, or every 8 frames when tight */
             uint64_t before = g_stor_rt_evicted; __block uint64_t bytes = 0; __block uint64_t *held = NULL; __block int nheld = 0, cheld = 0;
-            stor_collect_drop(^int(const stor_ent *e) { int go = e->rt_frames >= STOR_RT_MIN_FRAMES && e->rt_frame < changed && frame > e->rt_frame + STOR_RT_IDLE_FRAMES;
+            stor_collect_drop(^int(const stor_ent *e) { int go = e->rt_frames >= STOR_RT_MIN_FRAMES && e->rt_frame < changed && frame > e->rt_frame + idle;
                                                          if (go) { bytes += ((__bridge id<MTLTexture>)e->tex).allocatedSize;
                                                                    for (int i = 0; i < e->nser; i++) { if (nheld == cheld) { cheld = cheld ? cheld * 2 : 64; held = realloc(held, (size_t)cheld * sizeof *held); if (!held) MDIE("evicted holders"); } held[nheld++] = e->ser[i]; } }
                                                          return go; }, &g_stor_rt_evicted);
@@ -3406,8 +3432,8 @@ static void stor_sweep(uint64_t fence) {
             for (int i = 0; i < nheld; i++) treg_drop_serial(held[i]);
             free(held);
             if (g_stor_rt_evicted > before) { g_stor_rt_evicted_bytes += bytes;
-                MLOG("render targets not drawn into for %d frames released: %llu (%.1f MB) at frame %llu, %llu (%.0f MB) so far (TOTK_RT_EVICT=0 keeps them)", STOR_RT_IDLE_FRAMES,
-                     (unsigned long long)(g_stor_rt_evicted - before), bytes / 1048576.0, (unsigned long long)frame, (unsigned long long)g_stor_rt_evicted, g_stor_rt_evicted_bytes / 1048576.0); } }
+                MLOG("render targets of an earlier size not drawn into for %llu frames released%s: %llu (%.1f MB) at frame %llu, %llu (%.0f MB) so far (TOTK_RT_EVICT=0 keeps them)", (unsigned long long)idle,
+                     tight ? " (GPU memory tight)" : "", (unsigned long long)(g_stor_rt_evicted - before), bytes / 1048576.0, (unsigned long long)frame, (unsigned long long)g_stor_rt_evicted, g_stor_rt_evicted_bytes / 1048576.0); } }
     }
     stor_det_sweep(^int(const stor_ent *e) { return !e->nser && fence > e->idle_fence + STOR_IDLE_SUBMITS; }, &g_stor_swept);
 }
@@ -16796,3 +16822,33 @@ int botw_wb_from_stage(void *ev) {
 
 #include "nvn_sampler_border_probe.h"
 #include "nvn_texels_region_probe.h"
+
+/* "memreport <tag>" (input file, diagnostic): GPU allocated with a breakdown of what a resolution change can leave behind:
+   the storage-shared textures (the game's render targets among them) split into targets drawn since the latest size
+   change, targets last drawn before it (old size, waiting for stor_sweep), and the rest; interpolation's own textures,
+   cached and retired interpolators; the per-object motion arenas; the residency set and the deferred-release queue. */
+void mtl_mem_report(const char *tag) {
+    uint64_t frame = atomic_load(&g_cur_frame), changed = atomic_load(&g_rt_size_frame);
+    uint64_t cur_b = 0, old_b = 0, other_b = 0; int cur_n = 0, old_n = 0, other_n = 0;
+    enum { G = 12 }; struct { uint32_t w, h; uint64_t b; int n; } big[G]; int ng = 0;
+    pthread_mutex_lock(&g_smu);
+    for (uint32_t i = 0; i < g_by_storage.cap; i++) { stor_ent *e = g_by_storage.vals[i]; if (!e) continue;
+        uint64_t b = ((__bridge id<MTLTexture>)e->tex).allocatedSize;
+        if (e->rt_frames && changed && e->rt_frame < changed) {
+            old_b += b; old_n++;
+            int j = 0; while (j < ng && (big[j].w != e->k.w || big[j].h != e->k.h)) j++;
+            if (j == ng && ng < G) { big[ng].w = e->k.w; big[ng].h = e->k.h; big[ng].b = 0; big[ng].n = 0; ng++; }
+            if (j < ng) { big[j].b += b; big[j].n++; }
+        } else if (e->rt_frames) { cur_b += b; cur_n++; } else { other_b += b; other_n++; }
+    }
+    pthread_mutex_unlock(&g_smu);
+    pthread_mutex_lock(&g_deferred_mu); unsigned long nd = (unsigned long)g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
+    pthread_mutex_lock(&g_res_mu); unsigned long nr = (unsigned long)g_res_objects.count; uint64_t rb = g_res_live_bytes; pthread_mutex_unlock(&g_res_mu);
+    uint64_t om = 0; for (int i = 0; i < 3; i++) om += g_om.arena[i] ? g_om.arena[i].allocatedSize : 0;
+    char mfx[768]; mfx_mem_report(mfx, sizeof mfx);
+    MLOG("[memreport] %s: frame %llu (size change at %llu), GPU allocated %llu MB of budget %llu MB; render targets drawn since the change %d / %llu MB, last drawn before it %d / %llu MB, other shared-storage textures %d / %llu MB; motion arenas %llu MB; residency set %lu objects %llu MB; deferred releases %lu",
+         tag, (unsigned long long)frame, (unsigned long long)changed, (unsigned long long)(g_dev.currentAllocatedSize >> 20), (unsigned long long)(gpu_budget_bytes() >> 20),
+         cur_n, (unsigned long long)(cur_b >> 20), old_n, (unsigned long long)(old_b >> 20), other_n, (unsigned long long)(other_b >> 20), (unsigned long long)(om >> 20), nr, (unsigned long long)(rb >> 20), nd);
+    for (int j = 0; j < ng; j++) if (big[j].b >= (8u << 20)) MLOG("[memreport]   old-size targets %ux%u: %d, %llu MB", big[j].w, big[j].h, big[j].n, (unsigned long long)(big[j].b >> 20));
+    MLOG("[memreport]   interpolation: %s", mfx);
+}

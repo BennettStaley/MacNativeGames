@@ -233,6 +233,8 @@ static void *input_file(void *arg) {
         } else if (!strncmp(line, "render ", 7)) {   /* "render <w>x<h>": the live scene size (runtime_render_request), as the settings menu asks */
             unsigned w, h; char rest = 0; if (sscanf(line + 7, "%ux%u%c", &w, &h, &rest) < 2 || (rest && rest != '\n' && rest != '\r')) runtime_fail("render takes <width>x<height>");
             runtime_render_request(w, h);
+        } else if (!strncmp(line, "memreport", 9) && (line[9] == ' ' || line[9] == '\n' || line[9] == '\r' || !line[9])) {   /* "memreport [tag]": GPU memory breakdown in the log (nvn_mtl.m mtl_mem_report) */
+            extern void mtl_mem_report(const char *tag); char *tag = line + 9; tag += *tag == ' '; tag[strcspn(tag, "\r\n")] = 0; mtl_mem_report(tag);
         } else if (!strncmp(line, "set ", 4)) {   /* "set <key> <value>": a setting changed the way the settings menu changes it (settings_set) */
             char key[64], word[64]; int v;
             if (sscanf(line + 4, "%63s %63s", key, word) != 2 || runtime_setting_test(key, word, &v)) runtime_fail("set takes <settings key> <value as settings.txt writes it>");
