@@ -127,7 +127,23 @@ int main(void) {
                settings_in_tab(settings_index("audio.volume"), 0), "Downloads on Content, effects on Graphics, audio on Game");
     }
     for (int i = 0; i < SETTINGS_COUNT; i++) expect(strncmp(SETTINGS[i].key, "cheats.", 7) != 0, "cheats are not settings: settings.txt and Reset all never hold them");
-    expect(SETTINGS_COUNT == 38, "38 settings");
+    expect(SETTINGS_COUNT == 39, "39 settings");
+    {
+        /* Dynamic resolution: the game's own by default, TOTK_FIXED_RES=1 for Off at the next start, Mac only. */
+        const SettingDef *dr = &SETTINGS[settings_index("graphics.dynamic_res")];
+        expect(dr->type == SET_CHOICE && dr->def_mac == 0 && dr->def_ios == 0 && dr->apply == SET_RESTART && dr->platforms == SET_MAC &&
+               dr->env && !strcmp(dr->env, "TOTK_FIXED_RES") && dr->unavailable && !strcmp(dr->page, "World detail"),
+               "dynamic resolution: on by default, after a restart, Mac only");
+        settings_defaults(v, 0);
+        unsetenv("TOTK_FIXED_RES"); settings_export_env(v);
+        expect(!getenv("TOTK_FIXED_RES"), "the game's dynamic resolution leaves the variable unset");
+        expect(settings_parse_text("graphics.dynamic_res = off\n", v) == 1 && value(v, "graphics.dynamic_res") == 1, "dynamic resolution off parses");
+        settings_export_env(v);
+        expect(getenv("TOTK_FIXED_RES") && !strcmp(getenv("TOTK_FIXED_RES"), "1"), "off goes out as TOTK_FIXED_RES=1");
+        settings_defaults(v, 0); settings_take_env(v);
+        expect(value(v, "graphics.dynamic_res") == 1, "TOTK_FIXED_RES=1 shows as off");
+        unsetenv("TOTK_FIXED_RES");
+    }
     {
         const SettingDef *ds = &SETTINGS[settings_index("interface.download_shaders")];
         expect(ds->type == SET_BOOL && ds->def_mac == 1 && ds->def_ios == 0 && ds->apply == SET_LIVE && ds->platforms == SET_MAC &&

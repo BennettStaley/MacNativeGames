@@ -80,6 +80,9 @@ static const SettingChoice SET_RENDER_MAX[] = {{"1440p (2560 x 1440)", "1440", N
                                                {"4K (3840 x 2160)", "2160", "3840x2160", 2160}};
 static const SettingChoice SET_AA[] = {{"The game's own", "game", "0", 0}, {"Off", "off", "1", 1}, {"FXAA", "fxaa", "2", 2}, {"SMAA", "smaa", "3", 3}};
 static const SettingChoice SET_SHADOW[] = {{"The game's own", "game", NULL, 0}, {"2x", "2", "2", 2}, {"4x", "4", "4", 4}};
+/* Dynamic resolution (TOTK_FIXED_RES, runtime/game_patches_v143.c patch_fixed_res): the game's own drops the 3D world to 90 or
+   80 % under load; Off holds every step at 100 %. A code patch at start, so after a restart, and only on the Mac. */
+static const SettingChoice SET_DYNRES[] = {{"On (the game's own)", "on", NULL, 0}, {"Off (always 100 %)", "off", "1", 1}};
 static const SettingChoice SET_ANISO[] = {{"The game's", "game", "0", 0}, {"2x", "2", "2", 2}, {"4x", "4", "4", 4}, {"8x", "8", "8", 8}, {"16x", "16", "16", 16}};
 static const SettingChoice SET_TOUCH[] = {{"Always", "always", NULL, 0}, {"Hide with a controller", "controller", NULL, 1},
                                           {"Until touched", "touch", NULL, 2}, {"Off", "off", NULL, 3}};
@@ -137,6 +140,8 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"graphics.render_distance", "World detail", "Render distance", "How far the camera draws before distant land is cut off, against the game's own 25 km (version 1.4.3). It does not change the detail of distant land.",
      "TOTK_RENDER_DISTANCE", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 50, 300, 25, "%", NULL, 0, NULL, NULL, 0},
+    {"graphics.dynamic_res", "World detail", "Dynamic resolution", "The game lowers the 3D world to 90 or 80 % of the render resolution when frames run long; Off keeps it at 100 %, sharper but slower in busy places (version 1.4.3).",
+     "TOTK_FIXED_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_DYNRES, SET_N(SET_DYNRES), "Not on iPhone and iPad: their game code is fixed when the app is built.", NULL, 0},
     {"graphics.lod_bias", "Image", "Texture detail bias", "Below 0 picks sharper texture levels, in hundredths of a level; too low shimmers.",
      "TOTK_LOD_BIAS", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, -100, 0, 25, NULL, NULL, 0, NULL, NULL, 0},
     {"framerate.cap", "Frame rate", "Frame rate limit", "The most frames a second the game draws. Auto picks the highest steady rate the game holds (120, 60, 40 or 30 on a 120 Hz display), so frames never alternate between one and two refreshes. 40 needs a 120 Hz display.",

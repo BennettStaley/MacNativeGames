@@ -18,7 +18,7 @@ The menu has four tabs, each a bar of sections:
 | Tab | Sections |
 |---|---|
 | **Game** | Display · Frame rate (with frame interpolation) · Controls · Audio · Interface |
-| **Graphics** | Image (preset, anti-aliasing, sharpening, anisotropic filtering, texture detail) · Effects (bloom, depth of field, lens flare, cave fog) · World detail (field of view, render distance, shadow resolution) |
+| **Graphics** | Image (preset, anti-aliasing, sharpening, anisotropic filtering, texture detail) · Effects (bloom, depth of field, lens flare, cave fog) · World detail (field of view, render distance, shadow resolution, dynamic resolution) |
 | **Content** | Mods · Saves (Send saves) · Downloads (shader list, cheat list) |
 | **Tools** | Cheats · Spawn · World (time of day) · Camera (hide the HUD) |
 
@@ -90,6 +90,7 @@ Limits and why:
 | **Bloom** | 0–100 % of the game's glow around bright light. The tone map adds the bloom texture to the scene; below 100 % that texture is scaled first, so 0 % is no bloom at all. Version 1.4.3. |
 | **Lens flare** | On (the game's) or off. With the sun in view the game draws about a dozen rings, ghosts and a glint over the scene before its tone map; off leaves those draws out (the sun, its glow and bloom stay). Live. Version 1.4.3. |
 | **Render distance** | 50–300 % of the camera's far clip distance (the game's own is 100 %). The game's own is 25 km, more than the map is across, so below 100 % land in the far distance is cut off sooner and above 100 % mostly changes nothing you can see: it does not load more of the world or raise the detail of distant land, which the game decides separately. |
+| **Dynamic resolution** | *On* (the game's own) or *Off*. The game measures its frame times and, when frames run long, draws the 3D world at 90 % or 80 % of the render resolution; *Off* holds every step at 100 % (`TOTK_FIXED_RES=1`: one instruction of the game's resolution controller at `main+0x5848a8`), sharper in busy places at the cost of frame rate there. The render resolution you chose stays. Applies after a restart. Mac only (iPhone and iPad run code fixed at build). Version 1.4.3. |
 
 ## Frame rate, interface, controls, audio
 
@@ -137,6 +138,12 @@ Limits and why:
 Several settings follow features first offered on Switch and emulators by MaxLastBreath's UltraCam
 (https://gamebanana.com/mods/480138) and NX Optimizer (https://github.com/MaxLastBreath/nx-optimizer). This port
 reimplements them independently for 1.4.3 and contains none of their code.
+
+Not here yet: NX Optimizer's switches for ambient occlusion, volumetric fog, screen-space reflections, global
+illumination, the grass layers, far lights, forced level of detail, *Improve LOD* and *Remove QuaReduction*. In NX
+Optimizer they are settings of UltraCam (its `Shaders` and `Graphics` sections) or older code patches it downloads,
+so its files hold no game addresses or shader identities; each needs its 1.4.3 code site or render pass found first,
+the way depth of field and lens flare were (by their shaders in the draw log).
 ## World
 
 | Setting | What it does |
