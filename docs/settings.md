@@ -65,6 +65,23 @@ display resolution held 60 fps and used 5.4–6.1 GB of GPU memory against a 7.2
 The menu's second line shows **GPU memory** against that budget, orange above 80 % and red above 90 %: past it the game
 stops on purpose instead of risking a system crash.
 
+**Options that would exceed GPU memory** (Mac). The menu does not show a choice as on when it is not running:
+
+- *Frame interpolation* pauses itself above 95 % of the budget (per-object motion with it, when `TOTK_OBJ_MOTION=1`)
+  and resumes once the use plus what the pause freed is below 85 %; after 3 pauses it stays off for the session. A mode
+  chosen while the use plus its estimate is above 95 % is not turned on at all (it turns on by itself once that is below
+  85 %). The row keeps the chosen mode and says why it is not running, orange or red like the meter:
+  `Half the refresh rate — paused: not enough GPU memory (6.9 of 7.2 GB)`, `— not applied: not enough GPU memory`,
+  `— off for this session: not enough GPU memory`. Choosing Off and then a mode tries again.
+- In the selector, a choice that would clearly not fit is marked *(not enough GPU memory)* and stays selectable. For
+  frame interpolation (while it is not running): the use now plus about 56 bytes per display-resolution pixel (two scene
+  copies, the UI layer, three outputs, the motion texture and an assumed two RGBA16F textures of MetalFX history, which
+  Metal does not report; about 0.45 GB at 4K, 0.11 GB at 1080p), plus 192 MB of motion arenas with per-object motion,
+  above 95 % of the budget. For the maximum render resolution: the use measured above (1800p 6.1 GB, 4K 7.6 GB) above
+  the budget; a chosen one that does not fit says *may not fit* under the row. These are rough estimates from the
+  textures made and one Mac's measurements, not a promise either way; the meter and the pause are what count.
+- Other overruns of the budget still stop the game.
+
 Limits and why:
 
 - The 3D scene stops at 2560×1440. The game keeps its render targets in one fixed texture heap sized at start; a 4K
@@ -78,7 +95,7 @@ Limits and why:
 
 | Setting | What it does |
 |---|---|
-| **Frame interpolation** | MetalFX makes a frame between two game frames: off, 30 + 30, half the refresh rate, every frame (Mac and iPad). |
+| **Frame interpolation** | MetalFX makes a frame between two game frames: off, 30 + 30, half the refresh rate, every frame (Mac and iPad). It needs GPU memory, and on the Mac it gives way before the game would stop (see *Options that would exceed GPU memory* below): the row then says *paused*, *not applied* or *off for this session* next to the chosen mode. |
 | **Field of view** | 70–140 % of the game's camera angle. Aiming, first person and cutscenes keep their own changes, scaled. |
 | **Cave fog** | 0–100 % of the game's fog in caves and other enclosed places (the fog ramp the Env update writes from the area's palette): 50 % reaches it at twice the distance, 0 % has none. Outdoors on Great Sky Island it made no visible difference: the outdoor haze comes from the sky / atmosphere and is not adjustable yet. Version 1.4.3. |
 | **Shadow resolution** | The sun's cascaded shadow map: *the game's own* (the game picks the side every frame: 400 to 800 per cascade docked, 800 on Great Sky Island), *2x* or *4x* that for sharper shadow edges, capped at 2048 (so 4x of 800 is 2048); the game's other views grow too. 4x adds about 190 MB of depth maps in all. Mac only; changes while you play (the next frame). Version 1.4.3. |

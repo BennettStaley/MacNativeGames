@@ -105,7 +105,7 @@ static const SettingChoice SET_PRESET[] = {{"Custom", "custom", NULL, SET_PRESET
 static const SettingDef SETTINGS[] = {
     {"graphics.preset", "Image", "Preset", "Balanced is the game's own look. Sets the render scale, anti-aliasing, sharpening, filtering, shadows, render distance and frame rate limit together. Changing one of them shows Custom.",
      NULL, SET_CHOICE, SET_LIVE, SET_ALL, SET_PRESET_BALANCED, SET_PRESET_BALANCED, 0, 0, 0, NULL, SET_PRESET, SET_N(SET_PRESET), NULL, NULL, 0},
-    {"graphics.interpolation", "Frame rate", "Frame interpolation", "MetalFX makes a frame between two game frames.",
+    {"graphics.interpolation", "Frame rate", "Frame interpolation", "MetalFX makes a frame between two game frames. On the Mac, near the GPU memory limit it pauses (resuming once memory frees up, off for the session after 3 pauses), and a mode that would not fit is marked in the list and not turned on. The row says when the chosen mode is not running.",
      "TOTK_MFX", SET_CHOICE, SET_LIVE, SET_MAC | SET_IPAD, 0, 0, 0, 0, 0, NULL, SET_INTERP, SET_N(SET_INTERP),
      "Not tested on iPhone yet.", NULL, 0},
     {"display.output", "Display", "Display resolution", "The size of the finished picture. Text, icons and menus are drawn at this size, so they stay sharp; the 3D world is drawn at the render resolution below and stretched to fill it. Display native is your screen's own pixels.",
@@ -118,7 +118,7 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_CHOICE, SET_LIVE, SET_MAC, 1, 1, 0, 0, 0, NULL, SET_ASPECT, SET_N(SET_ASPECT), "Not on iPhone and iPad yet.", NULL, 0},
     {"display.headroom", "Display", "Maximum output", "The biggest output resolution you can switch to while playing. Higher sets more memory aside; takes effect after a restart.",
      "TOTK_OUTPUT_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_HEADROOM, SET_N(SET_HEADROOM), "Fixed on iPhone and iPad.", NULL, 0},
-    {"display.render_max", "Display", "Maximum render resolution", "The biggest the 3D world can be drawn at; set Render resolution to reach it. Above 1440p needs the 4K maximum output and costs memory and speed: on an 18 GB M3 Pro, 1800p ran at 60 fps and used about 6 of 7.2 GB of GPU memory; 4K needs about 1.5 GB more and runs slower. The top of the menu shows GPU memory against the limit the game stops at. Experimental.",
+    {"display.render_max", "Display", "Maximum render resolution", "The biggest the 3D world can be drawn at; set Render resolution to reach it. Above 1440p needs the 4K maximum output and costs memory and speed: on an 18 GB M3 Pro, 1800p ran at 60 fps and used about 6 of 7.2 GB of GPU memory; 4K needs about 1.5 GB more and runs slower. The top of the menu shows GPU memory against the limit the game stops at; a choice above the measured use is marked (not enough GPU memory). Experimental.",
      "TOTK_RENDER_RESERVE", SET_CHOICE, SET_RESTART, SET_MAC, 1440, 1440, 0, 0, 0, NULL, SET_RENDER_MAX, SET_N(SET_RENDER_MAX), "Fixed on iPhone and iPad.", NULL, 0},
     {"graphics.fov", "World detail", "Field of view", "How wide the camera sees, against the game's own (version 1.4.3).",
      "TOTK_FOV", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 70, 140, 5, "%", NULL, 0, NULL, NULL, 0},
