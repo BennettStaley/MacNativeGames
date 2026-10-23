@@ -361,8 +361,9 @@ NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> h
     // Metal 4 work needs explicit resource lifetime. Hold this exact frame's
     // bindings through completion, while the configuration cache retains only
     // the interpolator, not old scene/pool textures between configurations.
-    NSArray *resources = @[fi, fi.colorTexture, fi.prevColorTexture, depth,
-                           g.mv, g.ui, g.out[s], g.mv_par[s], om];
+    NSMutableArray *resources = [@[fi, fi.colorTexture, fi.prevColorTexture, depth,
+                                   g.mv, g.ui, g.out[s], g.mv_par[s]] mutableCopy];
+    if (om) [resources addObject:om];   // TOTK_OBJ_MOTION: the per-object motion target (nil when off)
     fi.colorTexture = nil; fi.prevColorTexture = nil; fi.depthTexture = nil;
     fi.motionTexture = nil; fi.uiTexture = nil; fi.outputTexture = nil;
     if (heap) [cb writeTimestampIntoHeap:heap atIndex:stamp + 1];

@@ -145,7 +145,7 @@ static void om_cache(NSString *key, id<MTLFunction> f) {
 static NSString *om_vs_src(NvShader *vs, NvShader *fs, NSString **why) {
     NSString *src = sh_src(vs), *head = @"struct main0_out\n{\n", *entry = @"vertex main0_out main0(";
     if ([src rangeOfString:head].location == NSNotFound || [src rangeOfString:entry].location == NSNotFound || [src rangeOfString:@"return out;"].location == NSNotFound) { *why = @"no main0_out / entry / return out"; return nil; }
-    NSRegularExpression *pre = [NSRegularExpression regularExpressionWithPattern:@"float4\\s+(\\w+)\\s*\\[\\[position\\]\\]" options:0 error:nil];
+    NSRegularExpression *pre = [NSRegularExpression regularExpressionWithPattern:@"float4\\s+(\\w+)\\s*\\[\\[position[^\\]]*\\]\\]" options:0 error:nil];
     NSTextCheckingResult *pm = [pre firstMatchInString:src options:0 range:NSMakeRange(0, src.length)];
     if (!pm) { *why = @"no [[position]] output"; return nil; }
     NSString *pos = [src substringWithRange:[pm rangeAtIndex:1]];

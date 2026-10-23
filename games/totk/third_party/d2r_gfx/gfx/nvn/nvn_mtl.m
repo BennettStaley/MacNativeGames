@@ -14507,7 +14507,7 @@ static int mfx_present_frame_body(const tex_t *t, double period, int discard) {
             [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
                 // Capturing the payload keeps this frame's inputs/output and
                 // interpolator alive even across a canvas/configuration change.
-                if (frame_resources.count != 8) MDIE("invalid interpolation resource lifetime payload");
+                if (frame_resources.count < 8) MDIE("invalid interpolation resource lifetime payload");   // 8, or 9 with TOTK_OBJ_MOTION
                 sysload_note_gpu(f.GPUStartTime, f.GPUEndTime);   // the load line's game GPU share includes the interpolation
                 if (f.error) MLOG("[red] [mfx] interpolation command buffer error: %s", f.error.description.UTF8String);
                 else if (h && fq > 0) { NSData *d = [h resolveCounterRange:NSMakeRange((NSUInteger)a * 2, 2)]; const MTL4TimestampHeapEntry *t = d.bytes;
