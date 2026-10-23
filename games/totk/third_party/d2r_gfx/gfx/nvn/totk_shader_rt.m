@@ -247,11 +247,24 @@ static NSMutableArray *variants_of(NSString *shader) {
     g_variants[shader] = v;
     return v;
 }
+/* Whether a variant translated with deps serves these answers. A texture slot whose kind the translator took from the
+   sampling instruction records only whether a depth-format texture sits there: "*" (any other) or "*_depth"
+   (Service.cs, docs/shader-variants.md). A vertex input the answers leave out is unbound: the replay feeds it a constant
+   of the declared type (nvn_mtl.m pso_desc), so any variant serves it. prepare_shader_seed.py deps_match is the same. */
 static int deps_match(NSDictionary *deps, NSDictionary *ans) {
     NSDictionary *defaults = @{@"tex": @"2d", @"img": @{}, @"attr": @"float", @"fout": @"float"};
     for (NSString *kind in defaults) {
         NSDictionary *want = deps[kind], *have = ans[kind];
-        for (NSString *slot in want) { id h = have[slot] ?: defaults[kind]; if (![h isEqual:want[slot]]) return 0; }
+        for (NSString *slot in want) {
+            id w = want[slot], h = have[slot];
+            if (!h && [kind isEqualToString:@"attr"]) continue;
+            if (!h) h = defaults[kind];
+            if ([w isEqual:@"*"] || [w isEqual:@"*_depth"]) {
+                if (![h isKindOfClass:NSString.class] || [h hasSuffix:@"_depth"] != [w isEqual:@"*_depth"]) return 0;
+                continue;
+            }
+            if (![h isEqual:w]) return 0;
+        }
     }
     return 1;
 }
@@ -312,6 +325,11 @@ static NSMutableDictionary *variant_request(NSString *shader, int stage, const u
     [rq addEntriesFromDictionary:answers];
     if (local) rq[@"local"] = local;
     rq[@"depth_minus_w"] = totk_depth_near_minus_w() ? @YES : @NO;   // nvnDeviceSetDepthMode: NEAR_IS_MINUS_W needs the GL -> Metal clip-z conversion in every vertex shader
+    /* A fragment shader's early fragment tests: control byte +0x718 of the 0x880-byte sections (the NVN driver reads it as
+       a fragment flag and the Switch tests depth before the shader). Breath of the Wild's shorter sections (the size word
+       at +0x20 between 0x7cc and 0x880, as for the key) are not read. Same rule as prepare_shader_seed.py. */
+    { uint32_t size; memcpy(&size, control + 0x20, 4);
+      if (stage == 1 && !(size >= 0x7cc && size < 0x880) && (control[0x718] & 1)) rq[@"early_fragment_tests"] = @YES; }
     if (no_translator()) rq[@"code_hex"] = hex(code + skip, c1t - skip);
     return rq;
 }

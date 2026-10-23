@@ -957,7 +957,7 @@ def variant_folder(game):
     """Where the game keeps the source of each patched shader variant it compiled while it was played (nvn_mtl.m
     variant_library: sampler border colours, missing varyings, the layer index, no depth output, MetalFX roles), named by
     its SHA-256: the player's shader cache, ~/Library/Application Support/MacNativeGames/<game>/shader-cache/rt-<chain>."""
-    return Path.home()/'Library/Application Support/MacNativeGames'/APPS[game][2]/'shader-cache/rt-totk-native-v6-unverified/variants'
+    return Path.home()/'Library/Application Support/MacNativeGames'/APPS[game][2]/'shader-cache/rt-totk-native-v8-unverified/variants'
 
 
 def variant_sources(game):
@@ -1362,7 +1362,7 @@ def verify_seed(seed, version, hashes=True, game='totk'):
     try:
         report = json.loads((seed/'seed-manifest.json').read_text())
         known = seed_digests(seed) if hashes else {}
-        if (report['version'] != version or report['chain'] != 'totk-native-v6-unverified' or
+        if (report['version'] != version or report['chain'] != 'totk-native-v8-unverified' or
                 report['shaders'] < (8000 if game == 'totk' else 2000) or not report['files'] or any(
                     Path(name).name != name or (hashes and seed_sha256(seed, name, known) != digest) for name, digest in report['files'].items())):
             raise ValueError('version, translation chain or file hash differs')
@@ -1437,6 +1437,10 @@ def step_app(tree, out, logs, *, version="v0", store=None, game='totk', cheats=N
         seed = tree/f'build/shader-seed/{version}'
         report = verify_seed(seed, version, game=game)
         copy_tree(seed, res/'build/shader-seed')
+        aliases = seed.with_name(seed.name+'.aliases.tsv')   # listed variants the seed carries under another name
+        if aliases.is_file():
+            run([tree/'.venv/bin/python', 'scripts/shader_list.py', 'rename', aliases, res/'build/pso_manifest.tsv',
+                 res/'build/pso_title.tsv'], logs/'shader-list-rename.log', cwd=tree)
         for src in sorted(seed.glob('*.metal')):   # each named in the manifest, its hash just checked
             lib = tree/f'build/shader-libs/{report["files"][src.name]}.metallib'
             if lib.is_file():

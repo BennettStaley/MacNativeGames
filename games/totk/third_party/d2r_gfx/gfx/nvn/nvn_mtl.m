@@ -10576,7 +10576,8 @@ static int skv_check(const void *pr, const p_draw *dw, const p_draw_idx *di) {
       int st_ok = !S.ds.st || ((S.ds.fail_f == keep && S.ds.zfail_f == keep && S.ds.fail_b == keep && S.ds.zfail_b == keep) || (!S.st_wmask[0] && !S.st_wmask[1]));
       if (!df_ok || !st_ok) return 0;
       /* shader side effects (stores to storage buffers / images in the vertex or fragment stage) happen whether or not a
-         sample passes (no shader declares early_fragment_tests). rw comes from the MSL's stores (refl_mark_stores): the
+         sample passes (unless the fragment shader declares early_fragment_tests, NVN control +0x718: then only for the
+         samples that pass, which hides nothing more). rw comes from the MSL's stores (refl_mark_stores): the
          translator flag said read-only for every shader, so the deferred-lighting quads (dbe0acd9 ...), which store a per-tile
          feedback word the next frame's class marker reads, were skipped as "0 samples" -- the title mural went dark except on
          retest frames (2026-10-16 night). Every material fragment shader stores too: an unconditional per-tile class-group flag
