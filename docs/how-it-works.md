@@ -43,6 +43,31 @@ place in `0x70_0000_0000..2^39`. When the fixed layout does not fit, the host pl
 by side in one free hole (as the iOS layout does) and shrinks the alias region in 4 GiB steps, down to 8 GiB, until it
 fits; the game uses less than 3 GiB of it. The `guest layout` log line shows the result. macOS 26 keeps the fixed layout.
 
+The pool the game is told it owns is `app_pool()` in `runtime/services.c`: one retail figure for every version, 3,285 MiB (`0xcd500000`), plus the page-rounded amount that the
+`TOTK_OUTPUT_RES` / `TOTK_RENDER_RES` HeapDef overlay hands to the texture heaps. `TOTK_APP_POOL` replaces that whole sum rather than adding to it, so a value chosen for a big resolution overlay has to carry its
+own margin; `GetInfo` 6 and 21 report whatever the two give.
+
+The game does not use the pool directly: during startup it asks for a main heap of the pool minus about 1,170-1,200 MiB of images and system margin, and that heap is what the game sizes itself
+by. Three points measured on 1.2.1 with the 2560x1440 overlay: pool 3,373 MiB gives the usual 2,204 MiB heap (`0x89c00000`), 5,120 MiB gives 3,924 MiB (`0xf5400000`), 5,248 MiB gives
+4,052 MiB (`0xfd400000`). Two bounds apply. `svcSetHeapSize` refuses a request above `HEAP_CAP` (4 GiB) or above the pool minus the mapped images, so the heap cannot be raised
+past 4,096 MiB without raising the cap too. And the heap sits in the low reservation after the stack (6 GiB on the Mac; on iOS the reservation ends right at the
+heap cap, with no slack). `TOTK_MEM_LOG=1` logs every `SetHeapSize` and `GetInfo` call.
+
+That margin is worth knowing about because a mod that sorts "game memory" into tiers by measuring that heap reads the retail 2,204 MiB as its smallest tier, and can then refuse a resolution the
+host serves without any trouble - warning about not enough memory while nothing is short of RAM. Raising the pool moves the game heap into the next tier, and an app bundle can carry the setting
+without a code change, as a LaunchServices environment entry (re-sign the bundle afterwards):
+
+```sh
+P="Tears of the Kingdom.app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$P"
+/usr/libexec/PlistBuddy -c "Add :LSEnvironment:TOTK_APP_POOL string 0x148000000" "$P"
+codesign -f -s - "Tears of the Kingdom.app"
+```
+
+The next packaging writes a new Info.plist, so the entry has to be added again after each build.
+
+The memory is real, though: the committed heap grows by the same amount, so on a 16 GiB Mac expect more paging, not a free upgrade.
+
 ## The graphics (games/totk/third_party/d2r_gfx/gfx/nvn)
 
 The game records NVN commands (Nintendo's graphics API) into command buffers. The NVN layer implements the API on the

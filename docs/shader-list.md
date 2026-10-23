@@ -102,17 +102,27 @@ app) the whole cache is warmed as before; `TOTK_WARM_ALL=1` does that for compar
 
 You do not need to do anything while playing. When the Mac has to translate a shader variant, or an iPhone or iPad
 misses one, that variant is not in the list yet, so the game writes it to `shader-list-contribution.txt`: one `V` row
-per shader and bind state, nothing else (`third_party/d2r_gfx/gfx/nvn/totk_shader_contrib.h`).
+per shader and bind state, nothing else (`third_party/d2r_gfx/gfx/nvn/totk_shader_contrib.h`). Since every build carries
+each shader's default variant ([shader-variants.md](shader-variants.md); `all_default` in the seed's manifest), only
+states those variants do not serve are written, never a default variant (`totk_shader_rt.m contrib_wanted`): the list
+keeps non-default variants only (2026-10-22; Breath of the Wild too since 2026-10-23).
+Render pipelines are collected with them (2026-10-22): one the game builds in play that the app's warm-up lists lack
+becomes an `R` row (and a `B` row with its border recipe), written off the submit thread (`nvn_mtl.m pso_contribute`).
+Its shaders are named as a build names them: a default or depth-bound variant keeps its name, any other is named after
+its deps as `prepare_shader_seed.py` names a list row (`totk_contrib_listed_name`), so another player's build has it.
 
 - Mac: `~/Library/Application Support/MacNativeGames/TOTK/shader-list-contribution.txt`
 - iPhone / iPad: Files app › On My iPhone (or iPad) › Tears of the Kingdom › `shader-list-contribution.txt`
 
-On a Mac, every 500 new rows the launcher asks once, before the game starts, whether to send the file. An iPhone or
+On a Mac, every 100 new rows of either kind the launcher asks once, before the game starts, whether to send the file. An iPhone or
 iPad never asks during play: while it is connected to the Mac that built its app (cable or the same Wi-Fi),
-`games/totk/ios/tools/shader_contrib_watch.py` (a LaunchAgent the iOS build installs) copies the file to the Mac every
-10 minutes at most and asks there, every 500 new rows per device. "Remind me next time" waits for the next 500;
+`games/totk/ios/tools/shader_contrib_watch.py` (a LaunchAgent the iOS build installs) fetches the device's rows every
+10 minutes at most and adds the ones not there yet to the same file the Mac writes:
+`shader-list-contribution/shader-list-contribution.txt` in your clone (the build makes the folder; Breath of the Wild's
+is `shader-list-contribution-botw.txt`). One file for the Mac and every device, since the list does not tell platforms
+apart; the folder opens in Finder with each reminder, which comes every 100 new rows in that file. "Remind me next time" waits for the next 100;
 "Don't remind me again" stops the reminders for good (the file is still kept). "Send" opens the [shader list contribution](https://github.com/ly05010419/MacNativeGames/issues/new?template=shader-list.yml)
-issue form; drag the file into it. Later reminders come at 1,000, 1,500 and so on, so sending the whole file each time
+issue form; drag the file into it. Later reminders come at 200, 300 and so on, so sending the whole file each time
 is fine: rows the list already has are skipped. The game never uploads anything by itself.
 
 ## Breath of the Wild
@@ -140,13 +150,15 @@ on the spot would): run the game with `DM_PSO_MANIFEST=off`, an empty `DM_NVN_SH
 ## Merging what players sent (maintainers)
 
 ```sh
-# what each open shader-list issue would add (changes nothing)
-python3 games/totk/scripts/collect_shader_issues.py
+# what each open shader-list issue would add (changes nothing); --seed drops the rows a build makes by itself
+python3 games/totk/scripts/collect_shader_issues.py --seed <work>/totk/build/shader-seed/v143
 # write the list; --close also thanks each merged issue and closes it
-python3 games/totk/scripts/collect_shader_issues.py --apply --close
+python3 games/totk/scripts/collect_shader_issues.py --seed <work>/totk/build/shader-seed/v143 --apply --close
+# drop rows already in the list that the seed's default (or depth-bound) variants serve
+python3 games/totk/scripts/shader_list.py prune games/totk/assets/shader_list.tsv <work>/totk/build/shader-seed/v143
 ```
 
-It takes only `V` rows from an attachment and drops everything else. Then check with `shader_list.py stats`, commit
+It takes only `V` rows and render pipeline `R` / `B` rows from an attachment and drops everything else. Then check with `shader_list.py stats`, commit
 the list and push; every Mac app prepares the new variants within a day (below), and the next iPhone and iPad builds
 carry them.
 

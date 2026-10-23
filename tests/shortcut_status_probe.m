@@ -19,6 +19,18 @@ void dm_gfx_set_flag(const char *name, int value) {
     else abort();
 }
 void shortcut_test_aspect_init(double view);
+/* runtime/gamepad.m's key 6 state without GameController (gamepad_layout.h's real cycle): a DualSense is connected. */
+static int fakePadType = GAMEPAD_TYPE_AUTO, fakePadDetected = GAMEPAD_TYPE_PLAYSTATION;
+int runtime_gamepad_type_cycle(void) { return fakePadType = gamepad_type_next(fakePadType); }
+int runtime_gamepad_type(int *detected) { if (detected) *detected = fakePadDetected; return fakePadType; }
+/* runtime/gamepad.m's mouse mode (key 7) without GameController; the window never has the keyboard here. */
+static int fakeMouse;
+int runtime_mouse_toggle(void) { return fakeMouse = !fakeMouse; }
+int runtime_mouse_enabled(void) { return fakeMouse; }
+void runtime_mouse_set_hook(void (*hook)(void)) { (void)hook; }
+void runtime_mouse_move(double dx, double dy) { (void)dx; (void)dy; }
+void runtime_mouse_button(int button, int down) { (void)button; (void)down; }
+void runtime_mouse_release(void) {}
 static void press(unsigned key) {
     runtime_input_key_synthetic(key, 1);
     runtime_input_key_synthetic(key, 0);

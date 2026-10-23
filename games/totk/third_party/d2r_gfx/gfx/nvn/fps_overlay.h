@@ -2,16 +2,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* TOTK: frames per second and the size of the game picture on screen (pixels) in its top-right corner, one line
-   ("FPS 97  2560x1440"; the top-left holds the hearts). The game's internal render resolution is
-   deliberately not shown (user, 2026-10-16). The game image itself (frame screenshots, texture dumps) never contains it. TOTK_FPS_OVERLAY=0 hides it. */
+/* TOTK: frames per second, the game's output resolution and, in brackets, its internal (3D scene) resolution in its
+   top-right corner, one line ("FPS 60  1920x1080 (1600x900)"; the top-left holds the hearts). The internal resolution was
+   left out at first (user, 2026-10-16) and asked for on 2026-10-23. The game image itself (frame screenshots, texture dumps) never contains it. TOTK_FPS_OVERLAY=0 hides it. */
 enum { FPS_OVERLAY_TEX_W = 768, FPS_OVERLAY_TEX_H = 64, FPS_OVERLAY_MAX_SCALE = 5 };
 
 /* fps / screen size < 0 / 0: not known yet ("--"). mfx: MetalFX upscaled the picture in the last frames. gen > 0: MetalFX
    frame interpolation shows that many generated frames a second besides the game's fps frames -> "FPS 50+50" (key 2).
    big: the game itself outputs more than 1920x1080 (true 2K) -> " 2K" at the end.
-   detail: "Readout detail" is Detailed -> "FPS 60  avg 59  1% low 48  2560x1440" (avg / low < 0: "--", not measured yet). */
-typedef struct { int fps, screen_w, screen_h, mfx, gen, big, detail, avg, low; } fps_overlay_info;
+   detail: "Readout detail" is Detailed -> "FPS 60  avg 59  1% low 48  2560x1440" (avg / low < 0: "--", not measured yet).
+   scene_w / scene_h: the internal (scene) resolution, shown as " (WxH)" after the output size when known. */
+typedef struct { int fps, screen_w, screen_h, mfx, gen, big, detail, avg, low, scene_w, scene_h; } fps_overlay_info;   // screen: the output; scene: the internal size, 0 = not known
 enum { FPS_STATS_SECONDS = 5 };   /* the window the average and the 1% low are measured over */
 
 int fps_overlay_enabled(void);
@@ -29,10 +30,11 @@ int fps_overlay_scale(double view_h);
    row stride FPS_OVERLAY_TEX_W * 4). Returns the box size in pixels. */
 void fps_overlay_raster(const fps_overlay_info *info, int scale, uint8_t *out, int *box_w, int *box_h);
 void fps_overlay_text(const fps_overlay_info *info, char *out, size_t n);   /* "FPS 97  2560x1440  MetalFX on" */
-/* Compact HUD (Mac default; TOTK_HUD=corners keeps the lines in the picture's corners): the FPS, shader and load lines are
+/* Compact HUD (Mac default; TOTK_HUD=corners keeps the lines in the picture's corners): the FPS, shader, render pipeline
+   (compact only) and load lines are
    not drawn into the picture but published here, and the window's corner panel (runtime/frontend.m) shows them with the
    shortcuts in one small box. */
-enum { HUD_FPS, HUD_SHADER, HUD_LOAD, HUD_LINES };
+enum { HUD_FPS, HUD_SHADER, HUD_PSO, HUD_LOAD, HUD_LINES };
 int hud_compact(void);
 void hud_publish(int line, const char *text, int highlight);
 int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* 0: the line was never published (hidden or not known yet) */
@@ -49,6 +51,7 @@ int fps_overlay_line_pixel_font(const char *text);   // 0: the line has a charac
 int shader_overlay_enabled(void);
 void shader_overlay_set(int on);   /* the settings menu's Shader counter, live */
 void shader_overlay_text(char *out, size_t n, uint64_t compiling, uint64_t fresh, int64_t total, uint64_t pipelines);   /* total < 0: "--" (not counted yet) */
+void pso_overlay_text(char *out, size_t n, uint64_t fresh, int64_t total);   /* "New render pipelines N / total M", the line under the shaders */
 /* Record that the game's present number `ticket` reached the screen at now_s (seconds). The rate of game presents is
    re-measured every half second; fps_overlay_value() returns it, or -1 before the first measurement. */
 void fps_overlay_note(uint64_t ticket, double now_s);

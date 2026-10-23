@@ -422,6 +422,32 @@ uint64_t runtime_output_res_extra_bytes(void){
     if(grow<=0)return 0;
     uint64_t kib=(uint64_t)ceil(113664.0*(1+grow)/1024.0)*1024-113664;return kib<<10;
 }
+/* Key 3's picture mode is kept between runs in the file TOTK_PICTURE_MODE names (the launcher: <data>/picture-mode.txt;
+   unset: nothing is kept, as before). It holds one word: off, metalfx, native-2k or native-4k. The next start with
+   automatic output sizes begins in that mode; a size larger than this app's swapchain falls back to the largest one it
+   has (native-4k on a 2K app starts at native 2K). An explicit TOTK_OUTPUT_RES=<w>x<h> starts as it says. */
+static void picture_mode_save(uint64_t size){
+    const char *path=getenv("TOTK_PICTURE_MODE");if(!path||!*path)return;
+    extern int mfxup_output_enabled(void);
+    const char *mode=mfxup_output_enabled()?"metalfx":size==pack_size(2560,1440)?"native-2k":
+                     size==pack_size(3840,2160)?"native-4k":"off";
+    FILE *f=fopen(path,"w");
+    if(!f||fprintf(f,"%s\n",mode)<0||fclose(f)){fprintf(stderr,"[totk] picture mode: cannot write %s\n",path);return;}
+    fprintf(stderr,"[totk] picture mode %s kept for the next start\n",mode);
+}
+static void picture_mode_restore(uint8_t *page){
+    const char *path=getenv("TOTK_PICTURE_MODE");if(!path||!*path||output_full_at_start)return;
+    char mode[32]="";FILE *f=fopen(path,"r");if(!f)return;
+    if(!fgets(mode,sizeof mode,f))mode[0]=0;
+    fclose(f);mode[strcspn(mode,"\r\n")]=0;
+    unsigned w=1920,h=1080;
+    if(!strcmp(mode,"native-4k")&&output_w>=3840&&output_h>=2160){w=3840;h=2160;}
+    else if((!strcmp(mode,"native-4k")||!strcmp(mode,"native-2k"))&&output_w>=2560&&output_h>=1440){w=2560;h=1440;}
+    else if(!strcmp(mode,"metalfx")){extern void dm_gfx_set_flag(const char *,int);dm_gfx_set_flag("mfx_output",1);dm_gfx_set_flag("mfx_upscale",1);}
+    else if(strcmp(mode,"off")){fprintf(stderr,"[totk] picture mode: %s holds \"%s\", not off, metalfx, native-2k or native-4k; starting off\n",path,mode);return;}
+    atomic_store((_Atomic uint64_t *)(void *)(page+32),pack_size(w,h));
+    fprintf(stderr,"[totk] picture mode: starts in %s (kept from the last run, %s)\n",mode,path);
+}
 static void patch_output_res(Module *m){
     unsigned w,h;if(!runtime_output_res(&w,&h))return;
     uint64_t data=(m->file_size+0x3fff)&~0x3fffULL,stub=((m->text_end+15)&~15ULL)+16;
@@ -462,8 +488,10 @@ static void patch_output_res(Module *m){
     uint64_t pending=atomic_load(&output_pending);
     atomic_store((_Atomic uint64_t *)(void *)(page+32),pending?pending:output_full_at_start?pack_size(w,h):pack_size(1920,1080));
     atomic_store((_Atomic uint64_t *)(void *)(page+40),0);
+    if(!pending)picture_mode_restore(page);   /* an output size the settings panel asked for wins over the kept picture mode */
     atomic_store(&output_page,page);   /* Publish initialized state to the HUD on the main thread. */
-    fprintf(stderr,"[totk] 1.4.3 output: %ux%u swapchain; starts %s, key 3 cycles MetalFX / native / off; display-config veneer +%#llx\n",w,h,output_full_at_start?"at requested resolution":"at 1920x1080",(unsigned long long)stub);
+    uint64_t start=atomic_load((_Atomic uint64_t *)(void *)(page+32));
+    fprintf(stderr,"[totk] 1.4.3 output: %ux%u swapchain; starts at %ux%u, key 3 cycles MetalFX / native / off; display-config veneer +%#llx\n",w,h,(unsigned)start,(unsigned)(start>>32),(unsigned long long)stub);
 }
 /* Scene render resolution - the 1.4.3 port of game_patches.c's TOTK_RENDER_RES patch, live since the settings menu.
    1.4.3 keeps the same graphics-parameter entry (+0x30 of the mode entry: handheld 1280x720, docked 1600x900) and the
@@ -508,6 +536,9 @@ static uint64_t render_latched;static unsigned render_canvas;   /* present threa
 static int render_size_parse(const char *e,unsigned *w,unsigned *h){
     char rest;return sscanf(e,"%ux%u%c",w,h,&rest)==2&&*w>=64&&*h>=64&&*w<=4096&&*h<=4096;
 }
+/* Upstream (e8edbcd) turned this patch on by default (the Mac scene at the canvas size, the phone at 960x540). This fork
+   keeps the game's own size until something asks for another (TOTK_RENDER_RES, or the settings panel's resolution model
+   and graphics.dynamic_res, live through runtime_render_request). TOTK_RENDER_RES=<w>x<h> sets a size at boot. */
 static int render_res(unsigned *w,unsigned *h){
     const char *e=getenv("TOTK_RENDER_RES");
     if(!e||!*e||!strcmp(e,"0"))return 0;
@@ -710,5 +741,7 @@ int runtime_output_mode_cycle(void){
     else{mfx=1;name="MetalFX 2K";}
     if(full!=native)runtime_output_res_toggle();
     dm_gfx_set_flag("mfx_output",mfx);dm_gfx_set_flag("mfx_upscale",mfx);
-    fprintf(stderr,"[totk] key 3: %s\n",name);return 1;
+    fprintf(stderr,"[totk] key 3: %s\n",name);
+    picture_mode_save(atomic_load((_Atomic uint64_t *)(void *)(output_page+32)));
+    return 1;
 }

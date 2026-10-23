@@ -4,7 +4,7 @@
 //                                                       and game-data/: the RomFS image and prepared shaders the app
 //                                                       points at (game-data.json; read-only for the game). BotW/ for
 //                                                       Breath of the Wild.
-//   ~/Library/Logs/MacNativeGames/totk.log             this run (totk.previous.log: the one before; botw.log for Breath of the Wild)
+//   ~/Library/Logs/MacNativeGames/totk.log             this run, only with the debug log on (totk.previous.log: the one before; botw.log for Breath of the Wild)
 // If the game is already running, the launcher only brings it to the front.
 #import <AppKit/AppKit.h>
 #include <sys/sysctl.h>
@@ -124,7 +124,7 @@ static void note(NSString *text) {
     [alert runModal];
 }
 
-/* Every TOTK_CONTRIB_STEP shaders the shared list does not have yet (totk_shader_contrib.h), before the game starts: ask
+/* Every TOTK_CONTRIB_STEP shaders and render pipelines the shared list does not have yet (totk_shader_contrib.h), before the game starts: ask
    the player to send the file in a GitHub issue. "Send" opens the issue form and shows the file in Finder to drag in.
    With gh signed in, "Submit automatically" takes the place of "Remind me next time" and sends this file at once. */
 static void contrib_reminder(NSString *path) {
@@ -133,9 +133,10 @@ static void contrib_reminder(NSString *path) {
     totk_contrib_reminded(path, rows);   // "next time": TOTK_CONTRIB_STEP rows later; "don't remind me again": never
     NSString *gh = gh_path();
     [NSApplication sharedApplication]; [NSApp activateIgnoringOtherApps:YES];
+    [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[[NSURL fileURLWithPath:path]]];   // the folder, before the question
     NSAlert *alert = [NSAlert new];
     alert.messageText = @"We would love your contribution";
-    alert.informativeText = [NSString stringWithFormat:@"%@%@", [NSString stringWithFormat:@"You have %lu shaders to contribute: ones your game met that the shared shader list does not have yet. They are kept in a small file with shader identifiers only: no game data, saves or personal information. Sent to GitHub and added to the shared list, they come with everyone's next build, and nobody stutters there again.\n\n", (unsigned long)rows],
+    alert.informativeText = [NSString stringWithFormat:@"%@%@", [NSString stringWithFormat:@"You have %lu shaders and render pipelines to contribute: ones your game met that the shared shader list does not have yet. They are kept in a small file with shader and pipeline identifiers only: no game data, saves or personal information. Sent to GitHub and added to the shared list, they come with everyone's next build, and nobody stutters there again.\n\n", (unsigned long)rows],
                              gh ? @"\"Submit automatically\" sends it now with the GitHub CLI (gh) signed in on this Mac, without the browser. \"Send\" opens the GitHub form and shows the file in Finder: drag it into the form."
                                 : @"\"Send\" opens the GitHub form and shows the file in Finder: drag it into the form."];
     [alert addButtonWithTitle:@"Send"];
@@ -278,6 +279,27 @@ static BOOL import_package(NSString *package, NSString *profile, NSString *backu
     return [alert runModal] == NSAlertFirstButtonReturn;
 }
 
+/* The contribution file: in the project folder the app was built from, <clone>/shader-list-contribution/shader-list-contribution.txt
+   (MNGContributionFolder in Info.plist, build_app.py), where players look and where the iPhone / iPad copies go too; the
+   data folder when that folder is gone (user 2026-10-22: nobody found the file in ~/Library). The file that was in the data
+   folder moves there once, with its reminder state. */
+static NSString *contrib_file(NSString *data) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *old = [data stringByAppendingPathComponent:@"shader-list-contribution.txt"];
+    NSString *folder = [NSBundle.mainBundle objectForInfoDictionaryKey:@"MNGContributionFolder"];
+    if (![folder isKindOfClass:NSString.class] || !folder.length || ![fm fileExistsAtPath:folder.stringByDeletingLastPathComponent]) return old;
+    if (![fm createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil]) return old;
+    // one file for the Mac and every iPhone / iPad (ios/tools/shader_contrib_watch.py merges theirs in): the rows are the same
+    // for every platform; Breath of the Wild has a list of its own
+    NSString *mine = [folder stringByAppendingPathComponent:strcmp(GAME_FOLDER, "TOTK") ? @"shader-list-contribution-botw.txt" : @"shader-list-contribution.txt"];
+    if (![fm fileExistsAtPath:mine] && [fm fileExistsAtPath:old]) {
+        [fm moveItemAtPath:old toPath:mine error:nil];
+        NSString *state = [old stringByAppendingString:@".reminded"];   // where the state was kept before (totk_contrib_state)
+        if ([fm fileExistsAtPath:state]) [fm moveItemAtPath:state toPath:totk_contrib_state(mine) error:nil];
+    }
+    return mine;
+}
+
 static BOOL make_dir(NSString *path) {
     return [NSFileManager.defaultManager createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
 }
@@ -373,6 +395,8 @@ int main(int argc, char **argv) {
           settings_take_env(values); settings_export_env(values);
           setenv("TOTK_SETTINGS", settings.fileSystemRepresentation, 1); }
         setenv("TOTK_CONTROLS", controls.fileSystemRepresentation, 1);
+        /* key 3's picture mode, kept between runs (runtime/game_patches_v143.c picture_mode_save / _restore) */
+        setenv("TOTK_PICTURE_MODE", env_or("TOTK_PICTURE_MODE", [data stringByAppendingPathComponent:@"picture-mode.txt"]).fileSystemRepresentation, 1);
         setenv("TOTK_PROFILE_DIR", profile.fileSystemRepresentation, 1);
         setenv("TOTK_SHADER_CACHE", cache.fileSystemRepresentation, 1);
         setenv("TOTK_GAME_SLOT_DIR", slot.fileSystemRepresentation, 1);
@@ -413,7 +437,9 @@ int main(int argc, char **argv) {
           setenv("TOTK_GPU_BUDGET_MB", [NSString stringWithFormat:@"%u", budget].UTF8String, 1); }
         setenv("TOTK_SLOT_OWNER", "user", 0);
         setenv("TOTK_SLOT_PURPOSE", "player", 0);
-        NSString *contrib = env_or("TOTK_SHADER_CONTRIB", [data stringByAppendingPathComponent:@"shader-list-contribution.txt"]);
+        // contrib_file only without a test's own file: it moves the player's file into the project folder
+        const char *contribEnv = getenv("TOTK_SHADER_CONTRIB");
+        NSString *contrib = contribEnv && *contribEnv ? env_or("TOTK_SHADER_CONTRIB", nil) : contrib_file(data);
         setenv("TOTK_SHADER_CONTRIB", contrib.fileSystemRepresentation, 1);
         /* The shared shader list the game downloads once a day and prepares in the background (third_party/d2r_gfx/gfx/nvn/
            totk_shader_list.m; Interface > Download new shaders). Download only; the game never uploads anything. */
@@ -426,10 +452,17 @@ int main(int argc, char **argv) {
           FILE *cf = fopen(cmds.fileSystemRepresentation, "w"); if (cf) fclose(cf);
           setenv("TOTK_INPUT_FILE", cmds.fileSystemRepresentation, 1); }
 
+        /* The log is written only with debug on, as on the iPhone: defaults write org.macnativegames.totk TOTK_DEBUG_LOG
+           -bool YES (org.macnativegames.botw for Breath of the Wild), or TOTK_DEBUG_LOG=1 in the environment, which wins
+           (the test tools pass it). Off, the game's output goes to /dev/null and the logs of earlier runs are removed. */
+        const char *debugEnv = getenv("TOTK_DEBUG_LOG");
+        BOOL debugLog = debugEnv ? (*debugEnv && strcmp(debugEnv, "0")) : [NSUserDefaults.standardUserDefaults boolForKey:@"TOTK_DEBUG_LOG"];
         NSString *log = [logs stringByAppendingPathComponent:@GAME_LOG ".log"];
-        [NSFileManager.defaultManager removeItemAtPath:[logs stringByAppendingPathComponent:@GAME_LOG ".previous.log"] error:nil];
-        [NSFileManager.defaultManager moveItemAtPath:log toPath:[logs stringByAppendingPathComponent:@GAME_LOG ".previous.log"] error:nil];
-        FILE *lf = fopen(log.fileSystemRepresentation, "w");
+        NSString *previous = [logs stringByAppendingPathComponent:@GAME_LOG ".previous.log"];
+        [NSFileManager.defaultManager removeItemAtPath:previous error:nil];
+        if (debugLog) [NSFileManager.defaultManager moveItemAtPath:log toPath:previous error:nil];
+        else [NSFileManager.defaultManager removeItemAtPath:log error:nil];
+        FILE *lf = fopen(debugLog ? log.fileSystemRepresentation : "/dev/null", "w");
         if (lf) {
             dup2(fileno(lf), STDOUT_FILENO);
             dup2(fileno(lf), STDERR_FILENO);
@@ -437,8 +470,9 @@ int main(int argc, char **argv) {
         }
         char *const arguments[] = {(char *)binary.fileSystemRepresentation, "rewritten/" TOTK_GAME_DIR, "boot", NULL};
         execv(arguments[0], arguments);
-        fprintf(stderr, "[launcher] execv failed: %s\n", strerror(errno));
-        show_error([NSString stringWithFormat:@"Starting the game failed. See %@.", log]);
+        int failed = errno;
+        fprintf(stderr, "[launcher] execv failed: %s\n", strerror(failed));
+        show_error([NSString stringWithFormat:@"Starting the game failed: %s.", strerror(failed)]);
         return 1;
     }
 }

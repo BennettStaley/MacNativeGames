@@ -59,7 +59,8 @@ static NSString *tsl_canonical(id deps) {
             if (![slot isKindOfClass:[NSString class]] || !tsl_slot(slot)) return nil;
             [out appendFormat:@"%@\"%@\":", first ? @"" : @",", slot]; first = NO;
             if ([v isKindOfClass:[NSString class]]) {
-                if (!tsl_word(v, 0)) return nil;
+                // "*" / "*_depth": a texture slot of the default bind state (totk_shader_rt.m: any texture, or any depth texture)
+                if (!tsl_word(v, 0) && !([kind isEqualToString:@"tex"] && ([v isEqualToString:@"*"] || [v isEqualToString:@"*_depth"]))) return nil;
                 [out appendFormat:@"\"%@\"", v];
             } else if ([v isKindOfClass:[NSDictionary class]] && [v count] <= 8) {
                 [out appendString:@"{"];
@@ -147,6 +148,9 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *tsl_parse(NSData *data, 
         } else if ([kind isEqualToString:@"R"]) {
             if (!(f.count == 3 && f[1].length % 2 == 0 && tsl_hex(f[1].UTF8String, f[1].length, 2, TSL_MAX_LINE) && tsl_flags(f[2])))
                 TSL_REJECT(@"line %zu is not an R row", line_no);
+        } else if ([kind isEqualToString:@"B"]) {   // a render pipeline's border recipes (vertex, fragment; "-" for none) and flags: warm-up only
+            if (!(f.count == 5 && f[1].length % 2 == 0 && tsl_hex(f[1].UTF8String, f[1].length, 2, TSL_MAX_LINE) && f[2].length && f[3].length && tsl_flags(f[4])))
+                TSL_REJECT(@"line %zu is not a B row", line_no);
         } else TSL_REJECT(@"line %zu is no shader list row", line_no);
     }
     NSMutableDictionary<NSString *, NSArray<NSString *> *> *out = [NSMutableDictionary dictionaryWithCapacity:rows.count];

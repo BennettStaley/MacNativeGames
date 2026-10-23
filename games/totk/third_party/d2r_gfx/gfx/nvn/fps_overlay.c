@@ -165,10 +165,12 @@ void fps_overlay_raster_line(const char *text, int highlight, int scale, uint8_t
 }
 
 void fps_overlay_text(const fps_overlay_info *info, char *text, size_t n) {
-    char fps[8], ss[12];
+    char fps[8], ss[12];   // ss: the output resolution, then the internal one in brackets
     if (info->fps < 0) snprintf(fps, sizeof fps, "--");
     else snprintf(fps, sizeof fps, "%d", info->fps > 999 ? 999 : info->fps);
     size_text(ss, sizeof ss, info->screen_w, info->screen_h);
+    char sc[16] = "";
+    if (info->scene_w > 0 && info->scene_h > 0) snprintf(sc, sizeof sc, " (%dx%d)", info->scene_w > 9999 ? 9999 : info->scene_w, info->scene_h > 9999 ? 9999 : info->scene_h);
     char gen[8] = "";
     if (info->gen > 0 && info->fps >= 0) snprintf(gen, sizeof gen, "+%d", info->gen > 999 ? 999 : info->gen);   // interpolated frames a second (key 2)
     // MetalFX did the upscale in the last frames (key 3 selects the manual MetalFX mode); 2K: true 2K output.
@@ -180,7 +182,7 @@ void fps_overlay_text(const fps_overlay_info *info, char *text, size_t n) {
         if (info->low < 0) snprintf(low, sizeof low, "--"); else snprintf(low, sizeof low, "%d", info->low > 999 ? 999 : info->low);
         snprintf(detail, sizeof detail, "  avg %s  1%% low %s", avg, low);
     }
-    snprintf(text, n, "FPS %s%s%s  %s%s%s", fps, gen, detail, ss, info->mfx ? "  MetalFX on" : "", info->big ? "  2K" : "");
+    snprintf(text, n, "FPS %s%s%s  %s%s%s%s", fps, gen, detail, ss, sc, info->mfx ? "  MetalFX on" : "", info->big ? "  2K" : "");
 }
 
 void fps_overlay_raster(const fps_overlay_info *info, int scale, uint8_t *out, int *box_w, int *box_h) {
@@ -227,11 +229,9 @@ void shader_overlay_set(int on) {
 int shader_overlay_enabled(void) {
     int set = atomic_load(&g_shader_overlay); if (set >= 0) return set;
     static int on = -1;
-#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-    const int def = 0;   // the phone translates nothing (misses go to shader-requests/)
-#else
+    /* On by default on the iPhone too since it shows the render pipelines (user 2026-10-22: only the FPS was there when the
+       game was opened from the home screen); it was off there because the phone translates no shaders. */
     const int def = 1;
-#endif
     if (on < 0) { const char *e = getenv("TOTK_SHADER_OVERLAY"); on = e ? strcmp(e, "0") != 0 : def; }
     return on;
 }
@@ -244,6 +244,14 @@ void shader_overlay_text(char *out, size_t n, uint64_t compiling, uint64_t fresh
     if (total < 0) snprintf(t, sizeof t, "--"); else snprintf(t, sizeof t, "%lld", (long long)(total > 999999 ? 999999 : total));
     snprintf(out, n, "Shaders %llu compiling / %llu new / %s total",
              (unsigned long long)(compiling > 99999 ? 99999 : compiling), (unsigned long long)(fresh > 99999 ? 99999 : fresh), t);
+}
+/* The render pipeline line under the shaders (user 2026-10-22: under the FPS and shaders, show the render pipelines, new /
+   total): pipelines this run built that this profile had never built (new to its warm list), and every render pipeline
+   ready this run (warm-up and play). */
+void pso_overlay_text(char *out, size_t n, uint64_t fresh, int64_t total) {
+    char t[16];
+    if (total < 0) snprintf(t, sizeof t, "--"); else snprintf(t, sizeof t, "%lld", (long long)(total > 999999 ? 999999 : total));
+    snprintf(out, n, "New render pipelines %llu / total %s", (unsigned long long)(fresh > 99999 ? 99999 : fresh), t);
 }
 
 /* A count's rate, re-measured every half second (game presents; interpolated frames shown). stale_s > 0: a gap longer
