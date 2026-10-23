@@ -1060,7 +1060,7 @@ static void cg_flush(void); static int cg_op_safe(unsigned op); static int cg_rt
 static void skv_set(int on); static int skv_retest(void);   // invisible-draw skipping: runtime switch (flag skip_invisible) and the retest period
 static uint64_t g_sub_serial;   // Submission index (used by the parallel precompile's 'predict only once per submission')
 static void pt_apply_request(void);
-static int g_sub_chunks; static uint64_t g_chunk_mark, g_stat_draw; static void chunk_cfg(void);   // mid-submission commits, defined before mtl_sub_commit
+static int g_sub_chunks; static uint64_t g_chunk_mark, g_chunk_t0, g_stat_draw; static void chunk_cfg(void);   // mid-submission commits, defined before mtl_sub_commit
 static int g_nupd, g_nshadow; static inline int upd_guard(uint64_t lo, uint64_t hi);   // renamed uniform updates, defined with mtl_sub_update
 void mtl_sub_begin(void) {
     g_fc_begin0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -1094,7 +1094,7 @@ void mtl_sub_begin(void) {
     [g_alloc4[alloc_i] reset];
     [g_cb beginCommandBufferWithAllocator:g_alloc4[alloc_i]];
     g_commit_blocks = [NSMutableArray array];
-    chunk_cfg(); g_sub_chunks = 0; g_chunk_mark = g_stat_draw;
+    chunk_cfg(); g_sub_chunks = 0; g_chunk_mark = g_stat_draw; g_chunk_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (g_nupd) MDIE("renamed uniform updates left over from the previous submission");
     g_nshadow = 0;
     g_npost = 0; g_vis = nil; g_vis_n = 0; g_vis_cur = -1; pend_begin();
@@ -1324,9 +1324,10 @@ static inline void enc_r_address(id<MTL4RenderCommandEncoder> e, unsigned stage,
 }
 static inline void enc_r_vbuf(id<MTL4RenderCommandEncoder> e, NSUInteger i, uint64_t gpu) { enc_r_address(e, 0, i, gpu); }
 static inline void enc_r_args(id<MTL4RenderCommandEncoder> e, MTLRenderStages s, uint64_t gpu, NSUInteger i) { enc_r_address(e, s == MTLRenderStageVertex ? 0 : 1, i, gpu); }
-static inline void enc_r_draw(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_DRAW,.u={p,v,n}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n]; }
-static inline void enc_r_draw_instanced(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n, NSUInteger i, NSUInteger b) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INSTANCED,.u={p,v,n,i,b}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n instanceCount:i baseInstance:b]; }
-static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INDEXED,.u={p,n,t,gpu,len,i,(uint64_t)bv,bi}},1); else [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi]; }
+static uint64_t g_enc_draws;   // TOTK: draws encoded into any render encoder (sd_finish: TOTK_DISCARD / TOTK_EMPTY_PASS_DC)
+static inline void enc_r_draw(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n) { g_enc_draws++; if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_DRAW,.u={p,v,n}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n]; }
+static inline void enc_r_draw_instanced(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n, NSUInteger i, NSUInteger b) { g_enc_draws++; if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INSTANCED,.u={p,v,n,i,b}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n instanceCount:i baseInstance:b]; }
+static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi) { g_enc_draws++; if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INDEXED,.u={p,n,t,gpu,len,i,(uint64_t)bv,bi}},1); else [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi]; }
 static inline void enc_r_store(id<MTL4RenderCommandEncoder> e, int depth, MTLStoreAction action, NSUInteger index) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_STORE,.u={(uint64_t)depth,action,index}},0); else if (depth == 1) [e setDepthStoreAction:action]; else if (depth == 2) [e setStencilStoreAction:action]; else [e setColorStoreAction:action atIndex:index]; }
 static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; blit_close(); rs_sync(); pt_mark(g_cb, 'C', nil); id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; if (bar_start_on()) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; bar_full_begun(); [e setArgumentTable:g_ct]; return e; }
 static inline id<MTLComputeCommandEncoder> enc_c_begin_concurrent(id<MTLCommandBuffer> cb) { return [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]; }
@@ -1963,7 +1964,7 @@ static uint64_t g_stat_draw;
 static uint64_t g_pass_draw0;   // g_stat_draw when the current render pass opened (TOTK_TIMELINE)
 static int g_chunk_first = -1, g_chunk_size, g_sub_chunks;
 static _Atomic int g_chunk_first_request = -1, g_chunk_size_request = -1;
-static uint64_t g_chunk_mark, g_chunk_commits;
+static uint64_t g_chunk_mark, g_chunk_commits, g_chunk_time_commits;
 static void chunk_cfg(void) {
     // Apply control-thread requests only at submission boundaries. Encoder,
     // allocator, barriers and final fence lifetime remain on the replay thread.
@@ -1982,6 +1983,7 @@ static void chunk_cfg(void) {
     g_chunk_size = size; g_chunk_first = first;
 }
 uint64_t mtl_chunk_commits(void) { return g_chunk_commits; }
+uint64_t mtl_chunk_time_commits(void) { return g_chunk_time_commits; }
 void mtl_blit_stats(uint64_t v[6]) { v[0] = g_blit_opens; v[1] = g_blit_splits; v[2] = g_upd_n; v[3] = g_upd_split; v[4] = g_copy_n; v[5] = g_copy_split; }
 static void mtl_sub_split(void) {
     uint64_t fc0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int fc_first = g_sub_chunks == 0;
@@ -2003,15 +2005,26 @@ static void mtl_sub_split(void) {
     q4_commit(g_cb, o);
     g_cb = [g_dev newCommandBuffer];
     [g_cb beginCommandBufferWithAllocator:g_alloc4[g_alloc_cur]];
-    g_sub_chunks++; g_chunk_commits++; g_chunk_mark = g_stat_draw;
+    g_sub_chunks++; g_chunk_commits++; g_chunk_mark = g_stat_draw; g_chunk_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (fc_first) { uint64_t fc4 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); g_fc_t[1] += fc0 - g_fc_snap_end; g_fc_t[2] += fc1 - fc0; g_fc_t[3] += fc2 - fc1; g_fc_t[4] += fc3 - fc2; g_fc_t[5] += fc4 - fc3; g_fc_n++; }
 }
+/* TOTK_CHUNK_US (default 300, 0 = off): besides the draw count, a split point also commits once this many microseconds
+   of replay have passed since the submission began or the last commit and at least 10 draws were replayed meanwhile
+   (Ryujinx AutoFlushCounter, 1.5 ms there), so the GPU gets work early when draws are slow to replay. Commits still
+   happen only where a new encoder is about to open: a render pass is never split. */
+static int chunk_us(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_CHUNK_US"); v = e ? atoi(e) : 300; if (v < 0) v = 0; MLOG("TOTK_CHUNK_US=%d: mid-submission commits also after %d us of replay (0 = by draw count only)", v, v); } return v; }
 // Called where a new encoder is about to be opened and none is open.
 static void chunk_maybe_split(void) {
     if (!g_chunk_size || !g_cb || g_enc || g_frz_on || tbdr_any() || pt_active()) return;
-    if (g_stat_draw - g_chunk_mark < (uint64_t)(g_sub_chunks ? g_chunk_size : g_chunk_first)) return;
+    uint64_t nd = g_stat_draw - g_chunk_mark; int by_time = 0;
+    if (nd < (uint64_t)(g_sub_chunks ? g_chunk_size : g_chunk_first)) {
+        int us = chunk_us();
+        if (!us || nd < 10 || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_chunk_t0 < (uint64_t)us * 1000ull) return;
+        by_time = 1;
+    }
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     mtl_sub_split();
+    if (by_time) g_chunk_time_commits++;
 }
 uint64_t mtl_sub_commit(void) {
     cg_flush();   // TOTK: cube-face-set groups still pending at the end of the submission (reason 4 in the stats line)
@@ -4160,8 +4173,17 @@ void ts_after(void);
 // ---------- Store lookahead: at pass end, decide from the later commands of the same submission whether each attachment's write-back is redundant ----------
 // On TBDR every attachment is written back to memory in full when the pass ends; Switch (Maxwell immediate-mode rendering) has no such cost. If an attachment is cleared in full before being read, the write-back is redundant (DontCare).
 // For the decision see mtl_sub_index / sdx_decide; only what can be proven within the same submission is accepted, and anything still undecided at the end of the submission is always written back.
-typedef struct { uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy; const char *wkey; int wslot; } sd_att;   // depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth
-static sd_att g_sd[9]; static int g_nsd;
+typedef struct { uint64_t disc; uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy; const char *wkey; int wslot; } sd_att;   // depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth
+static sd_att g_sd[9]; static int g_nsd;   // disc (TOTK_DISCARD): g_enc_draws + 1 when the game discarded the attachment in this pass, 0 if not
+static uint64_t g_sd_draw0;   // g_enc_draws when this encoder opened (TOTK_EMPTY_PASS_DC)
+/* TOTK_DISCARD=2 (opt-in): a discard while no pass is open makes the next pass's Load of that subresource DontCare. */
+typedef struct { uint64_t ser; int lv, sl, k; } disc_pend;   // k: colour index, 8 depth-stencil
+static disc_pend g_disc_pend[9]; static int g_ndisc_pend;
+static uint64_t g_dc_stat[6];   // attachments marked in an open pass, stored DontCare by a discard, loads made DontCare, empty passes, their attachments stored DontCare
+void mtl_store_dc_stats(uint64_t v[6]) { memcpy(v, g_dc_stat, sizeof g_dc_stat); }
+static int discard_level(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_DISCARD"); v = e ? atoi(e) : 1; if (v < 0) v = 0; if (v != 1) MLOG("TOTK_DISCARD=%d: %s", v, v ? "discards also make the next pass's load DontCare" : "NVN discards ignored"); } return v; }
+static int empty_pass_dc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_EMPTY_PASS_DC"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_EMPTY_PASS_DC=0: empty render passes store their attachments"); } return v; }
+static void rt_sub(const p_set_rt *r, int k, uint64_t *ser, int *lv, int *sl);
 static unsigned g_sd_plain;   // TOTK: g_sd entries (bit i) written in this encoder by a draw that samples none of its attachments (att_unstored_read)
 static int g_udc_ab = -1, g_udc_ab_on;
 // Attachments this pass did not write (depth / stencil test only, color write mask 0, etc.) get their write-back changed to DontCare: the content is already in memory, saving one full write-back.
@@ -4768,6 +4790,15 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
             }
         }
     }
+    if (g_ndisc_pend) {   // TOTK_DISCARD=2: the game discarded these subresources before this pass: their contents are undefined, so nothing to load
+        for (int j = 0; j < g_ndisc_pend; j++) { const disc_pend *d = &g_disc_pend[j]; uint64_t ser; int lv, sl;
+            if (d->k < 8 && (d->k >= R.rt.n || !pd.colorAttachments[d->k].texture)) continue;
+            rt_sub(&R.rt, d->k, &ser, &lv, &sl); if (!ser || ser != d->ser || lv != d->lv || sl != d->sl) continue;
+            if (d->k < 8) { if (pd.colorAttachments[d->k].loadAction == MTLLoadActionLoad) { pd.colorAttachments[d->k].loadAction = MTLLoadActionDontCare; g_dc_stat[2]++; } }
+            else { if (pd.depthAttachment.texture && pd.depthAttachment.loadAction == MTLLoadActionLoad) { pd.depthAttachment.loadAction = MTLLoadActionDontCare; g_dc_stat[2]++; }
+                   if (pd.stencilAttachment.texture && pd.stencilAttachment.loadAction == MTLLoadActionLoad) { pd.stencilAttachment.loadAction = MTLLoadActionDontCare; g_dc_stat[2]++; } } }
+        g_ndisc_pend = 0;
+    }
     { /* TOTK measurement switches (pictures are wrong with them): TOTK_EXP_NOLOAD=1 turns every Load into DontCare,
          TOTK_EXP_NOSTORE=1 drops the depth/stencil store. They size the attachment traffic cost, nothing else. */
       static int nl = -1, ns = -1; if (nl < 0) { nl = getenv("TOTK_EXP_NOLOAD") != NULL; ns = getenv("TOTK_EXP_NOSTORE") != NULL; if (nl || ns) MLOG("[experiment] attachments NOLOAD=%d NOSTORE=%d (picture will be wrong, bandwidth measurement only)", nl, ns); }
@@ -4827,7 +4858,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
                    (unsigned long)stt.width, (unsigned long)stt.height, pd.stencilAttachment.loadAction == MTLLoadActionClear ? "clear" : "load");
     }
     if (natt && nload == natt) g_pass_full_rw++;
-    g_nsd = 0; g_sd_plain = 0;
+    g_nsd = 0; g_sd_plain = 0; g_sd_draw0 = g_enc_draws;
     {
         for (int i = 0; i < R.rt.n && i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i]; if (!c.texture) continue;
             g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.color[i]->serial; g_sd[g_nsd].bytes = att_bytes(c.texture, c.level); g_sd[g_nsd].lv = (uint32_t)c.level; g_sd[g_nsd].sl = (uint32_t)(c.texture.textureType == MTLTextureType3D ? c.depthPlane : c.slice); g_sd[g_nsd].idx = i; g_sd[g_nsd].load = c.loadAction == MTLLoadActionLoad; g_sd[g_nsd].wrote = R.clear_c[i] != 0; g_nsd++;
@@ -8690,29 +8721,44 @@ static uint64_t lay_gpu(int offset) {   // GPU address of the constant `offset` 
     return gpu + 4u * (uint64_t)offset;
 }
 void mtl_layer_stats(uint64_t v[4]) { v[0] = g_stat_pass; v[1] = g_lay.passes; v[2] = g_lay.merges; v[3] = g_lay.refused; }
+/* An attachment whose contents nobody needs after the pass (stored DontCare whatever the store lookahead says):
+   1 the game discarded it (TOTK_DISCARD) and the pass encoded no draw after that; 2 the pass encoded no draw at all and
+   the attachment was not cleared (TOTK_EMPTY_PASS_DC, Ryujinx FixupStoreActions): a loaded attachment then holds what
+   memory holds, and one loaded DontCare holds nothing. Not with block-render write-backs (copied from the attachment
+   after the pass). Metal leaves an attachment stored DontCare undefined; Apple GPUs keep a loaded, untouched one (the
+   UDC self-test, DM_NVN_UDC_SELFTEST). */
+static int sd_dead_ext(const sd_att *t, int empty) {
+    if (t->disc && t->disc - 1 == g_enc_draws) return 1;
+    if (empty && !t->wrote) return 2;
+    return 0;
+}
 static void sd_finish(void) {
     if (!g_nsd) return;
     int tb_st = tbdr_piece(TB_STORE), tb_udc = tbdr_piece(TB_UDC);
-    if (!tb_st && !tb_udc) {   // All store pieces off: always write back
-        for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i];
-            enc_r_store(g_enc, t->depth, MTLStoreActionStore, (NSUInteger)t->idx); }
+    int empty = g_enc_draws == g_sd_draw0 && !g_nblk_wb && empty_pass_dc_on();
+    if (empty) g_dc_stat[3]++;
+    if (!tb_st && !tb_udc) {   // All store pieces off: always write back (except sd_dead_ext)
+        for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i]; int ext = sd_dead_ext(t, empty);
+            if (ext) { g_dc_stat[ext == 1 ? 1 : 4]++; g_bw_store -= t->bytes; }
+            enc_r_store(g_enc, t->depth, ext ? MTLStoreActionDontCare : MTLStoreActionStore, (NSUInteger)t->idx); }
         g_nsd = 0; return; }
     uint8_t nst[9]; uint64_t tb_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (tb_st && sdx_decide(nst)) { for (int i = 0; i < g_nsd; i++) if (nst[i] == 2) g_sd[i].state = 2; else sd_need(&g_sd[i], nst[i] >> 2); }
     else for (int i = 0; i < g_nsd; i++) sd_need(&g_sd[i], 6);   // Pass ended outside the list / index unavailable: always write back
     g_tb_ns[TB_STORE] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tb_t0;
     for (int i = 0; i < g_nsd; i++) {
-        sd_att *t = &g_sd[i]; int udc_dead = tb_udc && udc_on() && t->load && !t->wrote;
+        sd_att *t = &g_sd[i]; int udc_dead = tb_udc && udc_on() && t->load && !t->wrote, ext = sd_dead_ext(t, empty);
+        if (ext) g_dc_stat[ext == 1 ? 1 : 4]++;
         // A color attachment written in the same pass as the window texture does not enter the ledger: it is a link in the present chain, not a transient attachment that is 'reset every frame before use'.
         // The in-run 'upscale' pass writes two textures at once - scene texture + window texture - and the UI composite was merged into the same pass, so in-run nobody reads back the scene texture; as soon as the game stops drawing 3D (loading screen)
         // a separate composite pass samples it afterwards instead. 'About to enter the loading screen' is only known after the previous frame was submitted, so prediction cannot stop it: on iPad true fullscreen every install hits it once on the first act change
         // (the 2732×2048 attachment of frame N was not written back and is sampled for 4 consecutive frames starting at frame N+1; the key is permanently disabled). At the iPhone aspect ratio the same-size key already sees a reader during the trial period and is silently disabled.
         int xv_win = 0; for (int k = 0; k < R.rt.n && k < 8; k++) if (R.rt.color[k] && xv_present(R.rt.color[k]->serial)) xv_win = 1;
-        uint64_t xtag = 0; int xvcand = xv_on() && !xv_win && t->depth == 0 && t->state != 2 && t->why == 5 && xv_first_good(t->ser, t->lv, t->sl) && !xv_present(t->ser)
+        uint64_t xtag = 0; int xvcand = !ext && xv_on() && !xv_win && t->depth == 0 && t->state != 2 && t->why == 5 && xv_first_good(t->ser, t->lv, t->sl) && !xv_present(t->ser)
                                         && !xv_disabled(xtag = xv_tag_pass(R.rt.color[t->idx], t->lv, t->idx, &R.rt));
         int xvdead = xvcand && xv_trial_get(xtag, 0) >= XV_TRIAL;   // Only after the trial period is the write-back really skipped
         if (xvcand && !xvdead) xv_set(t->ser, t->lv, t->sl, XV_PROBE, xtag);   // Trial period: write back as usual, only track the next touch
-        int dead = t->state == 2 || udc_dead || xvdead; MTLStoreAction sa = dead ? MTLStoreActionDontCare : MTLStoreActionStore;
+        int dead = t->state == 2 || udc_dead || xvdead || ext; MTLStoreAction sa = dead ? MTLStoreActionDontCare : MTLStoreActionStore;
         if (xvdead) { xv_set(t->ser, t->lv, t->sl, XV_INVALID, xtag); g_xv_dc++; }
         if (t->state == 2) g_tb_hit[TB_STORE]++; if (udc_dead) g_tb_hit[TB_UDC]++; if (xvdead) g_tb_hit[TB_XV]++;
         enc_r_store(g_enc, t->depth, sa, (NSUInteger)t->idx);
@@ -12254,6 +12300,26 @@ static int frz_op(unsigned op, const void *a) {   // Returns 1 = this operation 
     return 0;
 }
 
+/* TOTK_DISCARD: nvnCommandBufferDiscardColor(index) / DiscardDepthStencil() leave that bound target's contents
+   undefined (index -1: depth-stencil). In an open pass the attachment is marked (sd_att.disc) and sd_finish stores it
+   DontCare if no draw was encoded after the mark; a later draw or clear in the same pass keeps the store. With no pass
+   open, TOTK_DISCARD=2 also makes the next pass's Load of that subresource DontCare (dropped at any op other than state,
+   targets, clears and draws). Not while a layered pass, merged pass, deferred replay or hoisted clear is in play. */
+static void discard_op(int index) {
+    int lvl = discard_level();
+    if (!lvl || S.render_disabled || g_lay.active || g_fz.active || g_defer_replaying || g_hoist_n) return;   // conditional rendering off: conservatively not discarded
+    if (index >= 8 || (index >= 0 && (index >= R.rt.n || !R.rt.color[index])) || (index < 0 && !R.rt.depth)) return;
+    if (g_enc) {
+        uint64_t ser = index >= 0 ? R.rt.color[index]->serial : R.rt.depth->serial;
+        for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i];
+            if (t->ser == ser && (index >= 0 ? t->depth == 0 && t->idx == index : t->depth != 0)) { t->disc = g_enc_draws + 1; g_dc_stat[0]++; } }
+        return;
+    }
+    if (lvl < 2 || tbdr_any() || g_ndisc_pend >= 9) return;
+    disc_pend d = {.k = index >= 0 ? index : 8}; rt_sub(&R.rt, d.k, &d.ser, &d.lv, &d.sl);
+    if (d.ser) g_disc_pend[g_ndisc_pend++] = d;
+}
+
 void mtl_exec(const uint8_t *p) {
     static int inited; if (!inited) { inited = 1; state_reset(); }
     static int dump_all = -1; if (dump_all < 0) dump_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
@@ -12366,7 +12432,17 @@ void mtl_exec(const uint8_t *p) {
             case OP_CLEAR_TEX: clear_tex(a); break;
             case OP_DISPATCH: dispatch(a); break;
             case OP_BARRIER: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;
+            case OP_DISCARD_COLOR: discard_op(((const p_flag *)a)->value < 0 ? 8 : ((const p_flag *)a)->value); break;   // a negative index is ignored (8)
+            case OP_DISCARD_DS: discard_op(-1); break;
             default: break;
+        }
+        if (g_ndisc_pend) switch (h.op) {   // TOTK_DISCARD=2: only state, targets, clears and draws keep a pending load discard
+            case OP_SET_RT: case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_DRAW: case OP_DRAW_IDX: case OP_DISCARD_COLOR: case OP_DISCARD_DS:
+            case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
+            case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
+            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_BLEND_COLOR: case OP_COPY_STRIDE: case OP_DEPTH_CLAMP:
+            case OP_RENDER_ENABLE: case OP_RASTER_DISCARD: case OP_RENDER_COND: break;
+            default: g_ndisc_pend = 0;
         }
         p += h.size;
     }

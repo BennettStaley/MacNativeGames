@@ -1693,6 +1693,14 @@ NVN(nvnCommandBufferSetRenderEnableConditional, void, NVNcommandBuffer *c, NVNco
 }
 // Rasterizer discard runs vertex work without rasterising; with no transform feedback that is the same as not drawing.
 NVN(nvnCommandBufferSetRasterizerDiscard, void, NVNcommandBuffer *c, uint32_t e) { REC(c, OP_RASTER_DISCARD, p_flag)->value = B(e) != 0; }
+/* TOTK_DISCARD (default 1, 0 = ignored as before): DiscardColor / DiscardDepthStencil leave the bound target's contents
+   undefined. They are recorded, and the replay stores such an attachment DontCare when the pass draws nothing more
+   after the discard (nvn_mtl.m discard_op). The calls are counted either way (mtl_discard_calls, periodic log). */
+static _Atomic uint64_t g_discard_calls[2];
+void mtl_discard_calls(uint64_t v[2]) { v[0] = atomic_load(&g_discard_calls[0]); v[1] = atomic_load(&g_discard_calls[1]); }
+static int discard_rec_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_DISCARD"); v = !(e && !strcmp(e, "0")); } return v; }
+NVN(nvnCommandBufferDiscardColor, void, NVNcommandBuffer *c, int i) { atomic_fetch_add(&g_discard_calls[0], 1); if (discard_rec_on()) REC(c, OP_DISCARD_COLOR, p_flag)->value = i; }
+NVN(nvnCommandBufferDiscardDepthStencil, void, NVNcommandBuffer *c) { atomic_fetch_add(&g_discard_calls[1], 1); if (discard_rec_on()) REC(c, OP_DISCARD_DS, p_flag)->value = -1; }
 /* TOTK diagnostic: TOTK_BINDPROG_LOG=<frame_lo>-<frame_hi> prints every BindProgram of those frames with the program object, its
    vertex-stage shader data address and the guest call chain (module+offset), so a program choice can be traced to game code. */
 static uint64_t g_frame;
@@ -2530,9 +2538,14 @@ static void tsummary(uint64_t frame) {
         { static uint64_t pun, puns; uint64_t un = 0, uns = 0; void mtl_upload_wait_stats(uint64_t *, uint64_t *); mtl_upload_wait_stats(&un, &uns);
           if (pf && frame > pf) LOG("[nvn] upload slot waits to frame %llu: %.2f per frame / %.3f ms", frame, (double)(un - pun) / (double)(frame - pf), (double)(uns - puns) / 1e6 / (double)(frame - pf));
           pun = un; puns = uns; }
-        { static uint64_t pcc; uint64_t mtl_chunk_commits(void), cc = mtl_chunk_commits();
-          if (pf && frame > pf) LOG("[nvn] chunked submits to frame %llu: %.2f extra chunks per frame", frame, (double)(cc - pcc) / (double)(frame - pf));
-          pcc = cc; }
+        { static uint64_t pcc, pct; uint64_t mtl_chunk_commits(void), cc = mtl_chunk_commits(), mtl_chunk_time_commits(void), ct = mtl_chunk_time_commits();
+          if (pf && frame > pf) LOG("[nvn] chunked submits to frame %llu: %.2f extra chunks per frame (%.2f by replay time, TOTK_CHUNK_US)", frame, (double)(cc - pcc) / (double)(frame - pf), (double)(ct - pct) / (double)(frame - pf));
+          pcc = cc; pct = ct; }
+        { static uint64_t pd[2], ps[6]; uint64_t d[2], v[6]; void mtl_discard_calls(uint64_t[2]), mtl_store_dc_stats(uint64_t[6]); mtl_discard_calls(d); mtl_store_dc_stats(v);
+          if (pf && frame > pf) { double nf = (double)(frame - pf);
+            LOG("[nvn] discards and empty passes to frame %llu: DiscardColor %.2f / DiscardDepthStencil %.2f per frame (TOTK_DISCARD); %.2f attachments marked in an open pass, %.2f stored DontCare by a discard, %.2f loads made DontCare; %.2f empty passes, %.2f of their attachments stored DontCare (TOTK_EMPTY_PASS_DC)", frame,
+                (d[0] - pd[0]) / nf, (d[1] - pd[1]) / nf, (v[0] - ps[0]) / nf, (v[1] - ps[1]) / nf, (v[2] - ps[2]) / nf, (v[3] - ps[3]) / nf, (v[4] - ps[4]) / nf); }
+          memcpy(pd, d, sizeof pd); memcpy(ps, v, sizeof ps); }
         if (synclog_env() && pf && frame > pf) { static uint64_t pc[2], pb[2], pn[2], pw[2]; double nf = (double)(frame - pf);
           for (int k = 0; k < 2; k++) { uint64_t c = atomic_load(&g_sw_calls[k]), b = atomic_load(&g_sw_blocked[k]), n = atomic_load(&g_sw_ns[k]), w = atomic_load(&g_sw_newest[k]);
             LOG("[nvn] CPU sync waits to frame %llu: %s %.2f per frame, %.2f actually blocked / %.3f ms, %.2f waiting on the newest submit", frame, k ? "acquire sync" : "fence sync", (c - pc[k]) / nf, (b - pb[k]) / nf, (n - pn[k]) / 1e6 / nf, (w - pw[k]) / nf);
