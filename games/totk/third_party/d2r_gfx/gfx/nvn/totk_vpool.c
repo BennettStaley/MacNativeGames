@@ -31,6 +31,8 @@ static uint8_t *vm_fresh(uint64_t span) {
     return (uint8_t *)(uintptr_t)a;
 }
 
+static void virt_add(uintptr_t lo, uintptr_t hi);
+static void virt_del(uintptr_t lo, uintptr_t hi);
 int totk_vpool_init(pool_t *o) {
     int phys = (o->flags & F_PHYSICAL) != 0, virt = (o->flags & F_VIRTUAL) != 0;
     o->game_mem = o->mem; o->host = NULL; o->span = 0;
@@ -46,11 +48,13 @@ int totk_vpool_init(pool_t *o) {
     o->host = vm_fresh(o->span);
     if (!o->host) return 0;
     o->mem = o->host;
+    if (virt) virt_add((uintptr_t)o->mem, (uintptr_t)o->mem + o->span);
     return 1;
 }
 
 int totk_vpool_fini(pool_t *o) {
     if (!o->host) return 0;
+    if (o->flags & F_VIRTUAL) virt_del((uintptr_t)o->host, (uintptr_t)o->host + o->span);
     mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)o->host, o->span);
     o->host = NULL; o->mem = o->game_mem; o->span = 0;
     return 1;
@@ -71,11 +75,47 @@ static int check_request(const pool_t *v, const totk_mapping_request *r, int i) 
 
 // TOTK diagnostics: mapping table (virtual range -> CPU address of the physical backing) so a watch on a GPU
 // address can protect the pages the CPU actually touches (the game reads/writes physical pools through their own view).
+/* TOTK frames in flight also needs it: the GPU reads a virtual pool through its own addresses, the CPU writes the
+   physical pool's storage, a different virtual range with its own page protections, so guarding the virtual pool alone
+   does not stop such a write (totk_vpool_guard). Entries a newer mapping overlaps are dropped; a full table is remembered
+   (the guard then reports virtual pools as unguardable). */
 typedef struct { uintptr_t va, cpu; uint64_t size; } vmap_ent;
-static vmap_ent g_vmap[512]; static int g_nvmap;
+#define VMAP_N 16384   /* was 512 (diagnostics only, silently dropped); sparse virtual pools map 64 KiB tiles */
+static vmap_ent g_vmap[VMAP_N]; static int g_nvmap, g_vmap_full;
+static void vmap_drop(uintptr_t lo, uintptr_t hi) {   // under g_map_mu
+    for (int i = 0; i < g_nvmap; ) if (g_vmap[i].va < hi && g_vmap[i].va + g_vmap[i].size > lo) g_vmap[i] = g_vmap[--g_nvmap]; else i++;
+}
 static void vmap_note(uintptr_t va, uint64_t size, uintptr_t cpu) {
-    for (int i = 0; i < g_nvmap; i++) if (g_vmap[i].va == va) { g_vmap[i] = (vmap_ent){va, cpu, size}; return; }
-    if (g_nvmap < 512) g_vmap[g_nvmap++] = (vmap_ent){va, cpu, size};
+    vmap_drop(va, va + size);
+    if (g_nvmap < VMAP_N) g_vmap[g_nvmap++] = (vmap_ent){va, cpu, size};
+    else if (!g_vmap_full) { g_vmap_full = 1; LOG("[red] vpool: mapping table full (%d); frames in flight treat virtual pools as unguarded", VMAP_N); }
+}
+/* Virtual pools (host ranges), so the guard knows which pools need their backing guarded. */
+#define VIRT_N 1024
+static struct { uintptr_t lo, hi; } g_virt[VIRT_N]; static int g_nvirt, g_virt_full;
+static void virt_add(uintptr_t lo, uintptr_t hi) {
+    pthread_mutex_lock(&g_map_mu);
+    if (g_nvirt < VIRT_N) { g_virt[g_nvirt].lo = lo; g_virt[g_nvirt].hi = hi; g_nvirt++; } else g_virt_full = 1;
+    pthread_mutex_unlock(&g_map_mu);
+}
+static void virt_del(uintptr_t lo, uintptr_t hi) {
+    pthread_mutex_lock(&g_map_mu);
+    for (int i = 0; i < g_nvirt; i++) if (g_virt[i].lo == lo) { g_virt[i] = g_virt[--g_nvirt]; break; }
+    vmap_drop(lo, hi);
+    pthread_mutex_unlock(&g_map_mu);
+}
+int totk_vpool_guard(uintptr_t lo, uintptr_t hi, uint64_t fence) {
+    pthread_mutex_lock(&g_map_mu);
+    int virt = g_virt_full, ok = 1;
+    for (int i = 0; i < g_nvirt && !virt; i++) virt = g_virt[i].lo < hi && g_virt[i].hi > lo;
+    if (virt && (g_vmap_full || g_virt_full)) ok = 0;
+    else if (virt)
+        for (int i = 0; i < g_nvmap; i++) { const vmap_ent *e = &g_vmap[i];
+            if (!e->cpu || e->va >= hi || e->va + e->size <= lo) continue;
+            uintptr_t a = e->va > lo ? e->va : lo, b = e->va + e->size < hi ? e->va + e->size : hi;
+            if (!nvn_dirty_guard((const void *)(e->cpu + (a - e->va)), b - a, fence)) ok = 0; }
+    pthread_mutex_unlock(&g_map_mu);
+    return virt ? (ok ? 1 : 0) : -1;
 }
 int totk_vpool_backing(uintptr_t va, uint64_t len, uintptr_t *cpu) {
     pthread_mutex_lock(&g_map_mu); int r = 0;
@@ -109,7 +149,7 @@ int totk_vpool_map(pool_t *v, int count, const totk_mapping_request *r) {
     for (int i = 0; i < count; i++) if (!check_request(v, &r[i], i)) return 0;
     pthread_mutex_lock(&g_map_mu);
     // GPU page tables of the old zero-copy buffer and dirty-page protections refer to the replaced pages.
-    nvn_dirty_remove_range(v->mem);
+    nvn_dirty_remove_range(v->mem, v->size);
     mtl_pool_del(v->mem);
     int ok = 1;
     for (int i = 0; ok && i < count; i++) ok = apply_request(v, &r[i]);

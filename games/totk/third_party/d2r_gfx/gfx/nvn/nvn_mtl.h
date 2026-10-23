@@ -65,6 +65,11 @@ int mtl_probe_depth_output(void);
 int mtl_probe_tile(void);
 
 uint64_t mtl_last_fence(void);                       // Fence value of the most recent submit (0 = never submitted)
+// TOTK frames in flight (nvn_mtl.m): submission flags by class and the counters behind the periodic [fif] line
+enum { FIF_FL_OCCL = 1, FIF_FL_UNG = 2, FIF_FL_STAT = 4, FIF_FL_VIRT = 8, FIF_FL_OVER = 16, FIF_FL_NOREC = 32 };
+#define MTL_FIF_NSTAT 17
+uint32_t mtl_fence_flags(uint64_t after, uint64_t upto);
+void mtl_fif_stats(uint64_t v[MTL_FIF_NSTAT], uint64_t sample[4][2]);
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);   // Returns 1 when the GPU has completed up to fence, 0 on timeout
 void mtl_finish(void);                               // Wait for all submitted commands to complete
 void mtl_drain(void);                                // Wait for all commands on the queue (including presents) to complete: submit an empty command buffer and wait for it

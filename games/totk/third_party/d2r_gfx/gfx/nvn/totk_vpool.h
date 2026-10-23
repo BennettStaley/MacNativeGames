@@ -24,3 +24,6 @@ int totk_vpool_fini(pool_t *pool);
 int totk_vpool_map(pool_t *virtual_pool, int count, const totk_mapping_request *requests);
 // TOTK diagnostics: CPU address of the physical backing of a virtual-pool range (1 = mapped, *cpu set).
 int totk_vpool_backing(uintptr_t va, uint64_t len, uintptr_t *cpu);
+// TOTK frames in flight: a submission ending with fence reads [lo, hi). If that lies in a virtual pool, guard the
+// physical storage mapped there (nvn_dirty_guard). -1: not a virtual pool; 1: all backing guarded; 0: some could not be.
+int totk_vpool_guard(uintptr_t lo, uintptr_t hi, uint64_t fence);

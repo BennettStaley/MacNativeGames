@@ -59,7 +59,7 @@ int mtl_probe_texels_region(void) {
             uint64_t before=atomic_load(&g_texels_gpu_writes);mtl_write_texels(&t,lv,0,&r,mem+3,row,img);
             if(memcmp(mem,expected,size)||atomic_load(&g_texels_gpu_writes)!=before)MDIE("texels-region overlapping source CPU fallback");checked++;
         }
-        mtl_pool_del(mem);nvn_dirty_remove_range(mem);mtl_finish();munmap(mem,size);free(expected);free(got);free(want);free(src);checked++;
+        mtl_pool_del(mem);nvn_dirty_remove_range(mem,size);mtl_finish();munmap(mem,size);free(expected);free(got);free(want);free(src);checked++;
     }}
     if(atomic_load(&g_texels_gpu_failures))MDIE("texels-region GPU failure");mtl_texels_gpu_report();return checked;
 }

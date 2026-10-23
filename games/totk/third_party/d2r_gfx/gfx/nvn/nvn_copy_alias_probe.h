@@ -53,7 +53,7 @@ int mtl_probe_copy_alias(void) {
             checked++;
         }
     }
-    nvn_dirty_remove_range(virtual_pool.mem); mtl_pool_del(virtual_pool.mem); totk_vpool_fini(&virtual_pool); virtual_buffer = nil;
+    nvn_dirty_remove_range(virtual_pool.mem, virtual_pool.size); mtl_pool_del(virtual_pool.mem); totk_vpool_fini(&virtual_pool); virtual_buffer = nil;
     g_copy_probe_no_alias = 0; res_remove(alias); res_remove(x); alias = nil; x = nil; free(mem); free(expected);
     return checked;
 }

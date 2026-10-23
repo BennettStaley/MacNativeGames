@@ -1937,6 +1937,13 @@ static int cond_eval(const void *payload, const void *op) {
     return enabled;
 }
 void mtl_counter_stats(uint64_t rep[32], uint64_t rst[32]) { memcpy(rep, g_cnt_report, sizeof g_cnt_report); memcpy(rst, g_cnt_reset, sizeof g_cnt_reset); }
+const char *cnt_type_name(uint64_t t) {
+    static const char *n[] = {"TIMESTAMP", "SAMPLES_PASSED", "INPUT_VERTICES", "INPUT_PRIMITIVES", "VERTEX_SHADER_INVOCATIONS", "TESS_CONTROL_SHADER_INVOCATIONS",
+        "TESS_EVALUATION_SHADER_INVOCATIONS", "GEOMETRY_SHADER_INVOCATIONS", "FRAGMENT_SHADER_INVOCATIONS", "TESS_EVALUATION_SHADER_PRIMITIVES",
+        "GEOMETRY_SHADER_PRIMITIVES", "CLIPPER_INPUT_PRIMITIVES", "CLIPPER_OUTPUT_PRIMITIVES", "PRIMITIVES_GENERATED", "TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN",
+        "ZCULL_STATS", "TIMESTAMP_TOP"};
+    return t < sizeof n / sizeof *n ? n[t] : "unknown";
+}
 
 /* TOTK: counter timestamps in the Tegra 19.2 MHz tick base of nn::os::GetSystemTick (runtime_dispatch: mach_absolute_time
    in ns * 12 / 625). The game turns the GPU timestamps of its frame (main+0x2a7b630, via nvnDeviceGetTimestampInNanoseconds
@@ -2140,8 +2147,8 @@ uint64_t mtl_sub_commit(void) {
     rs_sub_end();   // TOTK: encode stage drained before the command buffer is ended
     up_flush();
     uint64_t fence = ++g_fence;
-    { void fif_commit(uint64_t fence, int counters); int fif_guard_on(void);
-      if (fif_guard_on()) { int nc = 0; for (int i = 0; i < g_npost; i++) nc += g_post[i].kind == 2 || g_post[i].kind == 3; fif_commit(fence, nc); } }
+    { void fif_commit(uint64_t fence, int occl, int stat); int fif_guard_on(void);
+      if (fif_guard_on()) { int no = 0, ns = 0; for (int i = 0; i < g_npost; i++) { no += g_post[i].kind == 3; ns += g_post[i].kind == 2; } fif_commit(fence, no, ns); } }
     if (g_vis_ring_i >= 0) g_vis_ring[g_vis_ring_i].fence = fence;
     // CPU-visible effects after completion: copy the op table into the callback
     int n = g_npost; post_op *ops = n ? malloc(n * sizeof *ops) : NULL;
@@ -2263,8 +2270,14 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
      writes waits for that command (fif_readback_wait; producers: storage writes, texture->buffer and buffer copies,
      uniform updates, counters). Producer compute shaders the game reads back are learned and end a command buffer right
      after their dispatch, so the wait is for that early commit only (port of DavidZande's TOTK_LAG_READBACK=2, 6a87c04
-     / bdb8946). Submissions with counter reports, or with a pool the guard could not cover, are flagged
-     (mtl_fence_flags) and the lagged wait falls back to the real fence for them (hle_nvn.c).
+     / bdb8946). Submissions are flagged by class (fif_commit: occlusion reports, timestamp / statistics reports, pools
+     the guard could not cover) and hle_nvn.c fif_target decides per class whether the lagged wait falls back.
+   - Pool classes the guard sees (2026-10-23): ordinary pools (CPU cached / uncached / CPU_NO_ACCESS / compressible
+     alike: our own host writes go through prep_write, which waits too) are guarded page-protected ranges; pools sharing
+     a host page with a neighbour (NVN 4 KiB alignment vs 16 KiB host pages: the ~20 "untracked" pools a frame of the
+     2026-10-23 audit) are now registered clipped and guarded across both ranges (nvn_dirty_add_range); virtual pools
+     also guard the physical storage mapped into them, which the CPU writes through another address (totk_vpool_guard);
+     GPU_NO_ACCESS pools are never registered for the GPU, so no submission reads them.
    - TOTK_FIF_AUDIT=1: nothing waits; the guard and the readback check only count what would have waited, with sample
      addresses (does TOTK multi-buffer its dynamic data?). Unsafe, for measurement. */
 static uint64_t mtl_done_fence(void) { return __atomic_load_n(&g_done, __ATOMIC_ACQUIRE); }
@@ -2280,7 +2293,8 @@ int fif_guard_on(void) {
 #define FIF_SET 8192
 static uint64_t g_fif_lo[FIF_SET], g_fif_hi[FIF_SET]; static uint32_t g_fif_tag[FIF_SET], g_fif_gen, g_fif_list[FIF_SET / 2]; static int g_fif_n, g_fif_over;
 static _Atomic uint32_t g_fif_flags[4096]; static _Atomic uint64_t g_fif_flag_fence[4096];
-static _Atomic uint64_t g_fif_subs, g_fif_pools, g_fif_unguarded, g_fif_counter_subs;
+static _Atomic uint64_t g_fif_subs, g_fif_pools, g_fif_unguarded, g_fif_counter_subs, g_fif_stat_subs, g_fif_pool_untracked, g_fif_virt_ok, g_fif_virt_bad, g_fif_over_subs;
+int totk_vpool_guard(uintptr_t lo, uintptr_t hi, uint64_t fence);
 void fif_begin(void) { t_fif_rec = 1; if (!++g_fif_gen) { memset(g_fif_tag, 0, sizeof g_fif_tag); g_fif_gen = 1; } g_fif_n = 0; g_fif_over = 0; }
 static void fif_note_pool(uintptr_t lo, uintptr_t hi) {   // replay thread only (t_fif_rec)
     uint32_t h = (uint32_t)((lo >> 12) * 0x9E3779B1u) & (FIF_SET - 1);
@@ -2289,18 +2303,34 @@ static void fif_note_pool(uintptr_t lo, uintptr_t hi) {   // replay thread only 
         if (g_fif_lo[h] == lo) { if (hi > g_fif_hi[h]) g_fif_hi[h] = hi; return; }
     }
 }
-void fif_commit(uint64_t fence, int counters) {   // flag 1: counter reports; flag 2: a pool read zero-copy is not guarded
+/* Submission flags (mtl_fence_flags; hle_nvn.c fif_target decides per class):
+     FIF_FL_OCCL  samples-passed (occlusion) reports: real fence unless TOTK_FIF_COUNTERS=1
+     FIF_FL_STAT  timestamp / statistics reports: lagged unless TOTK_FIF_COUNTERS=0 (see fif_target)
+     FIF_FL_UNG   a pool read zero-copy with pages no tracking range covers (nvn_dirty_guard 0)
+     FIF_FL_VIRT  a virtual pool whose physical backing could not be guarded (totk_vpool_guard 0)
+     FIF_FL_OVER  more pools than the per-submission set holds
+     FIF_FL_NOREC the submission's flags were not recorded (mtl_fence_flags only)   (values: nvn_mtl.h) */
+void fif_commit(uint64_t fence, int occl, int stat) {
     t_fif_rec = 0;
-    uint32_t fl = (counters ? 1u : 0u) | (g_fif_over ? 2u : 0u);
-    for (int i = 0; i < g_fif_n; i++) { uint32_t h = g_fif_list[i]; if (!nvn_dirty_guard((const void *)(uintptr_t)g_fif_lo[h], g_fif_hi[h] - g_fif_lo[h], fence)) fl |= 2; }
+    uint32_t fl = (occl ? FIF_FL_OCCL : 0u) | (stat ? FIF_FL_STAT : 0u) | (g_fif_over ? FIF_FL_OVER : 0u);
+    uint64_t untracked = 0, vok = 0, vbad = 0;
+    for (int i = 0; i < g_fif_n; i++) { uint32_t h = g_fif_list[i];
+        if (!nvn_dirty_guard((const void *)(uintptr_t)g_fif_lo[h], g_fif_hi[h] - g_fif_lo[h], fence)) { fl |= FIF_FL_UNG; untracked++; }
+        int v = totk_vpool_guard((uintptr_t)g_fif_lo[h], (uintptr_t)g_fif_hi[h], fence);   // a virtual pool: also its physical storage, which the CPU writes through another address
+        if (v == 0) { fl |= FIF_FL_VIRT; vbad++; } else if (v > 0) vok++; }
     atomic_store(&g_fif_flags[fence & 4095], fl); atomic_store_explicit(&g_fif_flag_fence[fence & 4095], fence, memory_order_release);
-    atomic_fetch_add(&g_fif_subs, 1); atomic_fetch_add(&g_fif_pools, (uint64_t)g_fif_n); if (fl & 2) atomic_fetch_add(&g_fif_unguarded, 1); if (fl & 1) atomic_fetch_add(&g_fif_counter_subs, 1);
+    atomic_fetch_add(&g_fif_subs, 1); atomic_fetch_add(&g_fif_pools, (uint64_t)g_fif_n);
+    if (fl & (FIF_FL_UNG | FIF_FL_VIRT | FIF_FL_OVER)) atomic_fetch_add(&g_fif_unguarded, 1);
+    if (fl & FIF_FL_OVER) atomic_fetch_add(&g_fif_over_subs, 1);
+    if (fl & FIF_FL_OCCL) atomic_fetch_add(&g_fif_counter_subs, 1);
+    if (fl & FIF_FL_STAT) atomic_fetch_add(&g_fif_stat_subs, 1);
+    atomic_fetch_add(&g_fif_pool_untracked, untracked); atomic_fetch_add(&g_fif_virt_ok, vok); atomic_fetch_add(&g_fif_virt_bad, vbad);
 }
-uint32_t mtl_fence_flags(uint64_t after, uint64_t upto) {   // OR of the flags of the submissions (after, upto]; 2 for one not recorded
+uint32_t mtl_fence_flags(uint64_t after, uint64_t upto) {   // OR of the flags of the submissions (after, upto]; FIF_FL_NOREC for one not recorded
     if (upto <= after) return 0;
-    if (upto - after > 4000) return 2;
+    if (upto - after > 4000) return FIF_FL_NOREC;
     uint32_t fl = 0;
-    for (uint64_t f = after + 1; f <= upto; f++) fl |= atomic_load_explicit(&g_fif_flag_fence[f & 4095], memory_order_acquire) == f ? atomic_load(&g_fif_flags[f & 4095]) : 2u;
+    for (uint64_t f = after + 1; f <= upto; f++) fl |= atomic_load_explicit(&g_fif_flag_fence[f & 4095], memory_order_acquire) == f ? atomic_load(&g_fif_flags[f & 4095]) : (uint32_t)FIF_FL_NOREC;
     return fl;
 }
 /* GPU -> CPU producers (after DavidZande 41de26e / 6a87c04 rb_prod): ranges a GPU command writes, with its submission's
@@ -2309,7 +2339,7 @@ typedef struct { uint64_t lo, hi, fence, seq; char key[9]; } fif_prod;
 #define FIF_PROD_N 4096
 static fif_prod g_fprod[FIF_PROD_N]; static unsigned g_fprod_i; static pthread_mutex_t g_fprod_mu = PTHREAD_MUTEX_INITIALIZER;
 static char g_fearly[16][9]; static int g_nfearly;
-static uint64_t g_frb_waits, g_frb_ns, g_frb_full, g_frb_checked; static uint64_t g_frb_sample[4][2]; static unsigned g_frb_ns_i;
+static uint64_t g_frb_waits, g_frb_ns, g_frb_full, g_frb_checked, g_frb_cnt_cov, g_frb_cnt_fly; static uint64_t g_frb_sample[4][2]; static unsigned g_frb_ns_i;
 static int fif_early(const char *key) { for (int i = 0; i < g_nfearly; i++) if (!strncmp(g_fearly[i], key, 8)) return 1; return 0; }
 static void fif_prod_note(uint64_t lo, uint64_t n, const char *key, uint64_t seq) {
     if (!n || !fif_guard_on()) return;
@@ -2325,9 +2355,13 @@ static void fif_readback_wait(uint64_t lo, uint64_t n) {
     uint64_t done = mtl_done_fence(); fif_prod best = {0}; int have = 0;
     pthread_mutex_lock(&g_fprod_mu);
     g_frb_checked++;
+    int cov_cnt = 0;
     for (unsigned k = 0; k < FIF_PROD_N; k++) { const fif_prod *e = &g_fprod[k];
-        if (e->fence <= done || !(e->hi > lo && e->lo < lo + n)) continue;
+        if (!(e->hi > lo && e->lo < lo + n)) continue;
+        if (!cov_cnt && e->key[0] == 'c' && !strcmp(e->key, "counter")) { cov_cnt = 1; g_frb_cnt_cov++; }   // the game invalidates before reading counter results (then a lag is covered by this wait)
+        if (e->fence <= done) continue;
         if (!have || e->fence > best.fence || (e->fence == best.fence && e->seq > best.seq)) { best = *e; have = 1; } }
+    if (have && !strcmp(best.key, "counter")) g_frb_cnt_fly++;
     if (have) { g_frb_sample[g_frb_ns_i % 4][0] = lo; g_frb_sample[g_frb_ns_i % 4][1] = n; g_frb_ns_i++; }
     pthread_mutex_unlock(&g_fprod_mu);
     if (!have) return;
@@ -2352,11 +2386,17 @@ static void fif_readback_wait(uint64_t lo, uint64_t n) {
 }
 /* For the periodic log line (hle_nvn.c): v = {submissions, pools guarded, submissions unguarded, with counters,
    readback checks, readbacks of in-flight GPU writes (waits; audit: would-be waits), their wait ns, of them for a whole
-   submission, early-commit shaders, completion writes skipped as stale}; sample: the last readback ranges that hit. */
-void mtl_fif_stats(uint64_t v[10], uint64_t sample[4][2]) {
+   submission, early-commit shaders, completion writes skipped as stale,
+   10: submissions with timestamp / statistics reports, 11: pools a submission read that could not be guarded,
+   12 / 13: virtual pools whose physical backing was / could not be guarded, 14: pool invalidates over a counter record
+   (the game invalidates before reading counter results), 15: of them while the record was in flight, 16: submissions
+   whose pool set overflowed}; sample: the last readback ranges that hit. */
+void mtl_fif_stats(uint64_t v[MTL_FIF_NSTAT], uint64_t sample[4][2]) {
     v[0] = atomic_load(&g_fif_subs); v[1] = atomic_load(&g_fif_pools); v[2] = atomic_load(&g_fif_unguarded); v[3] = atomic_load(&g_fif_counter_subs);
-    pthread_mutex_lock(&g_fprod_mu); v[4] = g_frb_checked; v[5] = g_frb_waits; v[6] = g_frb_ns; v[7] = g_frb_full; v[8] = (uint64_t)g_nfearly; memcpy(sample, g_frb_sample, sizeof g_frb_sample); pthread_mutex_unlock(&g_fprod_mu);
+    pthread_mutex_lock(&g_fprod_mu); v[4] = g_frb_checked; v[5] = g_frb_waits; v[6] = g_frb_ns; v[7] = g_frb_full; v[8] = (uint64_t)g_nfearly; memcpy(sample, g_frb_sample, sizeof g_frb_sample);
+    v[14] = g_frb_cnt_cov; v[15] = g_frb_cnt_fly; pthread_mutex_unlock(&g_fprod_mu);
     v[9] = atomic_load(&g_post_stale);
+    v[10] = atomic_load(&g_fif_stat_subs); v[11] = atomic_load(&g_fif_pool_untracked); v[12] = atomic_load(&g_fif_virt_ok); v[13] = atomic_load(&g_fif_virt_bad); v[16] = atomic_load(&g_fif_over_subs);
 }
 
 static void mtl_finish_gpu(void) {
@@ -12877,7 +12917,9 @@ void mtl_exec(const uint8_t *p) {
                 mtl_exec((const uint8_t *)t); g_ret_n--; break; }
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4);
                 PD("Y signal_event cmd=%p dst=%p mode=%u value=%u", p, val, m, v); mtl_sub_event(val, m, v); break; }
-            case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
+            case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8);
+                if (!g_cnt_report[t & 31]++ && fif_guard_on()) MLOG("[fif] first counter report of type %s (%llu) at %#llx, frame %llu: %s", cnt_type_name(t), (unsigned long long)t, (unsigned long long)ad, (unsigned long long)atomic_load(&g_cur_frame),
+                    t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? "occlusion, waits keep the real fence (TOTK_FIF_COUNTERS=1 lags them)" : "written as {0, completion time}, waits lag (TOTK_FIF_COUNTERS=0: real fence)");
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
                 cpend_push(ad, g_fence + 1, 0, t != NVN_COUNTER_TYPE_SAMPLES_PASSED); fif_prod_note(ad, 16, "counter", 0);   // TOTK: value the completion handler will write (counter word)
                 if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
@@ -15224,7 +15266,7 @@ int mtl_probe_linear_rt_upload(void) {
         enc_b_copy_texture_buffer(blit(),tex,0,0,MTLOriginMake(0,0,0),MTLSizeMake(W,H,1),rb,0,row,row*H);mtl_sub_commit();mtl_finish();
         const uint16_t expected[4]={16384,32768,49151,65535};const uint16_t *got=rb.contents;
         for(NSUInteger i=0;i<W*H*bpp/2;i++){int want=expected[mode?i%4:0];if(abs((int)got[i]-want)>1)MDIE("linear-rt GPU render mode%d component%lu: %u != %d",mode,i,got[i],want);checked++;}
-        memset(&R,0,sizeof R);mtl_tex_release(&t);mtl_pool_del(mem);nvn_dirty_remove_range(mem);mtl_finish();res_remove(rb);munmap(mem,size);free(pixels);
+        memset(&R,0,sizeof R);mtl_tex_release(&t);mtl_pool_del(mem);nvn_dirty_remove_range(mem,size);mtl_finish();res_remove(rb);munmap(mem,size);free(pixels);
     }
     return checked;
 }
@@ -15304,7 +15346,7 @@ int mtl_probe_texture_retire(void) {
     }
     if(g_reup_reused<reused_before+7)MDIE("texture final cache: missing allocation reuse");checked++;
     atomic_store(&g_pkg_final_cache,saved_final);res_remove(final_rb);
-    mtl_pool_del(mem);nvn_dirty_remove_range(mem);mtl_finish();res_remove(rb);munmap(mem,size);
+    mtl_pool_del(mem);nvn_dirty_remove_range(mem,size);mtl_finish();res_remove(rb);munmap(mem,size);
     return checked;
 }
 

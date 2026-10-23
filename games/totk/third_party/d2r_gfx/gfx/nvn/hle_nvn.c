@@ -232,8 +232,8 @@ NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
     if (o->mem && !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS)) { mtl_present_flush_mem(o->mem, o->size, 0); x_drain();
         /* TOTK frames in flight: the game's own fence wait may have returned one frame early, so the pool's last reader can
            still be on the GPU; the memory goes back to the game when this returns. Untracked pools wait for everything. */
-        if (fif_env() > 1) { int fif_guard_on(void); uint64_t f = fif_guard_on() && nvn_dirty_tracked(o->mem, 1) ? nvn_dirty_range_fence(o->mem) : mtl_last_fence(); if (f) mtl_wait(f, UINT64_MAX); }
-        nvn_dirty_remove_range(o->mem); mtl_pool_del(o->mem); }
+        if (fif_env() > 1) { int fif_guard_on(void); uint64_t f = 0; if (!fif_guard_on() || !nvn_dirty_span_fence(o->mem, o->size, &f)) f = mtl_last_fence(); if (f) mtl_wait(f, UINT64_MAX); }
+        nvn_dirty_remove_range(o->mem, o->size); mtl_pool_del(o->mem); }
     totk_vpool_fini(o); o->magic = 0;
 }
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
@@ -609,31 +609,61 @@ static int synclog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK
    the game (the previous fence of the same object; never further). Safety (nvn_mtl.m "frames in flight", nvn_dirty.c
    guard): CPU writes to pool pages a submission in flight reads wait in the fault handler, readbacks (pool invalidates)
    wait for their GPU producer, completion-time writes skip destinations the game rewrote, pool finalize waits for the
-   pool's last reader. A lag over submissions that recorded counter reports (TOTK_FIF_COUNTERS=1 lags anyway) or read a
-   pool the guard could not cover falls back to the real fence. Synchronous replay only (the translation thread's tokens
-   are not lagged). TOTK_FIF_GUARD=0: the old unguarded measurement mode; TOTK_FIF_AUDIT=1: guarded pages and readbacks
-   only count what would have waited (unsafe, answers whether TOTK multi-buffers its dynamic data). */
+   pool's last reader. Lags are decided per class of what the skipped submissions did (nvn_mtl.m fif_commit flags):
+   - timestamp / statistics counter reports: lagged. Every type but samples passed is written as {0, GPU completion
+     time} by the completion handler (no real statistic exists here), and the game reads them for GPU timing; one frame
+     late is what the game sees on hardware with its own queue depth. A pool invalidate over a counter record still in
+     flight waits for it (fif_readback_wait). TOTK_FIF_COUNTERS=0: real fence for them too.
+   - samples passed (occlusion queries): real fence (they drive object culling); TOTK_FIF_COUNTERS=1 lags them as well.
+   - a pool with pages no tracking range covers, a virtual pool whose physical storage could not be guarded, a pool set
+     overflow, or a submission whose flags were not recorded: real fence.
+   Synchronous replay only (the translation thread's tokens are not lagged). TOTK_FIF_GUARD=0: the old unguarded
+   measurement mode; TOTK_FIF_AUDIT=1: guarded pages and readbacks only count what would have waited (unsafe, answers
+   whether TOTK multi-buffers its dynamic data). */
 static int fif_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_FRAMES_IN_FLIGHT"); v = e ? atoi(e) : 1; if (v > 1) LOG("[nvn] TOTK_FRAMES_IN_FLIGHT=%d: fence waits on the newest submission wait for the previous frame's fence (experimental)", v); } return v; }
-int fif_guard_on(void); uint32_t mtl_fence_flags(uint64_t after, uint64_t upto); void mtl_fif_stats(uint64_t v[10], uint64_t sample[4][2]);
-static void fif_log(uint64_t lagged, uint64_t fb_cnt, uint64_t fb_ung) {
-    static uint64_t last_lag, last_g[6], last_m[10], last_a; static uint64_t t_last;
-    uint64_t g[6], m[10], smp[4][2], an, as[8]; nvn_dirty_guard_stats(g); mtl_fif_stats(m, smp); nvn_dirty_guard_audit(&an, as);
+int fif_guard_on(void);
+void mtl_counter_stats(uint64_t rep[32], uint64_t rst[32]); const char *cnt_type_name(uint64_t t);
+/* Wait outcomes: 0 lagged (no flag), 1 lagged over timestamp / statistics reports, then the fallbacks to the real fence:
+   2 occlusion reports, 3 timestamp / statistics reports (TOTK_FIF_COUNTERS=0), 4 untracked pool pages, 5 virtual pool
+   backing, 6 pool set overflow, 7 flags not recorded. */
+enum { FW_LAG, FW_LAG_STAT, FW_FB_OCCL, FW_FB_STAT, FW_FB_UNG, FW_FB_VIRT, FW_FB_OVER, FW_FB_NOREC, FW_N };
+static _Atomic uint64_t g_fw[FW_N];
+static void fif_log(void) {
+    static uint64_t last_w[FW_N], last_g[6], last_m[MTL_FIF_NSTAT], last_a, last_add[3], last_rep[32]; static uint64_t t_last; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     uint64_t now = now_ns();
     if (t_last && now - t_last < 5000000000ull) return;
-    double nf = (double)(lagged + fb_cnt + fb_ung - last_lag); if (nf < 1) nf = 1;
-    LOG("[fif] last %.1f s: %llu waits lagged one frame, %llu fell back to the real fence (%llu counter reports, %llu unguarded pools); guard: %llu fault waits (%.3f a frame, %.3f ms a frame, %llu over 2 s), %.1f pools guarded a submission, %llu untracked; readbacks of in-flight GPU writes %llu of %llu checked (%.3f ms a frame, %llu for a whole submission), %llu early-commit shaders; completion writes skipped as stale %llu",
-        t_last ? (now - t_last) / 1e9 : 0.0, (unsigned long long)lagged, (unsigned long long)(fb_cnt + fb_ung), (unsigned long long)fb_cnt, (unsigned long long)fb_ung,
+    if (pthread_mutex_trylock(&mu)) return;
+    if (t_last && now - t_last < 5000000000ull) { pthread_mutex_unlock(&mu); return; }
+    uint64_t w[FW_N], g[6], m[MTL_FIF_NSTAT], smp[4][2], an, as[8], add[3], rep[32], rst[32];
+    for (int i = 0; i < FW_N; i++) w[i] = atomic_load(&g_fw[i]) - last_w[i];
+    nvn_dirty_guard_stats(g); mtl_fif_stats(m, smp); nvn_dirty_guard_audit(&an, as); nvn_dirty_add_stats(add); mtl_counter_stats(rep, rst);
+    uint64_t lag = w[FW_LAG] + w[FW_LAG_STAT], fb = 0; for (int i = FW_FB_OCCL; i < FW_N; i++) fb += w[i];
+    double nf = (double)(lag + fb); if (nf < 1) nf = 1;
+    uint64_t subs = m[0] - last_m[0];
+    LOG("[fif] last %.1f s: %llu waits lagged one frame (%llu over timestamp/statistics reports), %llu fell back to the real fence: occlusion reports %llu, timestamp/statistics reports %llu, untracked pool pages %llu, virtual pool backing %llu, pool set overflow %llu, not recorded %llu",
+        t_last ? (now - t_last) / 1e9 : 0.0, (unsigned long long)lag, (unsigned long long)w[FW_LAG_STAT], (unsigned long long)fb, (unsigned long long)w[FW_FB_OCCL], (unsigned long long)w[FW_FB_STAT],
+        (unsigned long long)w[FW_FB_UNG], (unsigned long long)w[FW_FB_VIRT], (unsigned long long)w[FW_FB_OVER], (unsigned long long)w[FW_FB_NOREC]);
+    LOG("[fif]   submissions %llu: with occlusion reports %llu, with timestamp/statistics reports %llu, unguarded %llu (set overflow %llu); %.1f pools guarded a submission, %llu pools unguardable (%llu range lookups found no tracking range), virtual pools backing guarded %llu / not %llu; pool registrations sharing a host page (clipped) %llu, adding no range (covered) %llu, untracked %llu (all time)",
+        (unsigned long long)subs, (unsigned long long)(m[3] - last_m[3]), (unsigned long long)(m[10] - last_m[10]), (unsigned long long)(m[2] - last_m[2]), (unsigned long long)(m[16] - last_m[16]),
+        subs ? (double)(m[1] - last_m[1]) / (double)subs : 0.0, (unsigned long long)(m[11] - last_m[11]), (unsigned long long)(g[5] - last_g[5]),
+        (unsigned long long)(m[12] - last_m[12]), (unsigned long long)(m[13] - last_m[13]), (unsigned long long)add[0], (unsigned long long)add[1], (unsigned long long)add[2]);
+    { char cb[512]; int o = 0; cb[0] = 0;
+      for (int t = 0; t < 32 && o < (int)sizeof cb - 64; t++) if (rep[t] > last_rep[t]) o += snprintf(cb + o, sizeof cb - o, "%s%s %llu", o ? ", " : "", cnt_type_name((uint64_t)t), (unsigned long long)(rep[t] - last_rep[t]));
+      LOG("[fif]   counter reports by type: %s; pool invalidates over a counter record %llu (%llu in flight)", o ? cb : "none", (unsigned long long)(m[14] - last_m[14]), (unsigned long long)(m[15] - last_m[15])); }
+    LOG("[fif]   guard: %llu fault waits (%.3f a frame, %.3f ms a frame, %llu over 2 s); readbacks of in-flight GPU writes %llu of %llu checked (%.3f ms a frame, %llu for a whole submission), %llu early-commit shaders; completion writes skipped as stale %llu",
         (unsigned long long)(g[0] - last_g[0]), (g[0] - last_g[0]) / nf, (g[1] - last_g[1]) / 1e6 / nf, (unsigned long long)(g[2] - last_g[2]),
-        m[0] > last_m[0] ? (double)(m[1] - last_m[1]) / (double)(m[0] - last_m[0]) : 0.0, (unsigned long long)(g[5] - last_g[5]),
         (unsigned long long)(m[5] - last_m[5]), (unsigned long long)(m[4] - last_m[4]), (m[6] - last_m[6]) / 1e6 / nf, (unsigned long long)(m[7] - last_m[7]), (unsigned long long)m[8], (unsigned long long)(m[9] - last_m[9]));
     if (getenv("TOTK_FIF_AUDIT")) LOG("[fif] audit: %llu CPU writes to pages a submission in flight reads (%.2f a frame), sample pages %#llx %#llx %#llx %#llx; readbacks of in-flight GPU writes sample %#llx+%llu %#llx+%llu",
         (unsigned long long)(an - last_a), (an - last_a) / nf, (unsigned long long)as[0], (unsigned long long)as[1], (unsigned long long)as[2], (unsigned long long)as[3],
         (unsigned long long)smp[0][0], (unsigned long long)smp[0][1], (unsigned long long)smp[1][0], (unsigned long long)smp[1][1]);
-    last_lag = lagged + fb_cnt + fb_ung; memcpy(last_g, g, sizeof g); memcpy(last_m, m, sizeof m); last_a = an; t_last = now;
+    for (int i = 0; i < FW_N; i++) last_w[i] += w[i];
+    memcpy(last_g, g, sizeof g); memcpy(last_m, m, sizeof m); last_a = an; memcpy(last_add, add, sizeof add); memcpy(last_rep, rep, sizeof rep); t_last = now;
+    pthread_mutex_unlock(&mu);
 }
 static uint64_t fif_target(const NVNsync *s, uint64_t fence) {
-    static struct { const NVNsync *s; uint64_t prev; } t[8]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static _Atomic uint64_t n_lag, n_fb_cnt, n_fb_ung;
-    static int cnt_ok = -1; if (cnt_ok < 0) { const char *e = getenv("TOTK_FIF_COUNTERS"); cnt_ok = e && atoi(e) > 0; }
+    static struct { const NVNsync *s; uint64_t prev; } t[8]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static _Atomic uint64_t n_lag;
+    static int cnt_mode = -2;   // TOTK_FIF_COUNTERS: -1 unset (lag timestamp / statistics, not occlusion), 0 lag none, 1 lag all
+    if (cnt_mode == -2) { const char *e = getenv("TOTK_FIF_COUNTERS"); cnt_mode = e ? (atoi(e) > 0) : -1; }
     uint64_t r = fence;
     pthread_mutex_lock(&mu);
     int i = 0; while (i < 8 && t[i].s && t[i].s != s) i++;
@@ -642,12 +672,19 @@ static uint64_t fif_target(const NVNsync *s, uint64_t fence) {
     if (t[i].s != s || t[i].prev < fence) { t[i].s = s; t[i].prev = fence; }
     pthread_mutex_unlock(&mu);
     if (r != fence && fif_guard_on()) {
-        uint32_t fl = mtl_fence_flags(r, fence);
-        if (fl & 2) { atomic_fetch_add(&n_fb_ung, 1); r = fence; }
-        else if ((fl & 1) && !cnt_ok) { atomic_fetch_add(&n_fb_cnt, 1); r = fence; }
+        uint32_t fl = mtl_fence_flags(r, fence); int why = FW_LAG;
+        if (fl & FIF_FL_NOREC) why = FW_FB_NOREC;
+        else if (fl & FIF_FL_OVER) why = FW_FB_OVER;
+        else if (fl & FIF_FL_UNG) why = FW_FB_UNG;
+        else if (fl & FIF_FL_VIRT) why = FW_FB_VIRT;
+        else if ((fl & FIF_FL_OCCL) && cnt_mode != 1) why = FW_FB_OCCL;
+        else if ((fl & FIF_FL_STAT) && cnt_mode == 0) why = FW_FB_STAT;
+        else if (fl & (FIF_FL_STAT | FIF_FL_OCCL)) why = FW_LAG_STAT;
+        atomic_fetch_add(&g_fw[why], 1);
+        if (why >= FW_FB_OCCL) r = fence;
     }
     if (r != fence) atomic_fetch_add(&n_lag, 1);
-    if (fif_guard_on()) fif_log(atomic_load(&n_lag), atomic_load(&n_fb_cnt), atomic_load(&n_fb_ung));
+    if (fif_guard_on()) fif_log();
     else if (r != fence && atomic_load(&n_lag) % 6000 == 1) LOG("[nvn] frames in flight (unguarded): %llu fence waits moved one frame back", (unsigned long long)atomic_load(&n_lag));
     return r;
 }

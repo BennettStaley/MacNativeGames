@@ -26,7 +26,7 @@ enum { BUSY_WAIT_MS = 2000 };
    after the page's own generation is stored, so a chunk at or below a stamp holds no page above it (nvn_dirty_check). */
 enum { CHUNK_SHIFT = 6 };
 typedef struct { uintptr_t base, end; _Atomic uint8_t *state; _Atomic uint64_t *gen; _Atomic uint64_t *cgen; size_t cap; _Atomic int live; _Atomic uint64_t latest;
-    _Atomic uint64_t fence, gstamp; } range_t;   // fence / gstamp (TOTK frames in flight): newest submission fence that reads this range, "now" when its pages were last all made read-only   // latest (TOTK): highest page generation in the range
+    _Atomic uint64_t fence, gstamp; uintptr_t owner; size_t osize; } range_t;   // owner / osize: the pool (storage, size) that registered the range (nvn_dirty_remove_range)   // fence / gstamp (TOTK frames in flight): newest submission fence that reads this range, "now" when its pages were last all made read-only   // latest (TOTK): highest page generation in the range
 static range_t g_r[MAX_RANGE];
 static _Atomic int g_nr;
 static uintptr_t g_pg, g_shift;
@@ -36,6 +36,8 @@ static _Atomic uint64_t g_adds_total;
 static _Atomic int g_live, g_live_peak;   // number of registered pools and peak (for the memory readout line)
 void nvn_dirty_stat(int *live, int *peak, int *cap) { *live = atomic_load(&g_live); *peak = atomic_load(&g_live_peak); *cap = MAX_RANGE; }
 static _Atomic int g_overflow_logged;
+static _Atomic uint64_t g_add_class[3];   // TOTK: pools registered clipped (shares a host page with another pool), adding nothing (all pages tracked by others), untracked (contains another range)
+void nvn_dirty_add_stats(uint64_t v[3]) { for (int i = 0; i < 3; i++) v[i] = atomic_load(&g_add_class[i]); }
 static pthread_mutex_t g_slot_mu = PTHREAD_MUTEX_INITIALIZER;   // Pool creation / destruction (guest threads, possibly concurrent) pick slots under a mutex; the page-fault handling path does not touch it
 static _Atomic uint64_t g_mp_calls, g_mp_pages, g_mp_ticks;   // This module's mprotect: call count, pages covered, time spent (mach timebase, safe in the page-fault path too)
 static void mp(uintptr_t a, size_t len, int prot) {
@@ -130,14 +132,11 @@ static inline void guard_check(range_t *r, uintptr_t addr) {
     if (__builtin_expect(atomic_load_explicit(&g_guard_max, memory_order_relaxed) != 0, 0) && g_done_fn && g_done_fn() < atomic_load(&g_guard_max)) guard_wait(r, addr);
 }
 void nvn_dirty_protect(const void *addr, size_t len);
-int nvn_dirty_guard(const void *addr, size_t len, uint64_t fence) {
-    range_t *r = len ? find((uintptr_t)addr) : NULL;
-    atomic_fetch_add(&g_guard_calls, 1);
-    if (!r || (uintptr_t)addr + len > r->end) { atomic_fetch_add(&g_guard_untracked, 1); return 0; }
+static void guard_range(range_t *r, uint64_t fence) {
     { uint64_t f = atomic_load(&r->fence); while (f < fence && !atomic_compare_exchange_weak(&r->fence, &f, fence)) {} }
     { uint64_t m = atomic_load(&g_guard_max); while (m < fence && !atomic_compare_exchange_weak(&g_guard_max, &m, fence)) {} }
     uint64_t gs = atomic_load(&r->gstamp);
-    if (gs && atomic_load(&r->latest) <= gs) { atomic_fetch_add(&g_guard_skipped, 1); return 1; }   // no page of the range was unprotected since it was all read-only
+    if (gs && atomic_load(&r->latest) <= gs) { atomic_fetch_add(&g_guard_skipped, 1); return; }   // no page of the range was unprotected since it was all read-only
     uint64_t s = atomic_load(&g_now);   // before the pass: a page unprotected after this gets a generation above it and is seen next time
     size_t np = (r->end - r->base) >> g_shift, nc = (np + (1u << CHUNK_SHIFT) - 1) >> CHUNK_SHIFT;
     for (size_t c = 0; c < nc; c++) {
@@ -147,9 +146,27 @@ int nvn_dirty_guard(const void *addr, size_t len, uint64_t fence) {
         nvn_dirty_protect((const void *)a, e - a);
     }
     { uint64_t g = atomic_load(&r->gstamp); while (g < s && !atomic_compare_exchange_weak(&r->gstamp, &g, s)) {} }
+}
+/* The span may lie in several ranges (a pool sharing its end pages with neighbours, see nvn_dirty_add_range): each one
+   is guarded; a page of the span no range covers makes it unguardable (0). */
+int nvn_dirty_guard(const void *addr, size_t len, uint64_t fence) {
+    atomic_fetch_add(&g_guard_calls, 1);
+    if (!len) { atomic_fetch_add(&g_guard_untracked, 1); return 0; }
+    uintptr_t a = (uintptr_t)addr, e = a + len;
+    while (a < e) {
+        range_t *r = find(a);
+        if (!r) { atomic_fetch_add(&g_guard_untracked, 1); return 0; }
+        guard_range(r, fence);
+        a = r->end;
+    }
     return 1;
 }
 uint64_t nvn_dirty_range_fence(const void *mem) { range_t *r = find((uintptr_t)mem); return r ? atomic_load(&r->fence) : 0; }
+int nvn_dirty_span_fence(const void *addr, size_t len, uint64_t *fence) {
+    uint64_t f = 0; uintptr_t a = (uintptr_t)addr, e = a + len;
+    while (a < e) { range_t *r = find(a); if (!r) return 0; uint64_t g = atomic_load(&r->fence); if (g > f) f = g; a = r->end; }
+    *fence = f; return 1;
+}
 void nvn_dirty_guard_audit(uint64_t *n, uint64_t sample[8]) { *n = atomic_load(&g_audit_n); for (int i = 0; i < 8; i++) sample[i] = atomic_load(&g_audit_sample[i]); }
 void nvn_dirty_guard_stats(uint64_t v[6]) {
     v[0] = atomic_load(&g_gw_n); v[1] = atomic_load(&g_gw_ticks) * (g_tb.denom ? g_tb.numer : 1) / (g_tb.denom ? g_tb.denom : 1);
@@ -215,20 +232,33 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     pthread_mutex_lock(&g_slot_mu);
     int n = atomic_load(&g_nr);
     int slot = -1;
-    {   /* TOTK: a pool created over memory that another live pool already covers must not get a second tracking range: find() returns
-           the first live range for an address, so a fault on a page protected under the older range would be looked up in the newer one
-           (state NONE, generation 0) and reported as a crash. Inside an existing range the pages are tracked already; any other overlap
-           leaves the new pool untracked (its textures are treated as always dirty, which is safe). */
-        uintptr_t nb = (uintptr_t)mem & ~(g_pg - 1), ne = ((uintptr_t)mem + size + g_pg - 1) & ~(g_pg - 1);
-        for (int i = 0; i < n; i++) {
+    /* TOTK: one tracking range per page: find() returns the first live range for an address, so a page covered by two
+       ranges would have its protection state looked up in the wrong one (a fault on a page protected under the older range
+       reported as a crash). NVN pools are 4 KiB aligned, host pages 16 KiB, so pools the game places next to each other
+       often share one host page. The new range is clipped to the pages no live range covers yet: a shared page at either
+       end stays with the range that has it (2026-10-23: before, such a pool was left untracked as a whole -- every texture
+       in it treated as dirty, and with TOTK_FRAMES_IN_FLIGHT=2 every submission reading it unguarded, about 20 pools a
+       frame in the world). A pool whose pages all lie in other ranges adds nothing (still fully tracked, by them); only an
+       older range strictly inside the new pool's span leaves it untracked (counted). */
+    uintptr_t nb = (uintptr_t)mem & ~(g_pg - 1), ne = ((uintptr_t)mem + size + g_pg - 1) & ~(g_pg - 1);
+    const uintptr_t nb0 = nb, ne0 = ne;
+    for (int moved = 1; moved && nb < ne; ) {
+        moved = 0;
+        for (int i = 0; i < n && nb < ne; i++) {
             if (!atomic_load_explicit(&g_r[i].live, memory_order_acquire) || ne <= g_r[i].base || nb >= g_r[i].end) continue;
-            static _Atomic int said; int expected = 0;
-            if (atomic_compare_exchange_strong(&said, &expected, 1))
-                LOG("dirty tracking: pool %p+%#zx overlaps tracked range %#lx-%#lx, %s", mem, size, (unsigned long)g_r[i].base, (unsigned long)g_r[i].end,
-                    nb >= g_r[i].base && ne <= g_r[i].end ? "already tracked by that range" : "not tracked separately");
-            pthread_mutex_unlock(&g_slot_mu); return;
+            if (g_r[i].base <= nb) { nb = g_r[i].end; moved = 1; }
+            else if (g_r[i].end >= ne) { ne = g_r[i].base; moved = 1; }
+            else {
+                atomic_fetch_add(&g_add_class[2], 1);
+                static _Atomic int said; int expected = 0;
+                if (atomic_compare_exchange_strong(&said, &expected, 1))
+                    LOG("dirty tracking: pool %p+%#zx contains tracked range %#lx-%#lx; not tracked", mem, size, (unsigned long)g_r[i].base, (unsigned long)g_r[i].end);
+                pthread_mutex_unlock(&g_slot_mu); return;
+            }
         }
     }
+    if (nb >= ne) { atomic_fetch_add(&g_add_class[1], 1); pthread_mutex_unlock(&g_slot_mu); return; }   // every page already tracked by other ranges
+    if (nb != nb0 || ne != ne0) atomic_fetch_add(&g_add_class[0], 1);
     for (int i = 0; i < n; i++) if (!atomic_load_explicit(&g_r[i].live, memory_order_acquire)) { slot = i; break; }
     if (slot < 0) {
         if (n >= MAX_RANGE) {
@@ -240,7 +270,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     }
     { int lv = atomic_fetch_add(&g_live, 1) + 1, pk = atomic_load(&g_live_peak); while (lv > pk && !atomic_compare_exchange_weak(&g_live_peak, &pk, lv)) {} }
     range_t *r = &g_r[slot];
-    uintptr_t base = (uintptr_t)mem & ~(g_pg - 1), end = ((uintptr_t)mem + size + g_pg - 1) & ~(g_pg - 1);
+    uintptr_t base = nb, end = ne;
     size_t np = (end - base) >> g_shift;
     _Atomic uint8_t *state = r->state;
     _Atomic uint64_t *gen = r->gen, *cgen = r->cgen;
@@ -253,15 +283,19 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     } else {
         memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset((void *)cgen, 0, nc * sizeof *cgen);
     }
+    r->owner = (uintptr_t)mem; r->osize = size;
     r->base = base; r->end = end; r->state = state; r->gen = gen; r->cgen = cgen; atomic_store(&r->latest, 0); atomic_store(&r->fence, 0); atomic_store(&r->gstamp, 0);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
     pthread_mutex_unlock(&g_slot_mu);
 }
 // Pool destruction: first restore still-protected pages to writable (the pool memory may be reused for something else once returned to the game), then mark invalid
-void nvn_dirty_remove_range(const void *mem) {
+void nvn_dirty_remove_range(const void *mem, size_t size) {
     pthread_mutex_lock(&g_slot_mu);
-    range_t *r = find((uintptr_t)mem);
+    /* TOTK: the range this pool registered, not find(mem): a pool that shares its first page with an older pool (or lies
+       inside it) would otherwise remove the older pool's range. Nothing is removed when the pool added no range. */
+    range_t *r = NULL; int n = atomic_load(&g_nr);
+    for (int i = 0; i < n; i++) if (atomic_load_explicit(&g_r[i].live, memory_order_acquire) && g_r[i].owner == (uintptr_t)mem && g_r[i].osize == size) { r = &g_r[i]; break; }
     if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); }
     pthread_mutex_unlock(&g_slot_mu);
 }

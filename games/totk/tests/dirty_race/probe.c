@@ -151,6 +151,44 @@ static void guard_check_probe(size_t pg, int negative) {
     atomic_store(&g_fdone, 6);
 }
 
+/* Pools sharing a host page (2026-10-23): NVN pools are 4 KiB aligned, host pages 16 KiB, so neighbours share the page
+   between them. The second pool used to be left untracked as a whole (frames in flight: every submission reading it
+   unguarded); now its range is clipped to the pages nobody tracks, the guard walks both ranges, and finalizing a pool
+   removes only the range it registered (it used to remove whichever range held its first byte). */
+static void shared_page_probe(size_t pg) {
+    uint8_t *m = mmap(NULL, 4 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (m == MAP_FAILED) { perror("mmap"); exit(2); }
+    const size_t k4 = 4096, asz = pg + k4, bsz = 3 * pg - asz;
+    uint64_t c0[3]; nvn_dirty_add_stats(c0);
+    nvn_dirty_add_range(m, asz);              /* A: pages 0-1 */
+    nvn_dirty_add_range(m + asz, bsz);        /* B: starts inside page 1, ends at page 3 */
+    nvn_dirty_add_range(m + k4, k4);          /* C: inside A */
+    uint64_t c1[3]; nvn_dirty_add_stats(c1);
+    EXPECT("shared page: B registered clipped", 1, c1[0] - c0[0]);
+    EXPECT("shared page: C inside A adds no range", 1, c1[1] - c0[1]);
+    EXPECT("shared page: B's whole span is tracked (page by page)", 1, nvn_dirty_tracked(m + 2 * pg, 16) && nvn_dirty_tracked(m + asz, 16));
+    EXPECT("shared page: B's span is guardable", 1, nvn_dirty_guard(m + asz, bsz, 7));
+    uint64_t f = 0;
+    EXPECT("shared page: B's span fence covers both ranges", 1, nvn_dirty_span_fence(m + asz, bsz, &f) && f == 7);
+    EXPECT("shared page: A's range carries the fence (shared page)", 7, nvn_dirty_range_fence(m));
+    atomic_store(&g_fdone, 7);
+    uint64_t s = nvn_dirty_now();
+    m[2 * pg + 8] = 3; m[pg + 8] = 4;
+    EXPECT("shared page: write to B's own page is dirty", 1, nvn_dirty_since(m + 2 * pg, 16, s));
+    EXPECT("shared page: write to the shared page is dirty", 1, nvn_dirty_since(m + pg, 16, s));
+    nvn_dirty_remove_range(m + k4, k4);
+    EXPECT("shared page: removing C keeps A tracked", 1, nvn_dirty_tracked(m, 16));
+    nvn_dirty_remove_range(m + asz, bsz);
+    EXPECT("shared page: removing B untracks B's own page", 0, nvn_dirty_tracked(m + 2 * pg, 16));
+    EXPECT("shared page: removing B keeps A tracked", 1, nvn_dirty_tracked(m + pg, 16));
+    EXPECT("shared page: a span with an untracked page is not guardable (control)", 0, nvn_dirty_guard(m + asz, bsz, 8));
+    atomic_store(&g_fdone, 8);
+    nvn_dirty_remove_range(m, asz);
+    EXPECT("shared page: removing A untracks it", 0, nvn_dirty_tracked(m, 16));
+    m[0] = 1; m[pg] = 1; m[2 * pg] = 1;   /* every page writable again */
+    munmap(m, 4 * pg);
+}
+
 int main(void) {
     g_negative = getenv("TOTK_PROBE_NEGATIVE") != NULL;
     struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = on_signal; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
@@ -198,6 +236,7 @@ int main(void) {
     stamp_order(pg);
     chunk_check(pg);
     guard_check_probe(pg, 0);
+    shared_page_probe(pg);
     printf("{\"status\":\"%s\",\"checks\":%d,\"failed\":%d}\n", g_fail ? "fail" : "pass", g_checks, g_fail);
     return g_fail != 0;
 }
