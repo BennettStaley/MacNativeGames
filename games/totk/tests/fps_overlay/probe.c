@@ -87,15 +87,16 @@ int main(void) {
     /* The FPS box: the system font (it has "MetalFX on", which the pixel font cannot draw), one line on the dark box; the
        box grows with what is shown. */
     int base, grown;
-    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 0, 0, 0, 0, 0, 0}, 2, px, &base, &h);
+    fps_overlay_raster(&(fps_overlay_info){.fps = 97, .screen_w = 2560, .screen_h = 1440}, 2, px, &base, &h);
     CHECK(base > 40 && h == 11 * 2, "\"FPS 97  2560x1440\" at scale 2: box %dx%d", base, h);
-    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 1, 0, 0, 0, 0, 0}, 2, px, &grown, &h);
+    fps_overlay_raster(&(fps_overlay_info){.fps = 97, .screen_w = 2560, .screen_h = 1440, .mfx = 1}, 2, px, &grown, &h);
     CHECK(grown > base + 40, "MetalFX on: \"  MetalFX on\" after the size (box %d, without it %d)", grown, base);
-    fps_overlay_raster(&(fps_overlay_info){50, 2560, 1440, 0, 50, 0, 0, 0, 0}, 2, px, &grown, &h);
+    fps_overlay_raster(&(fps_overlay_info){.fps = 50, .screen_w = 2560, .screen_h = 1440, .gen = 50}, 2, px, &grown, &h);
     CHECK(grown > base, "frame interpolation on: \"+50\" after the fps (box %d, without it %d)", grown, base);
-    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 0, 0, 1, 0, 0, 0}, 2, px, &grown, &h);
+    fps_overlay_raster(&(fps_overlay_info){.fps = 97, .screen_w = 2560, .screen_h = 1440, .big = 1}, 2, px, &grown, &h);
     CHECK(grown > base, "true 2K: \"  2K\" at the end (box %d, without it %d)", grown, base);
-    fps_overlay_raster(&(fps_overlay_info){999, 99999, 99999, 1, 5000, 1, 0, 0, 0}, FPS_OVERLAY_MAX_SCALE, px, &w, &h);   /* longest line: fits, or drops a scale */
+    fps_overlay_raster(&(fps_overlay_info){.fps = 999, .screen_w = 99999, .screen_h = 99999, .mfx = 1, .gen = 5000, .big = 1,
+                                           .scene_w = 99999, .scene_h = 99999}, FPS_OVERLAY_MAX_SCALE, px, &w, &h);   /* longest line: fits, or drops a scale */
     CHECK(w > 0 && w <= FPS_OVERLAY_TEX_W && h <= FPS_OVERLAY_TEX_H, "longest FPS line %dx%d outside the texture", w, h);
 
     const int values[] = {-1, 0, 7, 30, 60, 120, 999, 5000};
@@ -104,7 +105,7 @@ int main(void) {
         for (size_t z = 0; z < sizeof sizes / sizeof sizes[0]; z++)
         for (int mfx = 0; mfx <= 1; mfx++)
         for (int s = 1; s <= FPS_OVERLAY_MAX_SCALE; s++) {
-            fps_overlay_raster(&(fps_overlay_info){values[i], sizes[z][0], sizes[z][1], mfx, 0, 0, 0, 0, 0}, s, px, &w, &h);
+            fps_overlay_raster(&(fps_overlay_info){.fps = values[i], .screen_w = sizes[z][0], .screen_h = sizes[z][1], .mfx = mfx}, s, px, &w, &h);
             CHECK(w > 0 && h > 0 && w <= FPS_OVERLAY_TEX_W && h <= FPS_OVERLAY_TEX_H, "value %d scale %d box %dx%d outside texture", values[i], s, w, h);
             colours(w, h, &green, &yellow);
             int dirty = outside_dirty(w, h);
@@ -125,6 +126,11 @@ int main(void) {
     CHECK(!strcmp(line, "Shaders 99999 compiling / 99999 new / 999999 total"), "shader box text clamped \"%s\"", line);
     CHECK(!fps_overlay_line_pixel_font(line), "shader line \"%s\" drawn with the pixel font, which lacks its lower-case letters", line);
     CHECK(fps_overlay_line_pixel_font("FPS 60  2560x1440"), "the FPS line left the pixel font");
+    { char fl[96];   /* output resolution, then the internal (scene) one in brackets (2026-10-23) */
+      fps_overlay_text(&(fps_overlay_info){.fps = 60, .screen_w = 1920, .screen_h = 1080, .scene_w = 1600, .scene_h = 900}, fl, sizeof fl);
+      CHECK(!strcmp(fl, "FPS 60  1920x1080 (1600x900)"), "fps line with the internal resolution \"%s\"", fl);
+      fps_overlay_text(&(fps_overlay_info){.fps = 30, .screen_w = 1280, .screen_h = 720}, fl, sizeof fl);
+      CHECK(!strcmp(fl, "FPS 30  1280x720"), "fps line before the scene is known \"%s\"", fl); }
     shader_overlay_text(line, sizeof line, 123456, 123456, 9999999, 123456);
     CHECK(!fps_overlay_has_glyph('Q'), "negative control: 'Q' has no glyph in the pixel font but was reported");
     for (int s = 1; s <= FPS_OVERLAY_MAX_SCALE; s++) {

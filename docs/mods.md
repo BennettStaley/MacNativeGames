@@ -50,7 +50,9 @@ Some Other Mod
 
 ## What happens at start
 
-The log (`~/Library/Logs/MacNativeGames/totk.log`, iOS `Documents/log.txt`) lists, under `[totk] mods:`:
+The log (`~/Library/Logs/MacNativeGames/totk.log`, iOS `Documents/log.txt`) lists, under `[totk] mods:`
+(the log is off by default: turn it on with `defaults write org.macnativegames.totk TOTK_DEBUG_LOG -bool YES`,
+`org.macnativegames.botw` for Breath of the Wild, and start the game again; the `grep` checks on this page need it too):
 
 - each mod, whether it is on, its file count and notes (code patches not applied, its own ResourceSizeTable left out,
   made for an older game version, files a mod higher in the list already changes);

@@ -67,7 +67,8 @@ shader code and save formats are unchanged.
 
 - Check the current macOS output device and volume. Test a known system sound;
   if that also fails, inspect the device connection first.
-- Check `~/Library/Logs/MacNativeGames/totk.log` for CoreAudio setup failures,
+- Turn on the log (`defaults write org.macnativegames.totk TOTK_DEBUG_LOG -bool YES`,
+  then start the game again) and check `~/Library/Logs/MacNativeGames/totk.log` for CoreAudio setup failures,
   decode errors and output-level reports. A nonzero mixed level does not by
   itself prove the selected physical output is audible.
 - For local file-open diagnostics, quit the game normally and launch with:
@@ -106,3 +107,26 @@ Checks, without game data:
 - `make test-audio-effects RYUJINX_AUDIO_REF=<folder with Ryujinx.Audio.dll> DOTNET=<dotnet>`: 24 groups, 1,872,000
   samples against an unmodified Ryujinx.Audio (largest difference 4.47e-08), then 1,885,461 checks of the production
   effect graph, routing, capture / circular buffers and output prefill / recovery / stop.
+
+## Audio lost through splitter submix chains (2026-10-22)
+
+The submix ordering previously followed only `dest_mix_id`, even when the mixer
+actually routed through `dest_splitter_id`. A receiving submix could therefore
+be processed before its source. Samples arriving later were never propagated
+to the final mix and were cleared on the next frame.
+
+Ordering now follows every used splitter destination with an active receiving
+mix. Depths are memoized per frame, with a recursion guard for malformed cycles.
+The game-data-free regression exercises direct routing, one splitter, two
+splitters, and a branching path that rejoins a downstream submix:
+
+```sh
+python3 -m unittest discover -s tests -p test_audio_routing.py -v
+```
+
+It compares production-mixer stereo output against independently calculated
+PCM values under UBSan. The two-splitter and branching cases output zeros before
+the fix; all four cases pass afterwards. This verifies routing, while an actual
+in-game listening check is still needed to establish the cause of a particular
+missing-sound report.
+

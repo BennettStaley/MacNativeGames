@@ -20,7 +20,10 @@ Thanks for helping. This page says how the project works and what a pull request
 ## Repository layout
 
 - Tears of the Kingdom and Breath of the Wild share `games/totk`: one runtime, with switches for each game.
-- Every other game lives in `games/<name>/` and carries its own copy of the runtime, graphics layer, rewriter and scripts. A change for one game never edits another game's files.
+- Every other game lives in `games/<name>/` and carries its own copy of everything it builds and runs with: runtime, graphics layer, rewriter, shader translator (`prebuilt/`), and every script the build calls or imports. A change for one game never edits another game's files.
+  - Its build and scripts also never **read** another game's folder: no `../totk` or `../by3` paths in the Makefile, no importing or running another game's scripts, no copying another game's prebuilt tools. Copy what you need into your folder instead, and list where each copy came from (folder and commit), for example in `third_party/COPIES.md`. Otherwise a change to that game can break yours without anyone touching your files.
+  - Outside your folder, change only one line in the root README's update history. Ignore rules go in `games/<name>/.gitignore`, not the root one.
+  - Check before opening the PR: `git grep -nE '\.\./(totk|botw|by3)|games/(totk|botw|by3)' -- games/<name>` finds nothing but comments, and `git diff --stat origin/main -- . ':!games/<name>' ':!README.md'` is empty.
 - The NVN layer maps NVN semantics one by one (resources, shaders, state, draws, synchronization, presentation) and contains no camera, scene or gameplay decisions. Game-specific handling sits apart, says why it exists, is behind a switch, and is never needed for the game to run.
 
 ## Picture quality and performance

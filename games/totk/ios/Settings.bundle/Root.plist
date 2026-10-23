@@ -54,6 +54,24 @@
 				<string>Korean</string>
 			</array>
 		</dict>
+		<dict>
+			<key>Type</key>
+			<string>PSGroupSpecifier</string>
+			<key>Title</key>
+			<string>Debug</string>
+			<key>FooterText</key>
+			<string>On: writes Documents/log.txt for reading on a Mac (slightly slower); off records nothing. Takes effect after relaunching the game</string>
+		</dict>
+		<dict>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+			<key>Key</key>
+			<string>TOTK_DEBUG_LOG</string>
+			<key>Title</key>
+			<string>Debug log</string>
+			<key>DefaultValue</key>
+			<false/>
+		</dict>
 	</array>
 </dict>
 </plist>

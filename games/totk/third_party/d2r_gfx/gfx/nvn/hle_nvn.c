@@ -136,7 +136,7 @@ NVN(nvnDeviceGetProcAddress, PFNNVNGENERICFUNCPTRPROC, const NVNdevice *d, const
 
 // Device properties: values measured on Tegra X1 (nnheaders nvn_DeviceConstantsNX.h, obtained by calling nvnDeviceGetInteger item by item on SMO)
 static const int g_devinfo[] = {
-#ifdef GAME_BOTW
+#if defined(GAME_BOTW) && !defined(GAME_BOTW190)   // 1.9.0 (SDK 20.5) takes the values below, as TOTK
     [0x00] = 53, [0x01] = 311,  // Breath of the Wild 1.6.0 main+0xe55304 requires major 53, minor >= 311 (botw.md).
 #else
     [0x00] = 55, [0x01] = 15,   // Experimental ABI target: TOTK main+e9d614 requires major 55, minor >= 15. Unsupported functions stop.
@@ -2463,7 +2463,7 @@ static _Atomic int g_acap_k;      // its choice, read by present_ticks (0 = none
 static acap_t g_acap;             // present thread only
 static uint64_t g_pace_wait_ns;   // our pacing wait inside this frame's acquires (display-link tick / own clock), left out of the auto cap's frame time
 static int g_uncapped;   // TOTK_UNCAPPED configured, see present_cfg; suspended while frame interpolation paces the game (uncapped_now)
-static int g_paced_hz;   // the display-following rate, used instead of UNCAPPED_HZ while interpolation paces the game
+static int g_paced_hz;   // the display-following rate, used instead of the uncapped clock while interpolation paces the game
 #include "totk_mfx_mode.h"   /* totk_mfx.m: frame interpolation mode of this game frame (TOTK_MFX, key 2) */
 /* TOTK: frame interpolation at 30 fps or at half the refresh rate paces the game itself, so it suspends the uncapped mode;
    the uncapped interpolation mode keeps it. Key 2 cycles the modes at run time (2026-10-16 night). */
@@ -2471,7 +2471,19 @@ static int g_paced_hz;   // the display-following rate, used instead of UNCAPPED
    pre-rendered movie, which advances one movie frame per game frame). The game is then paced exactly as in the 30+30
    mode, without the interpolation. Weak: Tears of the Kingdom has none. */
 __attribute__((weak)) int runtime_game_fps_limit(void) { return 0; }
-static int game_holds_30(void) { return runtime_game_fps_limit() == 30; }
+/* TOTK_PHONE_FPS=30: the phone holds 30 fps the same way, presenting every second refresh of its 60 Hz screen, frame
+   step and present interval agreeing (lowering the uncapped clock to 30 Hz instead left the game's interval in 60 Hz
+   units: it raised it to 3 and the title ran at about 10 fps). The default is the screen's rate, at most 60 on an iPhone
+   14 (user 2026-10-23: 30 for an hour, then "lock the iPhone to 60"). */
+static int phone_holds_30(void) {
+#if TARGET_OS_IPHONE
+    static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PHONE_FPS"); v = e && atoi(e) == 30; }
+    return v;
+#else
+    return 0;
+#endif
+}
+static int game_holds_30(void) { return runtime_game_fps_limit() == 30 || phone_holds_30(); }
 static int uncapped_now(void) { int m = mfx_enabled(); return g_uncapped && !game_holds_30() && (m == MFX_OFF || m == MFX_MAX); }
 /* 30+30 on a display whose rate is not a multiple of 30 (the user's 100 Hz): the game is paced by our own clock at exactly
    30 fps instead of by the display link (3 refreshes would be 33 fps); the display link still shows each picture at a refresh. */
@@ -2790,16 +2802,22 @@ static void sleep_until_ns(uint64_t dl) {   // absolute time on the monotonic cl
 static int g_hz = -1, g_display_mode;
 /* TOTK_UNCAPPED (Mac and iPhone, default on; =0 off): like vsync off in other games. The game no longer waits for the display: it is
    paced by our own clock at UNCAPPED_HZ, and the display link shows the newest finished frame at every refresh (older ones
-   are merged away, as when the game runs ahead). The ceiling is 120 because the real-time frame step (game_patches.c)
-   clamps a frame to at least 1/120 s: above that the game would run fast. On a display of 120 Hz or more it changes nothing. */
-#define UNCAPPED_HZ 120
-/* TOTK_UNCAPPED_HZ: the uncapped clock's ceiling, 30..120 (default 120), or "display" for the display's refresh rate: the
-   iPhone app's default since 2026-10-17 (user: at most 60 on the iPhone 14's 60 Hz screen, where frames above it are never
-   shown and only heat the phone). The game still does not wait for the display, so a scene slower than the ceiling is not
-   held to 60 / 30 steps. */
+   are merged away, as when the game runs ahead). The Mac's ceiling is 120 by default (user 2026-10-22: 240 back to 120);
+   TOTK_UNCAPPED_HZ goes up to 240: the real-time frame step (game_patches*.c) follows the measured frame time at any
+   rate, so the game keeps its speed above 120 fps and on displays above 120 Hz. No ceiling at all (no present period) halved Breath of the Wild 1.9.0 on the same save, 81-93 ->
+   42-47 fps, also with a time-constraint declaration from the measured frame time; the cause is not known yet. */
+#define UNCAPPED_HZ 240           /* the highest TOTK_UNCAPPED_HZ takes */
+#define UNCAPPED_DEFAULT_HZ 120   /* the Mac's ceiling without TOTK_UNCAPPED_HZ */
+/* TOTK_UNCAPPED_HZ: the uncapped clock's ceiling, 30..240 (default 120 on the Mac), or "display" for the display's refresh
+   rate: the iPhone / iPad default (user 2026-10-17: at most 60 on the iPhone 14's 60 Hz screen, where frames above it are
+   never shown and only heat the phone; since 2026-10-23 the phone holds 30, phone_holds_30). The game still does not wait for the display, so a scene slower than the ceiling
+   is not held to 60 / 30 steps. */
 static int uncapped_cap(int scr) {
     const char *e = getenv("TOTK_UNCAPPED_HZ");
-    int v = !e ? UNCAPPED_HZ : !strcmp(e, "display") || !strcmp(e, "auto") ? (scr > 0 ? scr : 60) : atoi(e);   /* auto starts at the display rate */
+#if TARGET_OS_IPHONE
+    if (!e) e = "display";   // at most the screen's rate (60 on an iPhone 14); TOTK_PHONE_FPS=30 holds 30 (phone_holds_30)
+#endif
+    int v = !e ? UNCAPPED_DEFAULT_HZ : !strcmp(e, "display") || !strcmp(e, "auto") ? (scr > 0 ? scr : 60) : atoi(e);   /* auto starts at the display rate */
     return v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
 }
 static int g_follow_display;   /* the pacing rate came from the window's display (present_cfg): follow it when it changes */
@@ -2910,7 +2928,7 @@ static void present_cfg(const win_t *o) {
     g_follow_display = !e && realtime && scr > 0;
     { const char *l = getenv("TOTK_UNCAPPED_HZ"); atomic_store(&g_fps_limit, l && atoi(l) > 0 ? atoi(l) : 0); atomic_store(&g_fps_auto, l && !strcmp(l, "auto")); }
     { const char *u = getenv("TOTK_UNCAPPED"), *f60 = getenv("TOTK_FPS60");   // the original 30-frame mode needs fixed pacing; MetalFX interpolation suspends it while on (uncapped_now)
-      g_uncapped = !e && realtime && !(u && !strcmp(u, "0")) && !(f60 && !strcmp(f60, "0")) && g_hz < UNCAPPED_HZ; }
+      g_uncapped = !e && realtime && !(u && !strcmp(u, "0")) && !(f60 && !strcmp(f60, "0")); }
     if (g_uncapped) { g_hz = uncapped_cap(scr); LOG("[nvn] uncapped frame rate (TOTK_UNCAPPED, on by default; =0 off): no wait for display refresh, own clock capped at %d fps (TOTK_UNCAPPED_HZ); display %d Hz shows the newest frame on each refresh%s", g_hz, scr,
                                        mfx_enabled() ? " (suspended while frame interpolation is on: one frame every two refreshes)" : " (suspended when frame interpolation is turned on, key 2)"); }
     if (!g_hz) LOG("[nvn] [warning] DM_PRESENT_HZ=0: uncapped frame rate, frame pacing differs from real hardware, UI logic may drift (for profiling only, not for verdicts / comparisons)");
@@ -3073,12 +3091,19 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     // mistakenly stall the title rather than the save-loading screen.
     // Hold that first frame behind the loading screen if cache warm-up is still
     // active. This does not claim that an undiscovered variant cannot appear.
+    // The Mac waits until the warm-up is done, however long (user 2026-10-23: play
+    // starts with every listed pipeline ready); the phone keeps the 15 s limit.
     { static int gate; static uint64_t last_draws;
       uint64_t passes, draws; mtl_stats(&passes, &draws);
       uint64_t this_draws = draws >= last_draws ? draws - last_draws : 0;
       last_draws = draws;
       if (!gate && ((g_nvn_loadscreen_up && g_nvn_loadscreen_up()) || this_draws > 2000)) {
-          gate = 1; extern void mtl_note_world(void); mtl_note_world(); int ms = mtl_warm_wait(15000);
+#if TARGET_OS_IPHONE
+          const int warm_limit_ms = 15000;
+#else
+          const int warm_limit_ms = -1;   // upstream aa61eaf: the Mac's first world frame waits for the warm-up without a limit
+#endif
+          gate = 1; extern void mtl_note_world(void); mtl_note_world(); int ms = mtl_warm_wait(warm_limit_ms);
           if (ms) LOG("[nvn] first entry into the game waited %d ms for pipeline warm-up (%llu draws this frame)", ms, (unsigned long long)this_draws);
       } }
     present_cfg(o);

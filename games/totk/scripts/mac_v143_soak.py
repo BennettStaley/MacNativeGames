@@ -37,6 +37,8 @@ def main():
     assert env['TOTK_SLOT_OWNER'] == 'codex', 'private test ownership required'
     assert Path(env['TOTK_PROFILE_DIR']).resolve() == root/'profile'
     assert not env.get('DM_NVN_TSV'), 'disable per-frame TSV before long sessions'
+    # The launcher writes totk.log only with the debug log on (launcher.m; /dev/null otherwise)
+    assert env.get('TOTK_DEBUG_LOG') == '1', 'launch the game with TOTK_DEBUG_LOG=1: without it there is no totk.log to watch'
     commands = root/'input.txt'
     assert Path(env['TOTK_INPUT_FILE']).resolve() == commands
     slot = Path.home()/'Library/Application Support/MacNativeGames/TOTK/game-slot'

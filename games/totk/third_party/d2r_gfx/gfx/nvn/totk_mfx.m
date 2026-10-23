@@ -9,12 +9,16 @@
 //  - the UI drawn over it: attachment 7 of the later canvas passes, premultiplied (the game's colour blend, alpha
 //    accumulating coverage);
 //  - the G-buffer depth (D32F, not reversed, infinite far plane) and the camera block.
-// Motion vectors come from the camera: depth plus this and the previous frame's view-projection. MetalFX refines
-// motion itself (tests/metalfx_interp: zero motion still 36 dB), but what moves with the camera (Link) gets the
-// background's camera motion. TOTK_OBJ_MOTION=1 (default 0) adds per-object motion (totk_objmv.h, like RTX Remix's
-// draw call tracker): the opaque G-buffer draws also write their clip-space motion into an RG16Float attachment (NDC
-// delta previous - current; OBJMV_NONE where no draw of the previous frame matched), and the kernel takes it where
-// present and the camera motion elsewhere. Conventions measured by the probe: motion in pixels of the motion texture, pointing to the
+// Motion vectors come from the camera: depth plus this and the previous frame's view-projection. A pixel whose depth does
+// not match the previous frame's there (the previous depth around the reprojected position) is not still world: it gets
+// no motion on screen (mfx_mv_dyn, 2026-10-23). Before, what moves with the camera (Link) got the background's camera
+// motion and was put off his place in every interpolated frame, by the camera's step between two game frames: at 25+25
+// or 30+30 twice the step of 50+50 and 25-30 times a second, so he shook while the world stayed right (Breath of the Wild
+// 1.6.0). Zero motion everywhere shook the whole picture: MetalFX relies on the motion it is given.
+// TOTK_OBJ_MOTION=1 (default 0) adds per-object motion (totk_objmv.h, like RTX Remix's draw call tracker): the opaque
+// G-buffer draws also write their clip-space motion into an RG16Float attachment (NDC delta previous - current;
+// OBJMV_NONE where no draw of the previous frame matched), and the kernel takes it where present (before the depth test
+// above) and the camera motion elsewhere. Conventions measured by the probe: motion in pixels of the motion texture, pointing to the
 // previous position; the UI given apart and premultiplied (the "composited" mode returns a black frame).
 #import <MetalFX/MetalFX.h>
 #import <QuartzCore/QuartzCore.h>
@@ -35,6 +39,7 @@ static struct {
     id<MTL4FXFrameInterpolator> fi;
     NSUInteger in_w, in_h, out_w, out_h; MTLPixelFormat scene_fmt;
     id<MTLTexture> scene[2], ui, mv, out[MFX_OUT], outv[MFX_OUT];
+    id<MTLTexture> pdepth; uint64_t pdepth_frame;   // the previous interpolated frame's depth (copied after its motion), and its g.frames
     id<MTLResidencySet> rs;
     id<MTLComputePipelineState> mv_ps;
     id<MTL4ArgumentTable> mv_args[MFX_OUT];
@@ -59,6 +64,9 @@ static struct {
     double near_p, far_p, fov_deg, aspect; int proj_src;   // this frame's projection for MetalFX (cam_projection)
     uint64_t obj_frames;
 } g;
+/* Flag mfx_mv_dyn (default on): pixels that are not still world get no screen motion instead of the camera's. */
+static _Atomic int g_mv_dyn = 1;
+void mfx_set_mv_dyn(int on) { atomic_store(&g_mv_dyn, on != 0); MLOG("[flag] mfx_mv_dyn = %d: %s", on != 0, on ? "moving pixels get no camera motion" : "camera motion everywhere"); }
 
 /* Reconstructing identical MetalFX interpolators repeatedly grows device
  * allocations on the tested Mac, even after the old Objective-C object dies.
@@ -204,7 +212,7 @@ static void ensure_out(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFo
     for (int i = 0; i < MFX_OUT; i++) { old += obj_bytes(g.out[i]); drop(&g.out[i]); g.outv[i] = nil; }
     /* The interpolator and motion texture of the old size go too (the new ones are made at the next prepare), and the
        reference mfx_dump keeps to the old depth. The per-object motion target follows the depth size (mfx_obj_target). */
-    old += obj_bytes(g.mv); drop(&g.mv);
+    old += obj_bytes(g.mv); drop(&g.mv); old += obj_bytes(g.pdepth); drop(&g.pdepth); g.pdepth_frame = 0;
     if (g.fi && !is_cached(g.fi)) retire(g.fi);
     g.fi = nil; g.last_depth = nil; g.last_slot = -1; g.in_w = g.in_h = 0;
     MTLTextureUsage rt = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
@@ -268,26 +276,45 @@ static void ensure_fi(NSUInteger iw, NSUInteger ih) {
         if (fi_cache_on() && g_fi_cache_count < MFX_FI_CACHE) g_fi_cache[g_fi_cache_count++] = g.fi;
     }
     drop(&g.mv); g.mv = mk(MTLPixelFormatRG16Float, iw, ih, MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead);
+    drop(&g.pdepth); g.pdepth = mk(MTLPixelFormatDepth32Float, iw, ih, MTLTextureUsageShaderRead); g.pdepth_frame = 0;
     if (!g.mv_ps) {
         static const char *src =
             "#include <metal_stdlib>\nusing namespace metal;\n"
-            "struct P { float4x4 reproj; float2 size; float2 inv_size; float yflip; float obj; float maxpx, pad2; };\n"
+            "struct P { float4x4 reproj; float2 size; float2 inv_size; float yflip; float obj; float dyn, maxpx; };\n"
+            // view distance from a depth value (not reversed, infinite far plane: z = near / (1 - d)), in units of near
+            "static float vz(float d) { return 1.0 / max(1.0 - d, 1e-7); }\n"
             // camera motion of each depth pixel: where it was in the previous frame, in pixels of this texture. With
             // TOTK_OBJ_MOTION the motion the G-buffer draw wrote there wins (an NDC delta in Metal clip space: y up,
             // texture rows down); OBJMV_NONE (65000) or anything that large means none, the camera motion is used.
-            // The object's motion is also dropped when it differs from the camera motion by more than maxpx pixels:
-            // such a jump is almost always a draw matched with another object (culling changed while turning).
+            // With dyn, a pixel whose distance at that place in the previous frame is not what a still point would have
+            // had moved itself: no motion on screen. Still: within the 3x3 range of the previous depth there (1 % margin)
+            // where that depth is continuous (a slope), and within 1 % of one of the nine where it is not (an edge: the
+            // range of Link and the land behind him would take in any distance between them)
+            // The object's motion is dropped when it differs from the camera motion (before the still-world test) by more
+            // than maxpx pixels: such a jump is almost always a draw matched with another object (culling changed while turning).
             "kernel void mfx_mv(depth2d<float, access::read> d [[texture(0)]], texture2d<float, access::write> mv [[texture(1)]],\n"
-            "                   texture2d<float, access::read> om [[texture(2)]],\n"
+            "                   texture2d<float, access::read> om [[texture(2)]], depth2d<float, access::read> pd [[texture(3)]],\n"
             "                   constant P &p [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {\n"
             "  if (g.x >= uint(p.size.x) || g.y >= uint(p.size.y)) return;\n"
             "  float2 uv = (float2(g) + 0.5) * p.inv_size;\n"
-            "  float4 c = p.reproj * float4(uv.x * 2.0 - 1.0, p.yflip * (1.0 - uv.y * 2.0), d.read(g) * 2.0 - 1.0, 1.0);\n"
-            "  float2 m = 0.0;\n"
-            "  if (c.w > 1e-7) { float2 n = c.xy / c.w; m = (float2(n.x * 0.5 + 0.5, 0.5 - 0.5 * p.yflip * n.y) - uv) * p.size; }\n"
+            "  float d0 = d.read(g);\n"
+            "  float4 c = p.reproj * float4(uv.x * 2.0 - 1.0, p.yflip * (1.0 - uv.y * 2.0), d0 * 2.0 - 1.0, 1.0);\n"
+            "  float2 m = 0.0, cm = 0.0;\n"
+            "  if (c.w > 1e-7) {\n"
+            "    float2 n = c.xy / c.w, prev = float2(n.x * 0.5 + 0.5, 0.5 - 0.5 * p.yflip * n.y);\n"
+            "    m = (prev - uv) * p.size; cm = m;\n"
+            "    int2 q = int2(floor(prev * p.size));\n"
+            "    if (p.dyn > 0.5 && d0 < 1.0 && all(q >= 1) && all(q < int2(p.size) - 1)) {\n"
+            "      float ze = vz(c.z / c.w * 0.5 + 0.5), zmin = 3.4e38, zmax = 0.0; bool near = false;\n"
+            "      for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+            "        float z = vz(pd.read(uint2(q + int2(x, y)))); zmin = min(zmin, z); zmax = max(zmax, z); near = near || fabs(z - ze) <= ze * 0.01; }\n"
+            "      bool still = zmax <= zmin * 1.05 ? (ze >= zmin * 0.99 && ze <= zmax * 1.01) : near;\n"
+            "      if (!still) m = 0.0;\n"
+            "    }\n"
+            "  }\n"
             "  if (any(isnan(m)) || any(isinf(m))) m = 0.0;\n"
             "  if (p.obj > 0.5) { float2 o = om.read(g).xy;\n"
-            "    if (all(abs(o) < 16.0)) { float2 op = o * float2(0.5, -0.5) * p.size; if (length(op - m) <= p.maxpx) m = op; } }\n"
+            "    if (all(abs(o) < 16.0)) { float2 op = o * float2(0.5, -0.5) * p.size; if (length(op - cm) <= p.maxpx) m = op; } }\n"
             "  mv.write(float4(m, 0.0, 0.0), g);\n"
             "}\n";
         MTLCompileOptions *o = [MTLCompileOptions new]; o.mathMode = MTLMathModeSafe;
@@ -295,7 +322,7 @@ static void ensure_fi(NSUInteger iw, NSUInteger ih) {
         id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"mfx_mv"] : nil;
         g.mv_ps = fn ? [g.dev newComputePipelineStateWithFunction:fn error:&e] : nil;
         if (!g.mv_ps) MDIE("motion vector kernel: %s", e.localizedDescription.UTF8String);
-        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1; ad.maxTextureBindCount = 3;
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1; ad.maxTextureBindCount = 4;
         for (int i = 0; i < MFX_OUT; i++) {
             g.mv_args[i] = [g.dev newArgumentTableWithDescriptor:ad error:&e]; if (!g.mv_args[i]) MDIE("argument table: %s", e.localizedDescription.UTF8String);
             g.mv_par[i] = [g.dev newBufferWithLength:256 options:MTLResourceStorageModeShared]; [g.rs addAllocation:g.mv_par[i]];
@@ -393,9 +420,10 @@ int mfx_frame_prepare(double frame_s) {
     for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) par[c * 4 + r] = (float)m[r * 4 + c];   // float4x4 is column-major
     par[16] = (float)depth.width; par[17] = (float)depth.height; par[18] = 1.0f / depth.width; par[19] = 1.0f / depth.height; par[20] = (float)g.yflip;
     par[21] = obj ? 1.0f : 0.0f; g.enc_obj = obj; g.obj_frames += obj;
+    par[22] = atomic_load(&g_mv_dyn) && g.pdepth_frame && g.pdepth_frame == g.frames - 1 ? 1.0f : 0.0f;   // the previous game frame's depth is there
     static double maxpct = -1;   // TOTK_OBJ_MOTION_MAXPCT: an object's own motion beyond this % of the width is a mismatch (default 3)
     if (maxpct < 0) { const char *e = getenv("TOTK_OBJ_MOTION_MAXPCT"); maxpct = e ? atof(e) : 3.0; if (maxpct <= 0) maxpct = 1000; }
-    par[22] = (float)(maxpct * 0.01 * depth.width);
+    par[23] = (float)(maxpct * 0.01 * depth.width);
     cam_projection();
     g.enc_depth = depth;
     return s;
@@ -413,12 +441,17 @@ NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> h
     [g.mv_args[s] setTexture:depth.gpuResourceID atIndex:0]; [g.mv_args[s] setTexture:g.mv.gpuResourceID atIndex:1]; [g.mv_args[s] setAddress:g.mv_par[s].gpuAddress atIndex:0];
     id<MTLTexture> om = g.enc_obj && g.obj ? g.obj : g.mv;   // without per-object motion the kernel never reads texture 2; any valid texture
     [g.mv_args[s] setTexture:om.gpuResourceID atIndex:2];
+    [g.mv_args[s] setTexture:g.pdepth.gpuResourceID atIndex:3];
     id<MTL4ComputeCommandEncoder> e = [cb computeCommandEncoder];
-    [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];   // the game's frame is done
+    [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];   // the game's frame is done
     [e setComputePipelineState:g.mv_ps]; [e setArgumentTable:g.mv_args[s]];
     [e dispatchThreads:MTLSizeMake(depth.width, depth.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
     [e updateFence:g.fence afterEncoderStages:MTLStageDispatch];
+    // this frame's depth for the next one's still-world test, once the motion has read the previous one
+    [e barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+    [e copyFromTexture:depth toTexture:g.pdepth];
     [e endEncoding];
+    g.pdepth_frame = g.frames;
     if (heap) [cb writeTimestampIntoHeap:heap atIndex:stamp];   // after the motion vectors (which waited for the frame)
     id<MTL4FXFrameInterpolator> fi = g.fi;
     fi.colorTexture = g.scene[g.cur]; fi.prevColorTexture = g.scene[g.cur ^ 1]; fi.depthTexture = depth; fi.motionTexture = g.mv;
@@ -437,8 +470,8 @@ NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> h
     // bindings through completion, while the configuration cache retains only
     // the interpolator, not old scene/pool textures between configurations.
     NSMutableArray *resources = [@[fi, fi.colorTexture, fi.prevColorTexture, depth,
-                                   g.mv, g.ui, g.out[s], g.mv_par[s]] mutableCopy];
-    if (om) [resources addObject:om];   // TOTK_OBJ_MOTION: the per-object motion target (nil when off)
+                                   g.mv, g.ui, g.out[s], g.mv_par[s], g.pdepth] mutableCopy];
+    [resources addObject:om];   // texture 2: the per-object motion target (TOTK_OBJ_MOTION) or g.mv; always MFX_FRAME_RESOURCES entries
     fi.colorTexture = nil; fi.prevColorTexture = nil; fi.depthTexture = nil;
     fi.motionTexture = nil; fi.uiTexture = nil; fi.outputTexture = nil;
     if (heap) [cb writeTimestampIntoHeap:heap atIndex:stamp + 1];
@@ -545,7 +578,7 @@ static void mfx_release(int all) {
     for (int i = 0; i < 2; i++) { b += obj_bytes(g.scene[i]); drop(&g.scene[i]); }
     b += obj_bytes(g.ui); drop(&g.ui);
     for (int i = 0; i < MFX_OUT; i++) { b += obj_bytes(g.out[i]); drop(&g.out[i]); g.outv[i] = nil; }
-    b += obj_bytes(g.mv); drop(&g.mv); b += obj_bytes(g.obj); drop(&g.obj);
+    b += obj_bytes(g.mv); drop(&g.mv); b += obj_bytes(g.obj); drop(&g.obj); b += obj_bytes(g.pdepth); drop(&g.pdepth); g.pdepth_frame = 0;
     if (g.fi && !is_cached(g.fi)) retire(g.fi);
     unsigned n = all ? fi_cache_evict(1) : 0;
     g.fi = nil; g.last_depth = nil; g.last_slot = -1; g.in_w = g.in_h = 0; g.out_w = g.out_h = 0; g.depth = nil; g.enc_depth = nil;

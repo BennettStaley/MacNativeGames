@@ -2,12 +2,14 @@
 """MacNativeGames: turn your own XCI or NSP into a native Mac app or iPhone/iPad IPA.
 
     python3 build_app.py <game.xci|game.nsp> -k <prod.keys> [--platform macos|ios] [-o <output>] [--work <folder>]
-                         [--update <update.nsp>] [--mod <mod folder> [--install-mod-romfs]]
+                         [--update <update.nsp>] [--dlc <dlc.nsp> ...] [--mod <mod folder> [--install-mod-romfs]]
 
 Supported: TOTK base 1.0.0 (0100F2C0115B6000), XCI or NSP; optional --update with a supported cumulative update.
-Also Breath of the Wild 1.6.0 (01007EF00011E000) as one card image holding the base game, the update and the add-on
-content (games/botw): it needs --shared-fonts (the six .bfttf files a Tears of the Kingdom build extracted into its work
-folder, extracted/firmware/shared-fonts); its startup shaders come from its game data and its own shared shader list
+Also Breath of the Wild (01007EF00011E000, games/botw), in two forms: 1.6.0 as one card image holding the base game, the update
+and the add-on content, which needs --shared-fonts (the six .bfttf files a Tears of the Kingdom build extracted into its work
+folder, extracted/firmware/shared-fonts); or 1.9.0 as a base NSP with --update <the 1.9.0 update NSP> and fonts from --firmware
+or --shared-fonts as for a Tears of the Kingdom NSP; its add-on content (DLC) comes from --dlc <pack.nsp>, repeated for the
+two packs (01007EF00011F001, 01007EF00011F002), each one optional and checked against its pin. Its startup shaders come from its game data and its own shared shader list
 (games/botw/assets/shader_list.tsv). The game is recognised by the title IDs in the file, never by the file name.
 NSPs need common tickets (unless rights-free) and a separate shared-font source. iOS builds are unsigned IPAs for sideloading and require Xcode 26+, xcodegen, CMake, and network access to build device libraries.
 Nothing from the game is in this repository; everything is made from your files on your Mac. Key values are never printed.
@@ -25,7 +27,7 @@ signature, or signed again by a dump tool once all four code modules match, shar
      games/totk/tools/totk_xlate/publish_native.sh); startup shaders are extracted from your selected RomFS and
      translated into a bundled seed, ready for GPU warm-up even with an empty cache on the first launch
   4. the game binary and either a macOS app bundle or an unsigned iPhone/iPad IPA (large game data is cloned when possible);
-     for the Mac the startup shaders are then compiled once into this Mac's Metal cache (about 2 minutes on an M4), so the
+     for the Mac the startup shaders are then compiled once into this Mac's Metal cache (about 12 minutes for 1.4.3 on an M4 Max), so the
      first start does not compile them in the background (games/totk/tools/warm_metal_cache.m); with --mod
      --install-mod-romfs the player's mod folder for this version is replaced by the mod's RomFS files and its manifest
      (games/totk/scripts/mod_folder.py, games/totk/scripts/make_mod_manifest.py), so the build is playable with the mod as
@@ -61,20 +63,28 @@ UPDATED121 = json.loads((GAME / 'assets/expected-v1.2.1.json').read_text())
 UPDATED143 = json.loads((GAME / 'assets/expected-v1.4.3.json').read_text())
 VERSIONS = {'v0': EXPECTED, 'v112': UPDATED, 'v121': UPDATED121, 'v143': UPDATED143}
 UPDATES = ('v112', 'v121', 'v143')
-# Breath of the Wild 1.6.0 (games/botw; botw.md in the Tears of the Kingdom project): one card image with the base game, the
-# update and the add-on content. The game is chosen by the title IDs of the NCAs in the game file, never by its name.
+# Breath of the Wild (games/botw; botw.md in the Tears of the Kingdom project): 1.6.0 as one card image with the base game, the
+# update and the add-on content; 1.9.0 as a base NSP plus the 1.9.0 update NSP. The game is chosen by the title IDs of the NCAs
+# in the game file, never by its name.
 BOTW = REPO / 'games/botw'
 BOTW160 = json.loads((BOTW / 'assets/expected-v1.6.0.json').read_text())
+BOTW190 = json.loads((BOTW / 'assets/expected-v1.9.0.json').read_text())
 BOTW_LIST = BOTW / 'assets/shader_list.tsv'   # the game's shared shader list (docs/shader-list.md)
 VERSIONS['botw160'] = BOTW160
+VERSIONS['botw190'] = BOTW190
 TITLES = {'0100F2C0115B6000': 'totk', '01007EF00011E000': 'botw'}
 # Per game: app name, bundle identifier, executable name (= the player's data folder under
 # ~/Library/Application Support/MacNativeGames, games/totk/runtime/game_version.h GAME_FOLDER)
 APPS = {'totk': ('Tears of the Kingdom', 'org.macnativegames.totk', 'TOTK'), 'botw': ('Breath of the Wild', 'org.macnativegames.botw', 'BotW')}
 HACTOOL = ('https://github.com/SciresM/hactool.git', '1d64a83450e025622f3468c28fc4164dad2c5ef6')
 APP_NAME = 'Tears of the Kingdom'
+IOS_APP_NAME = 'TOTK'   # the iPhone / iPad home screen name: "Tears of the Kingdom" was cut to "Tears of the…" (user 2026-10-22)
 BUNDLE_ID = 'org.macnativegames.totk'
 SAVE_PACKAGE_TYPE = 'org.macnativegames.totk.save'   # .totksave (runtime/save_package.h); also in ios/project.yml
+# The languages the runtime gives the game (games/totk/runtime/services.c desired_language), as Info.plist
+# CFBundleLocalizations: macOS offers a per-app language in System Settings only for an app that lists them.
+# pt-BR only where the RomFS has the official USpt text (the 1.4.3 build, Breath of the Wild 1.9.0).
+GAME_LANGUAGES = ('en', 'ja', 'fr', 'de', 'es', 'it', 'nl', 'ru', 'ko', 'zh-Hans', 'zh-Hant')
 LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
 # Pinned upstream sources fetched at build time (repository, commit)
 SPIRV_CROSS = ('https://github.com/KhronosGroup/SPIRV-Cross.git', 'aa217aeb6c9f0ace7a0ab233b28807edf45eb165')
@@ -84,6 +94,15 @@ SPIRV_CROSS_SOURCES = ('main.cpp', 'spirv_cfg.cpp', 'spirv_cpp.cpp', 'spirv_cros
                        'spirv_reflect.cpp')
 SPIRV_CROSS_FLAGS = ('-O3', '-DNDEBUG', '-std=c++11', '-arch', 'arm64', '-Wno-deprecated-declarations')
 TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin']
+
+
+def contrib_folder():
+    """<clone>/shader-list-contribution (MNG_CONTRIB_FOLDER overrides): the one file players send, from the Mac and their
+    iPhones / iPads (app/launcher.m contrib_file, ios/tools/shader_contrib_watch.py). Made at build time if missing."""
+    folder = Path(os.environ.get('MNG_CONTRIB_FOLDER') or REPO / 'shader-list-contribution')
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
 
 # Nintendo's public ACID signing key (generation 0): a dump's main.npdm is genuine when this key verifies
 # its ACID signature, which is the check the Horizon loader itself makes before it starts a title
@@ -416,6 +435,32 @@ def identify_update(tree, game, keys, logs):
     staging.rmdir()
     say(f'update identified by verified ExeFS hashes: {VERSIONS[version]["display_version"]}')
     return version, source
+
+
+def identify_botw_update(tree, update, keys, logs):
+    """Breath of the Wild 1.6.0 or 1.9.0, by the verified ExeFS hashes of the update (never by the file name)."""
+    for version in ('botw160', 'botw190'):
+        exefs = tree / f'extracted/{version}/exefs'
+        if source_matches(exefs.parent / 'extraction-manifest.json', update) and exefs_matches(
+                exefs, VERSIONS[version]['exefs_sha256'], VERSIONS[version]['title_id']):
+            return version
+    staging = tree / 'extracted/update-detection-botw'
+    if staging.exists(): shutil.rmtree(staging)
+    run([tree / '.venv/bin/python', tree.parent / 'botw/scripts/extract_exefs.py', update, '--keys', keys,
+         '--output', staging / 'exefs'], logs / 'identify-update-botw.log', cwd=tree)
+    version = next((version for version in ('botw160', 'botw190')
+                    if exefs_matches(staging / 'exefs', VERSIONS[version]['exefs_sha256'], VERSIONS[version]['title_id'])), None)
+    if version is None:
+        shutil.rmtree(staging)
+        raise BuildError('unsupported Breath of the Wild update module hashes; expected 1.6.0 or 1.9.0 (the file name is not used to choose a version)')
+    target = tree / f'extracted/{version}'   # the verified ExeFS is kept, as identify_update does: step_code_botw reuses it
+    target.mkdir(parents=True, exist_ok=True)
+    if (target / 'exefs').exists(): shutil.rmtree(target / 'exefs')
+    (staging / 'exefs').rename(target / 'exefs')
+    (staging / 'extraction-manifest.json').replace(target / 'extraction-manifest.json')
+    staging.rmdir()
+    say(f'update identified by verified ExeFS hashes: Breath of the Wild {VERSIONS[version]["display_version"]}')
+    return version
 
 
 def font_report(folder):
@@ -1229,16 +1274,29 @@ def data_bundle(tree, version, logs, *, bundle_id=BUNDLE_ID):
     """The RomFS image (16 GB) as a bundle of its own, signed once and kept in the work folder (build/data-bundles). The
     app carries a clone of it in Contents/Helpers, and the app's seal records only its signature: sealing the image
     inside the app hashed all 16 GB on every packaging (88 s on an M4 Mac mini, 2026-10-20), now only when the image
-    changed (the stamp names the image file: size, mtime, inode). The game opens the image through a link at its usual
-    place, extracted/<version>/romfs/romfs.bin, and checks its SHA-256 itself as before (runtime/romfs.c)."""
+    changed (the stamp names the image: size, mtime and the SHA-256 the extraction verified, extracted/<version>/romfs/
+    index.json). Not its inode, which an APFS clone of the work folder changes: a clone signed all 16 GB again (8 min on
+    the external disk, 2026-10-22). The game opens the image through a link at its usual place,
+    extracted/<version>/romfs/romfs.bin, and checks its SHA-256 itself as before (runtime/romfs.c)."""
     image = tree / f'extracted/{version}/romfs/romfs.bin'
     bundle = tree / f'build/data-bundles/GameData-{version}.bundle'
     stamp = bundle.with_name(bundle.name + '.json')
     st = image.stat()
-    want = dict(format=1, size=st.st_size, mtime_ns=st.st_mtime_ns, inode=st.st_ino)
     try:
-        if json.loads(stamp.read_text()) == want and (bundle / 'Contents/_CodeSignature/CodeResources').is_file():
-            return bundle
+        sha = json.loads((image.parent / 'index.json').read_text()).get('romfs_sha256')
+    except (OSError, ValueError):
+        sha = None
+    want = dict(format=2, size=st.st_size, mtime_ns=st.st_mtime_ns, sha256=sha) if sha else \
+        dict(format=1, size=st.st_size, mtime_ns=st.st_mtime_ns, inode=st.st_ino)
+    try:
+        have = json.loads(stamp.read_text())
+        if (bundle / 'Contents/_CodeSignature/CodeResources').is_file():
+            if have == want:
+                return bundle
+            if (want['format'] == 2 and have.get('format') == 1 and have.get('size') == st.st_size
+                    and have.get('mtime_ns') == st.st_mtime_ns):   # an older stamp (or a clone's: other inode, same file)
+                stamp.write_text(json.dumps(want))
+                return bundle
     except (OSError, ValueError):
         pass
     say('4/4 app: signing the game data once (a minute or two; later builds reuse it)')
@@ -1277,13 +1335,55 @@ def app_seal_valid(app):
     return subprocess.run(['codesign', '--verify', '--strict', app], capture_output=True).returncode == 0
 
 
-def keep_game_data(new, old, *, verify=app_seal_valid):
+class _AppMoves:
+    """Keep rename inverses until publication finishes; do not discard the fresh data before then."""
+    def __init__(self):
+        self.done = []
+        self.discard = []
+        self.recovery_failed = False
+
+    def move(self, source, target):
+        source.rename(target)
+        self.done.append((source, target))
+
+    def restore(self, checkpoint=0):
+        while len(self.done) > checkpoint:
+            source, target = self.done[-1]
+            try:
+                if source.exists() or source.is_symlink():
+                    raise OSError(f'recovery destination already exists: {source}')
+                target.rename(source)
+            except OSError as error:
+                self.recovery_failed = True
+                raise BuildError(f'App update rollback could not restore {target} to {source}: {error}. '
+                                 'Files have been retained; recover them before rebuilding.') from error
+            self.done.pop()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, error, traceback):
+        if kind is not None and not self.recovery_failed:
+            self.restore()
+        elif kind is None:
+            for path in self.discard:
+                try:
+                    remove_tree(path)
+                except OSError as cleanup_error:
+                    say(f'Could not remove temporary game data {path}: {cleanup_error}')
+        return False
+
+
+def keep_game_data(new, old, *, verify=app_seal_valid, _moves=None):
     """When the app being replaced carries the same signed game data as the new one (the same signature, which names the
     image's SHA-256, the same Info.plist and image size), move its data bundle into the new app in place of the fresh
     clone. The image keeps its inode and times, so the runtime's RomFS verification record (runtime/romfs.c, keyed by
     them) still matches and the first start after a packaging does not hash 16 GB again (19.5 s, 2026-10-21). An image
     changed since keeps nothing either: its modification time moved, so the runtime hashes it and refuses it. Called when
     the old app no longer runs, just before it is replaced; if the new app's seal does not verify, the clone goes back."""
+    if _moves is None:
+        with _AppMoves() as moves:
+            return keep_game_data(new, old, verify=verify, _moves=moves)
     image = 'Contents/Resources/romfs.bin'
     kept = False
     for bundle in sorted((new / 'Contents/Helpers').glob('GameData-*.bundle')):
@@ -1296,17 +1396,17 @@ def keep_game_data(new, old, *, verify=app_seal_valid):
         fresh = new.with_name(f'{new.name}.{bundle.name}.fresh')   # outside the app: anything extra in it fails the seal
         if fresh.exists():
             remove_tree(fresh)
-        bundle.rename(fresh)
+        checkpoint = len(_moves.done)
+        _moves.move(bundle, fresh)
         try:
-            before.rename(bundle)
+            _moves.move(before, bundle)
         except OSError:
-            fresh.rename(bundle)
+            _moves.restore(checkpoint)
             continue
         if not verify(new):
-            bundle.rename(before)
-            fresh.rename(bundle)
+            _moves.restore(checkpoint)
             continue
-        remove_tree(fresh)
+        _moves.discard.append(fresh)
         kept = True
     return kept
 
@@ -1330,26 +1430,27 @@ def install_app(new, out, *, verify=None, remove=None):
     name is not an app's, deleted in the background with any left by an earlier packaging. Returns whether the installed
     game data was kept."""
     verify, remove = verify or app_seal_valid, remove or remove_in_background
-    kept = out.exists() and keep_game_data(new, out, verify=verify)
-    if not kept and not verify(new):
-        raise BuildError(f'{new}: the new app\'s signature does not verify (codesign --verify --strict); the installed app is unchanged')
-    leftovers = sorted(out.parent.glob(f'{glob.escape(out.name)}.replaced-*'))
-    if out.exists():
-        # The .app folder itself stays: macOS keeps its first-run check of an app (Gatekeeper / XProtect read the whole
-        # bundle, 185-200 s for the 17 GB one) with the folder. A new folder with the same contents was scanned again,
-        # new Contents in the same folder were not (2026-10-22). Everything in it moves out, the new Contents move in.
-        old = out.with_name(f'{out.name}.replaced-{os.getpid()}')
-        if old.exists():
-            remove_tree(old)
-        old.mkdir()
-        for entry in list(out.iterdir()):
-            entry.rename(old / entry.name)
-        for entry in list(new.iterdir()):
-            entry.rename(out / entry.name)
-        new.rmdir()
-        leftovers.append(old)
-    else:
-        new.rename(out)
+    with _AppMoves() as moves:
+        kept = out.exists() and keep_game_data(new, out, verify=verify, _moves=moves)
+        if not kept and not verify(new):
+            raise BuildError(f'{new}: the new app\'s signature does not verify (codesign --verify --strict); the installed app is unchanged')
+        leftovers = sorted(out.parent.glob(f'{glob.escape(out.name)}.replaced-*'))
+        if out.exists():
+            # The .app folder itself stays: macOS keeps its first-run check of an app (Gatekeeper / XProtect read the whole
+            # bundle, 185-200 s for the 17 GB one) with the folder. A new folder with the same contents was scanned again,
+            # new Contents in the same folder were not (2026-10-22). Everything in it moves out, the new Contents move in.
+            old = out.with_name(f'{out.name}.replaced-{os.getpid()}')
+            if old.exists():
+                remove_tree(old)
+            old.mkdir()
+            for entry in list(out.iterdir()):
+                moves.move(entry, old / entry.name)
+            for entry in list(new.iterdir()):
+                moves.move(entry, out / entry.name)
+            new.rmdir()
+            leftovers.append(old)
+        else:
+            moves.move(new, out)
     for path in leftovers:
         remove(path)
     return kept
@@ -1453,7 +1554,8 @@ def step_app(tree, out, logs, *, version="v0", store=None, game='totk', cheats=N
                 CFBundleDisplayName=app_name, CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],
                 CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
                 LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
-                GCSupportsControllerUserInteraction=True)
+                GCSupportsControllerUserInteraction=True,
+                CFBundleLocalizations=list(GAME_LANGUAGES) + (['pt-BR'] if version in ('v143', 'botw190') else []))
     # Save packages (.totksave, runtime/save_package.h): AirDrop / a double-click opens them with the app, whose launcher
     # imports them before the game starts (docs/save-sync.md). The iOS app declares the same type (ios/project.yml).
     # Tears of the Kingdom only: the packages carry its save layout.
@@ -1467,6 +1569,7 @@ def step_app(tree, out, logs, *, version="v0", store=None, game='totk', cheats=N
     if icon.exists():
         clone(icon, tmp / 'Contents/Resources/AppIcon.icns')
         info['CFBundleIconFile'] = 'AppIcon'
+    info['MNGContributionFolder'] = str(contrib_folder())   # app/launcher.m contrib_file: where players find it
     import plistlib
     (tmp / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
     (tmp / 'Contents/PkgInfo').write_bytes(b'APPL????')
@@ -1549,7 +1652,9 @@ def step_warm_metal(tree, out, logs, store=None):
         say(f"4/4 app: {who} has Metal's shader cache open, so the startup shaders are compiled on the first start instead "
             '(what this build compiled now would be lost when that program quits)')
         return
-    say("4/4 app: compiling the startup shaders for this Mac's GPU once (about 2 minutes on an M4, about 25 on an 8 GB M1; minutes saved on the first start)")
+    # about 46 a second on an M4 Max (#410: 1.4.3's 33,266 in 720 s); 8 GB Macs swap and take much longer
+    say(f"4/4 app: compiling the {len(sources):,} prepared shaders for this Mac's GPU once (about {max(1, round(len(sources) / 46 / 60))} "
+        "minutes on an M4 Max, much longer on an 8 GB Mac; saved on the first start)")
     t0 = time.time()
     try:
         clone(tree / 'build/warm-metal-cache', tool)
@@ -1673,28 +1778,161 @@ def identify_game(tree, game, keys, logs):
     if not report:
         raise BuildError(f'could not read the game file (see {log})')
     found = sorted({TITLES[t] for t in report['titles'] if t in TITLES})
+    if not found:
+        for title_id in ticket_title_ids(game):
+            application, kind = title_kind(title_id)
+            if kind == 'dlc' and application in TITLES:
+                raise BuildError(f'{game.name} is {APPS[TITLES[application]][0]} add-on content (DLC), not the game' +
+                                 (': pass the base NSP as the game file with --update <update.nsp>, and this file with --dlc'
+                                  if TITLES[application] == 'botw' else ', which this build does not support'))
     if len(found) != 1:
         raise BuildError(f'the game file holds {report["titles"]}: expected Tears of the Kingdom (0100F2C0115B6000) or '
                          f'Breath of the Wild (01007EF00011E000)')
     return found[0]
 
 
-def step_code_botw(tree, botw, game, keys, env, logs):
-    """The 1.6.0 ExeFS out of the card image (games/botw/scripts/extract_exefs.py), the three modules rewritten with the same
-    rewriter as Tears of the Kingdom (it learnt this game's jump tables), each file checked against expected-v1.6.0.json."""
-    version, expected = 'botw160', BOTW160
+# Ticket body offsets by signature type, as common_tickets in games/totk/scripts/extract_exefs.py (little-endian type:
+# RSA-4096, RSA-2048, ECDSA with SHA-1 at 0x10000-0x10002, the same three with SHA-256 at 0x10003-0x10005). Only the rights ID is read here, never the title key.
+TICKET_BODIES = {0x10000: 0x240, 0x10001: 0x140, 0x10002: 0x80, 0x10003: 0x240, 0x10004: 0x140, 0x10005: 0x80}
+
+
+def ticket_title_ids(path):
+    """The title IDs (16 hex digits, uppercase) in the rights IDs of the .tik files of a PFS0 package; [] for an XCI,
+    a package without tickets and a file that is not readable as PFS0."""
+    ids = []
+    try:
+        with path.open('rb') as f:
+            head = f.read(16)
+            if len(head) < 16 or head[:4] != b'PFS0':
+                return []
+            count, strings_size = struct.unpack_from('<II', head, 4)
+            table = f.read(count * 24)
+            strings = f.read(strings_size)
+            if len(table) < count * 24 or len(strings) < strings_size:
+                return []
+            data_start = 16 + count * 24 + strings_size
+            for i in range(count):
+                offset, size, name_at, _ = struct.unpack_from('<QQII', table, i * 24)
+                name = strings[name_at:strings.find(b'\0', name_at)] if name_at < len(strings) else b''
+                if not name.lower().endswith(b'.tik') or size < 4:
+                    continue
+                f.seek(data_start + offset)
+                sig = f.read(4)
+                body = TICKET_BODIES.get(struct.unpack('<I', sig)[0]) if len(sig) == 4 else None
+                if body is None or size < body + 0x168:
+                    continue
+                f.seek(data_start + offset + body + 0x160)
+                rights = f.read(8)
+                if len(rights) == 8:
+                    ids.append(rights.hex().upper())
+    except (OSError, struct.error):
+        return []
+    return ids
+
+
+def title_kind(title_id):
+    """(application ID, 'base' | 'update' | 'dlc') of a title ID: base ends in 000, update in 800, DLC is the rest
+    and belongs to the application 0x1000 below its 4096-title block."""
+    value = int(title_id, 16)
+    low = value & 0xFFF
+    if low == 0x000:
+        return f'{value:016X}', 'base'
+    if low == 0x800:
+        return f'{value & ~0xFFF:016X}', 'update'
+    return f'{(value & ~0xFFF) - 0x1000:016X}', 'dlc'
+
+
+def check_package(path, game, role):
+    """Stop early when a ticketed package is of the other game or of another kind than its role ('base' or 'update').
+    An XCI, a rights-free package and a title of no known game pass: the NCA checks of the extraction scripts follow."""
+    flags = {'base': 'the game file', 'update': '--update', 'dlc': '--dlc'}   # where each kind belongs on the command line
+    for title_id in ticket_title_ids(path):
+        application, kind = title_kind(title_id)
+        owner = TITLES.get(application)
+        if owner is None:
+            continue
+        if owner != game:
+            raise BuildError(f'{path.name} is {APPS[owner][0]} ({kind}), but this build is for {APPS[game][0]}: use the files of one game')
+        if kind != role:
+            raise BuildError(f'{path.name} is {APPS[game][0]} {kind} content, not the {role}: pass it as {flags[kind]}')
+
+
+def check_dlc(paths, expected):
+    """Stop early when a --dlc package is not an add-on pack this version pins, or when two files are the same pack."""
+    pins = {pack['title_id']: i for i, pack in expected['aoc'].items()}
+    owner = {}
+    for path in paths:
+        check_package(path, 'botw', 'dlc')
+        for title_id in ticket_title_ids(path):
+            if title_id not in pins:
+                raise BuildError(f'{path.name} is add-on content {title_id}, but the packs of this version are {", ".join(pins)}')
+            if owner.setdefault(title_id, path) != path:
+                raise BuildError(f'{owner[title_id].name} and {path.name} are the same DLC pack ({title_id}): pass one of them')
+
+
+def dlc_pack_valid(folder, pin):
+    try:
+        report = json.loads((folder / 'index.json').read_text())
+        return (report.get('status') == 'pass' and report['romfs_sha256'] == pin['sha256'] and (folder / 'runtime-index.bin').is_file()
+                and (folder / 'romfs.bin').stat().st_size == pin['size'])
+    except (OSError, ValueError, KeyError):
+        return False
+
+
+def step_dlc_botw(tree, botw, dlc, keys, logs, pins, aoc):
+    """1.9.0 add-on content: import each --dlc NSP (games/botw/scripts/extract_dlc.py) into aoc/<index> and check it against its
+    pin. A valid pack from an earlier run is reused; a pack that is not given this time is removed, so the app holds the given
+    packs only (the runtime takes the packs it finds: AOC_PRESENT_MASK)."""
+    titles = {pack['title_id']: i for i, pack in pins.items()}
+    staging = aoc.with_name('aoc-import')
+    keep = set()
+    for nsp in dlc:
+        index = next((titles[t] for t in ticket_title_ids(nsp) if t in titles), None)
+        if index is not None and dlc_pack_valid(aoc / index, pins[index]):
+            keep.add(index)
+            continue
+        say(f'2/4 data: importing the add-on content {nsp.name}')
+        shutil.rmtree(staging, ignore_errors=True)
+        try:
+            run([tree / '.venv/bin/python', botw / 'scripts/extract_dlc.py', nsp, '--keys', keys, '--output', staging], logs / f'botw-dlc-{nsp.stem}.log', cwd=tree)
+            (pack,) = list(staging.iterdir())
+            report = json.loads((pack / 'index.json').read_text())
+            index = str(report['index'])
+            check(f'add-on content {index}', report['romfs_sha256'], pins[index]['sha256'])
+            if report['romfs_size'] != pins[index]['size']:
+                raise BuildError(f'add-on content {index}: size {report["romfs_size"]} is not the expected {pins[index]["size"]}')
+            shutil.rmtree(aoc / index, ignore_errors=True)
+            aoc.mkdir(parents=True, exist_ok=True)
+            pack.rename(aoc / index)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        keep.add(index)
+    stale = [p for p in aoc.iterdir() if p.name not in keep] if aoc.is_dir() else []
+    if stale:
+        say(f'2/4 data: removing the add-on content not given with --dlc this time ({", ".join(sorted(p.name for p in stale))})')
+    for p in stale:
+        shutil.rmtree(p) if p.is_dir() else p.unlink()
+    if stale:   # the Makefile only sees packs that appear, so the old mask goes with the pack
+        (tree / 'build/botw190/aoc_config.h').unlink(missing_ok=True)
+
+
+def step_code_botw(tree, botw, game, keys, env, logs, *, version='botw160'):
+    """The ExeFS of the card image or of the separate 1.6.0 or 1.9.0 update given as game (games/botw/scripts/extract_exefs.py
+    reads the update's Program NCA, the one with a BKTR section), the three modules rewritten with the same rewriter as Tears of the Kingdom (it learnt
+    this game's jump tables), each file checked against expected-v<version>.json."""
+    expected = VERSIONS[version]
     py = tree / '.venv/bin/python'
     exefs = tree / f'extracted/{version}/exefs'
     want = expected['exefs_sha256']
     manifest = exefs.parent / 'extraction-manifest.json'
     if not source_matches(manifest, game) or not all((exefs / n).is_file() and sha256(exefs / n) == h for n, h in want.items()):
-        say('1/4 code: extracting the 1.6.0 ExeFS from the game file')
+        say(f'1/4 code: extracting the {expected["display_version"]} ExeFS from the game file')
         if exefs.exists():
             shutil.rmtree(exefs)
         run([py, botw / 'scripts/extract_exefs.py', game, '--keys', keys, '--output', exefs], logs / f'extract_exefs-{version}.log', cwd=tree)
     for n, h in want.items():
         if not (exefs / n).is_file():
-            raise BuildError(f'ExeFS {n} is missing; not Breath of the Wild 1.6.0')
+            raise BuildError(f'ExeFS {n} is missing; not Breath of the Wild {expected["display_version"]}')
         check(f'ExeFS {n}', sha256(exefs / n), h)
     if not (tree / f'extracted/{version}/elf/main-inventory.json').exists():
         run([py, 'scripts/prepare_modules.py', exefs, '--output', tree / f'extracted/{version}/elf'], logs / f'prepare_modules-{version}.log', cwd=tree)
@@ -1708,7 +1946,7 @@ def step_code_botw(tree, botw, game, keys, env, logs):
         run([py, 'third_party/d2r/patch_nso.py', exefs / name, out, name], logs / f'rewrite_{version}_{name}.log', cwd=tree,
             env=dict(env, DM_RULESET='native', DM_PRIVATE_GATES='0'))
         check(f'rewritten {name}', sha256(image), h)
-    # scripts/prepare_runtime.py binds the loader to these images (verify_rewrites.py --version botw160 re-runs the site-by-site check)
+    # scripts/prepare_runtime.py binds the loader to these images (verify_rewrites.py --version <version> re-runs the site-by-site check)
     report = dict(format=1, status='pass', rom_version=version, scope=f'hash match with verified {expected["display_version"]} rewrite',
                   module_file_sha256={**{f'extracted/{version}/exefs/{n}': want[n] for n in ('main', 'sdk', 'subsdk0')},
                                       **{f'rewritten/{version}/{n}.patched.bin': expected['rewritten_sha256'][f'{n}.patched.bin'] for n in ('main', 'sdk', 'subsdk0')}})
@@ -1717,11 +1955,13 @@ def step_code_botw(tree, botw, game, keys, env, logs):
     report_path.write_text(json.dumps(report, indent=2) + '\n')
 
 
-def step_data_botw(tree, botw, game, keys, logs, *, firmware=None, shared_fonts=None, update=None):
-    """The base + 1.6.0 RomFS merged from the card image (games/botw/scripts/extract_romfs.py, hactool BKTR), the two
-    add-on content volumes (extract_aoc_romfs.py), and the shared fonts: this card's system update partition is empty, so
-    they come from --shared-fonts, from an unpacked firmware (--firmware) or from a previous build in the work folder."""
-    version, expected = 'botw160', BOTW160
+def step_data_botw(tree, botw, game, keys, logs, *, version='botw160', update=None, dlc=(), firmware=None, shared_fonts=None):
+    """The base + update RomFS merged from the card image, or from a base game and its separate 1.6.0 or 1.9.0 update
+    (games/botw/scripts/extract_romfs.py, hactool BKTR); the add-on content: the card image's volumes (extract_aoc_romfs.py),
+    none for a separate 1.6.0 update, the packs of the --dlc NSPs for 1.9.0 (extract_dlc.py; none is needed); and the shared fonts: neither the card's system update
+    partition nor an NSP holds them, so they come from --shared-fonts, from --firmware or from a previous build in
+    the work folder."""
+    expected = VERSIONS[version]
     py = tree / '.venv/bin/python'
     folder = tree / f'extracted/{version}/romfs'
     index = folder / 'index.json'
@@ -1738,13 +1978,15 @@ def step_data_botw(tree, botw, game, keys, logs, *, firmware=None, shared_fonts=
         hactool = build_hactool(tree, logs)
         if folder.exists():
             shutil.rmtree(folder)
-        say('2/4 data: merging the base RomFS with the 1.6.0 update and verifying all IVFC levels (15 GB, about 5 minutes)')
+        say(f'2/4 data: merging the base RomFS with the {expected["display_version"]} update and verifying all IVFC levels (15 GB, about 5 minutes)')
         run([py, botw / 'scripts/extract_romfs.py', game, *(['--update', update] if update else []), '--keys', keys, '--hactool', hactool, '--output', folder], logs / 'botw-romfs.log', cwd=tree)
         report = json.loads(index.read_text())
-        check('1.6.0 RomFS', report['romfs_sha256'], expected['romfs']['sha256'])
-        check('1.6.0 RomFS size', report['romfs_size'], expected['romfs']['size'])
+        check(f'{expected["display_version"]} RomFS', report['romfs_sha256'], expected['romfs']['sha256'])
+        check(f'{expected["display_version"]} RomFS size', report['romfs_size'], expected['romfs']['size'])
     aoc = tree / f'extracted/{version}/aoc'
-    if update:
+    if version == 'botw190':   # 1.9.0: add-on content comes from the --dlc NSPs, and only from them
+        step_dlc_botw(tree, botw, dlc, keys, logs, expected['aoc'], aoc)
+    elif update:
         # A separate base/update install has no expansion pass. Drop cached card DLC
         # and its generated configuration before rebuilding in a reused work folder.
         if aoc.exists():
@@ -1794,10 +2036,9 @@ def step_data_botw(tree, botw, game, keys, logs, *, firmware=None, shared_fonts=
         validate_fonts(fonts)
 
 
-def step_shaders_botw(tree, botw, logs):
+def step_shaders_botw(tree, botw, logs, *, version='botw160'):
     """SPIRV-Cross and the translator as for Tears of the Kingdom; the startup seed from this game's archives and its
     shared shader list (games/botw/scripts/prepare_shader_seed.py, games/botw/assets/shader_list.tsv)."""
-    version = 'botw160'
     if not (tree / 'build/spirv-cross/spirv-cross').exists():
         say('3/4 shaders: building SPIRV-Cross with clang')
         build_spirv_cross(tree, logs)
@@ -1815,11 +2056,15 @@ def step_shaders_botw(tree, botw, logs):
 
 
 def parse_args(argv):
-    ap = argparse.ArgumentParser(description='Build a native Mac app or unsigned iPhone/iPad IPA from TOTK base 1.0.0 (XCI/NSP), optionally with the separate 1.1.2, 1.2.1 or 1.4.3 update; or a Mac app from Breath of the Wild base + separate 1.6.0 update, or a combined card image.',
+    ap = argparse.ArgumentParser(description='Build a native Mac app or unsigned iPhone/iPad IPA from TOTK base 1.0.0 (XCI/NSP), optionally with the separate 1.1.2, 1.2.1 or 1.4.3 update; or a Mac app from Breath of the Wild: a combined 1.6.0 card image, a base game with the separate 1.6.0 update, or a base NSP with its 1.9.0 update NSP and optional add-on content NSPs (--dlc).',
                                  epilog='example: python3 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys')
-    ap.add_argument('game', type=Path, nargs='?', help='the game file (.xci or .nsp), base game 1.0.0')
-    ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app')
+    ap.add_argument('game', type=Path, nargs='?', help='the game file (.xci or .nsp), base game 1.0.0 (Breath of the Wild: the 1.6.0 card image, or the base NSP with --update)')
+    ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app (Breath of the Wild: the 1.9.0 update NSP, not for a card image)')
+    ap.add_argument('--dlc', type=Path, action='append', metavar='DLC.nsp', help='Breath of the Wild 1.9.0 only: an add-on content (DLC) NSP; repeat for the second pack (01007EF00011F001, 01007EF00011F002); each is optional, and a pack left out is not in the app; 1.9.0 takes its packs from --dlc only, also when the game file is a card image')
     ap.add_argument('--platform', choices=('macos','ios'), default='macos', help='build a macOS app (default) or unsigned iPhone/iPad IPA')
+    ap.add_argument('--ios-game-data', choices=('app', 'documents'), default='app',
+                    help='iOS: carry the 17 GB RomFS image in the IPA (default), or leave it out for the app\'s Documents/GameData '
+                         '(ios/tools/install_device.py --game-data copies it there once; later builds install in minutes)')
     ap.add_argument('-k', '--keys', type=Path, help='your prod.keys (required for a build)')
     ap.add_argument('-o', '--out', type=Path, help=f'the app or IPA to write (default depends on --platform; next to the game file)')
     ap.add_argument('--work', type=Path, help='work folder (default: TOTK_build next to the game file)')
@@ -1841,7 +2086,7 @@ def parse_args(argv):
     ap.add_argument('--shader-cache', type=Path, help=argparse.SUPPRESS)   # removed: the seed comes from the game data and the shared list
     ap.add_argument('--no-shader-reminder', action='store_true', help='iOS: do not install the Mac agent that asks, while an iPhone / iPad with the game is connected, to send the shaders the shared list lacks')
     fonts = ap.add_mutually_exclusive_group()
-    fonts.add_argument('--firmware', type=Path, help='unpacked firmware NCA directory providing the six expected shared fonts (needed for NSP unless --shared-fonts or valid cached fonts are available)')
+    fonts.add_argument('--firmware', type=Path, help='unpacked firmware NCA directory providing the six expected shared fonts (needed for NSP unless --shared-fonts or valid cached fonts are available; Breath of the Wild 1.9.0 too)')
     fonts.add_argument('--shared-fonts', type=Path, help='previously extracted shared-font directory containing the six verified .bfttf files')
     ap.add_argument('--cheats', type=Path, help='an Atmosphère cheat file named <build ID>.txt, or a folder holding one, to build into the app (Cheats menu; all off until chosen)')
     return ap.parse_args(argv)
@@ -1864,8 +2109,8 @@ def main(argv):
         raise BuildError(f'no such file: {keys}')
     out = (args.out.expanduser().resolve() if args.out else game.parent / (f'{APP_NAME}.ipa' if args.platform=='ios' else f'{APP_NAME}.app'))
     work = (args.work.expanduser().resolve() if args.work else game.parent / 'TOTK_build')
-    if out.suffix.lower() != ('.ipa' if args.platform=='ios' else '.app'):
-        raise BuildError(f'the {args.platform} output must end in {".ipa" if args.platform=="ios" else ".app"}: {out}')
+    if out.suffix.lower() not in (('.ipa', '.app') if args.platform=='ios' else ('.app',)):   # iOS .app: unsigned folder for install_device.py
+        raise BuildError(f'the {args.platform} output must end in {".ipa or .app" if args.platform=="ios" else ".app"}: {out}')
     kind = input_kind(game)
     if kind not in ('xci', 'nsp'):
         raise BuildError('the base game must be an uncompressed XCI or NSP; NSZ is supported for update packages')
@@ -1886,6 +2131,10 @@ def main(argv):
         raise BuildError('an iPhone / iPad build loads no player mod folder, so --install-mod-romfs has nothing to fill: '
                          'build the Mac app (leave out --platform ios) to install a mod\'s RomFS')
     code_mod = mod if mod and (mod / 'exefs').is_dir() else None   # a data-only mod has no code to merge
+    dlcs = list(dict.fromkeys(d.expanduser().resolve() for d in args.dlc or []))
+    for dlc in dlcs:
+        if not dlc.is_file() or input_kind(dlc) != 'nsp':
+            raise BuildError(f'--dlc must be an add-on content NSP: {dlc}')
     version = 'v0'
     firmware = args.firmware.expanduser().resolve() if args.firmware else None
     shared_fonts = args.shared_fonts.expanduser().resolve() if args.shared_fonts else None
@@ -1898,9 +2147,11 @@ def main(argv):
         raise BuildError(f'no firmware directory: {firmware}')
     if shared_fonts:
         font_report(shared_fonts)
-    if kind == 'nsp' and not (firmware or shared_fonts or fonts_valid(work / 'totk/extracted/firmware/shared-fonts')):
-        raise BuildError('NSP files do not include system shared fonts. Supply --firmware <unpacked firmware NCA directory> '
-                         'or --shared-fonts <previously extracted font directory>; valid fonts in --work are also reused.')
+    no_fonts = BuildError('NSP files do not include system shared fonts. Supply --firmware <unpacked firmware NCA directory> '
+                          'or --shared-fonts <previously extracted font directory>; valid fonts in --work are also reused.')
+    fonts_given = firmware or shared_fonts or fonts_valid(work / 'totk/extracted/firmware/shared-fonts')
+    if kind == 'nsp' and not (fonts_given or (not args.work and fonts_valid(game.parent / 'BotW_build/totk/extracted/firmware/shared-fonts'))):   # Breath of the Wild's default work folder
+        raise no_fonts
     py = prerequisites(args)
     def existing_volume_path(path):
         path=path.resolve()
@@ -1913,13 +2164,15 @@ def main(argv):
     # The game decides the platforms, the work folder and the disk space needed, so it is identified before those checks.
     tree = prepare_work(work, py, logs)
     which = identify_game(tree, game, keys, logs)
+    if kind == 'nsp' and which != 'botw' and not fonts_given:   # only Breath of the Wild's fonts passed the check above
+        raise no_fonts
+    if dlcs and which != 'botw':
+        raise BuildError(f'{APPS[which][0]} has no DLC support: leave out --dlc')
     if which == 'botw':
         if cheats:
             raise BuildError('--cheats is for Tears of the Kingdom; Breath of the Wild has no Cheats menu yet (leave out --cheats)')
         if fresh_work and not args.work:   # BotW_build next to the game file, not TOTK_build
             shutil.rmtree(work)
-        if args.platform == 'ios':
-            raise BuildError('Breath of the Wild has no iPhone / iPad build yet: build the Mac app (leave out --platform ios)')
         if mod:
             raise BuildError('--mod: merging a mod\'s main-module patches is only wired for Tears of the Kingdom so far '
                              '(the patch sites of Breath of the Wild 1.6.0 are not listed in scripts/patch_sites.py)')
@@ -1928,24 +2181,45 @@ def main(argv):
             logs = work / 'logs'
             tree = prepare_work(work, py, logs)
         if not args.out:
-            out = game.parent / f'{APPS["botw"][0]}.app'
+            out = game.parent / f'{APPS["botw"][0]}.{"ipa" if args.platform == "ios" else "app"}'
+        check_package(game, 'botw', 'base')
+        if update:
+            check_package(update, 'botw', 'update')
+        elif kind != 'xci':
+            raise BuildError('Breath of the Wild from a base NSP needs the 1.9.0 update (or the 1.6.0 update): pass it with '
+                             '--update <update.nsp> (a card image already holds its 1.6.0 update)')
+        check_dlc(dlcs, BOTW190)   # the files first; the packs are the same for both versions
+        if update:   # the base game (NSP or XCI) with the separate 1.6.0 or 1.9.0 update
+            update = prepare_update_container(tree, update, keys, logs)
+            version = identify_botw_update(tree, update, keys, logs)
+        else:   # a combined card image: base, 1.6.0 update and add-on content
+            version = 'botw160'
+        if dlcs and version != 'botw190':
+            raise BuildError('--dlc takes the add-on content of Breath of the Wild 1.9.0; a 1.6.0 build takes it from a card image only, so leave out --dlc')
+        expected = VERSIONS[version]
         if shutil.disk_usage(existing_volume_path(work.parent if work.parent.exists() else game.parent)).free / 2**30 < 22 and \
-                not (work / 'totk/extracted/botw160/romfs/romfs.bin').exists():
+                not (work / f'totk/extracted/{version}/romfs/romfs.bin').exists():
             raise BuildError('needs about 22 GB free for the work folder (the app itself is an APFS clone of it when on the same volume)')
         if args.shader_cache:
             say('--shader-cache is no longer needed: the startup shaders come from the game data and the shared shader list (games/botw/assets/shader_list.tsv)')
         botw = work / 'botw'
-        say(f'Breath of the Wild {BOTW160["display_version"]} (by the title IDs in the game file); work folder {work}')
-        if update:
-            update = prepare_update_container(tree, update, keys, logs)
-        step_code_botw(tree, botw, update or game, keys, env, logs)
-        step_data_botw(tree, botw, game, keys, logs, firmware=firmware, shared_fonts=shared_fonts, update=update)
-        step_shaders_botw(tree, botw, logs)
-        step_shader_libs(tree, logs, version='botw160')
+        say(f'Breath of the Wild {expected["display_version"]}; work folder {work}')
+        step_code_botw(tree, botw, update or game, keys, env, logs, version=version)
+        step_data_botw(tree, botw, game, keys, logs, version=version, update=update, dlc=dlcs, firmware=firmware, shared_fonts=shared_fonts)
+        step_shaders_botw(tree, botw, logs, version=version)
+        step_shader_libs(tree, logs, version=version)
         # The work folder's copy of games/botw (prepare_work), relative: make splits a path with spaces into several targets
-        step_binary(tree, game, keys, {**env, 'SHADER_LIST': '../botw/assets/shader_list.tsv'}, logs, version='botw160', title='01007ef00011e000')
+        step_binary(tree, game, keys, {**env, 'SHADER_LIST': '../botw/assets/shader_list.tsv'}, logs, version=version, title='01007ef00011e000')
         say(f'4/4 app: assembling {out}')
-        step_app(tree, out, logs, version='botw160', game='botw')
+        if args.platform == 'ios':   # the same IPA tooling as Tears of the Kingdom (ios/tools/build_ipa.py --version botw160 / botw190)
+            run([py, 'ios/tools/build_ipa.py', '--tree', tree, '--out', out, '--version', version,
+                 '--logs', logs, '--app-name', APPS['botw'][2], '--bundle-id', APPS['botw'][1],
+                 *(['--image-outside'] if args.ios_game_data == 'documents' else [])], logs / 'build-ipa.log', cwd=tree, env=env)
+            say(f'done in {(time.time() - t0) / 60:.0f} min: {out}')
+            say('Install it with games/totk/ios/tools/install_device.py' + (f' --game-data {tree}/extracted/{version}/romfs/romfs.bin'
+                if args.ios_game_data == 'documents' else '') + '; saves and the shader cache stay in the app\'s Documents.')
+            return
+        step_app(tree, out, logs, version=version, game='botw')
         run([LSREGISTER, '-f', out], logs / 'register-app.log')
         say('4/4 app: macOS checks the app once (seconds when this app folder was checked before, a few minutes for a new one)')
         t1 = time.time()
@@ -1969,6 +2243,8 @@ def main(argv):
             required=(60 if update else 45) if not base_cached else (40 if update else 18)
         else:
             required=(40 if update else 25) if not base_cached else (25 if update else 18)
+        if args.ios_game_data=='documents' and base_cached:
+            required=10   # the IPA carries no 17 GB image
         if free<required:
             raise BuildError(f'iOS build needs about {required} GB free on the work/output volume for the IPA archive')
         if not same_volume and output_free<18:
@@ -2003,12 +2279,14 @@ def main(argv):
     store = None
     if args.platform=='ios':
         run([py, 'ios/tools/build_ipa.py', '--tree', tree, '--out', out, '--version', version,
-             '--logs', logs, '--app-name', APP_NAME, '--bundle-id', BUNDLE_ID], logs/'build-ipa.log', cwd=tree, env=env)
+             '--logs', logs, '--app-name', IOS_APP_NAME, '--bundle-id', BUNDLE_ID,
+             *(['--image-outside'] if args.ios_game_data == 'documents' else [])], logs/'build-ipa.log', cwd=tree, env=env)
         if not args.no_shader_reminder:
             # The iOS app never asks during play; while the device is connected, this Mac asks to send the shaders the
             # shared list lacks (ios/tools/shader_contrib_watch.py). Not essential: a failure only says so.
             try:
-                run([py, 'ios/tools/shader_contrib_watch.py', 'install'], logs/'shader-contrib-watch.log', cwd=tree, env=env)
+                run([py, 'ios/tools/shader_contrib_watch.py', 'install', '--store', contrib_folder()],   # in this clone, where players look
+                    logs/'shader-contrib-watch.log', cwd=tree, env=env)
                 say('   installed the Mac reminder for iPhone / iPad shader contributions (remove: python3 '
                     'games/totk/ios/tools/shader_contrib_watch.py uninstall)')
             except BuildError as e:

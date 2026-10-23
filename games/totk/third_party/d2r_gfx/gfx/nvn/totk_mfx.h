@@ -11,7 +11,8 @@
    takes effect at the next game frame boundary (mfx_latch at the present), so a frame is never half on. */
 #include "totk_mfx_mode.h"
 const char *mfx_mode_name(int mode);
-void mfx_set(int mode);  // mode < 0 cycles the requested mode
+void mfx_set(int mode);
+void mfx_set_mv_dyn(int on);   // flag mfx_mv_dyn (default on): pixels that are not still world get no camera motion  // mode < 0 cycles the requested mode
 int mfx_latch(void);     // at the game's present, after this frame's interpolation: take the requested mode; 1 = it changed
 // Per game frame, from the replay: the scene copy (the canvas copied before the first UI draw, in the canvas format),
 // the UI layer (colour attachment 7 of the later canvas passes), the G-buffer depth and the camera block (84 floats of
@@ -35,6 +36,10 @@ void mfx_note_obj(void);
 // frame). abort: a prepared frame that cannot be encoded (no free command buffer); drops the history.
 int mfx_frame_prepare(double frame_s);
 // Keep the returned resources alive until this command buffer's GPU completion.
+// The array holds exactly MFX_FRAME_RESOURCES entries: the interpolator, its colour / previous colour, depth, motion,
+// UI, output, the motion kernel's parameters, the previous depth (still-world test) and texture 2 of the motion kernel
+// (the per-object motion target with TOTK_OBJ_MOTION, else the motion texture again).
+#define MFX_FRAME_RESOURCES 10
 // Cached interpolators drop their public texture bindings after encoding.
 NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int slot, id<MTL4CounterHeap> heap, NSUInteger stamp);   // heap: timestamps at stamp / stamp+1 around MetalFX (may be nil)
 void mfx_note_gpu(double ms);   // GPU time of one interpolation, for the statistics line
