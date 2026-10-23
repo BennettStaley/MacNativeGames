@@ -1135,6 +1135,10 @@ void mtl_sub_begin(void) {
 }
 
 static void rp_end(void);
+/* TOTK: why the open render pass is ending, set just before the rp_end / rp_flush that ends it (consumed by rp_end): the
+   pass dump's 'W' line and the TOTK_PASS_GPU rows name it. "other" = a site that sets none. */
+static const char *g_end_why;
+#define RP_WHY(s) (g_end_why = (s))
 extern int g_frz_on; static int g_frz_state;   // 世界冻结：本帧锁存的状态（0 正常 / 1 完整帧 / 2 冻结帧），见 frz_op 上方的说明 | World freeze: the state latched for this frame (0 normal / 1 full frame / 2 frozen frame), see the note above frz_op
 // DM_NVN_PASSGPU_SERIAL=1（测量用）：主命令缓冲上每建一个编码器前编「发信号 n+1 → 等信号 n+1」——信号要等此前全部工作完成才发出，
 // 后面的编码器因此等前一个彻底跑完才开始；TBDR 上通道不再流水重叠，DM_NVN_PASSGPU 的逐通道起止跨度即该通道独占耗时（整帧总时长偏大，只看相对开销）
@@ -1205,7 +1209,7 @@ static inline void m4_end_render(id<MTL4RenderCommandEncoder> e) {   // end of a
    encoder starts with a queue barrier, so two consecutive stamps bracket one encoder. Mid-submission commits are skipped in
    those frames (a stamp at the top of a new command buffer would not wait for the previous one). The report is printed when
    the submission's GPU work has completed. */
-typedef struct { char kind; uint32_t w, h, fmt, nc, nload, nstore, depth; uint64_t draw0; char key[12]; } pt_ent;
+typedef struct { char kind; uint32_t w, h, fmt, nc, nload, nstore, depth; uint64_t draw0; char key[12]; const char *why; } pt_ent;
 #define PT_MAX 2048
 static _Atomic uint64_t g_cur_frame; static uint64_t g_stat_draw;   // tentative declarations, defined further down
 static _Atomic uint64_t g_stat_views;   // texture views made for texture ids (mtl_view_stats; the long-frame log's detail)
@@ -1272,9 +1276,9 @@ static void pt_finish(id cb, TotkCommitOptions *o, uint64_t frame) {
         const char *fp = getenv("TOTK_PASS_GPU_FILE"); FILE *ff = fp ? fopen(fp, "a") : NULL;
         // with a file the per-encoder rows go only there (one summary line per frame stays in the log)
         for (int k = 0; k < m && k < 40 && !fp; k++) { int i = ord[k]; const pt_ent *p = &ents[i]; uint64_t dn = (i + 1 < n ? ents[i + 1].draw0 : draws_end) - p->draw0;
-            MLOG("[pass-gpu]   #%d %c %.3f ms 绘制 %llu %ux%u fmt %u 色 %u 深 %u 读入 %u 写回 %u %s", i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->nstore, p->key[0] ? p->key : "-"); }
+            MLOG("[pass-gpu]   #%d %c %.3f ms 绘制 %llu %ux%u fmt %u 色 %u 深 %u 读入 %u 写回 %u %s 结束因 %s", i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->nstore, p->key[0] ? p->key : "-", p->why ? p->why : "-"); }
         if (ff) { for (int i = 0; i + 1 < n; i++) { const pt_ent *p = &ents[i]; uint64_t dn = ents[i + 1].draw0 - p->draw0;
-                      fprintf(ff, "%llu\t%d\t%c\t%.4f\t%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%s\n", (unsigned long long)frame, i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->key[0] ? p->key : "-"); }
+                      fprintf(ff, "%llu\t%d\t%c\t%.4f\t%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%s\t%s\n", (unsigned long long)frame, i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->key[0] ? p->key : "-", p->why ? p->why : "-"); }
                   fclose(ff); }
         free(ms); free(ord); free(ents);
     }];
@@ -1373,7 +1377,7 @@ static uint64_t g_blit_opens, g_blit_splits, g_upd_n, g_upd_split, g_copy_n, g_c
    test read a stale value 1 time in 3). The barrier when the encoder opens only orders it against earlier encoders. On
    Metal 4 the copy encoder is a compute encoder, so both blit and dispatch stages are ordered. TOTK_BLIT_BAR=0: off. */
 static int blit_bar_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_BLIT_BAR"); v = !e || atoi(e); } return v; }
-static id<MTL4ComputeCommandEncoder> blit_kind(int buffer_alias) { blit_note(); if (!g_blit) { g_blit_opens++; g_blit_splits += g_enc != nil; } rp_end();
+static id<MTL4ComputeCommandEncoder> blit_kind(int buffer_alias) { blit_note(); if (g_enc) RP_WHY("copy"); if (!g_blit) { g_blit_opens++; g_blit_splits += g_enc != nil; } rp_end();
     if (buffer_alias && !g_copy_probe_no_alias) g_blit_alias = 1; // rp_end may itself open and close a copy encoder
     if (!g_blit) { rs_sync(); ser_gate(); pt_mark(g_cb, 'B', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; g_bar_prior = 0; }
     else if (blit_bar_on()) [g_blit barrierAfterEncoderStages:MTLStageBlit | MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:blit_vis()];
@@ -4359,6 +4363,21 @@ static int g_enc_mode;          // 当前编码器的开法（rp_begin_ex 参数
 static int g_rt_range_active, g_rt_range_pending;
 static int g_rt_merged;         // 当前通道已续用过（至少一次同目标 SetRenderTargets 被并入） | The current pass has already been continued (at least one same-target SetRenderTargets was merged in)
 static uint64_t g_rt_merge_n;   // 累计续用次数 | Cumulative continuation count
+/* TOTK_PASS_CONTINUE=1 (experimental, default off): in a pass continued across a same-target SetRenderTargets
+   (TOTK_RT_CONTINUE), a draw that samples one of the attachments no longer ends the pass outright. At the continuation
+   point every attachment drawn so far is marked as needing a store before it is sampled (g_sd_plain), so the precise
+   check att_unstored_read still ends the pass exactly when the sampled pixels are only in tile memory -- what the pass
+   boundary at that SetRenderTargets guaranteed before. A draw that samples an attachment the pass only loaded and never
+   wrote (typically the depth buffer under depth-tested, depth-write-off decals) stays in the pass. Plain same-target
+   continuations only: not with layered / fused / range passes, and not with TOTK_ATT_STORE=0. */
+static int g_pc_merged; static uint64_t g_pc_kept, g_pc_split, g_pc_log_frame;
+static int att_store_on(void);
+static int pass_cont_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PASS_CONTINUE"); v = e && atoi(e) > 0;
+    if (v) MLOG("【实验】TOTK_PASS_CONTINUE=1：续用通道里采样附件的绘制只在附件像素还在 tile 里时切开 | a sampling draw ends a continued pass only when the attachment it samples was drawn in the pass"); } return v; }
+static void pc_note_continue(void) {
+    if (!pass_cont_on() || !att_store_on()) return;
+    g_pc_merged = 1; for (int i = 0; i < g_nsd; i++) if (g_sd[i].wrote) g_sd_plain |= 1u << i;
+}
 /* TOTK: layered render passes. The cube-map filter chain renders each face of a level in a pass of its own: six one-quad
    passes per level, 132 in the heaviest frames, and every Metal render pass costs ~50 us of fixed GPU time on the M4.
    When a pass opens on one layer of a cube / 2D-array level and a lookahead (lay_scan) finds SetRenderTargets for further
@@ -4518,7 +4537,13 @@ static void rp_end(void) { if (g_enc) {
     int ranged=g_rt_range_active && !g_rt_range_pending;
 #endif
     if (totk_tl_on()) totk_tl(TL_PASS_END, g_stat_pass, g_stat_draw - g_pass_draw0);
-    sd_finish(); enc_r_end(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_lay.active = 0;
+    { const char *why = g_end_why ? g_end_why : "other"; g_end_why = NULL;
+      PD("W %llu 通道结束 原因=%s 绘制=%llu 续用=%d", g_stat_pass, why, (unsigned long long)(g_stat_draw - g_pass_draw0), g_rt_merged);
+      if (g_pt_n && g_pt[g_pt_n - 1].kind == 'R' && pt_active()) g_pt[g_pt_n - 1].why = why; }
+    if (pass_cont_on()) { uint64_t f = atomic_load(&g_cur_frame); if (f >= g_pc_log_frame + 600) { g_pc_log_frame = f;
+        MLOG("[totk] TOTK_PASS_CONTINUE: %llu render passes ended, %llu same-target continuations; sampling draws in a continued pass: %llu stayed in it, %llu still ended it (attachment drawn earlier in the pass)",
+             (unsigned long long)g_stat_pass, (unsigned long long)g_rt_merge_n, (unsigned long long)g_pc_kept, (unsigned long long)g_pc_split); } }
+    sd_finish(); enc_r_end(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_pc_merged = 0; g_lay.active = 0;
     /* Diagnostic: inspect each full-size HDR render target immediately after its
        producer pass, on the same Metal 4 queue and before later passes reuse it. */
     { static int on = -1; static FILE *f; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
@@ -4546,7 +4571,7 @@ static void rp_end(void) { if (g_enc) {
 #ifdef NVN_RT_RANGE_TEST
     rr_finish(ranged);
 #endif
-} }
+} g_end_why = NULL; }   // a reason set where no pass was open must not label a later one
 /* Diagnostic (TOTK_NAN_TRACE with DM_NVN_NANDRAW=<first>-<last frame>, log DM_NVN_NANDRAW_LOG.watch): after every
    render pass, count Inf / NaN in the centre 128x128 of the texture the traced shader last read in its watched slot
    (an R32F target: the linear depth), and note the pass's colour targets (serial, NVN format, guest memory, Metal
@@ -10566,7 +10591,7 @@ static void clear_ds_core(id<MTL4RenderCommandEncoder> en, const uint32_t cfmt[8
 }
 static void clear_ds_quad(const p_clear_ds *c) {
     gpu_path_on("TOTK_GPU_MIDCLEAR", "mid-pass / masked / scissored depth-stencil clear");
-    if (g_enc && ((c->depth_mask && !g_pass.hd) || (c->stencil_mask && !g_pass.hs))) rp_end();
+    if (g_enc && ((c->depth_mask && !g_pass.hd) || (c->stencil_mask && !g_pass.hs))) { RP_WHY("clear-ds-plane"); rp_end(); }
     id<MTL4RenderCommandEncoder> en = rp_begin(); if (!en) return;
     NSUInteger tw = g_pass.tw, th = g_pass.th; MTLScissorRect sc = {0, 0, tw, th};
     if (R.has_sc) { int64_t x0 = MAX(R.sc.x, 0), y0 = MAX(R.sc.y, 0), x1 = MIN((int64_t)R.sc.x + R.sc.w, (int64_t)tw), y1 = MIN((int64_t)R.sc.y + R.sc.h, (int64_t)th);
@@ -10613,7 +10638,7 @@ static void prepare_draw_textures(NvProg *pr) {
         registry_unlock(); g_tex_preparing = 0;
         if (!g_tex_prepare_split) return;
         /* rp_end may flush deferred draws which also use the registry. */
-        g_tex_prepare_split = 0; rp_end();
+        g_tex_prepare_split = 0; RP_WHY("tex-prepare"); rp_end();
     }
 }
 /* TOTK_MFX: the camera of the G-buffer pass, from its first draw: vertex uniform 1, the 2368-byte block (view, view-projection,
@@ -11136,7 +11161,7 @@ static int mfxup_dock(__unsafe_unretained NvShader *fs) {
                  S.has_vp, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], R.has_sc, R.sc.x, R.sc.y, R.sc.w, R.sc.h, k[0], k[1], k[2], k[3], ow, oh);
         g_mfxup_dock_no[why]++; return 0; }
     if (!mfxup_prepare(MFXUP_DOCKED, src, dst, dst.width, dst.height, color_mode)) { g_mfxup_dock_no[0]++; return 0; }   // scaler still being built (background): the game's own upscale this frame
-    rp_end(); blit_close(); rs_sync();   // MetalFX encodes on the command buffer itself: the encode thread must be idle first
+    RP_WHY("metalfx"); rp_end(); blit_close(); rs_sync();   // MetalFX encodes on the command buffer itself: the encode thread must be idle first
     pt_mark(g_cb, 'X', nil);   // TOTK_PASS_GPU: the MetalFX upscale as its own entry
     if (!mfxup_encode_ex(MFXUP_DOCKED, g_cb, src, cw, ch, dst, dst.width, dst.height, color_mode)) { g_mfxup_dock_no[0]++; return 0; }
     mfxup_queue_residency();
@@ -11176,7 +11201,7 @@ static int mfxup_draw(NvProg *pr) {
         int tid = (int)(S.tex[1][0] & 0xfffff);
         id<MTLTexture> src = tid > 0 ? (__bridge id<MTLTexture>)tex_fast(tid) : nil;
         if (src) {
-            rp_end(); blit_close(); rs_sync();
+            RP_WHY("metalfx"); rp_end(); blit_close(); rs_sync();
             taa_out = taa_encode(g_cb, src);
             if (taa_out) {
                 static int added; if (!added && taa_residency()) { [g_q4 addResidencySet:taa_residency()]; added = 1; }
@@ -11198,7 +11223,7 @@ static int mfxup_draw(NvProg *pr) {
     int tid = (int)(S.tex[1][0] & 0xfffff); if (tid <= 0) return 0;
     id<MTLTexture> src = (__bridge id<MTLTexture>)tex_fast(tid), dst = tex_mtl(R.rt.color[0]);
     if (!src || !dst || src.width >= dst.width || src.height >= dst.height) return 0;
-    rp_end(); blit_close(); rs_sync();
+    RP_WHY("metalfx"); rp_end(); blit_close(); rs_sync();
     pt_mark(g_cb, 'X', nil);   // TOTK_PASS_GPU: the MetalFX upscale as its own entry
     id<MTLTexture> out = mfxup_encode(g_cb, taa_out ? taa_out : src, dst.width, dst.height);
     if (!out) return 0;   // the anti-aliased scene, if any, stays bound (g_mfxup_out)
@@ -11348,21 +11373,28 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     // The continued render pass may have been opened with fewer depth / stencil attachments (open modes 2 / 3 / 4): if the plane this draw needs is not attached, split before it (on reopen, attach per the new lookahead)
     if (g_rt_merged && g_enc_mode != 0 && (((S.ds.dt || S.ds.dw) && !g_pass.hd) || (S.ds.st && !g_pass.hs))) {
         static int once2; if (!once2++) MLOG("同目标续用：续用通道内绘制要的深度 / 模板平面没挂，在此切开（首例 通道 %llu）", g_stat_pass);
-        PD("M %llu 续用通道内绘制要的深度 / 模板平面没挂，在此切开", g_stat_pass); rp_end(); }
-    if (g_rt_range_active && (!rt_range_pr_ro(pr) || !S.ds.dt || S.ds.dw || S.ds.st)) rp_end();   // 原encoder边界的外部写可见性不删 | The external write visibility at the original encoder boundary is not removed
-    if (g_rt_merged && draw_samples_rt(pr)) { static int once; if (!once++) MLOG("同目标续用：续用通道内绘制要采样附件，在此切开（首例 通道 %llu）", g_stat_pass);
-        PD("M %llu 续用通道内绘制要采样附件，在此切开", g_stat_pass); rp_end(); }
+        PD("M %llu 续用通道内绘制要的深度 / 模板平面没挂，在此切开", g_stat_pass); RP_WHY("cont-ds-plane"); rp_end(); }
+    if (g_rt_range_active && (!rt_range_pr_ro(pr) || !S.ds.dt || S.ds.dw || S.ds.st)) { RP_WHY("rt-range"); rp_end(); }   // 原encoder边界的外部写可见性不删 | The external write visibility at the original encoder boundary is not removed
+    int pc_kept = 0;   // TOTK_PASS_CONTINUE: this sampling draw was let into the continued pass (att_unstored_read below decides)
+    if (g_rt_merged && draw_samples_rt(pr)) {
+        if (g_pc_merged && !g_lay.active && !g_fz.active && !g_rt_range_active) pc_kept = 1;
+        else { static int once; if (!once++) MLOG("同目标续用：续用通道内绘制要采样附件，在此切开（首例 通道 %llu）", g_stat_pass);
+            PD("M %llu 续用通道内绘制要采样附件，在此切开", g_stat_pass); RP_WHY("cont-samples-att"); rp_end(); } }
     // TOTK: the draw samples an attachment whose pixels are still only in tile memory: store them first (att_unstored_read).
     // Not in the second half of a fused pass: it reads the first half's pixels from tile memory by construction (fz_p2_draw).
     uint64_t att_rs[ATT_READS_MAX]; int att_n = att_store_on() ? draw_att_reads(pr, att_rs) : 0;
+    if (pc_kept && !att_n) {   // the two binding walks disagree: end the pass as without TOTK_PASS_CONTINUE
+        PD("M %llu 续用通道内绘制要采样附件（附件读认不出），在此切开", g_stat_pass); RP_WHY("cont-samples-att"); rp_end(); pc_kept = 0; }
     if (!(g_fz.active && g_fz.phase == 2) && att_unstored_read(att_rs, att_n)) {
         static int once; if (!once++) MLOG("[totk] a draw samples an attachment its pass drew: the pass is stored first (first: pass %llu)", g_stat_pass);
+        if (pc_kept) { g_pc_split++; pc_kept = 0; RP_WHY("cont-samples-drawn-att"); } else RP_WHY("samples-drawn-att");
         PD("M %llu 绘制采样本通道画过的附件，先写回再画", g_stat_pass); rp_flush(); }
+    if (pc_kept) { g_pc_kept++; PD("M %llu 续用通道内绘制只采样没画过的附件，不切（TOTK_PASS_CONTINUE）", g_stat_pass); }
     static id<MTLFunction> fz_fn;   // 合并通道后一个通道本次绘制的特化片元函数（nil = 用原版本） | Specialized fragment function for this draw of the later pass in a merged render pass (nil = use the original version)
     if (g_fz.active && g_enc && g_fz.phase == 2 && !fz_p2_draw(pr, dw, di, g_fz.lmap2, &fz_fn)) {   // 证不出：结束合并通道（前一个通道的结果照常写回），按后一个通道的原目标重开 | Cannot be proven: end the merged render pass (the earlier pass's result is stored as usual) and reopen with the later pass's original targets
         static int once3; if (!once3++) MLOG("可读 tile 通道合并：后一个通道的绘制证不出，退回分开（首例 通道 %llu）", g_stat_pass);
-        g_fz_fallback++; rp_end(); }
-    if (g_enc && g_pass.noatt) { NSUInteger w, h; noatt_dims(&w, &h); if (w > g_pass.tw || h > g_pass.th) rp_end(); }   // no render target: this draw needs a larger pass
+        g_fz_fallback++; RP_WHY("fuse-fallback"); rp_end(); }
+    if (g_enc && g_pass.noatt) { NSUInteger w, h; noatt_dims(&w, &h); if (w > g_pass.tw || h > g_pass.th) { RP_WHY("noatt-grow"); rp_end(); } }   // no render target: this draw needs a larger pass
     if (R.has_sc && !g_enc) {
         NSUInteger tw0 = 0, th0 = 0; rt_dims(&tw0, &th0);
         long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y < 0 ? 0 : R.sc.y, x1 = (long)R.sc.x + R.sc.w, y1 = (long)R.sc.y + R.sc.h;
@@ -11389,7 +11421,7 @@ frz_plain:;
     }
     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
     if (g_enc && g_lay.active && !lay_draw_ok(pr, dw, di)) {   // TOTK: this draw cannot write its layer: end the layered pass, draw in a plain one
-        PD("L %llu 分层通道内的绘制不能写层号，在此切开", g_stat_pass); rp_end(); g_lay.refuse = 1; g_lay.refused++; }
+        PD("L %llu 分层通道内的绘制不能写层号，在此切开", g_stat_pass); RP_WHY("layer-refuse"); rp_end(); g_lay.refuse = 1; g_lay.refused++; }
     if (g_pp_sharpen || g_pp_aa >= 2) pp_ui_hook(pr);   // sharpen / AA without a game FXAA draw: the canvas before the UI (totk_post.h)
     if (!g_mfx.scene_done && g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas && pr && pr->sh[0] && MFX_UI_DRAW(pr) && mfx_enabled())
         mfx_snapshot_scene();   // TOTK_MFX: first UI draw into the canvas: copy the finished scene first
@@ -11806,7 +11838,7 @@ static void dispatch(const p_dispatch *dp) {
             MLOG("内嵌计算核 %s 首次派发：调用点 %s+%#llx，线程组 %dx%dx%d，元素数（CPU 侧当前值）%u", cs->builtin, m ? m->name : "?",
                  m ? (unsigned long long)(dp->caller - (uint64_t)m->base) : (unsigned long long)dp->caller, dp->x, dp->y, dp->z, *(uint32_t *)u->addr);
         }
-        rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+        RP_WHY("dispatch"); rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
         id<MTLComputeCommandEncoder> ce = pg_compute();
         enc_c_pso(ce, ps);
         enc_c_args(ce, ((__bridge id<MTLBuffer>)ub).gpuAddress + uo, 0); enc_c_args(ce, ((__bridge id<MTLBuffer>)sb).gpuAddress + so, 1); enc_c_args(ce, ((__bridge id<MTLBuffer>)db).gpuAddress + dof, 2);   // 内嵌计算核：冷路径，直接取地址 | Built-in compute kernel: cold path, take the addresses directly
@@ -11816,7 +11848,7 @@ static void dispatch(const p_dispatch *dp) {
     }
     const uint16_t *tg = cs->rf.tg;
     if (!tg[0]) { RED_ONCE(29, "计算着色器缺线程组大小反射"); return; }
-    rp_end();
+    RP_WHY("dispatch"); rp_end();
     int reuse = disp_reuse_on() && !pg_on();
     id<MTLComputeCommandEncoder> ce;
     if (reuse) ce = disp_enc();
@@ -12130,7 +12162,7 @@ static int copy_t2t_astc(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
 static void copy_t2t(const p_copy_t2t *c) {
     if (c->src) xv_check(c->src->serial, c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, "贴图拷贝源");
-    rp_flush();   // 挂起的纯清除通道先落地（零源候选在通道结束时才进集合）；下面 blit() 本来也会结束通道 | Land the pending pure-clear render pass first (zero-source candidates only enter the set when the render pass ends); the blit() below would end the render pass anyway
+    if (g_enc) RP_WHY("copy-t2t"); rp_flush();   // 挂起的纯清除通道先落地（零源候选在通道结束时才进集合）；下面 blit() 本来也会结束通道 | Land the pending pure-clear render pass first (zero-source candidates only enter the set when the render pass ends); the blit() below would end the render pass anyway
     if (c->dst) zskip_del(c->dst->serial);
     if (c->src && c->dst && c->sr.xoffset == 0 && c->sr.yoffset == 0 && c->dr.xoffset == 0 && c->dr.yoffset == 0
         && c->sr.width == (int)c->src->d.width && c->sr.height == (int)c->src->d.height && c->dr.width == (int)c->dst->d.width && c->dr.height == (int)c->dst->d.height) {
@@ -12202,7 +12234,7 @@ static void clear_tex(const p_clear_tex *c) {
                  (unsigned long)w, (unsigned long)h, c->mask, !!(t.usage & MTLTextureUsageRenderTarget));
         return;
     }
-    rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    RP_WHY("clear-tex"); rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     for (int z = 0; z < nz; z++) {
         MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
         MTLRenderPassAttachmentDescriptor *a = depth ? rp.depthAttachment : stencil ? rp.stencilAttachment : rp.colorAttachments[0];
@@ -12508,8 +12540,8 @@ void mtl_exec(const uint8_t *p) {
                    costs ~50 us of GPU time on the M4. The checks in draw_inner (missing depth/stencil plane, sampling an
                    attachment) and in the clear ops still end the continued pass where needed. TOTK_RT_CONTINUE=0 turns it off. */
                 static int rt_cont = -1; if (rt_cont < 0) { const char *e = getenv("TOTK_RT_CONTINUE"); rt_cont = !(e && !strcmp(e, "0")); }
-                if (g_enc && g_enc_mode != 1 && !pend && R.has_rt && (tbdr_on() || rt_cont) && rt_same(&R.rt, r)) { g_rt_merged = 1; if (!g_rt_merge_n++) MLOG("同目标续用：首例 通道 %llu", g_stat_pass); PD("M %llu 同目标续用通道", g_stat_pass); R.rt = *r; break; }
-                if (!(pend && lc_push())) rp_flush();   // TOTK_LAZY_CLEAR: clears with no draw wait for the next pass that attaches their targets
+                if (g_enc && g_enc_mode != 1 && !pend && R.has_rt && (tbdr_on() || rt_cont) && rt_same(&R.rt, r)) { g_rt_merged = 1; pc_note_continue(); if (!g_rt_merge_n++) MLOG("同目标续用：首例 通道 %llu", g_stat_pass); PD("M %llu 同目标续用通道", g_stat_pass); R.rt = *r; break; }
+                if (!(pend && lc_push())) { RP_WHY(pend ? "set-rt+clear" : "set-rt"); rp_flush(); }   // TOTK_LAZY_CLEAR: clears with no draw wait for the next pass that attaches their targets
                 R.rt = *r; R.has_rt = 1; break;
             }
             case OP_CLEAR_COLOR: {
@@ -12519,7 +12551,7 @@ void mtl_exec(const uint8_t *p) {
                          (unsigned long long)R.rt.color[c->index]->serial, R.rt.color[c->index]->d.width, R.rt.color[c->index]->d.height, R.rt.color[c->index]->d.format, c->mask,
                          c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3], S.render_disabled ? " (rendering disabled)" : "");
                 if (S.render_disabled) { g_draw_skip[12]++; PD("E clear c%d skipped: rendering disabled", c->index); break; }   // TOTK: SetRenderEnable(false) / conditional
-                if (g_rt_merged) rp_end();   // 续用的通道里来了清除：在此结束，清除照旧挂到下一个通道开头 | A clear arrived in a continued render pass: end it here, and the clear is attached to the start of the next render pass as usual
+                if (g_rt_merged) { RP_WHY("cont-clear"); rp_end(); }   // 续用的通道里来了清除：在此结束，清除照旧挂到下一个通道开头 | A clear arrived in a continued render pass: end it here, and the clear is attached to the start of the next render pass as usual
                 if (c->index < 0 || c->index >= R.rt.n || !R.rt.color[c->index]) { RED_ONCE(5, "清色目标 %d 无效", c->index); break; }
                 if (g_enc || c->mask != 0xf || !scissor_full(R.rt.color[c->index], &R.rt.cview[c->index], R.rt.has_cview[c->index])) { if ((c->mask & 0xf) && !S.render_disabled) clear_quad(c); break; }
                 R.clear_c[c->index] = 1; R.cc[c->index] = MTLClearColorMake(c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3]);
@@ -12528,7 +12560,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_CLEAR_DS: {
                 const p_clear_ds *c = a;
                 if (S.render_disabled) { g_draw_skip[12]++; PD("E clear ds skipped: rendering disabled"); break; }   // TOTK
-                if (g_rt_merged) rp_end();
+                if (g_rt_merged) { RP_WHY("cont-clear"); rp_end(); }
                 if (!R.rt.depth || (!c->depth_mask && !(c->stencil_mask & 255))) break;
                 if (g_enc || ((c->stencil_mask & 255) && (c->stencil_mask & 255) != 255) || !scissor_full(R.rt.depth, &R.rt.dview, R.rt.has_dview)) { clear_ds_quad(c); break; }
                 if (c->depth_mask) { R.clear_d = 1; R.cd = c->depth; }
