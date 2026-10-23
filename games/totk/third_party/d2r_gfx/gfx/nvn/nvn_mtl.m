@@ -913,7 +913,12 @@ static _Atomic int g_pend_arena_pin = 1;
 static uint64_t g_pend_arena_hazards;
 static int pend_over(void) { return g_pend_over_fence > g_done; }
 static int pend_hits(uint64_t a, uint64_t n) { if (pend_over()) return 1; for (int i = 0; i < g_npend; i++) if (a < g_pend_hi[i] && a + n > g_pend_lo[i]) return 1; return 0; }
+/* TOTK: bumped whenever a uniform copy made earlier in this replay might no longer equal a fresh one plus the writes
+   noted since (upd_shadow's incremental copy, TOTK_SHADOW_INCR): a new submission, the snapshot table rebuilt or a range
+   dropped from it, a GPU copy noted (its bytes come from other memory), the table full. */
+static uint64_t g_mat_gen;
 static void pend_note(uint64_t dst, uint64_t n, const void *src, int kind) {
+    if (kind || g_npend >= PEND_MAX) g_mat_gen++;
     if (g_npend < PEND_MAX) { g_pend_lo[g_npend] = dst; g_pend_hi[g_npend] = dst + n; g_pend_src[g_npend] = src; g_pend_kind[g_npend] = (uint8_t)kind; g_pend_fence[g_npend] = g_fence + 1; g_npend++; }
     else g_pend_over_fence = g_fence + 1;
 }
@@ -928,7 +933,7 @@ static void pend_begin(void) {
         if (n != i) { g_pend_lo[n] = g_pend_lo[i]; g_pend_hi[n] = g_pend_hi[i]; g_pend_src[n] = g_pend_src[i]; g_pend_kind[n] = g_pend_kind[i]; g_pend_fence[n] = g_pend_fence[i]; }
         n++;
     }
-    g_npend = n;
+    g_npend = n; g_mat_gen++;
 }
 /* TOTK (2026-10-15): uniform contents as of the submit call. A submission is replayed inside nvnQueueSubmitCommands for
    several milliseconds; on the console the call returns at once and the GPU reads the constants soon after. Meanwhile the
@@ -1021,6 +1026,7 @@ static uint64_t g_usnap_skip_gpu;
 static int g_usnap_drop_off;   // probe-gpu-ubo-snapshot negative control only
 static void usnap_drop(uint64_t a, uint64_t n) {   // the GPU writes [a, a+n) within this submission
     if (!n) return;
+    g_mat_gen++;
     if (usnap_on()) {
         int dup = 0;   // the same buffer bound for many dispatches in a row: log it once
         for (int j = g_ngw - 1; j >= 0 && j >= g_ngw - 8; j--) if (g_gw[j].lo == a && g_gw[j].hi == a + n && g_gw[j].fence == g_fence + 1) { dup = 1; break; }
@@ -1551,7 +1557,7 @@ static void usnap_finish(void) {   // this submission's copies are about to be r
 void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *capv) {
     usnap_cap *cap = capv;
     usnap_finish();
-    g_nusnap = 0;
+    g_nusnap = 0; g_mat_gen++;
     if (!usnap_on()) { g_ngw = 0; ucap_free(cap); g_fc_snap_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); return; }
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     usnap_take(h, n, cap);   // keeps cap in g_usnap_cap until the copies are done (usnap_finish)
@@ -1703,7 +1709,8 @@ static uint64_t upd_overlap_seq(uint64_t lo, uint64_t hi) {
     for (int i = a - 1; i >= 0 && g_upd_maxhi[i] > lo; i--) if (g_upd[i].hi > lo && g_upd[i].seq > last) last = g_upd[i].seq;
     return last;
 }
-typedef struct { uint64_t lo, size, seq, gpu; } ubo_shadow;
+typedef struct { uint64_t lo, size, seq, gpu; uint8_t *cpu; uint64_t gen, done; int npend; } ubo_shadow;   // cpu/gen/done/npend: upd_shadow's incremental copy (TOTK_SHADOW_INCR)
+static uint64_t g_ren_incr;
 #define UBO_SHADOW_MAX 512
 static ubo_shadow g_shadow[UBO_SHADOW_MAX]; static int g_nshadow;
 /* Small direct-mapped index into the authoritative shadow list. Always compare the
@@ -1729,7 +1736,7 @@ static int ub_rename_on(void) {
     if (v < 0) { const char *e = getenv("TOTK_UB_RENAME"); v = !(e && !strcmp(e, "0")); MLOG("TOTK: inline uniform updates %s", v ? "renamed per binding (render passes stay open)" : "copied on the GPU timeline (TOTK_UB_RENAME=0)"); }
     return v;
 }
-void mtl_ren_stats(uint64_t v[6]) { v[0] = g_ren_updates; v[1] = g_ren_shadows; v[2] = g_ren_bytes; v[3] = g_ren_flushes; v[4] = g_ren_late; v[5] = g_ren_fallback; }
+void mtl_ren_stats(uint64_t v[7]) { v[6] = g_ren_incr; v[0] = g_ren_updates; v[1] = g_ren_shadows; v[2] = g_ren_bytes; v[3] = g_ren_flushes; v[4] = g_ren_late; v[5] = g_ren_fallback; }
 /* Bytes [a, a+n) as the GPU will see them at this point of the submission: memory, then every pending write that the GPU
    has not completed yet, oldest first (inline updates carry their bytes; GPU copies read their source the same way). */
 static void pend_materialize_x(uint64_t a, uint8_t *out, size_t n, int depth, int wait) {
@@ -1779,6 +1786,7 @@ static inline int upd_guard(uint64_t lo, uint64_t hi) {
     g_ren_flushes++; upd_flush(); return 1;
 }
 // GPU address of a private copy of the uniform range [lo, lo+size) holding the logged updates, or 0 when none overlaps it.
+static int shadow_incr_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_SHADOW_INCR"); on = !(e && !strcmp(e, "0")); if (!on) MLOG("TOTK_SHADOW_INCR=0: every uniform copy rebuilt from the snapshot and all pending writes"); } return on; }   // =0: every copy the full way (A/B)
 static uint64_t upd_shadow(uint64_t lo, uint64_t size) {
     uint64_t last = size ? upd_overlap_seq(lo, lo + size) : 0;
     if (!last) return 0;
@@ -1802,10 +1810,26 @@ static uint64_t upd_shadow(uint64_t lo, uint64_t size) {
         return g_shadow[i].gpu;
     }
     id<MTLBuffer> sb; size_t so = arena_alloc((size_t)size, &sb);
-    pend_materialize(lo, (uint8_t *)sb.contents + so, (size_t)size, 0);
+    uint8_t *cpu = (uint8_t *)sb.contents + so;
+    /* TOTK (port of LudovicLemarinel 8ecce5b): a newer version of a range copied earlier in this replay is that copy plus the
+       writes noted since; rebuilding it read the whole snapshot and walked every pending write (thousands) for each copy
+       (96% of copies in the source's measurement). Only while nothing else changed (g_mat_gen) and no write completed
+       meanwhile (g_done); else the full way. */
+    uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE); int prev = -1;
+    if (shadow_incr_on()) for (int i = g_nshadow - 1; i >= 0; i--) if (g_shadow[i].lo == lo && g_shadow[i].size == size) { prev = i; break; }
+    if (prev >= 0 && g_shadow[prev].gen == g_mat_gen && g_shadow[prev].done == done && g_shadow[prev].npend <= g_npend) {
+        memcpy(cpu, g_shadow[prev].cpu, (size_t)size);
+        for (int i = g_shadow[prev].npend; i < g_npend; i++) {
+            uint64_t plo = g_pend_lo[i], phi = g_pend_hi[i];
+            if (phi <= lo || plo >= lo + size || g_pend_fence[i] <= done) continue;
+            uint64_t s0 = plo > lo ? plo : lo, e0 = phi < lo + size ? phi : lo + size;
+            memcpy(cpu + (s0 - lo), (const uint8_t *)g_pend_src[i] + (s0 - plo), e0 - s0);   // kind 0 only: a kind 1 write bumps g_mat_gen
+        }
+        g_ren_incr++;
+    } else pend_materialize(lo, cpu, (size_t)size, 0);
     uint64_t gpu = sb.gpuAddress + so;
     if (g_nshadow == UBO_SHADOW_MAX) g_nshadow = 0;
-    g_shadow[g_nshadow++] = (ubo_shadow){lo, size, last, gpu};
+    g_shadow[g_nshadow++] = (ubo_shadow){lo, size, last, gpu, cpu, g_mat_gen, done, g_npend};
     if(indexed)g_shadow_index[slot]=(uint16_t)g_nshadow;
     g_ren_shadows++; g_ren_bytes += size;
     return gpu;
@@ -2065,7 +2089,7 @@ uint64_t mtl_sub_commit(void) {
     defer_fallback();   // Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
     rp_flush();
     usnap_finish();   // TOTK: the helper threads must be done with the copies (they are, long before this)
-    g_nusnap = 0;   // TOTK: the replay is done; the uniform copies stay in this submission's arena until it completes
+    g_nusnap = 0; g_mat_gen++;   // TOTK: the replay is done; the uniform copies stay in this submission's arena until it completes
     upd_flush();   // TOTK: renamed uniform updates reach memory here, after every draw that read them through private copies
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     rs_sub_end();   // TOTK: encode stage drained before the command buffer is ended
@@ -2410,6 +2434,13 @@ static int texture_plan_on(void) {
 }
 static uint64_t g_vertex_streams_bound, g_vertex_streams_omitted;
 static int g_vertex_streams_negative;
+/* TOTK, vertex stream address cache (port of DavidZande a4b1b7d, from nxnative 697df75): every draw resolved each bound
+   stream's guest address through mtl_gpu_addr (the per-thread pool cache, or g_mu and the pool index on a miss). Per replay
+   thread, a stream slot keeps the GPU address it resolved while its guest address and the pool generation (g_pool_gen)
+   are unchanged; the pool is resident already (pool_res stays set until the pool is removed, which bumps the generation).
+   TOTK_VBUF_CACHE=0 turns it off. */
+static uint64_t g_vbuf_reuse, g_vbuf_resolve;
+static int vbuf_cache_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_VBUF_CACHE"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_VBUF_CACHE=0: vertex stream addresses resolved on every draw"); } return v; }
 static int vertex_streams_on(void) {
     int v=atomic_load(&g_vertex_streams_on);
     if(v<0){const char *e=getenv("TOTK_VERTEX_STREAMS");v=!(e && !atoi(e));atomic_store(&g_vertex_streams_on,v);}
@@ -2423,7 +2454,7 @@ static int pkg_final_cache_on(void) {
     if (v < 0) { const char *e = getenv("TOTK_PKG_FINAL_CACHE"); v = !(e && !atoi(e)); atomic_store(&g_pkg_final_cache, v); }
     return v;
 }
-@interface NvPkg : NSObject { @public id<MTLTexture> tex; uint64_t stamp, seen, hash, owned_gen; int tracked, owned, hashed; reup_key key; uint64_t chash, csub, used; uintptr_t lo, hi; uint8_t *edge; uint32_t eh, et; int edge_want; } @end   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
+@interface NvPkg : NSObject { @public id<MTLTexture> tex; uint64_t stamp, seen, hash, owned_gen; int tracked, owned, hashed; reup_key key; uint64_t chash, csub, used; uintptr_t lo, hi; uint8_t *edge; uint32_t eh, et; int edge_want; uint64_t hot_f, hot_since; uint32_t hot_n; uint8_t hot, hot_cools; } @end   // hot_* (TOTK_PKG_HOT): a texture rewritten every frame, checked by content instead of page faults   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
 /* TOTK: a mirrored texture the GPU starts rendering into is told directly (g_smu held), so tex_mtl no longer asks the owned
    set again every time any other serial joins it (a locked lookup per CPU-pool texture per new render target). */
 static void pkg_owned_locked(uint64_t k) { id o = hm_get_id(&g_by_serial, &k); if ([o isKindOfClass:[NvPkg class]]) ((NvPkg *)o)->owned = 1; }
@@ -3523,6 +3554,7 @@ static int pkg_edge_clean(const tex_t *t, NvPkg *pk) {   // 1: only the shared p
     return 1;
 }
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key, NvPkg *pk);
+static int g_pkg_noprot;   // TOTK_PKG_HOT: set while uploading a hot texture; its pages are left writable
 static id<MTLTexture> pkg_upload(const tex_t *t, uint64_t *stamp, reup_key *key, NvPkg *pk) {
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
     id<MTLTexture> r = pkg_upload_(t, stamp, key, pk);
@@ -3616,7 +3648,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key
                  (unsigned long long)n, (unsigned long long)nz, (unsigned long long)(n / 8), (void *)t->pool, t->pool ? t->pool->flags : 0, t->pool ? (void *)t->pool->host : NULL, (long long)t->off, (unsigned long long)atomic_load(&g_cur_frame)); } }
     *stamp = nvn_dirty_now();   // TOTK (#90): before protecting, as in wb_note: a write that faults during the protect or the copy is newer than it
     if (pk && pk->edge_want) pkg_edge_snap(t, pk);
-    if (!pkg_hashed(t)) nvn_dirty_protect(t->mem, t->L.size);
+    if (!pkg_hashed(t) && !g_pkg_noprot) nvn_dirty_protect(t->mem, t->L.size);   // g_pkg_noprot: a hot texture, checked by content (TOTK_PKG_HOT)
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;   // cube array depth = layer-faces
     int tca = tex_astc(t);   // TOTK: BC1 -> ASTC 4x4 (see tex_astc)
@@ -3780,6 +3812,47 @@ static int tex_mirrored(const tex_t *t) {
     return 1;
 }
 static int tex_check_once(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_TEX_CHECK_ONCE"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_TEX_CHECK_ONCE=0: CPU-pool textures are checked for writes on every use (old behaviour)"); } return v; }
+/* TOTK_PKG_HOT (port of DavidZande 5352ab7): hot textures. In some places the game rewrites a few big CPU-pool textures
+   on the CPU every frame for 0.3-1 s (source's play log: ~800 write-protect faults a frame, 3-5 re-uploads / ~18 MB a
+   frame, frames of 35-90 ms with the GPU and the submit normal). Each frame the copy was uploaded, its pages protected,
+   and every page faulted again. A texture re-uploaded in PKG_HOT_AFTER frames in a row is checked by a content hash once
+   per submission instead (as the small pkg_hashed ones), with its pages left writable; after PKG_HOT_COOL frames without
+   a change it is protected again, and each time it comes back the quiet time doubles (up to 128x). A texture in an
+   untracked pool stays hot: the hash is all there is. Needs TOTK_TEX_CHECK_ONCE. TOTK_PKG_HOT=0 off. */
+enum { PKG_HOT_AFTER = 3, PKG_HOT_COOL = 180 };
+static uint64_t g_pkg_hot_in, g_pkg_hot_out, g_pkg_hot_checks, g_pkg_hot_hash_ns;   // content hashes of hot textures: count and time
+static uint64_t pkg_hot_hash(const tex_t *t) { uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), h = pkg_hash(t->mem, t->L.size); g_pkg_hot_hash_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; g_pkg_hot_checks++; return h; }
+static int pkg_hot_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PKG_HOT"); v = !(e && !strcmp(e, "0")) && tex_check_once(); MLOG("hot textures (rewritten every frame: checked by content, no page faults): %s", v ? "on (TOTK_PKG_HOT=0 off)" : "off"); } return v; }
+/* Called before a re-upload of a protected texture: counts the frames in a row with a re-upload, and on the
+   PKG_HOT_AFTER-th switches the texture to hot. *h gets the hash of the bytes before the copy (the copy is never older). */
+static void pkg_hot_note(NvPkg *pk, const tex_t *t, uint64_t *h) {
+    if (!pkg_hot_on()) return;
+    uint64_t f = atomic_load(&g_cur_frame);
+    if (f == pk->hot_f) return;
+    pk->hot_n = f - pk->hot_f <= 2 ? pk->hot_n + 1 : 1; pk->hot_f = f;
+    if (pk->hot_n < PKG_HOT_AFTER) return;
+    pk->hot = 1; pk->hashed = 1; pk->hot_since = f; *h = pkg_hot_hash(t);
+    uint64_t n = ++g_pkg_hot_in;
+    if (n <= 30 || n % 200 == 0)
+        MLOG("[hot] f%llu texture ser=%llu %ux%ux%u fmt %#x lv%u %.1f MB mem=%p re-uploaded %u frames in a row: checked by content now, no page faults (%llu so far)",
+             (unsigned long long)f, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.levels, t->L.size / 1048576.0, (void *)t->mem, pk->hot_n, (unsigned long long)n);
+}
+/* A hot texture after its content check (clean = unchanged since the copy): after PKG_HOT_COOL quiet frames it goes back
+   to page protection. Order: stamp, protect, hash again. A write before the protection shows in the hash; one after it
+   faults and gets a generation above the stamp. Returns the clean answer; *h is the latest hash. */
+static int pkg_hot_cool(NvPkg *pk, const tex_t *t, uint64_t *h, int clean) {
+    uint64_t f = atomic_load(&g_cur_frame);
+    if (!clean) { pk->hot_since = f; return 0; }
+    if (f - pk->hot_since < (uint64_t)PKG_HOT_COOL << pk->hot_cools) return 1;
+    if (!nvn_dirty_tracked(t->mem, t->L.size)) { pk->hot_since = f; return 1; }   // nothing to protect: stay hot
+    uint64_t st = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);
+    *h = pkg_hot_hash(t);
+    if (*h != pk->chash) { pk->hot_since = f; return 0; }
+    pk->hot = 0; pk->hashed = 0; pk->hot_n = 0; if (pk->hot_cools < 7) pk->hot_cools++; pk->stamp = st; pk->seen = st; pk->tracked = 0;
+    uint64_t n = ++g_pkg_hot_out;
+    if (n <= 30 || n % 200 == 0) MLOG("[hot] f%llu texture ser=%llu %ux%u quiet for %llu frames: page protection again (%llu so far)", (unsigned long long)f, (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned long long)(f - pk->hot_since), (unsigned long long)n);
+    return 1;
+}
 static id<MTLTexture> tex_mtl(const tex_t *ct) {
     tex_t *t = (tex_t *)ct; BOTW_TEX_FOLLOW(t)
     if (!t || !t->serial) return nil;
@@ -3800,7 +3873,8 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
             } else
             if (pk->hashed) {   // TOTK: small texture, content hash once per submission (see pkg_hashed)
                 if (pk->csub == g_sub_serial) return pk->tex;
-                pk->csub = g_sub_serial; h = pkg_hash(t->mem, t->L.size); clean = h == pk->chash;
+                pk->csub = g_sub_serial; h = pk->hot ? pkg_hot_hash(t) : pkg_hash(t->mem, t->L.size); clean = h == pk->chash;
+                if (pk->hot) clean = pkg_hot_cool(pk, t, &h, clean);   // TOTK_PKG_HOT
             } else {
             /* TOTK: once per submission, as for the small hashed ones: the contents are those of the submit call (the rule
                of the uniform snapshot). Re-checking on every use, whenever any game thread had written any page since,
@@ -3832,7 +3906,8 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
                 if (clean) return pk->tex;
             }
             TILELOG(t, "re-upload from the pool bytes");
-            uint64_t st; reup_key nk; g_mip_nodrop = pk->owned; id<MTLTexture> nt = pkg_upload(t, &st, &nk, pk); g_mip_nodrop = 0;   // Pool content changed (streamed assets written into the same storage): switch to a new texture; in-flight draws still read the old one
+            if (pk->tex && !pk->owned && !pk->hashed) pkg_hot_note(pk, t, &h);   // TOTK_PKG_HOT: rewritten every frame -> hot
+            uint64_t st; reup_key nk; g_mip_nodrop = pk->owned; g_pkg_noprot = pk->hot; id<MTLTexture> nt = pkg_upload(t, &st, &nk, pk); g_mip_nodrop = 0; g_pkg_noprot = 0;   // Pool content changed (streamed assets written into the same storage): switch to a new texture; in-flight draws still read the old one
             if (nt) { id<MTLTexture> old = pk->tex; pk->tex = nt; reup_retire(old, &pk->key); pk->key = nk; if (pk->hashed) pk->chash = h; ser_bump(t->serial); pk->stamp = st; pk->seen = st; g_pkg_reuploads++; if (dirtycheck()) pk->hash = full_hash(t->mem, t->L.size); }
             else { free(pk->edge); pk->edge = NULL; }   // TOTK (#90): the bytes kept belong to the upload that failed
             return pk->tex;
@@ -3916,6 +3991,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     { uint64_t hits, misses, checked;
       pthread_mutex_lock(&g_mu); hits=g_pool_queries.hits; misses=g_pool_queries.misses; checked=g_pool_query_checked; pthread_mutex_unlock(&g_mu);
       MLOG("[pool-query-cache] enabled=%d hits=%llu misses=%llu checked=%llu",pool_query_on(),(unsigned long long)hits,(unsigned long long)misses,(unsigned long long)checked); }
+    MLOG("[pkg-hot] enabled=%d in=%llu out=%llu checks=%llu hash_ms=%.1f", pkg_hot_on(), (unsigned long long)g_pkg_hot_in, (unsigned long long)g_pkg_hot_out, (unsigned long long)g_pkg_hot_checks, g_pkg_hot_hash_ns / 1e6);
+    MLOG("[vbuf-cache] enabled=%d reused=%llu resolved=%llu", vbuf_cache_on(), (unsigned long long)g_vbuf_reuse, (unsigned long long)g_vbuf_resolve);
     MLOG("[pool-tls] enabled=%d hits=%llu misses=%llu verified=%llu",pool_tls_on(),(unsigned long long)g_pool_tls_hits,(unsigned long long)g_pool_tls_misses,(unsigned long long)g_pool_tls_verified);
     MLOG("[shadow-index] enabled=%d hit=%llu miss=%llu verified=%llu",shadow_index_on(),(unsigned long long)g_shadow_index_hits,(unsigned long long)g_shadow_index_misses,(unsigned long long)g_shadow_index_verified);
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
@@ -10967,13 +11044,20 @@ static void bind_vertex_streams(id<MTL4RenderCommandEncoder> en, NvShader *vs) {
     uint16_t mask=vertex_streams_on()?vertex_stream_mask(vs):UINT16_MAX;
     uint64_t bound=0,omitted=0;
     if(g_vertex_streams_negative)mask&=~(1u<<5);
+    static _Thread_local struct { uint64_t addr, gpu, gen; } vc[16];   // see vbuf_cache_on
+    uint64_t gen=vbuf_cache_on()?atomic_load_explicit(&g_pool_gen,memory_order_acquire):0;   // taken before resolving: a pool change meanwhile forces a fresh lookup next time
     for(unsigned stream=0;stream<16;stream++) {
-        if(!S.vbuf[stream].address)continue;
+        uint64_t addr=S.vbuf[stream].address;
+        if(!addr)continue;
         if(!(mask&(1u<<stream))){omitted++;continue;}
-        void *mb;uint64_t mo,gpu;
-        if(mtl_gpu_addr(S.vbuf[stream].address,1,&mb,&mo,&gpu)) {
-            enc_r_vbuf(en,16+stream,gpu);use_rec("buf",S.vbuf[stream].address,S.vbuf[stream].size,0,NULL);bound++;
+        uint64_t gpu;
+        if(gen&&vc[stream].gen==gen&&vc[stream].addr==addr){gpu=vc[stream].gpu;g_vbuf_reuse++;}
+        else {
+            void *mb;uint64_t mo;g_vbuf_resolve++;
+            if(!mtl_gpu_addr(addr,1,&mb,&mo,&gpu))continue;
+            if(gen){vc[stream].addr=addr;vc[stream].gpu=gpu;vc[stream].gen=gen;}
         }
+        enc_r_vbuf(en,16+stream,gpu);use_rec("buf",addr,S.vbuf[stream].size,0,NULL);bound++;
     }
     g_vertex_streams_bound+=bound;g_vertex_streams_omitted+=omitted;
     static id<MTLBuffer> zero;static uint64_t zero_gpu;
@@ -13910,7 +13994,8 @@ static int mfx_present_frame_body(const tex_t *t, double period, int discard) {
             for (int i = 0; i < nshot; i++) if (shots[i] == f) { char path[1024]; snprintf(path, sizeof path, shot_path, (int)f); mtl_finish_gpu(); shot(mfx_output(slot), path, 1, NULL); }
         }
     }
-    if (getenv("TOTK_MFX_DUMP") && t) {   // keep a copy of this presented image for the next frame's dump (diagnostic)
+    static int mfx_dump_env = -1; if (mfx_dump_env < 0) mfx_dump_env = getenv("TOTK_MFX_DUMP") != NULL;   // TOTK: read once, not on every present
+    if (mfx_dump_env && t) {   // keep a copy of this presented image for the next frame's dump (diagnostic)
         id<MTLTexture> sc = tex_mtl(t);
         if (sc && (!g_mfx_swap_prev || g_mfx_swap_prev.width != sc.width || g_mfx_swap_prev.height != sc.height)) {
             MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:sc.pixelFormat width:sc.width height:sc.height mipmapped:NO];
@@ -15402,6 +15487,11 @@ int mtl_probe_vertex_streams(void) {
         if(g_vertex_streams_bound-bound!=expected_bind && !g_vertex_streams_negative)MDIE("vertex stream probe unexpected binding count");checked++;
         uint64_t skips=g_arg_bind_skips;bind_vertex_streams(en,vs);
         if(cache_mode && !g_arg_bind_cache_negative && g_arg_bind_skips==skips)MDIE("argument binding probe did not skip repeated addresses");checked++;
+        if(vbuf_cache_on()) {   // TOTK_VBUF_CACHE: a repeated bind reuses the resolved addresses; a pool change forces fresh lookups
+            uint64_t reuse=g_vbuf_reuse;bind_vertex_streams(en,vs);if(g_vbuf_reuse==reuse)MDIE("vertex stream cache probe did not reuse resolved addresses");checked++;
+            uint64_t resolve=g_vbuf_resolve;atomic_fetch_add(&g_pool_gen,1);bind_vertex_streams(en,vs);
+            if(g_vbuf_resolve-resolve!=expected_bind && !g_vertex_streams_negative)MDIE("vertex stream cache probe: %llu fresh lookups after a pool change, want %u",(unsigned long long)(g_vbuf_resolve-resolve),expected_bind);checked++;
+        }
         enc_r_draw(en,MTLPrimitiveTypeTriangle,0,3);enc_r_end(en);
         enc_b_copy_texture_buffer(blit(),texture,0,0,MTLOriginMake(0,0,0),MTLSizeMake(16,16,1),rb,0,64,1024);mtl_sub_commit();mtl_finish();
         for(unsigned i=0;i<1024;i++){int expected=scenario==2?0:(int[]){64,128,191,255}[i%4];if(abs((int)((uint8_t *)rb.contents)[i]-expected)>1)MDIE("vertex stream probe GPU mismatch mode%d scenario%d byte%u",mode,scenario,i);checked++;}
