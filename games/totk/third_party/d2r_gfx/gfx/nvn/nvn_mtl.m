@@ -4914,6 +4914,7 @@ static void shmap_load(void) {
     warm_start();
 }
 
+typedef struct { int n; int aid[8]; unsigned axes[8]; float col[8][4]; samp_par par[8]; } border_sig;   // TOTK: the samplers one border_key call found (see border_key)
 @interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, writes_depth, lay_ok; uint8_t drv_scanned[3];   /* drv_scanned (TOTK): driver segment c0 / c2 reads found by drv_scan in the MSL but missing from the reflection json */ /* lay_ok (TOTK): vertex MSL can write the layer (1) or not (-1), 0 = not checked yet; writes_depth (TOTK): the fragment function has a [[depth(...)]] output, so its pipeline needs a depth attachment */ const char *builtin; uint64_t logged; char key[80]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint16_t texture_slots[NVN_REFL_MAXB]; uint8_t texture_count, texture_plan_ready;
     uint32_t cb_ext[NVN_REFL_MAXB];   // TOTK: bytes each user uniform binding can read, 0 = unknown / off (cb_extent_scan)
@@ -4923,7 +4924,10 @@ static void shmap_load(void) {
     tex_slot_cache tex_slots;
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass;   // ab_pass：编这块参数的渲染通道序号——只在同一通道内复用（跨通道 / 跨提交的块所在 arena 可能已回收重写） | ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn; id<MTLFunction> no_depth_fn;
-    NSString *src, *src_path; NSDictionary<NSNumber *, NSString *> *io; NSMutableDictionary<NSString *, id<MTLFunction>> *vpatch; id<MTLFunction> mfx_fn[8]; uint8_t mfx_tried[8]; NSMutableDictionary<NSString *, id<MTLFunction>> *bpatch; int border_seen; } @end   // TOTK: MSL source, user varyings (locn -> type), patched vertex functions   // bflib：可读 tile 版本 <键>_bf（合并 B 第 2 步） | bflib: readable-tile version <key>_bf (merge B step 2)
+    NSString *src, *src_path; NSDictionary<NSNumber *, NSString *> *io; NSMutableDictionary<NSString *, id<MTLFunction>> *vpatch; id<MTLFunction> mfx_fn[8]; uint8_t mfx_tried[8]; NSMutableDictionary<NSString *, id<MTLFunction>> *bpatch; int border_seen;
+    // TOTK (upstream #286): the last results of border_key (per stage, under the registry lock), fs_fn_border (per nodepth, g_bpatch_lock) and vs_fn_for (4 entries, g_vpatch_lock), so a draw that binds what the previous one bound builds no key strings
+    border_sig bk_sig[2]; NSString *bk_str[2]; NSString *fb_key[2]; id<MTLFunction> fb_fn[2];
+    NvShader *vf_fs[4]; NSString *vf_bkey[4]; id<MTLFunction> vf_fn[4]; int vf_layered[4]; uint8_t vf_ok[4], vf_next; } @end   // TOTK: MSL source, user varyings (locn -> type), patched vertex functions   // bflib：可读 tile 版本 <键>_bf（合并 B 第 2 步） | bflib: readable-tile version <key>_bf (merge B step 2)
 @implementation NvShader @end
 /* TOTK: a shader's MSL source is needed only to build derived functions (varying patches, layered vertex, depth-less and
    MetalFX UI fragment variants). The Mac keeps it; iOS keeps only the path and reads it when needed (thousands of sources
@@ -6355,11 +6359,13 @@ static int vs_layerable(NvShader *vs) {
 static NSString *fs_src_without_depth(NvShader *fs);
 /* TOTK: samplers that clamp to a border colour Metal does not have (samp_border_custom) are emulated in the shader: the
    stage's sample calls on them return that colour when the coordinate is outside [0, 1]. border_key lists the stage's
-   bound samplers that need it (argument id and colour; nil when none), border_src rewrites the MSL. */
+   bound samplers that need it (argument id and colour; nil when none), border_src rewrites the MSL. The key of the stage's
+   last call is kept with the samplers it came from: a draw that binds the same ones gets that string back (upstream #286). */
 static NSString *border_key(NvShader *sh, int stage, float colours[][4], int aids[], unsigned axes[], int *n) {
     *n = 0;
     if (!atomic_load_explicit(&g_border_custom_any, memory_order_relaxed)) return nil;
-    NSMutableString *key = nil;
+    NSString *key = nil;
+    border_sig sig; memset(&sig, 0, sizeof sig);
     registry_lock();
     for (int i = 0; i < sh->rf.nb && *n < 8; i++) {
         const nvn_rbind *b = &sh->rf.b[i];
@@ -6371,9 +6377,20 @@ static NSString *border_key(NvShader *sh, int stage, float colours[][4], int aid
         axes[*n] = ((p->ws == 4 || p->ws == 5) ? 1u : 0u) |
                    ((p->wt == 4 || p->wt == 5) ? 2u : 0u) |
                    ((p->wr == 4 || p->wr == 5) ? 4u : 0u);
-        if (!key) key = [NSMutableString string];
-        [key appendFormat:@"%d:%u:%a,%a,%a,%a;", b->aid, axes[*n], colours[*n][0], colours[*n][1], colours[*n][2], colours[*n][3]];
+        memcpy(sig.col[*n], colours[*n], sizeof sig.col[*n]); sig.aid[*n] = aids[*n]; sig.axes[*n] = axes[*n]; memcpy(&sig.par[*n], p, sizeof *p);   // the whole sampler: more than the key reads
         ++*n;
+    }
+    sig.n = *n;
+    if (*n) {
+        int si = stage == 0 || stage == 1 ? stage : -1;
+        if (si >= 0 && sh->bk_str[si] && !memcmp(&sig, &sh->bk_sig[si], sizeof sig)) key = sh->bk_str[si];
+        else {
+            NSMutableString *k = [NSMutableString string];
+            for (int j = 0; j < *n; j++)
+                [k appendFormat:@"%d:%u:%a,%a,%a,%a;", aids[j], axes[j], colours[j][0], colours[j][1], colours[j][2], colours[j][3]];
+            key = [k copy];
+            if (si >= 0) { sh->bk_sig[si] = sig; sh->bk_str[si] = key; }
+        }
     }
     registry_unlock();
     if (key) sh->border_seen = 1;
@@ -6436,16 +6453,24 @@ static int variant_defer(NSString *job, void (^build)(void)) {
 }
 #define VARIANT_NONE ((__bridge id)kCFNull)   // cached: the border rewrite found no sample call, so no patched function
 typedef struct { float c[8][4]; int a[8]; unsigned x[8]; int n; } border_in;
+static os_unfair_lock g_bpatch_lock = OS_UNFAIR_LOCK_INIT, g_vpatch_lock = OS_UNFAIR_LOCK_INIT;   // fs->bpatch / fb_*, vs->vpatch / vf_*
+static id<MTLFunction> fs_fn_border_with(NvShader *fs, int nd, NSString *key, border_in b);
 /* The fragment function for the draw's samplers (border_key), nil when none needs the emulation. */
 static id<MTLFunction> fs_fn_border(NvShader *fs, int nodepth) {
     if (!fs || !sh_has_src(fs)) return nil;
     border_in b;
-    NSString *key = border_key(fs, 1, b.c, b.a, b.x, &b.n);
-    if (!key) return nil;
-    int nd = nodepth && fs->writes_depth;
-    if (nd) key = [@"nodepth;" stringByAppendingString:key];
-    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
-    os_unfair_lock_lock(&lock); id fn = fs->bpatch[key]; os_unfair_lock_unlock(&lock);
+    NSString *bkey = border_key(fs, 1, b.c, b.a, b.x, &b.n);
+    if (!bkey) return nil;
+    int nd = nodepth && fs->writes_depth;   // the same key object means the same samplers as last time (border_key)
+    os_unfair_lock_lock(&g_bpatch_lock); id<MTLFunction> last = fs->fb_key[nd] == bkey ? fs->fb_fn[nd] : nil; os_unfair_lock_unlock(&g_bpatch_lock);
+    if (last) return last;
+    id<MTLFunction> fn = fs_fn_border_with(fs, nd, bkey, b);
+    if (fn) { os_unfair_lock_lock(&g_bpatch_lock); fs->fb_key[nd] = bkey; fs->fb_fn[nd] = fn; os_unfair_lock_unlock(&g_bpatch_lock); }   // nil: not compiled yet (or none), asked again next time
+    return fn;
+}
+static id<MTLFunction> fs_fn_border_with(NvShader *fs, int nd, NSString *bkey, border_in b) {
+    NSString *key = nd ? [@"nodepth;" stringByAppendingString:bkey] : bkey;
+    os_unfair_lock_lock(&g_bpatch_lock); id fn = fs->bpatch[key]; os_unfair_lock_unlock(&g_bpatch_lock);
     if (fn) return fn == VARIANT_NONE ? nil : fn;
     id (^make)(void) = ^id {
         border_in v = b;
@@ -6456,31 +6481,49 @@ static id<MTLFunction> fs_fn_border(NvShader *fs, int nodepth) {
             f = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
             if (!f) MDIE("fragment shader %s with emulated sampler border colour: %s", fs->key, err.localizedDescription.UTF8String);
         }
-        os_unfair_lock_lock(&lock);
+        os_unfair_lock_lock(&g_bpatch_lock);
         if (!fs->bpatch) fs->bpatch = [NSMutableDictionary dictionary];
         if (!fs->bpatch[key]) fs->bpatch[key] = f;
         f = fs->bpatch[key];
-        os_unfair_lock_unlock(&lock);
+        os_unfair_lock_unlock(&g_bpatch_lock);
         return f;
     };
     if (variant_defer([NSString stringWithFormat:@"fs %s %@", fs->key, key], ^{ make(); })) return nil;
     fn = make();
     return fn == VARIANT_NONE ? nil : fn;
 }
+static id<MTLFunction> vs_fn_variant(NvShader *vs, NvShader *fs, int layered, NSString *bkey, border_in b);
 static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int border) {
-    static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
     if (layered && !vs_layerable(vs)) MDIE("vertex shader %s cannot write the render target array index", vs->key);
     border_in b; b.n = 0;   // TOTK: vertex-stage samplers with a border colour Metal lacks (PSO_VBORDER)
     NSString *bkey = border && sh_has_src(vs) ? border_key(vs, 0, b.c, b.a, b.x, &b.n) : nil;
+    /* The variant for (fs, layered, border key) is a function of those alone: the last four found are kept on the vertex
+       shader, holding the objects they were found with (a key object is the same only while the samplers are). */
+    id<MTLFunction> f = nil;
+    os_unfair_lock_lock(&g_vpatch_lock);
+    for (int i = 0; i < 4 && !f; i++)
+        if (vs->vf_ok[i] && vs->vf_fs[i] == fs && vs->vf_bkey[i] == bkey && vs->vf_layered[i] == layered) f = vs->vf_fn[i];
+    os_unfair_lock_unlock(&g_vpatch_lock);
+    if (f) return f;
+    f = vs_fn_variant(vs, fs, layered, bkey, b);
+    if (f) {   // nil: not compiled yet, asked again next time
+        os_unfair_lock_lock(&g_vpatch_lock);
+        int i = vs->vf_next++ & 3;
+        vs->vf_fs[i] = fs; vs->vf_bkey[i] = bkey; vs->vf_layered[i] = layered; vs->vf_fn[i] = f; vs->vf_ok[i] = 1;
+        os_unfair_lock_unlock(&g_vpatch_lock);
+    }
+    return f;
+}
+static id<MTLFunction> vs_fn_variant(NvShader *vs, NvShader *fs, int layered, NSString *bkey, border_in b) {
     if (!sh_has_src(vs) || (!layered && !bkey && (!fs || !sh_has_src(fs)))) return vs->fn;
-    os_unfair_lock_lock(&lk);
+    os_unfair_lock_lock(&g_vpatch_lock);
     NSDictionary *in = fs && sh_has_src(fs) ? msl_varyings(fs) : nil, *out = in ? msl_varyings(vs) : nil;
     NSMutableArray *miss = [NSMutableArray array];
     for (NSNumber *l in [in.allKeys sortedArrayUsingSelector:@selector(compare:)]) if (!out[l]) [miss addObject:l];
-    if (!miss.count && !layered && !bkey) { os_unfair_lock_unlock(&lk); return vs->fn; }
+    if (!miss.count && !layered && !bkey) { os_unfair_lock_unlock(&g_vpatch_lock); return vs->fn; }
     NSString *key = [NSString stringWithFormat:@"%@%@%@", layered ? @"layer;" : @"", bkey ? [NSString stringWithFormat:@"border:%@", bkey] : @"", [miss componentsJoinedByString:@","]];
     id<MTLFunction> f = vs->vpatch[key];
-    os_unfair_lock_unlock(&lk);
+    os_unfair_lock_unlock(&g_vpatch_lock);
     if (f) return f;
     id<MTLFunction> (^make)(void) = ^id<MTLFunction> {
         border_in v = b;
@@ -6509,7 +6552,7 @@ static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int bo
         NSError *e = nil; id<MTLLibrary> lib = variant_library(src, &e);
         id<MTLFunction> g = lib ? [lib newFunctionWithName:vs->fn.name] : nil;
         if (!g) MDIE("vertex shader %s (variant %s): %s", vs->key, key.UTF8String, e.localizedDescription.UTF8String);
-        os_unfair_lock_lock(&lk);
+        os_unfair_lock_lock(&g_vpatch_lock);
         if (!vs->vpatch) vs->vpatch = [NSMutableDictionary dictionary];
         if (!vs->vpatch[key]) {
             vs->vpatch[key] = g;
@@ -6518,7 +6561,7 @@ static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int bo
             if (layered && !lonce++) MLOG("[totk] layered pass: vertex shader %s writes the render target array index", vs->key);
         }
         g = vs->vpatch[key];
-        os_unfair_lock_unlock(&lk);
+        os_unfair_lock_unlock(&g_vpatch_lock);
         return g;
     };
     if (variant_defer([NSString stringWithFormat:@"vs %s %@", vs->key, key], ^{ make(); })) return nil;
