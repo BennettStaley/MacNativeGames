@@ -8,7 +8,7 @@
 A fork of [ly05010419/MacNativeGames](https://github.com/ly05010419/MacNativeGames), the native Tears of the Kingdom port,
 with an in-game settings menu, mods and save transfer added (see [This fork](#this-fork-settings-mods-and-save-transfer-status-2026-10-20)).
 This README is in English; the original project's README also has instructions in Chinese
-([中文说明](https://github.com/ly05010419/MacNativeGames#chinese)).
+([Chinese instructions](https://github.com/ly05010419/MacNativeGames#chinese)).
 
 ## Legal
 
