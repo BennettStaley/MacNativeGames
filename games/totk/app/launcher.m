@@ -21,7 +21,6 @@
 #include "game_version.h"
 #include "controller_map.h"
 #include "settings_schema.h"
-#include "include/totk_ui_lang.h"
 #include "totk_shader_contrib.h"   // the shared shader list contribution and its reminder
 #import "save_package.h"           // .totksave: saves sent from another Mac or an iPhone / iPad
 
@@ -135,22 +134,19 @@ static void contrib_reminder(NSString *path) {
     NSString *gh = gh_path();
     [NSApplication sharedApplication]; [NSApp activateIgnoringOtherApps:YES];
     NSAlert *alert = [NSAlert new];
-    alert.messageText = @(TOTK_UI("期待你的贡献", "We would love your contribution"));
-    alert.informativeText = [NSString stringWithFormat:@"%@%@", [NSString stringWithFormat:@(TOTK_UI("你有 %lu 个着色器可以贡献：玩的时候遇到的、公共着色器清单里还没有的。它们记在一个小文件里，只有着色器的标识，不含游戏内容、存档或个人信息。把它发到 GitHub 加进公共清单，以后大家打包的 App 都会带上它们，玩到那里不再卡顿。\n\n",
-                                      "You have %lu shaders to contribute: ones your game met that the shared shader list does not have yet. They are kept in a small file with shader identifiers only: no game data, saves or personal information. Sent to GitHub and added to the shared list, they come with everyone's next build, and nobody stutters there again.\n\n")), (unsigned long)rows],
-                             gh ? @(TOTK_UI("点“自动提交”会用这台 Mac 上登录的 GitHub 命令行（gh）直接提交，不用打开网页。点“发送”会打开 GitHub 的提交页面，并在访达里显示这个文件，把它拖进页面即可。",
-                                            "\"Submit automatically\" sends it now with the GitHub CLI (gh) signed in on this Mac, without the browser. \"Send\" opens the GitHub form and shows the file in Finder: drag it into the form."))
-                                : @(TOTK_UI("点“发送”会打开 GitHub 的提交页面，并在访达里显示这个文件，把它拖进页面即可。",
-                                            "\"Send\" opens the GitHub form and shows the file in Finder: drag it into the form."))];
-    [alert addButtonWithTitle:@(TOTK_UI("发送", "Send"))];
-    [alert addButtonWithTitle:gh ? @(TOTK_UI("自动提交", "Submit automatically")) : @(TOTK_UI("下次提醒", "Remind me next time"))];
-    [alert addButtonWithTitle:@(TOTK_UI("不要提醒了", "Don't remind me again"))];
+    alert.messageText = @"We would love your contribution";
+    alert.informativeText = [NSString stringWithFormat:@"%@%@", [NSString stringWithFormat:@"You have %lu shaders to contribute: ones your game met that the shared shader list does not have yet. They are kept in a small file with shader identifiers only: no game data, saves or personal information. Sent to GitHub and added to the shared list, they come with everyone's next build, and nobody stutters there again.\n\n", (unsigned long)rows],
+                             gh ? @"\"Submit automatically\" sends it now with the GitHub CLI (gh) signed in on this Mac, without the browser. \"Send\" opens the GitHub form and shows the file in Finder: drag it into the form."
+                                : @"\"Send\" opens the GitHub form and shows the file in Finder: drag it into the form."];
+    [alert addButtonWithTitle:@"Send"];
+    [alert addButtonWithTitle:gh ? @"Submit automatically" : @"Remind me next time"];
+    [alert addButtonWithTitle:@"Don't remind me again"];
     NSModalResponse choice = [alert runModal];
     if (choice == NSAlertThirdButtonReturn) totk_contrib_never(path);
     if (choice == NSAlertSecondButtonReturn && gh) {
         NSString *issue = contrib_submit(gh, path, rows);
-        if (issue) { note([NSString stringWithFormat:@"%@\n%@", @(TOTK_UI("感谢你的 shader 贡献，让我们一起让游戏更流畅！", "Thank you for your shader contribution! Let's make the game smoother together!")), issue]); return; }
-        note(@(TOTK_UI("自动提交没有成功，改为打开提交页面。", "Submitting automatically did not work; opening the form instead.")));
+        if (issue) { note([NSString stringWithFormat:@"%@\n%@", @"Thank you for your shader contribution! Let's make the game smoother together!", issue]); return; }
+        note(@"Submitting automatically did not work; opening the form instead.");
         choice = NSAlertFirstButtonReturn;
     }
     if (choice != NSAlertFirstButtonReturn) return;

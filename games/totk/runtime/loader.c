@@ -1,6 +1,5 @@
 /* Native ARM64 module loader. Guest images and generated metadata stay local. */
 #include "runtime.h"
-#include "totk_ui_lang.h"
 #include <TargetConditionals.h>
 #include <dlfcn.h>
 #include <stdbool.h>
@@ -502,7 +501,7 @@ uint64_t runtime_image_bytes(void) { uint64_t total=0;for(unsigned i=0;i<NM;i++)
 static void loader_ready(void) { fprintf(stderr,"[totk] rtld callback: modules linked\n"); }
 static void module_inits(void) {
  fprintf(stderr,"[totk] SDK startup returned; running module constructors\n");
- for(unsigned i=0;i<NM;i++){char detail[128];snprintf(detail,sizeof detail,TOTK_UI("运行 %s 游戏模块初始化代码（%u/%u）","Running the %s game module initializers (%u/%u)"),modules[i].name,i+1,(unsigned)NM);runtime_boot_status(TOTK_UI("初始化游戏模块","Initializing game modules"),detail);fprintf(stderr,"[totk] ENTER %s DT_INIT\n",modules[i].name);((void(*)(void))(modules[i].base+modules[i].init))();uint32_t state;memcpy(&state,modules[i].base+modules[i].ctor_flag,4);need(state==2,"DT_INIT deferred or skipped constructors");
+ for(unsigned i=0;i<NM;i++){char detail[128];snprintf(detail,sizeof detail,"Running the %s game module initializers (%u/%u)",modules[i].name,i+1,(unsigned)NM);runtime_boot_status("Initializing game modules",detail);fprintf(stderr,"[totk] ENTER %s DT_INIT\n",modules[i].name);((void(*)(void))(modules[i].base+modules[i].init))();uint32_t state;memcpy(&state,modules[i].base+modules[i].ctor_flag,4);need(state==2,"DT_INIT deferred or skipped constructors");
  fprintf(stderr,"[totk] RETURN %s DT_INIT state=%u init_array_count=%llu\n",modules[i].name,state,(unsigned long long)(modules[i].init_size/8));}
 }
 void runtime_startup_checkpoint(uintptr_t caller) {
@@ -516,7 +515,7 @@ static void module_finis(void) { runtime_fail("guest exited: module finalizers n
 #endif
 static void boot(void) {
  fprintf(stderr,"[totk] game version %s\n", TOTK_GAME_VERSION);
- runtime_boot_status(TOTK_UI("启动游戏运行环境","Starting the game runtime"),TOTK_UI("连接游戏代码与 macOS 系统服务","Connecting the game code to macOS system services"));
+ runtime_boot_status("Starting the game runtime","Connecting the game code to macOS system services");
  runtime_thread_init();uint32_t main_handle=svc_thread_main_init();
 #ifdef GAME_BOTW
  /* SDK 7.3.2 (Breath of the Wild): Start(handle, arg, rtld callback, module initializers). The order inside is the one of

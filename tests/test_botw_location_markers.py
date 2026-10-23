@@ -45,7 +45,8 @@ class LocationMarkers(unittest.TestCase):
         t = doc['LocationMarker'][0]['Translate']
         self.assertAlmostEqual(t['X'], -672.46, places=2); self.assertAlmostEqual(t['Z'], 1513.63, places=2)
     def test_msbt_reader(self):
-        names = lm.msbt_labels(msbt_doc([('Dungeon038', '玛·奥努神庙'), ('StartPoint', '复苏神庙')]))
-        self.assertEqual(names, {'Dungeon038': '玛·奥努神庙', 'StartPoint': '复苏神庙'})
+        shrine, start = '\u739b\u00b7\u5965\u52aa\u795e\u5e99', '\u590d\u82cf\u795e\u5e99'   # non-ASCII names (Chinese shrine names)
+        names = lm.msbt_labels(msbt_doc([('Dungeon038', shrine), ('StartPoint', start)]))
+        self.assertEqual(names, {'Dungeon038': shrine, 'StartPoint': start})
 
 if __name__ == '__main__': unittest.main()

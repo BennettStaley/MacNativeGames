@@ -73,7 +73,6 @@ static void colours(int w, int h, int *green, int *yellow) {
 
 int main(void) {
     int w, h, green, yellow;
-    setenv("TOTK_UI_LANG", "zh", 1);   /* the Chinese labels below; the English ones are checked after them */
     /* The 5x7 pixel font (lines of ASCII only: the bottom-right load line): glyph pixels against the written patterns. */
     fps_overlay_raster_line("FPS 60  8x9", 0, 1, px, &w, &h);
     CHECK(w == 11 * 6 - 1 + 4 && h == 11, "box size %dx%d (\"FPS 60  8x9\" is 11 characters, one line)", w, h);
@@ -85,13 +84,13 @@ int main(void) {
     broken[3][26] = broken[3][26] == '1' ? '0' : '1';
     CHECK(pattern_mismatches(rows) == 1, "negative control: flipped pixel not detected exactly once");
 
-    /* The FPS box: the system font (it has "MetalFX已开启", user 2026-10-17), one line on the dark box; the box grows with
-       what is shown. */
+    /* The FPS box: the system font (it has "MetalFX on", which the pixel font cannot draw), one line on the dark box; the
+       box grows with what is shown. */
     int base, grown;
     fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 0, 0, 0, 0, 0, 0}, 2, px, &base, &h);
     CHECK(base > 40 && h == 11 * 2, "\"FPS 97  2560x1440\" at scale 2: box %dx%d", base, h);
     fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 1, 0, 0, 0, 0, 0}, 2, px, &grown, &h);
-    CHECK(grown > base + 60, "MetalFX on: \"  MetalFX已开启\" after the size (box %d, without it %d)", grown, base);
+    CHECK(grown > base + 40, "MetalFX on: \"  MetalFX on\" after the size (box %d, without it %d)", grown, base);
     fps_overlay_raster(&(fps_overlay_info){50, 2560, 1440, 0, 50, 0, 0, 0, 0}, 2, px, &grown, &h);
     CHECK(grown > base, "frame interpolation on: \"+50\" after the fps (box %d, without it %d)", grown, base);
     fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 0, 0, 1, 0, 0, 0}, 2, px, &grown, &h);
@@ -115,24 +114,17 @@ int main(void) {
     CHECK(fps_overlay_scale(1440) == 4 && fps_overlay_scale(900) == 2 && fps_overlay_scale(4000) == FPS_OVERLAY_MAX_SCALE && fps_overlay_scale(10) == 1,
           "scale for 1440/900/4000/10 = %d/%d/%d/%d", fps_overlay_scale(1440), fps_overlay_scale(900), fps_overlay_scale(4000), fps_overlay_scale(10));
 
-    /* The automatic shader collection box (bottom-left, user 2026-10-17: "新着色器 N / 总计 M", no pipeline count): its text,
-       bounds of the longest line at every scale, and the yellow highlight. */
+    /* The automatic shader collection box (bottom-left, no pipeline count): its text, bounds of the longest line at every
+       scale, and the yellow highlight. */
     char line[96];
     shader_overlay_text(line, sizeof line, 2, 3, 7428, 12);
-    CHECK(!strcmp(line, "着色器 编译中 2 / 本次新增 3 / 总计 7428"), "shader box text \"%s\"", line);
+    CHECK(!strcmp(line, "Shaders 2 compiling / 3 new / 7428 total"), "shader box text \"%s\"", line);
     shader_overlay_text(line, sizeof line, 0, 0, -1, 0);
-    CHECK(!strcmp(line, "着色器 编译中 0 / 本次新增 0 / 总计 --"), "shader box text before the cache is counted \"%s\"", line);
+    CHECK(!strcmp(line, "Shaders 0 compiling / 0 new / -- total"), "shader box text before the cache is counted \"%s\"", line);
     shader_overlay_text(line, sizeof line, 123456, 123456, 9999999, 123456);
-    CHECK(!strcmp(line, "着色器 编译中 99999 / 本次新增 99999 / 总计 999999"), "shader box text clamped \"%s\"", line);
-    /* English labels (TOTK_UI_LANG=en, or a Mac whose language is not Chinese). */
-    setenv("TOTK_UI_LANG", "en", 1);
-    shader_overlay_text(line, sizeof line, 2, 3, 7428, 12);
-    CHECK(!strcmp(line, "Shaders 2 compiling / 3 new / 7428 total"), "English shader box text \"%s\"", line);
-    CHECK(!fps_overlay_line_pixel_font(line), "English shader line \"%s\" drawn with the pixel font, which lacks its lower-case letters", line);
+    CHECK(!strcmp(line, "Shaders 99999 compiling / 99999 new / 999999 total"), "shader box text clamped \"%s\"", line);
+    CHECK(!fps_overlay_line_pixel_font(line), "shader line \"%s\" drawn with the pixel font, which lacks its lower-case letters", line);
     CHECK(fps_overlay_line_pixel_font("FPS 60  2560x1440"), "the FPS line left the pixel font");
-    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 1, 0, 0, 0, 0, 0}, 2, px, &grown, &h);
-    CHECK(grown > base + 40, "English MetalFX on: \"  MetalFX on\" after the size (box %d, without it %d)", grown, base);
-    setenv("TOTK_UI_LANG", "zh", 1);
     shader_overlay_text(line, sizeof line, 123456, 123456, 9999999, 123456);
     CHECK(!fps_overlay_has_glyph('Q'), "negative control: 'Q' has no glyph in the pixel font but was reported");
     for (int s = 1; s <= FPS_OVERLAY_MAX_SCALE; s++) {
@@ -172,7 +164,6 @@ int main(void) {
     CHECK(fps_overlay_avg_value() == 60 && fps_overlay_low_value() == 60, "merged presents: average %d, 1%% low %d (each frame its half)", fps_overlay_avg_value(), fps_overlay_low_value());
     {
         char ft[128];
-        setenv("TOTK_UI_LANG", "en", 1);
         fps_overlay_text(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 1, 59, 48}, ft, sizeof ft);
         CHECK(!strcmp(ft, "FPS 60  avg 59  1% low 48  2560x1440"), "detailed line \"%s\"", ft);
         fps_overlay_text(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 1, -1, -1}, ft, sizeof ft);
@@ -187,9 +178,6 @@ int main(void) {
             fps_overlay_raster(&(fps_overlay_info){999, 99999, 99999, 1, 5000, 1, 1, 999, 999}, s, px, &w, &h);
             CHECK(w > 0 && w <= FPS_OVERLAY_TEX_W && h <= FPS_OVERLAY_TEX_H && outside_dirty(w, h) == 0, "longest detailed line at scale %d: box %dx%d", s, w, h);
         }
-        setenv("TOTK_UI_LANG", "zh", 1);
-        fps_overlay_text(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 1, 59, 48}, ft, sizeof ft);
-        CHECK(!strcmp(ft, "FPS 60  平均 59  1%低帧 48  2560x1440"), "Chinese detailed line \"%s\"", ft);
     }
     /* Interpolated frames shown: their own rate, independent of the game rate; a gap of more than a second (interpolation
        switched off and on) starts a new window instead of averaging the off time in. */

@@ -9,7 +9,6 @@
 #include "aoc_config.h"
 #include "fs_host.h"
 #include "romfs_path.h"
-#include "totk_ui_lang.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -70,7 +69,7 @@ static void verify_image(Vol *v, const char *dir) {
     int pf = open(path, O_RDONLY | O_NOFOLLOW);
     if (pf >= 0) { int ok = read(pf, &saved, sizeof saved) == (ssize_t)sizeof saved; close(pf);
         if (ok && !force && !memcmp(&saved, &want, sizeof want)) { fprintf(stderr, "[botw] add-on content %d unchanged; reused the SHA-256 verification record\n", v->index); return; } }
-    char what[64]; snprintf(what, sizeof what, "%s %d", TOTK_UI("校验追加内容", "Verifying add-on content"), v->index);
+    char what[64]; snprintf(what, sizeof what, "%s %d", "Verifying add-on content", v->index);
     fprintf(stderr, "[botw] verifying add-on content %d SHA-256 (%llu bytes)%s\n", v->index, (unsigned long long)v->image_size, force ? " [forced]" : "");
     sha_fd(v->image_fd, v->image_sha, v->image_size, what);
     need(fstat(v->image_fd, &st) == 0 && (uint64_t)st.st_size == v->image_size, "add-on content image stat");

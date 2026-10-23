@@ -115,12 +115,10 @@ class MacReminderForDevicesTests(unittest.TestCase):
         self.assertEqual(watch.reminded_at(''), 0)
         self.assertEqual(watch.reminded_at('500\n'), 500)
         self.assertIsNone(watch.reminded_at('never\n'))
-        self.assertEqual(watch.message(500, 'iPad')[2:], ('Remind me next time', "Don't remind me again", 'Send')
-                         if not watch.chinese() else ('下次提醒', '不要提醒了', '发送'))
+        self.assertEqual(watch.message(500, 'iPad')[2:], ('Remind me next time', "Don't remind me again", 'Send'))
 
     def test_gh_replaces_remind_me_next_time_with_submit(self):
-        self.assertEqual(watch.message(500, 'iPad', auto=True)[2:], ('Submit automatically', "Don't remind me again", 'Send')
-                         if not watch.chinese() else ('自动提交', '不要提醒了', '发送'))
+        self.assertEqual(watch.message(500, 'iPad', auto=True)[2:], ('Submit automatically', "Don't remind me again", 'Send'))
         with tempfile.TemporaryDirectory() as tmp:   # no gh on PATH or in the usual places: no automatic button
             old = (watch.GH_CANDIDATES, watch.shutil.which)
             watch.GH_CANDIDATES, watch.shutil.which = (str(Path(tmp) / 'gh'),), lambda name: None

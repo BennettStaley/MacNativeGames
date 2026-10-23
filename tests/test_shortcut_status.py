@@ -46,7 +46,7 @@ class ShortcutStatus(unittest.TestCase):
                     for overridden in (False, True):
                         with self.subTest(version=version, layout=layout, overridden=overridden):
                             env = os.environ.copy()
-                            env.update(TOTK_UI_LANG='en', TOTK_HUD=layout,
+                            env.update(TOTK_HUD=layout,
                                        TOTK_MFX='interp' if overridden else '0',
                                        TOTK_MFX_OUTPUT='1' if overridden else '0',
                                        TOTK_MFX_UPSCALE='0', TOTK_TAA='0')
