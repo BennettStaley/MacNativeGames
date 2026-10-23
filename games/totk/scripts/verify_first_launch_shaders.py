@@ -24,8 +24,8 @@ LOG = Path.home()/'Library/Logs/MacNativeGames/totk.log'
 
 def startup_facts(text, mode, expected):
     discovery = re.findall(r'\[shader-seed\].*?着色器 (\d+) 个，导入 (\d+) 个文件', text)
-    priority = re.findall(r'启动关键管线已就绪：等待 (\d+) ms，可用着色器 (\d+) / 渲染管线 (\d+) / 计算管线 (\d+)', text)
-    first, ready, user = (text.find(s) for s in ('first presented frame', '启动关键管线已就绪：', '[input] user input'))
+    priority = re.findall(r'Startup-critical pipelines ready: waited (\d+) ms, (\d+) shaders / (\d+) render pipelines / (\d+) compute pipelines', text)
+    first, ready, user = (text.find(s) for s in ('first presented frame', 'Startup-critical pipelines ready:', '[input] user input'))
     return dict(discovery=[list(map(int, x)) for x in discovery],
         priority=[list(map(int, x)) for x in priority],
         seed_ready_before_first_present=0 <= ready < first,
@@ -77,7 +77,7 @@ def trial(app, output, mode, cache, profile, expected, timeout=1800):
             deadline, ready = time.monotonic()+timeout, None
             while time.monotonic() < deadline:
                 check()
-                if 'first presented frame' in text and '管线预热完成：' in text:
+                if 'first presented frame' in text and 'Pipeline warm-up done:' in text:
                     ready = ready or time.monotonic()
                     if time.monotonic()-ready >= 15:
                         break
@@ -94,11 +94,11 @@ def trial(app, output, mode, cache, profile, expected, timeout=1800):
             if not (output/'title.png').exists():
                 raise RuntimeError('title screenshot did not complete')
             discovered = re.findall(r'\[shader-seed\].*?着色器 (\d+) 个，导入 (\d+) 个文件', text)
-            warm = re.findall(r'管线预热完成：着色器 (\d+) 个 / 渲染管线 (\d+) 个.*?/ 计算管线 (\d+) 个', text)
-            priority = re.findall(r'启动关键管线已就绪：等待 (\d+) ms，可用着色器 (\d+) / 渲染管线 (\d+) / 计算管线 (\d+)', text)
+            warm = re.findall(r'Pipeline warm-up done: (\d+) shaders / (\d+) render pipelines.*?/ (\d+) compute pipelines', text)
+            priority = re.findall(r'Startup-critical pipelines ready: waited (\d+) ms, (\d+) shaders / (\d+) render pipelines / (\d+) compute pipelines', text)
             report.update(discovery=[list(map(int, x)) for x in discovered],
                           warm=[list(map(int, x)) for x in warm], priority=[list(map(int, x)) for x in priority],
-                          warm_before_first_present=text.index('管线预热完成：') < text.index('first presented frame'),
+                          warm_before_first_present=text.index('Pipeline warm-up done:') < text.index('first presented frame'),
                           cache_files_after=len(list(cache.iterdir())))
             if mode == 'off':
                 assert not discovered, 'negative control imported the seed'
