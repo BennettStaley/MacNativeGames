@@ -14,6 +14,7 @@ void settings_observe(void (*fn)(const char *key, int value));   /* called after
 /* The window's drawable and the screen's native width in pixels (the Mac frontend, on resize): "Match the window", "Display
    native" and "Fill the screen" follow them. */
 void settings_display_size(unsigned drawable_w, unsigned drawable_h, unsigned screen_w);
+void settings_output_size(unsigned *w, unsigned *h);   /* the display resolution last asked for */
 int settings_render_size(int scale, unsigned *w, unsigned *h);   /* the render resolution a 3D render scale gives now; 1 = capped */
 const char *settings_display_status(void);      /* "Output 2560 x 1440, 3D scene 1280 x 720": what the game was last asked for */
 void settings_aspect_follow(float ratio);   /* key 4 changed the shape (-1 fit, 0 16:9, a ratio): display.aspect follows, not applied again */

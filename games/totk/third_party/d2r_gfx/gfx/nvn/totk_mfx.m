@@ -93,6 +93,10 @@ static id<MTL4FXFrameInterpolator> fi_cached(NSUInteger iw, NSUInteger ih) {
 static _Atomic int g_on, g_req;
 static void mfx_release(int all);
 static int g_bp_paused;   // mfx_present_tick: paused near the GPU memory budget
+static int g_applied = 1; // 0: the mode last chosen (mfx_set) has not been turned on yet (mfx_interp_state: refused)
+static uint64_t g_mem_used, g_mem_budget;   // at the last present (mfx_present_tick)
+static unsigned g_last_w, g_last_h;         // the last output size interpolation ran at (mfx_need_bytes)
+static int mfx_refuse(int mode);
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 const char *mfx_mode_name(int m) {
     static const char *const names[MFX_NMODES] = {"off", "30+30 (the game at 30 fps)", "half the refresh rate (50+50 on a 100 Hz display)", "uncapped (every game frame interpolated)"};
@@ -114,6 +118,7 @@ void mfx_set(int m) {
     if (m >= MFX_NMODES) { MLOG("[flag] mfx_interp takes 0..%d (-1 cycles), got %d", MFX_NMODES - 1, m); return; }
     int v = m < 0 ? (atomic_load(&g_req) + 1) % MFX_NMODES : m;
     if (g_bp_paused) { g_bp_paused = 0; MLOG("the user's choice ends the pause near the GPU memory budget"); }
+    g_applied = v == MFX_OFF;
     atomic_store(&g_req, v);
     MLOG("[flag] mfx_interp = %d: %s (from the next game frame)", v, mfx_mode_name(v));
 }
@@ -121,6 +126,8 @@ int mfx_latch(void) {
     pthread_once(&g_once, mfx_init);
     int r = atomic_load(&g_req), was = atomic_load(&g_on);
     if (r == was) return 0;
+    if (was == MFX_OFF && mfx_refuse(r)) return 0;   // it would not fit: never turned on (mfx_interp_state says so)
+    if (r != MFX_OFF) g_applied = 1;
     g.prev_ok = g.hist_ok = 0; g.scene_ok = g.cam_ok = 0; g.depth = nil; g.last_prepare_s = 0;   // the next interpolated pair starts fresh
     atomic_store(&g_on, r);
     MLOG("frame interpolation %s -> %s", mfx_mode_name(was), mfx_mode_name(r));
@@ -208,7 +215,7 @@ static void ensure_out(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFo
         g.out[i] = mk(MTLPixelFormatRGBA8Unorm_sRGB, w, h, MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView);
         g.outv[i] = [g.out[i] newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm];
     }
-    g.out_w = w; g.out_h = h; g.fi = nil; g.prev_ok = g.hist_ok = 0;
+    g.out_w = w; g.out_h = h; g_last_w = (unsigned)w; g_last_h = (unsigned)h; g.fi = nil; g.prev_ok = g.hist_ok = 0;
     unsigned evicted = fi_cache_evict(0);
     MLOG("scene (format %lu) / UI / output textures %lux%lu", (unsigned long)fmt, (unsigned long)w, (unsigned long)h);
     if (had) MLOG("size change %lux%lu -> %lux%lu: %llu MB of textures of the old size and %u cached interpolators of another output size retired (released after %d presents)",
@@ -544,9 +551,6 @@ static void mfx_release(int all) {
    optional, so above MFX_BP_HIGH percent of the budget they are paused first (the requested mode becomes off at the next
    present, mfx_latch releases what they hold) and resumed once the use plus what the pause freed is under MFX_BP_LOW
    percent. After MFX_BP_MAX pauses they stay off for the session (each rebuild costs memory; key 2 turns them on again). */
-#define MFX_BP_HIGH 95
-#define MFX_BP_LOW 85
-#define MFX_BP_MAX 3
 static int g_bp_saved, g_bp_count, g_bp_measured, g_bp_said;
 static uint64_t g_bp_tick, g_bp_used_at, g_bp_freed;
 static void bp_pause(uint64_t used, uint64_t budget, const char *why) {
@@ -557,9 +561,37 @@ static void bp_pause(uint64_t used, uint64_t budget, const char *why) {
     MLOG("near the GPU memory budget: interpolation paused (%s: %llu of %llu MB, %llu%%; per-object motion too; resumes under %d%%)",
          why, (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), (unsigned long long)(used * 100 / budget), MFX_BP_LOW);
 }
+/* Rough GPU memory of interpolation per output pixel, from the textures it makes (ensure_out, ensure_fi): two scene
+   copies (up to RGBA16Float, 16 B), the UI layer (RGBA16Float, 8 B), MFX_OUT RGBA8 outputs (12 B), the motion texture
+   (RG16Float at the render size, at most 4 B) and the interpolator's own history, which Metal does not report (assumed
+   about two RGBA16Float textures, 16 B). About 0.45 GB at 4K, 0.11 GB at 1080p. */
+#define MFX_BYTES_PER_PX 56
+unsigned long long mfx_need_bytes(unsigned w, unsigned h) {
+    if (!w || !h) { w = g_last_w; h = g_last_h; }
+    unsigned long long b = (unsigned long long)w * h * MFX_BYTES_PER_PX;
+    if (b && mfx_obj_motion_on()) b += 3ull * 64 << 20;   // three position arenas of TOTK_OBJ_MOTION_MB (64 MiB to start)
+    return b;
+}
+/* mfx_latch, off -> mode: the use at the last present plus the estimate above MFX_BP_HIGH percent of the budget: the
+   mode is held like a pause (resumed on its own once the use plus the estimate is under MFX_BP_LOW percent) without
+   allocating anything. Unknown output size (never ran): not checked here, the pause at the present still applies. */
+static int mfx_refuse(int mode) {
+    uint64_t need = mfx_need_bytes(0, 0), used = g_mem_used, budget = g_mem_budget;
+    if (!budget || !need || used + need <= budget / 100 * MFX_BP_HIGH) return 0;
+    g_bp_paused = 1; g_bp_saved = mode; g_bp_count++; g_bp_tick = g_tick; g_bp_used_at = used; g_bp_measured = 1; g_bp_freed = need;
+    atomic_store(&g_req, MFX_OFF);
+    MLOG("not enough GPU memory for interpolation: %s not turned on (%llu of %llu MB in use, about %llu MB needed; over %d%%)",
+         mfx_mode_name(mode), (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), (unsigned long long)(need >> 20), MFX_BP_HIGH);
+    return 1;
+}
+int mfx_interp_state(void) {
+    pthread_once(&g_once, mfx_init);
+    if (g_bp_paused) return !g_applied ? MFX_STATE_REFUSED_MEMORY : g_bp_count >= MFX_BP_MAX ? MFX_STATE_OFF_MEMORY : MFX_STATE_PAUSED_MEMORY;
+    return atomic_load(&g_on) || atomic_load(&g_req) ? MFX_STATE_ON : MFX_STATE_OFF;
+}
 void mfx_present_tick(uint64_t used, uint64_t budget) {
     pthread_once(&g_once, mfx_init);
-    g_tick++;
+    g_tick++; g_mem_used = used; g_mem_budget = budget;
     if (g_nret) retire_drain(0);
     if (!budget) return;
     if (!g_bp_paused) { if (used > budget / 100 * MFX_BP_HIGH) bp_pause(used, budget, "present"); return; }

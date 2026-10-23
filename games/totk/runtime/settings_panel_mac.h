@@ -80,6 +80,62 @@ static NSString *settings_value_text(const SettingDef *d, int v) {
     if (d->type == SET_RANGE) return [NSString stringWithFormat:@"%d%s", v, d->unit ? d->unit : ""];
     return v ? @"On" : @"Off";
 }
+/* ---- GPU memory: choices that would not fit, and a chosen mode that is not running for lack of it ---- */
+void mtl_gpu_memory(uint64_t *used, uint64_t *budget);   /* nvn_mtl.m: allocated now, and the budget the game stops at */
+int mfx_obj_motion_on(void);   /* totk_mfx.h: TOTK_OBJ_MOTION=1, paused with interpolation */
+static double settings_gb(uint64_t b) { return b / 1073741824.0; }
+static BOOL settings_mem_row(const SettingDef *d) { return !strcmp(d->key, "graphics.interpolation") || !strcmp(d->key, "display.render_max"); }
+/* display.render_max: the GPU memory in use at 1800p / 4K, from the one measurement there is (docs/settings.md: an 18 GB
+   M3 Pro at a 4K display resolution, 2026-10-21: 1800p up to 6.1 GB, 4K about 1.5 GB more). An estimate, not a promise. */
+static uint64_t settings_render_max_need(int v) { return v >= 2160 ? 7600ull << 20 : v >= 1800 ? 6100ull << 20 : 0; }
+/* 1: choice v of d would clearly not fit. Frame interpolation: the use now plus its estimate (mfx_need_bytes at the display
+   resolution) above the pause threshold (MFX_BP_HIGH percent); while it runs its memory is already in use, so no mode is
+   marked. Maximum render resolution: the measured use above the budget. */
+static BOOL settings_mem_short(const SettingDef *d, int v, uint64_t used, uint64_t budget) {
+    if (!budget || !v) return NO;
+    if (!strcmp(d->key, "graphics.interpolation")) {
+        if (mfx_interp_state() == MFX_STATE_ON) return NO;
+        unsigned w, h; settings_output_size(&w, &h);
+        return used + mfx_need_bytes(w, h) > budget / 100 * MFX_BP_HIGH;
+    }
+    if (!strcmp(d->key, "display.render_max")) return settings_render_max_need(v) > budget;
+    return NO;
+}
+static NSString *settings_choice_title(const SettingDef *d, int k, uint64_t used, uint64_t budget) {
+    NSString *t = @(d->choices[k].label); unsigned w, h;
+    if (!strcmp(d->key, "display.scale")) {   /* each render resolution with the size it gives at this display resolution */
+        int capped = settings_render_size(d->choices[k].value, &w, &h); t = [NSString stringWithFormat:@"%@ · %u×%u%@", t, w, h, capped ? @" (max)" : @""];
+    }
+    if (settings_mem_short(d, d->choices[k].value, used, budget)) t = [t stringByAppendingString:@" (not enough GPU memory)"];
+    return t;
+}
+/* The line under a memory row: the chosen value and why it is not running (or may not fit); nil when nothing to say. */
+static NSString *settings_mem_note(const SettingDef *d, uint64_t used, uint64_t budget, NSColor **color) {
+    int v = settings_get(d->key); NSString *chosen = settings_value_text(d, v);
+    *color = NSColor.systemRedColor;
+    if (!strcmp(d->key, "graphics.interpolation")) {
+        NSString *also = mfx_obj_motion_on() ? @" Per-object motion is paused with it." : @"";
+        switch (mfx_interp_state()) {
+        case MFX_STATE_PAUSED_MEMORY:
+            *color = NSColor.systemOrangeColor;
+            return [NSString stringWithFormat:@"%@ — paused: not enough GPU memory (%.1f of %.1f GB). It resumes by itself below %d%%.%@",
+                    chosen, settings_gb(used), settings_gb(budget), MFX_BP_LOW, also];
+        case MFX_STATE_REFUSED_MEMORY:
+            return [NSString stringWithFormat:@"%@ — not applied: not enough GPU memory (%.1f of %.1f GB in use, about %.1f GB more needed). It turns on by itself if memory frees up.%@",
+                    chosen, settings_gb(used), settings_gb(budget), settings_gb(mfx_need_bytes(0, 0)), also];
+        case MFX_STATE_OFF_MEMORY:
+            return [NSString stringWithFormat:@"%@ — off for this session: not enough GPU memory (paused %d times). Choose Off and then a mode to try again.%@",
+                    chosen, MFX_BP_MAX, also];
+        }
+        return nil;
+    }
+    if (!strcmp(d->key, "display.render_max") && settings_mem_short(d, v, used, budget)) {
+        *color = NSColor.systemOrangeColor;
+        return [NSString stringWithFormat:@"%@ — may not fit: it used about %.1f GB where it was measured, the limit here is %.1f GB, and the game stops past it.",
+                chosen, settings_gb(settings_render_max_need(v)), settings_gb(budget)];
+    }
+    return nil;
+}
 static int settings_page_tab(const char *page) {
     for (int k = 0; k < SETTINGS_NSECTIONS; k++) if (!strcmp(SETTINGS_SECTIONS[k].name, page)) return SETTINGS_SECTIONS[k].tab;
     return 0;
@@ -192,12 +248,9 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
     int v = settings_get(d->key); NSControl *c;
     if (d->type == SET_BOOL) { NSSwitch *s = [NSSwitch new]; s.state = v ? NSControlStateValueOn : NSControlStateValueOff; c = s; }
     else if (d->type == SET_CHOICE) {
-        NSPopUpButton *p = [NSPopUpButton new];
-        BOOL render = !strcmp(d->key, "display.scale");   /* each render resolution with the size it gives at this display resolution */
-        for (int k = 0; k < d->nchoices; k++) {
-            NSString *t = @(d->choices[k].label); unsigned w, h;
-            if (render) { int capped = settings_render_size(d->choices[k].value, &w, &h); t = [NSString stringWithFormat:@"%@ · %u×%u%@", t, w, h, capped ? @" (max)" : @""]; }
-            [p addItemWithTitle:t]; if (d->choices[k].value == v) [p selectItemAtIndex:k];
+        NSPopUpButton *p = [NSPopUpButton new]; uint64_t used = 0, budget = 0; mtl_gpu_memory(&used, &budget);
+        for (int k = 0; k < d->nchoices; k++) {   /* a choice that would not fit stays selectable, marked (settings_mem_short) */
+            [p addItemWithTitle:settings_choice_title(d, k, used, budget)]; if (d->choices[k].value == v) [p selectItemAtIndex:k];
         }
         [p.widthAnchor constraintEqualToConstant:190].active = YES; c = p;
     } else {
@@ -237,6 +290,11 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
         help.identifier = @"help"; help.maximumNumberOfLines = 1; help.cell.truncatesLastVisibleLine = YES;
         help.lineBreakMode = NSLineBreakByTruncatingTail;
         [text addArrangedSubview:help];
+    }
+    if (settings_mem_row(d)) {   /* not running / may not fit for lack of GPU memory (refreshMemoryRows) */
+        NSTextField *note = [NSTextField wrappingLabelWithString:@""]; note.identifier = @"memnote"; note.hidden = YES;
+        note.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium]; note.preferredMaxLayoutWidth = 176;
+        [text addArrangedSubview:note];
     }
     NSView *control = [self controlFor:d index:i];
     for (NSView *v in @[text, control]) { v.translatesAutoresizingMaskIntoConstraints = NO; [row addSubview:v]; }
@@ -646,7 +704,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
 - (void)refreshStatus {
     const char *s = settings_display_status();
     /* The memory meter: what the GPU holds against the budget the game stops at (bigger sizes, Maximum render resolution). */
-    extern void mtl_gpu_memory(uint64_t *used, uint64_t *budget); uint64_t used = 0, budget = 0; mtl_gpu_memory(&used, &budget);
+    uint64_t used = 0, budget = 0; mtl_gpu_memory(&used, &budget);
     NSMutableAttributedString *line = [[NSMutableAttributedString alloc] initWithString:s && *s ? @(s) : @"" attributes:@{
         NSFontAttributeName:status.font, NSForegroundColorAttributeName:NSColor.secondaryLabelColor}];
     if (budget) {
@@ -657,10 +715,37 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
             attributes:@{NSFontAttributeName:status.font, NSForegroundColorAttributeName:c}]];
     }
     status.attributedStringValue = line;
+    [self refreshMemoryRows:used budget:budget];
     int pending = mods_changed_since_start();   /* Restart now: a setting marked (after restart), or mod changes */
     for (int i = 0; i < SETTINGS_COUNT && !pending; i++) pending = settings_pending_restart(SETTINGS[i].key);
     if (!pending) pending = cheats_pending() || runtime_cheats_files_changed();   /* code patches switched, cheat files changed */
     restartNow.hidden = !pending || !runtime_front_can_restart();
+}
+/* The memory rows on this page: the note under the label and the marks in the selector, as memory changes. */
+static NSView *settings_find_id(NSView *v, NSString *ident) {
+    if ([v.identifier isEqual:ident]) return v;
+    for (NSView *sub in v.subviews) { NSView *t = settings_find_id(sub, ident); if (t) return t; }
+    return nil;
+}
+static NSPopUpButton *settings_find_popup(NSView *v) {
+    if ([v isKindOfClass:NSPopUpButton.class]) return (NSPopUpButton *)v;
+    for (NSView *sub in v.subviews) { NSPopUpButton *p = settings_find_popup(sub); if (p) return p; }
+    return nil;
+}
+- (void)refreshMemoryRows:(uint64_t)used budget:(uint64_t)budget {
+    for (NSUInteger k = 0; k < rows.count && k < rowSetting.count; k++) {
+        int i = rowSetting[k].intValue; if (i < 0 || i >= SETTINGS_COUNT || !settings_mem_row(&SETTINGS[i])) continue;
+        const SettingDef *d = &SETTINGS[i];
+        NSTextField *note = (NSTextField *)settings_find_id(rows[k], @"memnote"); NSColor *c = nil;
+        NSString *text = settings_mem_note(d, used, budget, &c);
+        if (note && ![note.stringValue isEqualToString:text ?: @""]) { note.stringValue = text ?: @""; note.hidden = !text; }
+        if (note && c) note.textColor = c;
+        NSPopUpButton *p = settings_find_popup(rows[k]);
+        for (int j = 0; p && j < d->nchoices && j < p.numberOfItems; j++) {
+            NSString *t = settings_choice_title(d, j, used, budget);
+            if (![[p itemAtIndex:j].title isEqualToString:t]) [p itemAtIndex:j].title = t;
+        }
+    }
 }
 - (void)restartGame { [self hide]; runtime_front_restart(); }
 - (void)meterTick { if (self.superview) [self refreshStatus]; }   /* the memory meter, once a second while the menu shows */

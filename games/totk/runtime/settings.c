@@ -43,6 +43,7 @@ static int render_size(unsigned cw, unsigned ch, int scale, unsigned *sw, unsign
     *sw &= ~7u; *sh &= ~7u; if (*sw < 64) *sw = 64; if (*sh < 64) *sh = 64;
     return capped;
 }
+void settings_output_size(unsigned *w, unsigned *h) { pthread_mutex_lock(&lock); *w = display_cw; *h = display_ch; pthread_mutex_unlock(&lock); }
 int settings_render_size(int scale, unsigned *w, unsigned *h) {
     int own; pthread_mutex_lock(&lock); unsigned cw = display_cw, ch = display_ch; pthread_mutex_unlock(&lock);
     return render_size(cw, ch, scale, w, h, &own);
