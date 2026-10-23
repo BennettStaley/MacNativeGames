@@ -113,7 +113,7 @@ def main():
                         audio = dict(rms=float(match[1]), peak=float(match[2]),
                                      underruns=int(match[3]), overruns=int(match[4]))
                         report['audio_reports'] += 1
-                    if re.search(r'GPU fault|command buffer.*(?:failed|error)|integrity mismatch|\[fatal\]|runtime_fail|EXC_BAD_ACCESS|【红】', line, re.I):
+                    if re.search(r'GPU fault|command buffer.*(?:failed|error)|integrity mismatch|\[fatal\]|runtime_fail|EXC_BAD_ACCESS|\[red\]|【红】', line, re.I):
                         field = 'preexisting_diagnostic_lines' if initial_scan else 'suspicious_log_lines'
                         if len(report[field]) < 200:
                             report[field].append(line)
