@@ -59,6 +59,9 @@ static const SettingChoice SET_CAP[] = {{"Auto (steady)", "auto", "auto", -1}, {
                                         {"60 fps", "60", "60", 60}, {"120 fps", "120", "120", 120}, {"Display refresh rate", "display", "display", 0}};
 static const SettingChoice SET_INTERP[] = {{"Off", "off", "0", 0}, {"30 + 30", "interp30", "interp30", 1},
                                            {"Half the refresh rate", "half", "interp", 2}, {"Every frame", "max", "interpmax", 3}};
+/* What MetalFX is given, drawn over the picture (totk_mfx.m mfx_debug_encode, TOTK_MFX_DEBUG_VIEW). Needs frame interpolation. */
+static const SettingChoice SET_MFX_DEBUG[] = {{"Off", "off", NULL, 0}, {"Motion", "motion", "motion", 1}, {"Depth", "depth", "depth", 2},
+                                              {"Split (picture, motion, depth)", "split", "split", 3}};
 /* Display (settings.c display_apply): the output is the 16:9 picture the game composes, text and icons included (live up to
    the headroom); the render scale sizes the 3D scene against it; the aspect ratio is the shape it is shown at. */
 enum { SET_OUT_WINDOW = 0, SET_OUT_NATIVE = 1, SET_OUT_CUSTOM = 2 };
@@ -107,6 +110,9 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_CHOICE, SET_LIVE, SET_ALL, SET_PRESET_BALANCED, SET_PRESET_BALANCED, 0, 0, 0, NULL, SET_PRESET, SET_N(SET_PRESET), NULL, NULL, 0},
     {"graphics.interpolation", "Frame rate", "Frame interpolation", "MetalFX makes a frame between two game frames. On the Mac, near the GPU memory limit it pauses (resuming once memory frees up, off for the session after 3 pauses), and a mode that would not fit is marked in the list and not turned on. The row says when the chosen mode is not running.",
      "TOTK_MFX", SET_CHOICE, SET_LIVE, SET_MAC | SET_IPAD, 0, 0, 0, 0, 0, NULL, SET_INTERP, SET_N(SET_INTERP),
+     "Not tested on iPhone yet.", NULL, 0},
+    {"graphics.mfx_debug_view", "Frame rate", "Interpolation debug view", "Shows what frame interpolation is given: motion (direction as colour, brighter is faster, outlined where per-object motion was used), depth (near is bright), or the picture, motion and depth side by side. Needs frame interpolation on.",
+     "TOTK_MFX_DEBUG_VIEW", SET_CHOICE, SET_LIVE, SET_MAC | SET_IPAD, 0, 0, 0, 0, 0, NULL, SET_MFX_DEBUG, SET_N(SET_MFX_DEBUG),
      "Not tested on iPhone yet.", NULL, 0},
     {"display.output", "Display", "Display resolution", "The size of the finished picture. Text, icons and menus are drawn at this size, so they stay sharp; the 3D world is drawn at the render resolution below and stretched to fill it. Display native is your screen's own pixels.",
      NULL, SET_CHOICE, SET_LIVE, SET_MAC, 1080, 1080, 0, 0, 0, NULL, SET_OUTPUT, SET_N(SET_OUTPUT), "iPhone and iPad show 720p.", NULL, 0},

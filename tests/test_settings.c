@@ -127,7 +127,10 @@ int main(void) {
                settings_in_tab(settings_index("audio.volume"), 0), "Downloads on Content, effects on Graphics, audio on Game");
     }
     for (int i = 0; i < SETTINGS_COUNT; i++) expect(strncmp(SETTINGS[i].key, "cheats.", 7) != 0, "cheats are not settings: settings.txt and Reset all never hold them");
-    expect(SETTINGS_COUNT == 39, "39 settings");
+    expect(SETTINGS_COUNT == 40, "40 settings");
+    { int a[SETTINGS_COUNT]; settings_defaults(a, 0);
+      expect(value(a, "graphics.mfx_debug_view") == 0 && settings_parse_text("graphics.mfx_debug_view = split\n", a) == 1 &&
+             value(a, "graphics.mfx_debug_view") == 3, "the interpolation debug view is off by default and reads by its word"); }
     {
         /* Dynamic resolution: the game's own by default, TOTK_FIXED_RES=1 for Off at the next start, Mac only. */
         const SettingDef *dr = &SETTINGS[settings_index("graphics.dynamic_res")];

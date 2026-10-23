@@ -58,6 +58,10 @@ static struct {
     int obj_ok, enc_obj;            // obj written this frame; the prepared frame uses it
     double near_p, far_p, fov_deg, aspect; int proj_src;   // this frame's projection for MetalFX (cam_projection)
     uint64_t obj_frames;
+    id<MTLTexture> last_om;         // the per-object motion the last encoded frame used (nil: none), for mfx_debug_encode
+    id<MTLRenderPipelineState> dbg_ps[3]; MTLPixelFormat dbg_fmt[3];   // TOTK_MFX_DEBUG_VIEW, by target format
+    id<MTL4ArgumentTable> dbg_args[MFX_OUT];
+    id<MTLBuffer> dbg_par[MFX_OUT];
 } g;
 
 /* Reconstructing identical MetalFX interpolators repeatedly grows device
@@ -439,12 +443,143 @@ NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> h
     NSMutableArray *resources = [@[fi, fi.colorTexture, fi.prevColorTexture, depth,
                                    g.mv, g.ui, g.out[s], g.mv_par[s]] mutableCopy];
     if (om) [resources addObject:om];   // TOTK_OBJ_MOTION: the per-object motion target (nil when off)
+    g.last_om = g.enc_obj && g.obj ? g.obj : nil;   // mfx_debug_encode
     fi.colorTexture = nil; fi.prevColorTexture = nil; fi.depthTexture = nil;
     fi.motionTexture = nil; fi.uiTexture = nil; fi.outputTexture = nil;
     if (heap) [cb writeTimestampIntoHeap:heap atIndex:stamp + 1];
     g.mv_prev_yaw = atan2(g.prev_cam[2], g.prev_cam[0]) * 180 / M_PI;   // yaw of the previous frame, for mfx_mv_log
     memcpy(g.prev_cam, g.cam, sizeof g.cam); g.cur ^= 1; g.hist_ok = 1; g.made++;
     return resources;
+}
+/* TOTK_MFX_DEBUG_VIEW=motion | depth | split (or the setting graphics.mfx_debug_view, flag mfx_debug_view 0..3): what
+   MetalFX was given for the frame just encoded, drawn over both pictures shown for it (the interpolated output and the
+   game's own frame), so the screen shows the inputs instead of the result.
+   - motion: the motion texture exactly as MetalFX reads it (g.mv): the direction of the vector to the previous position
+     as hue (right red, up green-yellow, left cyan, down blue-violet), its length as brightness, full at 32 pixels of the
+     motion texture per frame. With TOTK_OBJ_MOTION, pixels where the kernel took the object's own motion (the motion
+     equals the per-object value there) are tinted lighter and outlined in white. Derived here from g.mv and the
+     per-object target, so mfx_mv itself is unchanged.
+   - depth: the G-buffer depth linearised with this frame's near / far (cam_projection), log scale from the near plane
+     (white) to min(far, 4000 units) (black).
+   - split: left third the picture, middle third motion, right third depth, white lines between.
+   One render pass per target (load, one full-screen triangle, store) in the interpolation command buffer, after MetalFX;
+   nothing is encoded or allocated while off. Frames that are not interpolated (first frame, camera cut, missing input)
+   show the plain picture, and nothing shows while interpolation is off (no motion or depth exist then). */
+static _Atomic int g_dbg = -1;
+int mfx_debug_view(void) {
+    int v = atomic_load_explicit(&g_dbg, memory_order_relaxed);
+    if (v >= 0) return v;
+    const char *e = getenv("TOTK_MFX_DEBUG_VIEW");
+    v = !e || !*e || !strcmp(e, "0") || !strcmp(e, "off") ? 0 : !strcmp(e, "motion") || !strcmp(e, "1") ? 1 :
+        !strcmp(e, "depth") || !strcmp(e, "2") ? 2 : !strcmp(e, "split") || !strcmp(e, "3") ? 3 : -1;
+    if (v < 0) { MLOG("[red] TOTK_MFX_DEBUG_VIEW must be off, motion, depth or split, got %s: off", e); v = 0; }
+    if (v) MLOG("TOTK_MFX_DEBUG_VIEW=%s: the interpolation inputs are drawn over the picture", e);
+    atomic_store(&g_dbg, v);
+    return v;
+}
+void mfx_debug_view_set(int v) {
+    static const char *const names[] = {"off", "motion", "depth", "split"};
+    if (v < 0) v = (mfx_debug_view() + 1) % 4;
+    if (v > 3) { MLOG("[flag] mfx_debug_view takes 0..3 (off, motion, depth, split; -1 cycles), got %d", v); return; }
+    atomic_store(&g_dbg, v);
+    MLOG("[flag] mfx_debug_view = %d: %s%s", v, names[v], v && !mfx_enabled() ? " (shows once frame interpolation is on)" : "");
+}
+static id<MTLRenderPipelineState> dbg_pipeline(MTLPixelFormat fmt) {
+    for (int i = 0; i < 3; i++) if (g.dbg_ps[i] && g.dbg_fmt[i] == fmt) return g.dbg_ps[i];
+    static const char *src =
+        "#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct V { float4 p [[position]]; };\n"
+        "vertex V vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); V o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
+        // vp: the target rectangle (x, y, w, h); size: the motion / depth texture; da / db: 1 / view depth = db + (1 - d) * da;
+        // dn: near plane; dlog: 1 / log2(farthest shown / near)
+        "struct P { float4 vp; float2 size; float mode; float obj; float da; float db; float dn; float dlog; };\n"
+        "static float3 hsv(float h, float v) { return v * clamp(abs(fract(h + float3(0.0, 2.0, 1.0) / 3.0) * 6.0 - 3.0) - 1.0, 0.0, 1.0); }\n"
+        // the kernel took the object's own motion here: the motion equals it (up to half-float rounding)
+        "static bool objmv(texture2d<float, access::read> mv, texture2d<float, access::read> om, int2 q, float2 sz) {\n"
+        "  uint2 c = uint2(clamp(q, int2(0), int2(sz) - 1)); float2 o = om.read(c).xy;\n"
+        "  if (!all(abs(o) < 16.0)) return false;\n"
+        "  float2 op = o * float2(0.5, -0.5) * sz; return length(mv.read(c).xy - op) <= 0.02 + 0.002 * length(op);\n"
+        "}\n"
+        "fragment float4 fs(V in [[stage_in]], texture2d<float, access::read> mv [[texture(0)]], depth2d<float, access::read> d [[texture(1)]],\n"
+        "                   texture2d<float, access::read> om [[texture(2)]], constant P &p [[buffer(0)]]) {\n"
+        "  float2 uv = (in.p.xy - p.vp.xy) / p.vp.zw; int view = int(p.mode);\n"
+        "  if (view == 3) {\n"
+        "    float px = 1.0 / p.vp.z;\n"
+        "    if (abs(uv.x - 1.0 / 3.0) < 1.5 * px || abs(uv.x - 2.0 / 3.0) < 1.5 * px) return float4(1.0);\n"
+        "    if (uv.x < 1.0 / 3.0) discard_fragment();\n"
+        "    view = uv.x < 2.0 / 3.0 ? 1 : 2;\n"
+        "  }\n"
+        "  int2 q = int2(clamp(uv, 0.0, 0.99999) * p.size);\n"
+        "  if (view == 2) {\n"
+        "    float z = d.read(uint2(q)); float inv = p.db + (1.0 - z) * p.da;\n"
+        "    float v = inv > 0.0 ? 1.0 - saturate(log2(max(1.0 / (inv * p.dn), 1.0)) * p.dlog) : 0.0;\n"
+        "    return float4(v, v, v, 1.0);\n"
+        "  }\n"
+        "  float2 m = mv.read(uint2(q)).xy; float mag = length(m);\n"
+        "  float3 c = mag > 1e-4 ? hsv(fract(atan2(-m.y, m.x) / 6.2831853), saturate(mag / 32.0)) : float3(0.0);\n"
+        "  if (p.obj > 0.5) {\n"
+        "    bool u = objmv(mv, om, q, p.size);\n"
+        "    bool edge = u != objmv(mv, om, q + int2(1, 0), p.size) || u != objmv(mv, om, q - int2(1, 0), p.size) ||\n"
+        "                u != objmv(mv, om, q + int2(0, 1), p.size) || u != objmv(mv, om, q - int2(0, 1), p.size);\n"
+        "    if (edge) c = float3(1.0); else if (u) c = mix(c, float3(1.0), 0.2);\n"
+        "  }\n"
+        "  return float4(c, 1.0);\n"
+        "}\n";
+    NSError *e = nil;
+    id<MTLLibrary> lib = [g.dev newLibraryWithSource:@(src) options:nil error:&e];
+    if (!lib) { MLOG("[red] debug view shader: %s", e.localizedDescription.UTF8String); return nil; }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
+    pd.colorAttachments[0].pixelFormat = fmt;
+    id<MTLRenderPipelineState> ps = [g.dev newRenderPipelineStateWithDescriptor:pd error:&e];
+    if (!ps) { MLOG("[red] debug view pipeline (format %lu): %s", (unsigned long)fmt, e.localizedDescription.UTF8String); return nil; }
+    int k = 0; while (k < 2 && g.dbg_ps[k]) k++;   // the output view's format and the swapchain's; a third replaces the last
+    g.dbg_ps[k] = ps; g.dbg_fmt[k] = fmt;
+    if (!g.dbg_args[0]) {
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1; ad.maxTextureBindCount = 3;
+        for (int i = 0; i < MFX_OUT; i++) {
+            g.dbg_args[i] = [g.dev newArgumentTableWithDescriptor:ad error:&e]; if (!g.dbg_args[i]) MDIE("argument table: %s", e.localizedDescription.UTF8String);
+            g.dbg_par[i] = [g.dev newBufferWithLength:256 options:MTLResourceStorageModeShared]; [g.rs addAllocation:g.dbg_par[i]];
+        }
+        [g.rs commit];
+    }
+    MLOG("debug view pipeline for format %lu", (unsigned long)fmt);
+    return ps;
+}
+NSArray *mfx_debug_encode(id<MTL4CommandBuffer> cb, int s, id<MTLTexture> present, const int crop[4]) {
+    int view = atomic_load_explicit(&g_dbg, memory_order_relaxed);
+    if (view < 0) view = mfx_debug_view();
+    if (!view || s < 0 || s >= MFX_OUT || !g.last_depth || !g.mv || !g.out[s] || !g.outv[s] || g.last_slot != s) return nil;
+    id<MTLTexture> depth = g.last_depth, om = g.last_om ? g.last_om : g.mv, targets[2] = {g.outv[s], present};
+    double n = g.near_p > 0 ? g.near_p : 0.1, f = g.far_p > n ? g.far_p : 1e7, shown = fmin(f, 4000.0);
+    NSMutableArray *res = [NSMutableArray arrayWithObjects:depth, g.mv, om, g.out[s], g.outv[s], nil];
+    for (int k = 0; k < 2; k++) {
+        id<MTLTexture> t = targets[k]; if (!t) continue;
+        double x = 0, y = 0, w = t.width, h = t.height;
+        if (k == 1 && crop && crop[2] > 0 && crop[3] > 0 && crop[0] >= 0 && crop[1] >= 0 &&
+            (NSUInteger)(crop[0] + crop[2]) <= t.width && (NSUInteger)(crop[1] + crop[3]) <= t.height) { x = crop[0]; y = crop[1]; w = crop[2]; h = crop[3]; }
+        id<MTLRenderPipelineState> ps = dbg_pipeline(t.pixelFormat); if (!ps) return nil;
+        float *p = (float *)((char *)g.dbg_par[s].contents + k * 128);
+        p[0] = (float)x; p[1] = (float)y; p[2] = (float)w; p[3] = (float)h; p[4] = (float)depth.width; p[5] = (float)depth.height;
+        p[6] = (float)view; p[7] = g.last_om ? 1.0f : 0.0f;
+        p[8] = (float)((f - n) / (n * f)); p[9] = (float)(1.0 / f); p[10] = (float)n; p[11] = (float)(1.0 / log2(shown / n > 2 ? shown / n : 2));
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+        rp.colorAttachments[0].texture = t; rp.colorAttachments[0].loadAction = MTLLoadActionLoad; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTL4RenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+        if (!e) { MLOG("[red] debug view: no render encoder"); return nil; }
+        [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];   // after MetalFX and the game's frame
+        id<MTL4ArgumentTable> a = g.dbg_args[s];
+        [a setTexture:g.mv.gpuResourceID atIndex:0]; [a setTexture:depth.gpuResourceID atIndex:1]; [a setTexture:om.gpuResourceID atIndex:2];
+        [a setAddress:g.dbg_par[s].gpuAddress + (uint64_t)k * 128 atIndex:0];
+        [e setArgumentTable:a atStages:MTLRenderStageFragment];
+        [e setViewport:(MTLViewport){x, y, w, h, 0, 1}]; [e setRenderPipelineState:ps];
+        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [e endEncoding];
+        [res addObject:t];
+    }
+    [res addObject:g.dbg_par[s]];
+    static uint64_t said; if (!said++) MLOG("debug view %d drawn (motion / depth %lux%lu, near %g, farthest shown %g)", view, (unsigned long)depth.width, (unsigned long)depth.height, n, shown);
+    return res;
 }
 /* TOTK_MFX_MVLOG=<every n frames>: read the motion texture back after the interpolation and log its median and the
    camera step (diagnostic; waits for the GPU). */
@@ -548,7 +683,7 @@ static void mfx_release(int all) {
     b += obj_bytes(g.mv); drop(&g.mv); b += obj_bytes(g.obj); drop(&g.obj);
     if (g.fi && !is_cached(g.fi)) retire(g.fi);
     unsigned n = all ? fi_cache_evict(1) : 0;
-    g.fi = nil; g.last_depth = nil; g.last_slot = -1; g.in_w = g.in_h = 0; g.out_w = g.out_h = 0; g.depth = nil; g.enc_depth = nil;
+    g.fi = nil; g.last_depth = nil; g.last_om = nil; g.last_slot = -1; g.in_w = g.in_h = 0; g.out_w = g.out_h = 0; g.depth = nil; g.enc_depth = nil;
     g.prev_ok = g.hist_ok = 0; g.obj_ok = 0;
     MLOG("interpolation off: %llu MB of textures and %u cached interpolators retired (released after %d presents)", (unsigned long long)(b >> 20), n, MFX_RETIRE_TICKS);
 }

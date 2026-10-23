@@ -39,6 +39,13 @@ int mfx_frame_prepare(double frame_s);
 NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int slot, id<MTL4CounterHeap> heap, NSUInteger stamp);   // heap: timestamps at stamp / stamp+1 around MetalFX (may be nil)
 void mfx_note_gpu(double ms);   // GPU time of one interpolation, for the statistics line
 void mfx_frame_abort(void);
+/* TOTK_MFX_DEBUG_VIEW (setting graphics.mfx_debug_view, flag mfx_debug_view): 0 off, 1 motion, 2 depth, 3 split. debug_encode,
+   right after mfx_frame_encode into the same command buffer: draws the view over the interpolated output of slot and over
+   present (the game's frame; crop: x, y, w, h of it that is shown, or NULL / zero size for all of it); returns the
+   resources to keep alive with the frame's, or nil when off. */
+int mfx_debug_view(void);
+void mfx_debug_view_set(int view);   // < 0 cycles
+NSArray *mfx_debug_encode(id<MTL4CommandBuffer> cb, int slot, id<MTLTexture> present, const int crop[4]);
 id<MTLTexture> mfx_output(int slot);   // RGBA8Unorm view of the sRGB output, like the swapchain textures
 void mfx_stats(char *out, size_t n);
 // At every game present (also while off): releases retired textures / interpolators (an old size or configuration) and

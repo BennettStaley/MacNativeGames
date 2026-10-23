@@ -84,7 +84,7 @@ static NSString *settings_value_text(const SettingDef *d, int v) {
 void mtl_gpu_memory(uint64_t *used, uint64_t *budget);   /* nvn_mtl.m: allocated now, and the budget the game stops at */
 int mfx_obj_motion_on(void);   /* totk_mfx.h: TOTK_OBJ_MOTION=1, paused with interpolation */
 static double settings_gb(uint64_t b) { return b / 1073741824.0; }
-static BOOL settings_mem_row(const SettingDef *d) { return !strcmp(d->key, "graphics.interpolation") || !strcmp(d->key, "display.render_max"); }
+static BOOL settings_mem_row(const SettingDef *d) { return !strcmp(d->key, "graphics.interpolation") || !strcmp(d->key, "display.render_max") || !strcmp(d->key, "graphics.mfx_debug_view"); }
 /* display.render_max: the GPU memory in use at 1800p / 4K, from the one measurement there is (docs/settings.md: an 18 GB
    M3 Pro at a 4K display resolution, 2026-10-21: 1800p up to 6.1 GB, 4K about 1.5 GB more). An estimate, not a promise. */
 static uint64_t settings_render_max_need(int v) { return v >= 2160 ? 7600ull << 20 : v >= 1800 ? 6100ull << 20 : 0; }
@@ -128,6 +128,11 @@ static NSString *settings_mem_note(const SettingDef *d, uint64_t used, uint64_t 
                     chosen, MFX_BP_MAX, also];
         }
         return nil;
+    }
+    if (!strcmp(d->key, "graphics.mfx_debug_view")) {   /* motion and depth exist only while interpolation runs */
+        if (!v || mfx_interp_state() == MFX_STATE_ON) return nil;
+        *color = NSColor.systemOrangeColor;
+        return [NSString stringWithFormat:@"%@ — needs frame interpolation: turn it on above to see the view.", chosen];
     }
     if (!strcmp(d->key, "display.render_max") && settings_mem_short(d, v, used, budget)) {
         *color = NSColor.systemOrangeColor;
