@@ -5,7 +5,7 @@
    draws of the G-buffer pass are matched with the same draw of the previous frame and their vertices compared:
    - Pass: one whose depth is the G-buffer depth MetalFX takes (mfx_pass_setup: D32F of the colour size, three or more
      colour targets), not layered, not a readable-tile merge, at most six colour targets. Colour attachment OM_ATT (6) gets
-     the RG16Float motion target (totk_mfx.m), cleared to OBJMV_NONE by the first such pass of the frame.
+     the RGBA16Float motion target (totk_mfx.m), cleared to OBJMV_NONE by the first such pass of the frame.
    - Draw (role MFX_ROLE_MOTION): depth test on, no blending on any target, no alpha-to-coverage, triangles. Every other
      draw of the pass leaves the attachment alone (write mask none, PSO_OBJMV). Discard (alpha-tested foliage) needs
      nothing: a discarded fragment writes no motion either.
@@ -13,8 +13,12 @@
      of this frame's position arena and reads prev[] of the previous frame's arena for the same draw (buffer OM_VBUF,
      struct totk_om_draw); both go to the fragment as two extra varyings. Skinning and vertex animation are in the vertex
      shader, so they are in the positions.
-   - Fragment variant (om_fs_fn): color(6) = prev.xy / prev.w - cur.xy / cur.w (Metal NDC); OBJMV_NONE when the previous
+   - Fragment variant (om_fs_fn): color(6).rg = prev.xy / prev.w - cur.xy / cur.w (Metal NDC); OBJMV_NONE when the previous
      position is unknown (w <= 0), behind the camera or more than half the screen away (most likely a mismatched draw).
+     color(6).b = cur.w, the fragment's view distance. Draws that are not motion draws (border-emulated shaders, lmap,
+     terrain and other large meshes) leave attachment 6 alone, so a motion draw hidden by one of them later would keep
+     its motion under it (motion "below the terrain"): totk_mfx.m's kernel takes the motion only where this distance is
+     the one of the final depth at that pixel (TOTK_OBJ_MOTION_ZTOL), else the camera motion.
    - Identity across frames: (vertex shader, vertex buffer of attribute 0, index buffer, first vertex / base vertex,
      count, instances, vertex range, primitive) and the ordinal among the pass's draws with those (om_key). The previous
      frame's table gives that draw's offset in the previous arena; a new or resized draw writes OBJMV_NONE (camera motion).
@@ -81,10 +85,10 @@ static void om_pass_setup(MTL4RenderPassDescriptor *pd) {
     if (nc < 3) return;
     MTLRenderPassColorAttachmentDescriptor *a = pd.colorAttachments[OM_ATT];
     a.texture = mfx_obj_target(g_dev, dt.width, dt.height);
-    a.loadAction = g_om.cleared ? MTLLoadActionLoad : MTLLoadActionClear; a.clearColor = MTLClearColorMake(OBJMV_NONE, OBJMV_NONE, 0, 0);
+    a.loadAction = g_om.cleared ? MTLLoadActionLoad : MTLLoadActionClear; a.clearColor = MTLClearColorMake(OBJMV_NONE, OBJMV_NONE, 0, 0);   // B 0: no distance, never taken
     a.storeAction = MTLStoreActionStore;
     g_om.cleared = 1;
-    g_pass.cfmt[OM_ATT] = (uint32_t)MTLPixelFormatRG16Float; g_pass.objmv = 1;
+    g_pass.cfmt[OM_ATT] = (uint32_t)MTLPixelFormatRGBA16Float; g_pass.objmv = 1;
     mfx_note_obj();
 }
 static void om_frame_end(void) {   // at the game's present
@@ -256,14 +260,15 @@ static NSString *om_fs_src(NvShader *fs, NSString **why) {
     if ([src rangeOfString:head].location == NSNotFound || [src rangeOfString:entry].location == NSNotFound || [src rangeOfString:@"return out;"].location == NSNotFound) { *why = @"no main0_out / entry / return out"; return nil; }
     if ([src rangeOfString:[NSString stringWithFormat:@"[[color(%d)]]", OM_ATT]].location != NSNotFound) { *why = @"writes colour 6 itself"; return nil; }
     NSString *helper = [NSString stringWithFormat:
-        @"static inline float2 totk_om_motion(float4 c, float4 p) {\n"
+        @"static inline float4 totk_om_motion(float4 c, float4 p) {\n"
+         "    float z = clamp(c.w, 0.0, 65000.0);   // the fragment's view distance: totk_mfx.m keeps the motion only where the final depth is this draw's\n"
          "%@"
-         "    if (!(p.w > 1e-6) || !(c.w > 1e-6)) return float2(%.1f);\n"
+         "    if (!(p.w > 1e-6) || !(c.w > 1e-6)) return float4(%.1f, %.1f, z, 0.0);\n"
          "    float2 d = p.xy / p.w - c.xy / c.w;\n"
-         "    if (any(isnan(d)) || any(isinf(d)) || any(abs(d) > 1.0)) return float2(%.1f);\n"
-         "    return d;\n}\n\n",
-        om_diag() == 1 ? [NSString stringWithFormat:@"    return float2(%.1f);   // TOTK_OBJ_MOTION_DIAG=1\n", OBJMV_NONE] : om_diag() == 2 ? @"    return float2(0.0);   // TOTK_OBJ_MOTION_DIAG=2\n" : @"",
-        OBJMV_NONE, OBJMV_NONE];
+         "    if (any(isnan(d)) || any(isinf(d)) || any(abs(d) > 1.0)) return float4(%.1f, %.1f, z, 0.0);\n"
+         "    return float4(d, z, 0.0);\n}\n\n",
+        om_diag() == 1 ? [NSString stringWithFormat:@"    return float4(%.1f, %.1f, z, 0.0);   // TOTK_OBJ_MOTION_DIAG=1\n", OBJMV_NONE, OBJMV_NONE] : om_diag() == 2 ? @"    return float4(0.0, 0.0, z, 0.0);   // TOTK_OBJ_MOTION_DIAG=2\n" : @"",
+        OBJMV_NONE, OBJMV_NONE, OBJMV_NONE, OBJMV_NONE];
     NSString *iname = @"in";
     if ([src rangeOfString:ihead].location != NSNotFound) {
         NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"main0_in\\s+(\\w+)\\s*\\[\\[stage_in\\]\\]" options:0 error:nil];
@@ -271,11 +276,11 @@ static NSString *om_fs_src(NvShader *fs, NSString **why) {
         if (!m) { *why = @"main0_in is not the stage input"; return nil; }
         iname = [src substringWithRange:[m rangeAtIndex:1]];
         src = [src stringByReplacingCharactersInRange:[src rangeOfString:ihead] withString:[ihead stringByAppendingString:@"    float4 totk_om_c [[user(totk_om_c)]];\n    float4 totk_om_p [[user(totk_om_p)]];\n"]];
-        src = [src stringByReplacingCharactersInRange:[src rangeOfString:head] withString:[NSString stringWithFormat:@"%@%@    float2 totk_om_mv [[color(%d)]];\n", helper, head, OM_ATT]];
+        src = [src stringByReplacingCharactersInRange:[src rangeOfString:head] withString:[NSString stringWithFormat:@"%@%@    float4 totk_om_mv [[color(%d)]];\n", helper, head, OM_ATT]];
     } else {
         if ([src rangeOfString:@"[[stage_in]]"].location != NSNotFound) { *why = @"stage input of another type"; return nil; }
         NSString *istruct = [ihead stringByAppendingString:@"    float4 totk_om_c [[user(totk_om_c)]];\n    float4 totk_om_p [[user(totk_om_p)]];\n};\n\n"];
-        src = [src stringByReplacingCharactersInRange:[src rangeOfString:head] withString:[NSString stringWithFormat:@"%@%@%@    float2 totk_om_mv [[color(%d)]];\n", helper, istruct, head, OM_ATT]];
+        src = [src stringByReplacingCharactersInRange:[src rangeOfString:head] withString:[NSString stringWithFormat:@"%@%@%@    float4 totk_om_mv [[color(%d)]];\n", helper, istruct, head, OM_ATT]];
         NSString *param = @"main0_in in [[stage_in]]";
         NSRange r = [src rangeOfString:entry];
         BOOL empty = [src characterAtIndex:r.location + r.length] == ')';
@@ -315,5 +320,5 @@ static void om_pso_desc(MTLRenderPipelineDescriptor *d, const pso_key *k, NvShad
     if ((int)(k->a2c >> 2 & 3) != MFX_ROLE_MOTION || (k->a2c & (PSO_VBORDER | PSO_LAYERED)) || merged || fsfn || !k->dfmt || !fs) return;
     id<MTLFunction> vf = om_vs_fn(vs, fs), ff = om_fs_fn(fs);
     if (!vf || !ff) return;
-    d.vertexFunction = vf; d.fragmentFunction = ff; c.writeMask = MTLColorWriteMaskRed | MTLColorWriteMaskGreen;
+    d.vertexFunction = vf; d.fragmentFunction = ff; c.writeMask = MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue;
 }
