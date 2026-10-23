@@ -8203,52 +8203,17 @@ static int tex_slots_diagnostics(void) {
     if (active < 0) active = getenv("DM_NVN_TEXPNG_FS") != NULL || getenv("DM_NVN_FLASHHDR") != NULL;
     return active;
 }
-static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
-    if (!sh->ae) return 1;
-    if (nvn_stage == 1 && !strncmp(sh->key, "0ac9a54938974396", 16) && getenv("DM_NVN_FLASHHDR") && R.rt.n && R.rt.color[0])
-        g_flash_tonemap_target = tex_mtl(R.rt.color[0]);
-    uint64_t slots[NVN_REFL_MAXB] = {0};
-    args_sync_dirty();
-    static int ab_noreuse = -1; if (ab_noreuse < 0) ab_noreuse = getenv("DM_NVN_AB_NOREUSE") != NULL;   // TOTK diagnostic: never reuse a shader's argument buffer within a pass
-    int epoch_mode = arg_epoch_on() && nvn_stage != 5 && arg_epoch_safe(sh);
-    arg_epoch_key epoch = {0}; int epoch_hit = 0;
-    if (epoch_mode) {
-        // Serialize with descriptor publication, as the full builder does. The
-        // key precedes resource lookup: later changes cannot validate old bytes.
-        registry_lock(); epoch = arg_epoch_current(nvn_stage);
-        if (g_arg_epoch_negative && sh->ab_buf) epoch.bindings = sh->ab_epoch.bindings;
-        epoch_hit = sh->ab_buf && !memcmp(&epoch, &sh->ab_epoch, sizeof epoch);
-        registry_unlock();
-    }
-    int reuse = !ab_noreuse && !passdump() && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
-        (epoch_mode ? epoch_hit : !g_args_dirty[nvn_stage]);
-    int verify_epoch = reuse && epoch_mode && atomic_load_explicit(&g_arg_epoch_check, memory_order_relaxed);
-    if (reuse) {
-        if (epoch_mode) { atomic_fetch_add_explicit(&g_arg_epoch_hits, 1, memory_order_relaxed); if (g_args_dirty[nvn_stage]) atomic_fetch_add_explicit(&g_arg_epoch_extra, 1, memory_order_relaxed); }
-        if (!verify_epoch) {
-            bind_args(en, nvn_stage, metal_vertex, sh->ab_buf, sh->ab_gpu, sh->ab_off, sh->rf.abi);
-            g_args_dirty[nvn_stage] = 0; g_stat_args_reuse++;
-            return 1;
-        }
-    }
-    #define USE(r, u) do { (void)(u); if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
-    // DM_NVN_PASSDUMP: on the first new encode per pass per stage, records the shader key (K) and the actual source of each binding (B: UBO address / length / first 4 floats, texture ID and serial, or "dummy")
-    static uint64_t bl_pass[6]; static int bl_all = -1; if (bl_all < 0) bl_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL || getenv("TOTK_INPUT_FILE") != NULL;   // Record on every new encode (otherwise only the first time per pass per stage)
-    int bl = passdump() && (bl_all || bl_pass[nvn_stage] != g_stat_pass);
-    if (bl) { bl_pass[nvn_stage] = g_stat_pass; PD("K %llu st%d key=%s nb=%d prog=%p", g_stat_pass, nvn_stage, sh->key[0] ? sh->key : sh->builtin ? sh->builtin : "?", sh->rf.nb, (const void *)S.prog); }
-    int slot_mode = tex_slots_on() && !verify_epoch && nvn_stage != 5 && arg_epoch_safe(sh) && !ab_noreuse &&
-        !passdump() && !g_res_check_on && g_use != USE_REC && !tex_slots_diagnostics() && !nan_trace_match(sh);
-    int slot_check = slot_mode && atomic_load_explicit(&g_tex_slots_check, memory_order_relaxed);
-    tex_slot_key slot_key = {0}; uint64_t slot_mask = 0, slot_hits = 0, slot_misses = 0;
-    uint64_t handles[NVN_REFL_MAXB];
-    registry_lock();   // The texture / sampler registration tables may be being grown or rewritten by the game thread
-    int slot_context = 0;
-    if (slot_mode) {
-        slot_key = (tex_slot_key){g_pass.serial, g_arena_epoch, g_reg_gen, g_ser_gen,
-            nvn_dirty_now(), g_owned_gen, (uint64_t)nvn_stage};
-        if (g_tex_slots_negative == 21) slot_key.registry = sh->tex_slots.key.registry;
-        slot_context = sh->tex_slots.valid && !memcmp(&slot_key, &sh->tex_slots.key, sizeof slot_key);
-    }
+/* TOTK_REPLAY_FAST: the binding loop of encode_args, inlined twice: with diag = 1 (any diagnostic switch on, or
+   TOTK_REPLAY_FAST=0) it is the original loop; with diag = 0 the compiler drops every diagnostic test and call
+   (pass dump, DM_GFXUSE recording, DM_RES_CHECK, TOTK_NAN_TRACE, DM_NVN_TEXPNG_FS, DM_NVN_FLASHHDR, DM_NVN_WATCH_SB),
+   so a production draw runs only the binding work. ea_diag_any() decides which copy runs. */
+static inline __attribute__((always_inline)) void ea_bind_loop(NvShader *sh, int nvn_stage, uint64_t *slots, uint64_t *handles,
+        int slot_mode, int *slot_context_io, const tex_slot_key *slot_key_in, int slot_check, uint64_t *slot_mask_io,
+        uint64_t *slot_hits_io, uint64_t *slot_misses_io, int bl_in, const int diag) {
+    const int bl = diag && bl_in;
+    const tex_slot_key slot_key = *slot_key_in;
+    int slot_context = *slot_context_io; uint64_t slot_mask = *slot_mask_io, slot_hits = *slot_hits_io, slot_misses = *slot_misses_io;
+    #define EA_USE(r, u) do { (void)(u); if (diag && __builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
     for (int i = 0; i < sh->rf.nb; i++) {
         const nvn_rbind *b = &sh->rf.b[i];
         int reg = b->reg, aid = b->aid;
@@ -8267,7 +8232,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
             void *mb; uint64_t mo, gpu;
             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "stage %d cb%d has no uniform buffer bound", nvn_stage, reg); continue; }
-            use_rec("buf", u->addr, u->size, 0, NULL);
+            if (diag) use_rec("buf", u->addr, u->size, 0, NULL);
             uint64_t ren = g_nupd ? upd_shadow(u->addr, bl ? u->size : cb_read_len(sh, i, u->size)) : 0;   // TOTK: renamed inline updates (see upd_shadow); with TOTK_CB_EXTENT=1 only the bytes the shader reads (cb_extent_scan; the whole binding while the pass dump reads it back)
             if (ren) { gpu = ren; if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) RED_ONCE(58, "UI matrix patch reads memory, skipping the uniform copy with inline updates"); }
             else if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
@@ -8293,29 +8258,29 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                 }
             }
             slots[aid] = gpu;
-            USE((__bridge id<MTLBuffer>)mb, MTLResourceUsageRead);
+            EA_USE((__bridge id<MTLBuffer>)mb, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT) {   // SAMPT: the sampler part of a combined handle (texture ID | sampler ID << 20)
             int sid = reg < 128 ? (int)((b->kind == NVN_RB_SAMPT ? S.tex[nvn_stage][reg] : S.samp[nvn_stage][reg]) >> 20) : 0;
             __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
             slots[aid] = sid && sid < g_nsreg && g_srid[sid] ? g_srid[sid] : dummy_samp_rid();
-            USE(ss ? ss : dummy_samp(), MTLResourceUsageRead);
+            EA_USE(ss ? ss : dummy_samp(), MTLResourceUsageRead);
             if (bl && sid > 0) { int ok = sid < g_nsreg && g_sreg_ok[sid]; samp_par sp = ok ? g_sreg[sid] : (samp_par){0};   // g_rmu is already held in this section
                 if (ok) PD("B %llu st%d samp reg%d sid=%d mag=%d min=%d cmp=%d/%d wrap=%d,%d,%d lod=%g..%g (0 nearest / 1 bilinear; 2-5 with mip)", g_stat_pass, nvn_stage, reg, sid, (int)sp.magf, (int)sp.minf, (int)sp.cmp_mode, (int)sp.cmp_func, (int)sp.ws, (int)sp.wt, (int)sp.wr, sp.lod_min, sp.lod_max); }
         } else if (b->kind == NVN_RB_TEX) {
             int tid = reg < 128 ? (int)(S.tex[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
-            if (nvn_stage == 1 && reg == 0 && !strncmp(sh->key, "0ac9a54938974396", 16) && getenv("DM_NVN_FLASHHDR")) g_flash_hdr_source = t;
-            if (t && tid < g_ntreg) use_rec("tex", (uint64_t)g_treg[tid].t.mem, g_treg[tid].t.L.size, tid, &g_treg[tid].t);
-            if (t && passdump() && tid < g_ntreg) PD("R %llu st%d ser=%llu mem=%p sz=%llu", g_stat_pass, nvn_stage, g_treg[tid].t.serial, (void *)g_treg[tid].t.mem, (unsigned long long)g_treg[tid].t.L.size);
-            if (t && tid < g_ntreg) tp_note_fs(sh->key, g_treg[tid].t.serial, &g_treg[tid].t);   // TOTK: DM_NVN_TEXPNG_FS
+            if (diag && nvn_stage == 1 && reg == 0 && !strncmp(sh->key, "0ac9a54938974396", 16) && getenv("DM_NVN_FLASHHDR")) g_flash_hdr_source = t;
+            if (diag && t && tid < g_ntreg) use_rec("tex", (uint64_t)g_treg[tid].t.mem, g_treg[tid].t.L.size, tid, &g_treg[tid].t);
+            if (diag && t && passdump() && tid < g_ntreg) PD("R %llu st%d ser=%llu mem=%p sz=%llu", g_stat_pass, nvn_stage, g_treg[tid].t.serial, (void *)g_treg[tid].t.mem, (unsigned long long)g_treg[tid].t.L.size);
+            if (diag && t && tid < g_ntreg) tp_note_fs(sh->key, g_treg[tid].t.serial, &g_treg[tid].t);   // TOTK: DM_NVN_TEXPNG_FS
             if (bl) PD("B %llu st%d tex reg%d tid=%d %s ser=%llu nvnfmt=%#x vfmt=%#x fmt=%lu %lux%lux%lu view_lv=%lu+%lu view_sl=%lu array=%lu target=%lu", g_stat_pass, nvn_stage, reg, tid, t ? "real" : "dummy", t && tid < g_ntreg ? g_treg[tid].t.serial : 0,
                        tid < g_ntreg ? g_treg[tid].t.d.format : 0, tid < g_ntreg && g_treg[tid].has_v && g_treg[tid].v.set_format ? g_treg[tid].v.format : 0ull,
                        (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth,
                        (unsigned long)(t.parentTexture ? t.parentRelativeLevel : 0), (unsigned long)t.mipmapLevelCount,
                        (unsigned long)(t.parentTexture ? t.parentRelativeSlice : 0), (unsigned long)t.arrayLength, (unsigned long)t.textureType);
-            if (nan_trace_match(sh) && t) { static int wid = -2; if (wid == -2) { const char *e = getenv("TOTK_NAN_TRACE_WATCH"); wid = e ? atoi(e) : 7; }
+            if (diag && nan_trace_match(sh) && t) { static int wid = -2; if (wid == -2) { const char *e = getenv("TOTK_NAN_TRACE_WATCH"); wid = e ? atoi(e) : 7; }
                 if (aid == wid && (__bridge void *)t != g_nt_watch_ptr) { g_nt_watch = t; g_nt_watch_ptr = (__bridge void *)t; g_nt_watch_ser = tid < g_ntreg ? g_treg[tid].t.serial : 0; } }
-            if (nan_trace_match(sh)) {   /* diagnostic TOTK_NAN_TRACE: what each texture slot of the traced shader holds, once per frame */
+            if (diag && nan_trace_match(sh)) {   /* diagnostic TOTK_NAN_TRACE: what each texture slot of the traced shader holds, once per frame */
                 static long nt_frame = -1; static int nt_count; long fr = (long)atomic_load(&g_cur_frame);
                 if (fr != nt_frame) { nt_frame = fr; nt_count = 0; }
                 if (nt_count++ < sh->rf.nb) MLOG("[nan-trace] bind F%ld id%d reg%d tid=%d %s ser=%llu nvnfmt=%#x vfmt=%#x mtl=%lu %lux%lux%lu lv%lu mem=%p size=%llu flags=%#x levels=%u mtlobj=%p parent=%p", fr, aid, reg, tid, t ? "tex" : "dummy",
@@ -8332,15 +8297,15 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                 if (av) { t = av; trid = av.gpuResourceID._impl; } }
             if (g_mfxup_out && (__bridge void *)sh == (__bridge void *)g_mfxup_sh && t == g_mfxup_src) { t = g_mfxup_out; trid = t.gpuResourceID._impl; }   // TOTK_MFX_UPSCALE
             slots[aid] = trid;
-            USE(t, MTLResourceUsageRead);
+            EA_USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_IMG) {   // Writable texture: NVN image slot r (BindImages) ↔ D3D u_r
             int tid = reg < 32 ? (int)(S.img[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
-            if (passdump()) PD("W %llu st%d reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "real" : "dummy", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
+            if (diag && passdump()) PD("W %llu st%d reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "real" : "dummy", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
             if (t && !(t.usage & MTLTextureUsageShaderWrite)) { RED_ONCE(32, "texture bound to an image slot lacks write usage (texture id %d)", tid); t = nil; }
             if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
             slots[aid] = trid;
-            USE(t, MTLResourceUsageRead | MTLResourceUsageWrite);
+            EA_USE(t, MTLResourceUsageRead | MTLResourceUsageWrite);
         } else if (b->kind == NVN_RB_TBUF) {   // Typed buffer: the buffer texture (target BUFFER) in texture slot r
             int tid = reg < 128 ? (int)(S.tex[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
@@ -8348,7 +8313,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             if (bl) PD("B %llu st%d tbuf reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "real" : "dummy", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
             if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
             slots[aid] = trid;
-            USE(t, MTLResourceUsageRead);
+            EA_USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SBUFU) {   // TOTK: the shader loads this storage buffer's address from a user uniform block (slot reg, byte offset off); resolve that pointer now
             const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
             uint64_t va = 0; int pr = 0;
@@ -8360,8 +8325,8 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             void *mb; uint64_t mo, gpu;
             if (va && g_nupd && upd_overlap_seq(va, va + 65536)) { g_ren_late++; RED_ONCE(60, "storage buffer pointer %#llx in a uniform slot found overlapping a pending uniform update only after the encoder opened", (unsigned long long)va); }
             if (va && b->rw) usnap_drop(va, 65536);   // TOTK: the shader may write there (extent unknown: 64 KiB as for the update check)
-            if (va && mtl_gpu_addr(va, 1, &mb, &mo, &gpu)) { use_rec("buf", va, 1, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
-            else { RED_ONCE(40, "stage %d uniform slot %d offset %u: storage buffer pointer %#llx is not in a memory pool (uniform %s)", nvn_stage, reg, b->off, (unsigned long long)va, u && u->addr ? "bound" : "unbound"); slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead);
+            if (va && mtl_gpu_addr(va, 1, &mb, &mo, &gpu)) { if (diag) use_rec("buf", va, 1, 0, NULL); slots[aid] = gpu; EA_USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
+            else { RED_ONCE(40, "stage %d uniform slot %d offset %u: storage buffer pointer %#llx is not in a memory pool (uniform %s)", nvn_stage, reg, b->off, (unsigned long long)va, u && u->addr ? "bound" : "unbound"); slots[aid] = dummy_buf_gpu(); EA_USE(dummy_buf(), MTLResourceUsageRead);
                 /* TOTK diagnostic (first 12): which bound uniform block of this stage holds a pool pointer at this offset, and the head of every bound block */
                 static uint64_t dn; if (dn < 12 && sh) { dn++; char line[1400]; size_t o = 0;
                     for (int r = 0; r < 16; r++) { const p_bind_buf *q = &S.ubo[nvn_stage][r]; void *qb; uint64_t qo; if (!q->addr || q->size < 16 || !mtl_addr(q->addr, q->size, &qb, &qo)) continue; const uint32_t *w = (const uint32_t *)(uintptr_t)q->addr; uint64_t v = q->size >= (uint64_t)b->off + 8 ? *(const uint64_t *)(uintptr_t)(q->addr + b->off) : 0;
@@ -8372,7 +8337,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         } else if (b->kind == NVN_RB_SBUFP || b->kind == NVN_RB_UBOP) {   // B: storage buffers / compute-stage uniforms are device pointers; the address is taken by NVN slot
             const p_bind_buf *u = reg < 16 ? (b->kind == NVN_RB_UBOP ? &S.ubo[nvn_stage][reg] : &S.ssbo[nvn_stage][reg]) : NULL;
             void *mb; uint64_t mo, gpu;
-            { /* TOTK: DM_NVN_WATCH_SB=<shader key prefix>:<reg>: arm the guest read/write watch on this storage buffer (see runtime_watch_set) */
+            if (diag) { /* TOTK: DM_NVN_WATCH_SB=<shader key prefix>:<reg>: arm the guest read/write watch on this storage buffer (see runtime_watch_set) */
               static const char *wsb = NULL; static int wsb_init, wsb_reg = -1, wsb_done; if (!wsb_init) { wsb_init = 1; const char *e = getenv("DM_NVN_WATCH_SB"); if (e && strchr(e, ':')) { size_t L = strchr(e, ':') - e; char *k = malloc(L + 1); memcpy(k, e, L); k[L] = 0; wsb = k; wsb_reg = atoi(strchr(e, ':') + 1); } }
               if (wsb && !wsb_done && u && u->addr && reg == wsb_reg && sh && sh->key && !strncmp(sh->key, wsb, strlen(wsb))) { extern void runtime_watch_set(uintptr_t, size_t); runtime_watch_set((uintptr_t)u->addr, (size_t)u->size); wsb_done = 1; MLOG("[watch] armed on storage buffer reg%d of %.16s addr=%#llx size=%llu", reg, sh->key, (unsigned long long)u->addr, (unsigned long long)u->size); } }
             uint64_t ren = 0;
@@ -8382,10 +8347,10 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             }
             if (b->kind == NVN_RB_SBUFP && b->rw && u && u->addr) usnap_drop(u->addr, u->size ? u->size : 1);   // TOTK: the shader may write it: no stale uniform copy from here on
             const usnap_t *usc = !ren && b->kind == NVN_RB_UBOP && u && u->addr ? usnap_find(u->addr, u->size ? u->size : 1) : NULL;   // TOTK: compute uniforms as of the submit call
-            if (ren) { slots[aid] = ren; USE(dummy_buf(), MTLResourceUsageRead); }
-            else if (usc) { slots[aid] = usc->gpu + (u->addr - usc->lo); USE(dummy_buf(), MTLResourceUsageRead); }
-            else if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { use_rec("buf", u->addr, u->size, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
-            else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
+            if (ren) { slots[aid] = ren; EA_USE(dummy_buf(), MTLResourceUsageRead); }
+            else if (usc) { slots[aid] = usc->gpu + (u->addr - usc->lo); EA_USE(dummy_buf(), MTLResourceUsageRead); }
+            else if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { if (diag) use_rec("buf", u->addr, u->size, 0, NULL); slots[aid] = gpu; EA_USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
+            else { slots[aid] = dummy_buf_gpu(); EA_USE(dummy_buf(), MTLResourceUsageRead); }
             if (bl) { /* TOTK: first 16 bytes and the count of non-zero 32-bit words (CPU view of the pool: what earlier GPU work left there) */
                 uint64_t nz = 0, nw = 0; uint32_t w4[4] = {0, 0, 0, 0}; void *mb2; uint64_t mo2;
                 if (u && u->addr && u->size && mtl_addr(u->addr, u->size, &mb2, &mo2)) { const uint32_t *q = (const uint32_t *)((const uint8_t *)[(__bridge id<MTLBuffer>)mb2 contents] + mo2); nw = u->size / 4; for (uint64_t i = 0; i < nw; i++) nz += q[i] != 0; memcpy(w4, q, nw >= 4 ? 16 : nw * 4); }
@@ -8400,22 +8365,80 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         } else if (b->kind == NVN_RB_C1) {      // B: the shader's own constant segment, built when the shader is fetched
             id<MTLBuffer> cb = sh->c1buf ? sh->c1buf : zero_bank();   // c1 has length 0 (600 of them in the whole library) yet the shader still declares it: reads 0
             slots[aid] = (sh->c1buf ? sh->c1_gpu : zero_bank_gpu()) + (sh->c1buf ? sh->c1off : 0);
-            USE(cb, MTLResourceUsageRead);
+            EA_USE(cb, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SUPPORT) {   // support_buffer: scale 1.0, BGRA swap 0, viewport transform not disabled (viewport fields are not read)
             slots[aid] = support_gpu();
-            USE(support_buf(), MTLResourceUsageRead);
+            EA_USE(support_buf(), MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_DRV0 || b->kind == NVN_RB_DRV2) {
             // NVN driver constant segments: those proven unread by static analysis at packaging time are supplied as 0; those read are filled on the spot from the current bindings - c0 = storage buffer table (base + 0x10 r: address 64 bits, size 32 bits),
             // c2 = texture handle table (0x168 + 8 r) and sampler handle table (0x568 + 8 r), the values being the NVN handles the game gave at bind time; positions read outside the tables are registered at packaging time and reported a failure at load time
             int bank = b->kind == NVN_RB_DRV2 ? 2 : 0;
-            if (!sh->rf.drv_read[bank] || (sh->drv_scanned[bank] && !drvfill_on())) { slots[aid] = zero_bank_gpu(); USE(zero_bank(), MTLResourceUsageRead); }
+            if (!sh->rf.drv_read[bank] || (sh->drv_scanned[bank] && !drvfill_on())) { slots[aid] = zero_bank_gpu(); EA_USE(zero_bank(), MTLResourceUsageRead); }
             else {
                 id<MTLBuffer> db; slots[aid] = driver_bank_gpu(bank, nvn_stage, &db);
-                USE(db, MTLResourceUsageRead);
+                EA_USE(db, MTLResourceUsageRead);
             }
         } else RED_ONCE(46, "binding kind %d not implemented", b->kind);
     }
-    #undef USE
+    #undef EA_USE
+    *slot_context_io = slot_context; *slot_mask_io = slot_mask; *slot_hits_io = slot_hits; *slot_misses_io = slot_misses;
+}
+/* Whether any diagnostic that the binding loop consults is on. The pass dump is a per-frame window, so the answer is
+   cached per frame; DM_GFXUSE recording and the live DM_NVN_TEXPNG_FS switch are read on every call (one load each). */
+static int ea_diag_any(void) {
+    static uint64_t fr = UINT64_MAX; static int per_frame, env = -1;
+    if (env < 0) env = getenv("DM_NVN_WATCH_SB") || getenv("DM_NVN_TEXPNG_FS") || getenv("DM_NVN_FLASHHDR") || getenv("DM_NVN_CBDUMP");
+    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
+    if (f != fr) { fr = f; per_frame = !replay_fast() || env || g_res_check_on || nan_trace_prefix() || passdump(); }
+    return per_frame || g_use == USE_REC || atomic_load_explicit(&g_diag_texpng_fs, memory_order_relaxed);
+}
+static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
+    if (!sh->ae) return 1;
+    if (nvn_stage == 1 && tex_slots_diagnostics() && !strncmp(sh->key, "0ac9a54938974396", 16) && getenv("DM_NVN_FLASHHDR") && R.rt.n && R.rt.color[0])   // tex_slots_diagnostics: DM_NVN_FLASHHDR or DM_NVN_TEXPNG_FS set (cached), so production skips the key compare
+        g_flash_tonemap_target = tex_mtl(R.rt.color[0]);
+    uint64_t slots[NVN_REFL_MAXB] = {0};
+    args_sync_dirty();
+    static int ab_noreuse = -1; if (ab_noreuse < 0) ab_noreuse = getenv("DM_NVN_AB_NOREUSE") != NULL;   // TOTK diagnostic: never reuse a shader's argument buffer within a pass
+    int epoch_mode = arg_epoch_on() && nvn_stage != 5 && arg_epoch_safe(sh);
+    arg_epoch_key epoch = {0}; int epoch_hit = 0;
+    if (epoch_mode) {
+        // Serialize with descriptor publication, as the full builder does. The
+        // key precedes resource lookup: later changes cannot validate old bytes.
+        registry_lock(); epoch = arg_epoch_current(nvn_stage);
+        if (g_arg_epoch_negative && sh->ab_buf) epoch.bindings = sh->ab_epoch.bindings;
+        epoch_hit = sh->ab_buf && !memcmp(&epoch, &sh->ab_epoch, sizeof epoch);
+        registry_unlock();
+    }
+    int reuse = !ab_noreuse && !passdump() && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
+        (epoch_mode ? epoch_hit : !g_args_dirty[nvn_stage]);
+    int verify_epoch = reuse && epoch_mode && atomic_load_explicit(&g_arg_epoch_check, memory_order_relaxed);
+    if (reuse) {
+        if (epoch_mode) { atomic_fetch_add_explicit(&g_arg_epoch_hits, 1, memory_order_relaxed); if (g_args_dirty[nvn_stage]) atomic_fetch_add_explicit(&g_arg_epoch_extra, 1, memory_order_relaxed); }
+        if (!verify_epoch) {
+            bind_args(en, nvn_stage, metal_vertex, sh->ab_buf, sh->ab_gpu, sh->ab_off, sh->rf.abi);
+            g_args_dirty[nvn_stage] = 0; g_stat_args_reuse++;
+            return 1;
+        }
+    }
+    // DM_NVN_PASSDUMP: on the first new encode per pass per stage, records the shader key (K) and the actual source of each binding (B: UBO address / length / first 4 floats, texture ID and serial, or "dummy")
+    static uint64_t bl_pass[6]; static int bl_all = -1; if (bl_all < 0) bl_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL || getenv("TOTK_INPUT_FILE") != NULL;   // Record on every new encode (otherwise only the first time per pass per stage)
+    int bl = passdump() && (bl_all || bl_pass[nvn_stage] != g_stat_pass);
+    if (bl) { bl_pass[nvn_stage] = g_stat_pass; PD("K %llu st%d key=%s nb=%d prog=%p", g_stat_pass, nvn_stage, sh->key[0] ? sh->key : sh->builtin ? sh->builtin : "?", sh->rf.nb, (const void *)S.prog); }
+    int slot_mode = tex_slots_on() && !verify_epoch && nvn_stage != 5 && arg_epoch_safe(sh) && !ab_noreuse &&
+        !passdump() && !g_res_check_on && g_use != USE_REC && !tex_slots_diagnostics() && !nan_trace_match(sh);
+    int slot_check = slot_mode && atomic_load_explicit(&g_tex_slots_check, memory_order_relaxed);
+    tex_slot_key slot_key = {0}; uint64_t slot_mask = 0, slot_hits = 0, slot_misses = 0;
+    uint64_t handles[NVN_REFL_MAXB];
+    registry_lock();   // The texture / sampler registration tables may be being grown or rewritten by the game thread
+    int slot_context = 0;
+    if (slot_mode) {
+        slot_key = (tex_slot_key){g_pass.serial, g_arena_epoch, g_reg_gen, g_ser_gen,
+            nvn_dirty_now(), g_owned_gen, (uint64_t)nvn_stage};
+        if (g_tex_slots_negative == 21) slot_key.registry = sh->tex_slots.key.registry;
+        slot_context = sh->tex_slots.valid && !memcmp(&slot_key, &sh->tex_slots.key, sizeof slot_key);
+    }
+    if (ea_diag_any()) ea_bind_loop(sh, nvn_stage, slots, handles, slot_mode, &slot_context, &slot_key, slot_check, &slot_mask, &slot_hits, &slot_misses, bl, 1);
+    else ea_bind_loop(sh, nvn_stage, slots, handles, slot_mode, &slot_context, &slot_key, slot_check, &slot_mask, &slot_hits, &slot_misses, bl, 0);
     if (slot_mode) {
         for (int i = 0; i < sh->rf.nb; i++) {
             const nvn_rbind *b = &sh->rf.b[i]; int aid = b->aid;
