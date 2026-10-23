@@ -10,9 +10,12 @@ typedef struct {
 } pso_key;
 // pso_key.a2c: bit 0 alpha-to-coverage; bit 1 (TOTK) layered pass, the vertex function writes the render target array index;
 // bits 2-3 (TOTK_MFX) MetalFX copy role of the draw: 1 scene to attachment 6, 2 / 3 UI (blended / opaque) to attachment 7;
-// bit 4 (TOTK) the vertex function emulates a sampler border colour Metal lacks (vs_fn_for, border_key).
+// bit 4 (TOTK) the vertex function emulates a sampler border colour Metal lacks (vs_fn_for, border_key);
+// bit 5 (TOTK_OBJ_MOTION) colour attachment 6 is the per-object motion target (totk_objmv.h): written by role 1
+// (MFX_ROLE_MOTION) draws through the motion variants, write mask none for every other draw.
 #define PSO_LAYERED 2u
 #define PSO_VBORDER 16u
+#define PSO_OBJMV 32u
 
 typedef struct {
     uint8_t kind, fbmask;

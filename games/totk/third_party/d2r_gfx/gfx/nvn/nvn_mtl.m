@@ -4253,15 +4253,21 @@ static void rr_reset(void);
 static id<MTL4RenderCommandEncoder> g_enc;
 static int rp_active(void) { return g_enc != nil; }
 // Target info of the current render pass: determined once from the attachments at rp_begin and shared by all draws in the pass (pipeline key, depth-stencil, viewport / scissor all depend only on it)
-static struct { uint32_t cfmt[8], dfmt, sfmt, samples; int hd, hs; NSUInteger tw, th; uint64_t serial, reg_gen, ser_gen, range_dirty; int range_external, range_depth_nonro; __unsafe_unretained id<MTLTexture> range_color, range_depth; int layered, mfx, noatt; } g_pass;
+static struct { uint32_t cfmt[8], dfmt, sfmt, samples; int hd, hs; NSUInteger tw, th; uint64_t serial, reg_gen, ser_gen, range_dirty; int range_external, range_depth_nonro; __unsafe_unretained id<MTLTexture> range_color, range_depth; int layered, mfx, noatt, objmv; } g_pass;   // objmv: TOTK_OBJ_MOTION pass (totk_objmv.h)
 /* TOTK_MFX=interp (totk_mfx.m): the canvas is the float target the game composes the frame in and then copies to the
    presented texture (docked: 1920x1080, the 1600x900 scene upscaled into it; handheld: 1280x720, the scene drawn in it).
    Before the first UI draw into it (a TOTK UI vertex shader) the pass is ended and the canvas copied: that is the scene.
    From there on canvas passes get colour attachment 7, the UI layer every draw is copied to. The G-buffer pass gives the
    depth and the camera. role: 2 UI with the game's blend, 3 opaque UI. */
+#define MFX_ROLE_MOTION 1   // TOTK_OBJ_MOTION: an opaque G-buffer draw writing its motion to attachment 6 (totk_objmv.h)
 #define MFX_ROLE_UI 2
 #define MFX_ROLE_UI_OPAQUE 3
 static struct { uint64_t canvas, last_c0, swap[4]; uint32_t swap_w, swap_h; int nswap, scene_done, ui_cleared, depth_done, want_cam, role; uint64_t frames; } g_mfx;
+// TOTK_OBJ_MOTION (totk_objmv.h, included after the readable-tile merge state)
+static void om_note_depth(id<MTLTexture> dt);
+static void om_pass_setup(MTL4RenderPassDescriptor *pd);
+static void om_frame_end(void);
+static int om_role(int prim);
 static id<MTLRenderPipelineState> g_enc_pso; static id<MTLDepthStencilState> g_enc_dss;   // Already set on this encoder (not set again if identical)
 static int g_enc_vis, g_enc_has_vis;   // This encoder's current visibility count mode (0 off / slot number + 1), and whether a visibility buffer is attached
 static int g_pso_dirty = 1, g_dss_dirty = 1;   // Pipeline / depth-stencil related state was changed during replay
@@ -4930,8 +4936,9 @@ static void mfx_pass_setup(MTL4RenderPassDescriptor *pd) {
     id<MTLTexture> dt = pd.depthAttachment.texture;
     if (!g_mfx.depth_done && dt && c0 && dt.pixelFormat == MTLPixelFormatDepth32Float && dt.width == c0.width && dt.height == c0.height && dt.width >= 320) {
         int nc = 0; for (int i = 0; i < R.rt.n && i < 8; i++) nc += pd.colorAttachments[i].texture != nil;
-        if (nc >= 3) { mfx_note_depth(dt); g_mfx.depth_done = 1; g_mfx.want_cam = 1; }
+        if (nc >= 3) { mfx_note_depth(dt); om_note_depth(dt); g_mfx.depth_done = 1; g_mfx.want_cam = 1; }
     }
+    om_pass_setup(pd);   // TOTK_OBJ_MOTION: the motion attachment of passes into the G-buffer depth
     if (t0 && c0 && g_mfx.scene_done && g_mfx.canvas == t0->serial && R.rt.n <= 7 && pd.colorAttachments[0].level == 0 && !pd.colorAttachments[7].texture) {
         MTLRenderPassColorAttachmentDescriptor *a7 = pd.colorAttachments[7];
         a7.texture = mfx_ui_target(g_dev, c0.width, c0.height);
@@ -7455,6 +7462,10 @@ static id<MTLComputePipelineState> cs_new(NvShader *cs, NSError **e) {
     if (ps) par_add(g_dev, key, d);
     return ps;
 }
+// TOTK_OBJ_MOTION (totk_objmv.h)
+static id<MTLFunction> om_vs_fn(NvShader *vs, NvShader *fs);
+static id<MTLFunction> om_fs_fn(NvShader *fs);
+static void om_pso_desc(MTLRenderPipelineDescriptor *d, const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged);
 static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     // A border pipeline's key carries its vertex function (pso_get, warm_worker): built off the submit thread too, it reads no sampler here.
@@ -7509,8 +7520,9 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
             c.rgbBlendOperation = bop(k->blend[l].eq_rgb); c.alphaBlendOperation = bop(k->blend[l].eq_a);
         }
     }
+    if (k->a2c & PSO_OBJMV) om_pso_desc(d, k, vs, fs, fsfn, merged);   // TOTK_OBJ_MOTION: attachment 6
     int mr = (int)(k->a2c >> 2) & 3;   // TOTK_MFX role (see g_mfx): attachment 7 takes the UI layer
-    if (mr) {
+    if (mr >= MFX_ROLE_UI) {
         id<MTLFunction> mf = fs_fn_mfx(fs, mr, k->dfmt == 0);
         d.colorAttachments[7].blendingEnabled = NO; d.colorAttachments[7].writeMask = MTLColorWriteMaskNone;
         if (mf) {
@@ -7648,6 +7660,7 @@ static int pso_pend_state(const pso_key *k) {   // -1 not predicted, 0 compiling
 }
 /* A new pipeline into the cache and the warm lists (submit thread). */
 static void pso_adopt(const pso_key *k, NvShader *vs, NvShader *fs, int border, int merged, id<MTLRenderPipelineState> ps, uint64_t bt, int bg, NSString *brec) {
+    if (k->a2c & PSO_OBJMV) { hm_put_id(&g_pso, k, ps); return; }   // TOTK_OBJ_MOTION pipelines stay out of the warm lists (off by default)
     pso_key rk = *k; rk.a2c &= ~PSO_VBORDER; if (border) rk.fsfn = NULL;   // the warm-up list records the plain pipeline: a border variant is built from the draw's samplers
     pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&rk, vs, fs, merged, merged ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
     if (survey_shader_log()) MLOG("[survey-shader] frame %llu render pipeline %s in %.2f ms%s", (unsigned long long)atomic_load(&g_cur_frame), shex, (bp_now() - bt) / 1e6, bg ? " (background, from queued to adopted)" : "");
@@ -7706,7 +7719,12 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (!vs) { RED_ONCE(13, "program has no vertex shader (or it is not mapped)"); return nil; }
     pso_key k; pso_key_fill(&k, vs, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, g_pso_lmap != NULL);
     if (g_pass.layered) k.a2c |= PSO_LAYERED;   // TOTK: layered pass (see g_lay)
-    if (g_mfx.role) k.a2c |= (uint32_t)g_mfx.role << 2;   // TOTK_MFX: scene / UI copy variant (see pso_desc)
+    /* TOTK_MFX: UI copy variant / TOTK_OBJ_MOTION motion variant (see pso_desc), set in the key below. A motion draw
+       that needs another fragment variant (merged pass, reading its attachments, border colour) or a vertex border
+       variant keeps the game's function and writes no motion (role 0): the picture before the motion. */
+    int role = g_mfx.role;
+    if (role == MFX_ROLE_MOTION && (g_pso_lmap || g_pso_fbfn)) role = 0;
+    if (g_pass.objmv) k.a2c |= PSO_OBJMV;
     if (g_pso_lmap) { memcpy(k.lmap, g_pso_lmap, 8); k.fsfn = (__bridge void *)g_pso_fsfn; }
     // Async variants: for a draw that may be skipped, a patched function not compiled yet is compiled in the background
     // and the draw deferred. Checked before the cache lookup: a key without its border function would find another pipeline.
@@ -7716,20 +7734,22 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     int probe = !g_pso_lmap && draw_may_skip(pr), plain = !probe && !g_pso_lmap && border_plain_ok();
     g_vprobe = probe || plain; g_vmissing = 0;
     NSString *vrec = nil, *frec = nil;   // the border recipes of this key (pso_adopt)
-    __unsafe_unretained id<MTLFunction> bfn = !g_pso_lmap && !g_mfx.role ? fs_fn_border(fs, k.dfmt == 0, &frec) : nil;   // TOTK: sampler border colour emulation
+    __unsafe_unretained id<MTLFunction> bfn = !g_pso_lmap && (!role || role == MFX_ROLE_MOTION) ? fs_fn_border(fs, k.dfmt == 0, &frec) : nil;   // TOTK: sampler border colour emulation
+    if (bfn && role == MFX_ROLE_MOTION) role = 0;
     // TOTK: or the variant reading the draw's own attachments from the tile (att_fb_take). Unlike a border variant it is never
     // left out for the plain function: the draw gave up the store before it, so it waits for it or is deferred.
-    int fbread = !bfn && !g_pso_lmap && !g_mfx.role && g_pso_fbfn;
+    int fbread = !bfn && !g_pso_lmap && !role && g_pso_fbfn;
     if (fbread) bfn = g_pso_fbfn;
     if (bfn) k.fsfn = (__bridge void *)bfn;
     { float bc[8][4]; int ba[8], bn; unsigned axes[8]; if (border_key(vs, 0, bc, ba, axes, &bn)) {
-        k.a2c |= PSO_VBORDER;
+        k.a2c |= PSO_VBORDER; if (role == MFX_ROLE_MOTION) role = 0;
         // The same shader can bind different border constants. Cache the actual
         // vertex variant identity, not just the fact that one exists. Persisted
         // recipes clear this pointer in pso_skey_from, keeping the stable ABI.
         k.vs = (__bridge void *)vs_fn_for(vs, fs, (k.a2c & PSO_LAYERED) != 0, 1, &vrec);
     } }
     g_vprobe = 0;
+    if (role) k.a2c |= (uint32_t)role << 2;
     if (g_vmissing && !plain) { g_pso_deferred = 1; return nil; }
     int bordered = (bfn && !fbread) || (k.a2c & PSO_VBORDER);
     if (g_vmissing) { if (!fbread) { bfn = nil; k.fsfn = NULL; } k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; }
@@ -7747,7 +7767,8 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
         g_vprobe = 1;
         if (!(k.a2c & PSO_VBORDER)) vs_fn_for(vs, fs, (k.a2c & PSO_LAYERED) != 0, 0, NULL);
         if (fs && !bfn && !k.dfmt) fs_fn_without_depth(fs);
-        if (fs && g_mfx.role) fs_fn_mfx(fs, g_mfx.role, k.dfmt == 0);
+        if (fs && role >= MFX_ROLE_UI) fs_fn_mfx(fs, role, k.dfmt == 0);
+        if (role == MFX_ROLE_MOTION && !(k.a2c & PSO_VBORDER)) { om_vs_fn(vs, fs); om_fs_fn(fs); }   // TOTK_OBJ_MOTION variants in the background
         g_vprobe = 0;
         if (g_vmissing) { g_pso_deferred = 1; return nil; }
     }
@@ -7789,7 +7810,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_mru_get(NvProg *pr) {
     if (atomic_load_explicit(&g_border_custom_any, memory_order_relaxed)) {   // the samplers bound now, as pso_get reads them
         float bc[8][4]; int ba[8], bn; unsigned ax[8];
         vb = border_key(vs, 0, bc, ba, ax, &bn);
-        if (!g_mfx.role && fs && sh_has_src(fs)) fb = border_key(fs, 1, bc, ba, ax, &bn);
+        if ((!g_mfx.role || g_mfx.role == MFX_ROLE_MOTION) && fs && sh_has_src(fs)) fb = border_key(fs, 1, bc, ba, ax, &bn);
     }
     for (int i = 0; i < 4; i++)
         if (pr->mru_ps[i] && pr->mru_gen[i] == g_pso_state_gen && pr->mru_vs[i] == vs && pr->mru_fs[i] == fs && !memcmp(pr->mru_pass[i], sig, sizeof sig)
@@ -9022,6 +9043,7 @@ typedef struct {
     uint8_t cov2[8];                     // Physical attachments covered by the first draw of the later pass
 } fuse_t;
 static fuse_t g_fz; static uint64_t g_fz_n, g_fz_draws, g_fz_fallback;
+#include "totk_objmv.h"   // TOTK_OBJ_MOTION
 typedef struct { int idx; p_draw dw; p_draw_idx di; p_scissor sc; int has_sc; void *S_; uint8_t pm[8]; } defer_snap;   // pm: group P target index → logical color number of this draw (identity for its own draws; a composed mapping for absorbed upstream groups)
 typedef struct {
     int active, at_q, in_p, n, reason, reason_op, logged, reset_between; uint64_t born;   // born: creation serial (replay is ordered by it, not by slot)
@@ -11860,9 +11882,10 @@ frz_plain:;
     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
     g_fd_dw = NULL; g_fd_di = NULL;
     if (!en) { g_draw_skip[8]++; return; }
-    if (g_pass.mfx || g_mfx.role) {   // TOTK_MFX: every draw into the canvas after the scene copy goes to the UI layer too
+    if (g_pass.mfx || g_pass.objmv || g_mfx.role) {   // TOTK_MFX: every draw into the canvas after the scene copy goes to the UI layer too
         int r = 0;
-        if (g_pass.mfx) {
+        if (g_pass.objmv && !g_pass.mfx) r = om_role(dw ? dw->prim : di ? di->prim : -1);   // TOTK_OBJ_MOTION: an opaque G-buffer draw
+        else if (g_pass.mfx) {
             r = S.color.blend_en & 1 ? MFX_ROLE_UI : MFX_ROLE_UI_OPAQUE;
             /* TOTK_MFX_ROLELOG=<first>-<last frame>: every canvas draw with its role (diagnostic) */
             static long r0 = -2, r1; if (r0 == -2) { const char *e = getenv("TOTK_MFX_ROLELOG"); r0 = e ? atol(e) : -1; r1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : r0; }
@@ -11999,6 +12022,7 @@ frz_plain:;
       enc_r_clip(en, S.depth_clamp && !noclamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip); }   // TOTK: SetDepthClamp
     enc_r_blend_color(en, S.blend_color[0], S.blend_color[1], S.blend_color[2], S.blend_color[3]);
     bind_vertex_streams((id<MTL4RenderCommandEncoder>)en,pr->sh[0]);
+    if (g_pass.objmv && g_mfx.role == MFX_ROLE_MOTION && pr->sh[0]) om_bind((id<MTL4RenderCommandEncoder>)en, pr, dw, di);   // TOTK_OBJ_MOTION: this draw's positions
     if (g_lay.active) enc_r_vbuf(en, LAY_BUF_INDEX, lay_gpu(g_lay_probe_neg == 1 ? 0 : g_lay.cur - g_lay.base));   // TOTK: this draw's layer within the layered pass
     if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
@@ -14513,6 +14537,7 @@ static int mfx_present_frame_body(const tex_t *t, double period, int discard) {
         if (sc && g_mfx_swap_prev) { mtl_finish_gpu(); id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder]; [b copyFromTexture:sc toTexture:g_mfx_swap_prev]; [b endEncoding]; cb_commit(cb); cb_wait(cb); }
     }
     g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = 0; BOTW_MFX_FRAME_RESET()
+    om_frame_end();   // TOTK_OBJ_MOTION: this frame's draws become the previous frame's
     if (++g_mfx.frames % 300 == 0) { char b[256]; mfx_stats(b, sizeof b); MLOG("[mfx] up to frame %llu: %s", (unsigned long long)atomic_load(&g_cur_frame), b); }
     return slot;
 }

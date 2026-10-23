@@ -22,6 +22,13 @@ void mfx_note_scene(void);
 void mfx_note_depth(id<MTLTexture> depth);
 void mfx_note_camera(const float *cam, int n);
 id<MTLResidencySet> mfx_residency(void);   // our textures; the queue adds it once
+// TOTK_OBJ_MOTION=1 (default 0): per-object motion from the opaque G-buffer draws (totk_objmv.h). The target is RG16Float
+// of the depth size, holding the NDC delta previous - current per pixel, OBJMV_NONE where none is known (camera motion
+// is used there); mfx_note_obj: this frame's G-buffer pass wrote it.
+#define OBJMV_NONE 65000.0f
+int mfx_obj_motion_on(void);
+id<MTLTexture> mfx_obj_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h);
+void mfx_note_obj(void);
 // At the game's present. prepare: checks this frame's inputs and returns the output slot of the interpolated frame
 // between the previous and this frame, or -1 (first frame, missing input, scene cut; state already advanced). frame_s:
 // the pacing period (two display refreshes; 0 in unpaced measurement runs). encode: motion vectors and the interpolation into cb (Metal 4, own command buffer, GPU order after this

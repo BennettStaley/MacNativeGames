@@ -9,9 +9,12 @@
 //  - the UI drawn over it: attachment 7 of the later canvas passes, premultiplied (the game's colour blend, alpha
 //    accumulating coverage);
 //  - the G-buffer depth (D32F, not reversed, infinite far plane) and the camera block.
-// Motion vectors come from the camera only: depth plus this and the previous frame's view-projection. MetalFX refines
+// Motion vectors come from the camera: depth plus this and the previous frame's view-projection. MetalFX refines
 // motion itself (tests/metalfx_interp: zero motion still 36 dB), but what moves with the camera (Link) gets the
-// background's camera motion. Conventions measured by the probe: motion in pixels of the motion texture, pointing to the
+// background's camera motion. TOTK_OBJ_MOTION=1 (default 0) adds per-object motion (totk_objmv.h, like RTX Remix's
+// draw call tracker): the opaque G-buffer draws also write their clip-space motion into an RG16Float attachment (NDC
+// delta previous - current; OBJMV_NONE where no draw of the previous frame matched), and the kernel takes it where
+// present and the camera motion elsewhere. Conventions measured by the probe: motion in pixels of the motion texture, pointing to the
 // previous position; the UI given apart and premultiplied (the "composited" mode returns a black frame).
 #import <MetalFX/MetalFX.h>
 #import <QuartzCore/QuartzCore.h>
@@ -51,7 +54,10 @@ static struct {
     uint64_t frames, made, skip_input, skip_first, skip_cut, skip_busy, miss[4];   // miss: scene, camera, depth, UI
     double gpu_ms[300]; int ngpu;   // GPU time of the last interpolations (MetalFX part)
     double last_prepare_s, dt;      // time of the previous game frame's prepare; this pair's interval (MetalFX deltaTime)
+    id<MTLTexture> obj;             // TOTK_OBJ_MOTION: per-object motion of the G-buffer draws (see mfx_obj_target)
+    int obj_ok, enc_obj;            // obj written this frame; the prepared frame uses it
     double near_p, far_p, fov_deg, aspect; int proj_src;   // this frame's projection for MetalFX (cam_projection)
+    uint64_t obj_frames;
 } g;
 
 /* Reconstructing identical MetalFX interpolators repeatedly grows device
@@ -152,6 +158,22 @@ id<MTLTexture> mfx_scene_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h, M
 id<MTLTexture> mfx_ui_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h) { ensure_out(dev, w, h, 0); return g.ui; }
 id<MTLResidencySet> mfx_residency(void) { return g.rs; }
 void mfx_note_scene(void) { g.scene_ok = 1; }
+/* TOTK_OBJ_MOTION: the RG16Float target the G-buffer draws write their motion to (NDC delta, previous minus current;
+   OBJMV_NONE: no motion known, the camera motion is used). Same size as the G-buffer depth. */
+int mfx_obj_motion_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_OBJ_MOTION"); on = e && atoi(e) > 0; if (on) MLOG("TOTK_OBJ_MOTION=1: per-object motion vectors from the opaque G-buffer draws"); }
+    return on;
+}
+id<MTLTexture> mfx_obj_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h) {
+    if (!g.dev) g.dev = dev;
+    if (!g.obj || g.obj.width != w || g.obj.height != h) {
+        drop(&g.obj); g.obj = mk(MTLPixelFormatRG16Float, w, h, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+        MLOG("per-object motion target %lux%lu", (unsigned long)w, (unsigned long)h);
+    }
+    return g.obj;
+}
+void mfx_note_obj(void) { g.obj_ok = 1; }
 void mfx_note_depth(id<MTLTexture> d) { if (d && d.pixelFormat == MTLPixelFormatDepth32Float && d.textureType == MTLTextureType2D) g.depth = d; }
 void mfx_note_camera(const float *c, int n) {
     if (n < 84) return;
@@ -179,11 +201,16 @@ static void ensure_fi(NSUInteger iw, NSUInteger ih) {
     if (!g.mv_ps) {
         static const char *src =
             "#include <metal_stdlib>\nusing namespace metal;\n"
-            "struct P { float4x4 reproj; float2 size; float2 inv_size; float yflip; float pad0, pad1, pad2; };\n"
-            // camera motion of each depth pixel: where it was in the previous frame, in pixels of this texture
+            "struct P { float4x4 reproj; float2 size; float2 inv_size; float yflip; float obj; float pad1, pad2; };\n"
+            // camera motion of each depth pixel: where it was in the previous frame, in pixels of this texture. With
+            // TOTK_OBJ_MOTION the motion the G-buffer draw wrote there wins (an NDC delta in Metal clip space: y up,
+            // texture rows down); OBJMV_NONE (65000) or anything that large means none, the camera motion is used.
             "kernel void mfx_mv(depth2d<float, access::read> d [[texture(0)]], texture2d<float, access::write> mv [[texture(1)]],\n"
+            "                   texture2d<float, access::read> om [[texture(2)]],\n"
             "                   constant P &p [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {\n"
             "  if (g.x >= uint(p.size.x) || g.y >= uint(p.size.y)) return;\n"
+            "  if (p.obj > 0.5) { float2 o = om.read(g).xy;\n"
+            "    if (all(abs(o) < 16.0)) { mv.write(float4(o * float2(0.5, -0.5) * p.size, 0.0, 0.0), g); return; } }\n"
             "  float2 uv = (float2(g) + 0.5) * p.inv_size;\n"
             "  float4 c = p.reproj * float4(uv.x * 2.0 - 1.0, p.yflip * (1.0 - uv.y * 2.0), d.read(g) * 2.0 - 1.0, 1.0);\n"
             "  float2 m = 0.0;\n"
@@ -196,7 +223,7 @@ static void ensure_fi(NSUInteger iw, NSUInteger ih) {
         id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"mfx_mv"] : nil;
         g.mv_ps = fn ? [g.dev newComputePipelineStateWithFunction:fn error:&e] : nil;
         if (!g.mv_ps) MDIE("motion vector kernel: %s", e.localizedDescription.UTF8String);
-        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1; ad.maxTextureBindCount = 2;
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1; ad.maxTextureBindCount = 3;
         for (int i = 0; i < MFX_OUT; i++) {
             g.mv_args[i] = [g.dev newArgumentTableWithDescriptor:ad error:&e]; if (!g.mv_args[i]) MDIE("argument table: %s", e.localizedDescription.UTF8String);
             g.mv_par[i] = [g.dev newBufferWithLength:256 options:MTLResourceStorageModeShared]; [g.rs addAllocation:g.mv_par[i]];
@@ -273,6 +300,7 @@ int mfx_frame_prepare(double frame_s) {
        pacing period. The pacing itself is held at two display refreshes by present_ticks (hle_nvn.c). */
     double now = CACurrentMediaTime(), dt = g.last_prepare_s > 0 ? now - g.last_prepare_s : frame_s;
     g.last_prepare_s = now; g.dt = dt > 1.0 / 250 && dt < 0.1 ? dt : frame_s > 0 ? frame_s : 1.0 / 30;
+    int obj = g.obj_ok && mfx_obj_motion_on() && g.obj && depth && g.obj.width == depth.width && g.obj.height == depth.height; g.obj_ok = 0;
     g.scene_ok_was = g.scene_ok; g.cam_ok_was = g.cam_ok; g.scene_ok = g.cam_ok = 0; g.depth = nil;
     if (!ok) {
         g.skip_input++; g.miss[0] += !g.scene_ok_was; g.miss[1] += !g.cam_ok_was; g.miss[2] += !depth; g.miss[3] += !g.ui;
@@ -292,6 +320,7 @@ int mfx_frame_prepare(double frame_s) {
     float *par = g.mv_par[s].contents;
     for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) par[c * 4 + r] = (float)m[r * 4 + c];   // float4x4 is column-major
     par[16] = (float)depth.width; par[17] = (float)depth.height; par[18] = 1.0f / depth.width; par[19] = 1.0f / depth.height; par[20] = (float)g.yflip;
+    par[21] = obj ? 1.0f : 0.0f; g.enc_obj = obj; g.obj_frames += obj;
     cam_projection();
     g.enc_depth = depth;
     return s;
@@ -307,6 +336,8 @@ NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> h
     static int cb_rs = -1; if (cb_rs < 0) { const char *e = getenv("TOTK_MFX_CB_RESIDENCY"); cb_rs = !e || strcmp(e, "0"); }
     if (cb_rs && g.rs) [cb useResidencySet:g.rs];
     [g.mv_args[s] setTexture:depth.gpuResourceID atIndex:0]; [g.mv_args[s] setTexture:g.mv.gpuResourceID atIndex:1]; [g.mv_args[s] setAddress:g.mv_par[s].gpuAddress atIndex:0];
+    id<MTLTexture> om = g.enc_obj && g.obj ? g.obj : g.mv;   // without per-object motion the kernel never reads texture 2; any valid texture
+    [g.mv_args[s] setTexture:om.gpuResourceID atIndex:2];
     id<MTL4ComputeCommandEncoder> e = [cb computeCommandEncoder];
     [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];   // the game's frame is done
     [e setComputePipelineState:g.mv_ps]; [e setArgumentTable:g.mv_args[s]];
@@ -331,7 +362,7 @@ NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> h
     // bindings through completion, while the configuration cache retains only
     // the interpolator, not old scene/pool textures between configurations.
     NSArray *resources = @[fi, fi.colorTexture, fi.prevColorTexture, depth,
-                           g.mv, g.ui, g.out[s], g.mv_par[s]];
+                           g.mv, g.ui, g.out[s], g.mv_par[s], om];
     fi.colorTexture = nil; fi.prevColorTexture = nil; fi.depthTexture = nil;
     fi.motionTexture = nil; fi.uiTexture = nil; fi.outputTexture = nil;
     if (heap) [cb writeTimestampIntoHeap:heap atIndex:stamp + 1];
@@ -424,8 +455,8 @@ static double gpu_pct(double q) {
     return a[(int)(q * (n - 1))];
 }
 void mfx_stats(char *out, size_t n) {
-    snprintf(out, n, "interpolated frames %llu / game frames %llu (MetalFX GPU p50 %.2f / p95 %.2f ms; frame interval %.1f ms); not interpolated: missing input %llu (colour %llu camera %llu depth %llu UI %llu), first frame / history reset %llu, camera cut %llu, command buffer busy %llu",
-             (unsigned long long)g.made, (unsigned long long)g.frames, gpu_pct(0.5), gpu_pct(0.95), g.dt * 1e3, (unsigned long long)g.skip_input, (unsigned long long)g.miss[0], (unsigned long long)g.miss[1],
+    snprintf(out, n, "interpolated frames %llu (with per-object motion %llu) / game frames %llu (MetalFX GPU p50 %.2f / p95 %.2f ms; frame interval %.1f ms); not interpolated: missing input %llu (colour %llu camera %llu depth %llu UI %llu), first frame / history reset %llu, camera cut %llu, command buffer busy %llu",
+             (unsigned long long)g.made, (unsigned long long)g.obj_frames, (unsigned long long)g.frames, gpu_pct(0.5), gpu_pct(0.95), g.dt * 1e3, (unsigned long long)g.skip_input, (unsigned long long)g.miss[0], (unsigned long long)g.miss[1],
              (unsigned long long)g.miss[2], (unsigned long long)g.miss[3],
              (unsigned long long)g.skip_first, (unsigned long long)g.skip_cut, (unsigned long long)g.skip_busy);
 }
