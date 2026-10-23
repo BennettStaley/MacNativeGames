@@ -1,9 +1,9 @@
-/* 崩溃报告闸门（思路取自 nxnative d47f899 的 crash.c，MIT，github.com/seedds/nxnative；代码是本项目自己的）。
-   只让第一个崩溃的线程打印现场：几条线程一起崩时（作业线程常一起撞上同一份坏数据）各自的现场原先交错成一团。
-   后来的线程停在 pause() 里，等第一个线程打完后 _exit 结束进程；第一个线程自己又进来（打印时又出了别的信号）就立即退出。
-   打印卡住时（读到挂起线程持有的东西等）由 seconds 秒后的 SIGALRM 收尾：写一行后以 128 + 原信号退出，进程不会挂着不走。
-   只在确定要报告崩溃之后调用：能恢复的故障（runtime_fault_guard 守护的读、图形层的脏页故障、模拟的指令）必须在它之前处理完返回，
-   否则一个线程在打印时，别的线程的可恢复故障会被当成崩溃停住。只用异步信号安全的调用。
+/* Crash report gate (idea taken from nxnative d47f899's crash.c, MIT, github.com/seedds/nxnative; the code is this project's own).
+   Only the first crashing thread prints its state: when several threads crash together (job threads often hit the same bad data at once), their reports used to interleave into a mess.
+   Later threads park in pause() until the first thread finishes printing and ends the process with _exit; if the first thread itself comes back in (another signal while printing), it exits at once.
+   If printing hangs (reading something a suspended thread holds, for example), a SIGALRM after `seconds` seconds finishes the job: it writes one line and exits with 128 + the original signal, so the process never hangs.
+   Call it only once a crash is certain to be reported: recoverable faults (reads guarded by runtime_fault_guard, dirty-page faults in the graphics layer, emulated instructions) must be handled and return before it,
+   otherwise, while one thread is printing, another thread's recoverable fault would be parked as a crash. Uses only async-signal-safe calls.
    Crash report gate (idea from nxnative d47f899's crash.c, MIT, github.com/seedds/nxnative; the code is this project's own).
    Only the first crashing thread prints its state: when several threads crash together (job threads often run into the same bad
    data), their dumps used to interleave. Later threads stop in pause() until the first one finishes and ends the process with
