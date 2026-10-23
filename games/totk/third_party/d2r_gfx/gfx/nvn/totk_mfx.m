@@ -91,6 +91,8 @@ static id<MTL4FXFrameInterpolator> fi_cached(NSUInteger iw, NSUInteger ih) {
 /* g_on: the mode of this game frame (read by the replay, the present path and the pacing in hle_nvn.c); g_req: what the
    user asked for (key 2 / flag mfx_interp), taken over at the next present. */
 static _Atomic int g_on, g_req;
+static void mfx_release(int all);
+static int g_bp_paused;   // mfx_present_tick: paused near the GPU memory budget
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 const char *mfx_mode_name(int m) {
     static const char *const names[MFX_NMODES] = {"off", "30+30 (the game at 30 fps)", "half the refresh rate (50+50 on a 100 Hz display)", "uncapped (every game frame interpolated)"};
@@ -111,6 +113,7 @@ void mfx_set(int m) {
     pthread_once(&g_once, mfx_init);
     if (m >= MFX_NMODES) { MLOG("[flag] mfx_interp takes 0..%d (-1 cycles), got %d", MFX_NMODES - 1, m); return; }
     int v = m < 0 ? (atomic_load(&g_req) + 1) % MFX_NMODES : m;
+    if (g_bp_paused) { g_bp_paused = 0; MLOG("the user's choice ends the pause near the GPU memory budget"); }
     atomic_store(&g_req, v);
     MLOG("[flag] mfx_interp = %d: %s (from the next game frame)", v, mfx_mode_name(v));
 }
@@ -121,6 +124,7 @@ int mfx_latch(void) {
     g.prev_ok = g.hist_ok = 0; g.scene_ok = g.cam_ok = 0; g.depth = nil; g.last_prepare_s = 0;   // the next interpolated pair starts fresh
     atomic_store(&g_on, r);
     MLOG("frame interpolation %s -> %s", mfx_mode_name(was), mfx_mode_name(r));
+    if (r == MFX_OFF) mfx_release(g_bp_paused);   // nothing of ours stays allocated while off (the interpolator cache too when paused)
     return 1;
 }
 
@@ -133,16 +137,69 @@ static id<MTLTexture> mk(MTLPixelFormat f, NSUInteger w, NSUInteger h, MTLTextur
     [g.rs addAllocation:t]; [g.rs commit];
     return t;
 }
-static void drop(id<MTLTexture> __strong *t) { if (*t) { [g.rs removeAllocation:*t]; *t = nil; } }
+/* Retired objects (textures of an old size, interpolators of an old configuration): the game's command buffers of the
+   last frames and the interpolation payloads may still use them, and Metal 4 encoders do not retain what they use, so
+   they stay referenced and resident for MFX_RETIRE_TICKS presents (mfx_present_tick; frames in flight are at most 3)
+   and are then released in one go, with the bytes freed in the log. */
+#define MFX_RETIRE_TICKS 8
+#define MFX_RETIRE_MAX 64
+static struct { __strong id obj; uint64_t tick, bytes; } g_ret[MFX_RETIRE_MAX];
+static int g_nret; static uint64_t g_tick;
+static uint64_t obj_bytes(id o) { return [o conformsToProtocol:@protocol(MTLResource)] ? (uint64_t)((id<MTLResource>)o).allocatedSize : 0; }
+static int is_cached(id<MTL4FXFrameInterpolator> fi);
+static void retire_drain(int all) {
+    uint64_t bytes = 0, n = 0, fis = 0; int k = 0;
+    for (int i = 0; i < g_nret; i++) {
+        if (!all && g_tick - g_ret[i].tick < MFX_RETIRE_TICKS) { if (k != i) { g_ret[k] = g_ret[i]; g_ret[i].obj = nil; } k++; continue; }
+        id o = g_ret[i].obj; g_ret[i].obj = nil;
+        if ([o conformsToProtocol:@protocol(MTLAllocation)] && g.rs) [g.rs removeAllocation:(id<MTLAllocation>)o];
+        if ([o conformsToProtocol:@protocol(MTL4FXFrameInterpolator)]) fis++;
+        bytes += g_ret[i].bytes; n++;
+    }
+    g_nret = k;
+    if (!n) return;
+    if (g.rs) [g.rs commit];
+    MLOG("released %llu MB of retired MetalFX resources (%llu objects, %llu of them interpolators, whose own memory is not counted)",
+         (unsigned long long)(bytes >> 20), (unsigned long long)n, (unsigned long long)fis);
+}
+static void retire(id o) {
+    if (!o) return;
+    for (int i = 0; i < g_nret; i++) if (g_ret[i].obj == o) return;
+    if (g_nret == MFX_RETIRE_MAX) retire_drain(1);   // never expected (a few objects per size change); bounded all the same
+    g_ret[g_nret].obj = o; g_ret[g_nret].tick = g_tick; g_ret[g_nret].bytes = obj_bytes(o); g_nret++;
+}
+// Retire a texture of ours (it leaves the residency set when released, see retire_drain).
+static void drop(id<MTLTexture> __strong *t) { if (*t) { retire(*t); *t = nil; } }
+static int is_cached(id<MTL4FXFrameInterpolator> fi) { for (unsigned i = 0; i < g_fi_cache_count; i++) if (g_fi_cache[i] == fi) return 1; return 0; }
+/* The cached interpolators of another output size or colour format than the current one: an interpolator holds history
+   and intermediate textures of its output size (hundreds of MB at 3456x1944), and a resolution change would otherwise
+   keep up to MFX_FI_CACHE of them alongside the new one. all: every cached one (memory released for a pause). */
+static unsigned fi_cache_evict(int all) {
+    unsigned k = 0, n = 0;
+    for (unsigned i = 0; i < g_fi_cache_count; i++) {
+        id<MTL4FXFrameInterpolator> fi = g_fi_cache[i];
+        if (!all && fi.outputWidth == g.out_w && fi.outputHeight == g.out_h && fi.colorTextureFormat == g.scene_fmt) g_fi_cache[k++] = fi;
+        else { retire(fi); n++; }
+    }
+    for (unsigned i = k; i < g_fi_cache_count; i++) g_fi_cache[i] = nil;
+    g_fi_cache_count = k;
+    return n;
+}
 
 // Scene / UI / output textures follow the canvas size; the interpolator also depends on the depth size.
 static void ensure_out(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFormat fmt) {
     if (!g.dev) g.dev = dev;
     if (g.out_w == w && g.out_h == h && g.scene[0] && (!fmt || fmt == g.scene_fmt)) return;
     if (!fmt) fmt = g.scene_fmt ? g.scene_fmt : MTLPixelFormatRG11B10Float;
-    for (int i = 0; i < 2; i++) drop(&g.scene[i]);
-    drop(&g.ui);
-    for (int i = 0; i < MFX_OUT; i++) { drop(&g.out[i]); g.outv[i] = nil; }
+    uint64_t old = 0; NSUInteger ow = g.out_w, oh = g.out_h; int had = g.scene[0] != nil;
+    for (int i = 0; i < 2; i++) { old += obj_bytes(g.scene[i]); drop(&g.scene[i]); }
+    old += obj_bytes(g.ui); drop(&g.ui);
+    for (int i = 0; i < MFX_OUT; i++) { old += obj_bytes(g.out[i]); drop(&g.out[i]); g.outv[i] = nil; }
+    /* The interpolator and motion texture of the old size go too (the new ones are made at the next prepare), and the
+       reference mfx_dump keeps to the old depth. The per-object motion target follows the depth size (mfx_obj_target). */
+    old += obj_bytes(g.mv); drop(&g.mv);
+    if (g.fi && !is_cached(g.fi)) retire(g.fi);
+    g.fi = nil; g.last_depth = nil; g.last_slot = -1; g.in_w = g.in_h = 0;
     MTLTextureUsage rt = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     for (int i = 0; i < 2; i++) g.scene[i] = mk(fmt, w, h, MTLTextureUsageShaderRead);   // blit copies of the canvas
     g.scene_fmt = fmt;
@@ -152,7 +209,10 @@ static void ensure_out(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFo
         g.outv[i] = [g.out[i] newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm];
     }
     g.out_w = w; g.out_h = h; g.fi = nil; g.prev_ok = g.hist_ok = 0;
+    unsigned evicted = fi_cache_evict(0);
     MLOG("scene (format %lu) / UI / output textures %lux%lu", (unsigned long)fmt, (unsigned long)w, (unsigned long)h);
+    if (had) MLOG("size change %lux%lu -> %lux%lu: %llu MB of textures of the old size and %u cached interpolators of another output size retired (released after %d presents)",
+                  (unsigned long)ow, (unsigned long)oh, (unsigned long)w, (unsigned long)h, (unsigned long long)(old >> 20), evicted, MFX_RETIRE_TICKS);
 }
 id<MTLTexture> mfx_scene_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFormat fmt) { ensure_out(dev, w, h, fmt); return g.scene[g.cur]; }
 id<MTLTexture> mfx_ui_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h) { ensure_out(dev, w, h, 0); return g.ui; }
@@ -168,8 +228,10 @@ int mfx_obj_motion_on(void) {
 id<MTLTexture> mfx_obj_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h) {
     if (!g.dev) g.dev = dev;
     if (!g.obj || g.obj.width != w || g.obj.height != h) {
+        uint64_t old = obj_bytes(g.obj); NSUInteger ow = g.obj ? g.obj.width : 0, oh = g.obj ? g.obj.height : 0;
         drop(&g.obj); g.obj = mk(MTLPixelFormatRG16Float, w, h, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
-        MLOG("per-object motion target %lux%lu", (unsigned long)w, (unsigned long)h);
+        if (ow) MLOG("per-object motion target %lux%lu (the %lux%lu one, %llu MB, retired)", (unsigned long)w, (unsigned long)h, (unsigned long)ow, (unsigned long)oh, (unsigned long long)(old >> 20));
+        else MLOG("per-object motion target %lux%lu", (unsigned long)w, (unsigned long)h);
     }
     return g.obj;
 }
@@ -184,6 +246,7 @@ void mfx_note_camera(const float *c, int n) {
 static void ensure_fi(NSUInteger iw, NSUInteger ih) {
     if (g.fi && g.in_w == iw && g.in_h == ih && g.fi.colorTextureFormat == g.scene_fmt && g.fi.outputWidth == g.out_w && g.fi.outputHeight == g.out_h) return;
     NSError *e = nil;
+    if (g.fi && !is_cached(g.fi)) retire(g.fi);   // another input (render) size: the old interpolator unless the cache keeps it
     g.fi = fi_cached(iw, ih);
     if (!g.fi) {
         MTLFXFrameInterpolatorDescriptor *d = [MTLFXFrameInterpolatorDescriptor new];
@@ -460,4 +523,60 @@ void mfx_stats(char *out, size_t n) {
              (unsigned long long)g.made, (unsigned long long)g.obj_frames, (unsigned long long)g.frames, gpu_pct(0.5), gpu_pct(0.95), g.dt * 1e3, (unsigned long long)g.skip_input, (unsigned long long)g.miss[0], (unsigned long long)g.miss[1],
              (unsigned long long)g.miss[2], (unsigned long long)g.miss[3],
              (unsigned long long)g.skip_first, (unsigned long long)g.skip_cut, (unsigned long long)g.skip_busy);
+}
+
+/* Off: every texture / interpolator of ours is retired (released MFX_RETIRE_TICKS presents later, logged there). The
+   interpolator cache is kept for a toggle (key 2) unless all: rebuilding identical interpolators grows device memory
+   (see MFX_FI_CACHE), and a pause near the budget is about memory. */
+static void mfx_release(int all) {
+    uint64_t b = 0;
+    for (int i = 0; i < 2; i++) { b += obj_bytes(g.scene[i]); drop(&g.scene[i]); }
+    b += obj_bytes(g.ui); drop(&g.ui);
+    for (int i = 0; i < MFX_OUT; i++) { b += obj_bytes(g.out[i]); drop(&g.out[i]); g.outv[i] = nil; }
+    b += obj_bytes(g.mv); drop(&g.mv); b += obj_bytes(g.obj); drop(&g.obj);
+    if (g.fi && !is_cached(g.fi)) retire(g.fi);
+    unsigned n = all ? fi_cache_evict(1) : 0;
+    g.fi = nil; g.last_depth = nil; g.last_slot = -1; g.in_w = g.in_h = 0; g.out_w = g.out_h = 0; g.depth = nil; g.enc_depth = nil;
+    g.prev_ok = g.hist_ok = 0; g.obj_ok = 0;
+    MLOG("interpolation off: %llu MB of textures and %u cached interpolators retired (released after %d presents)", (unsigned long long)(b >> 20), n, MFX_RETIRE_TICKS);
+}
+/* GPU memory budget (nvn_mtl.m gpu_budget_check stops the game past it): frame interpolation and per-object motion are
+   optional, so above MFX_BP_HIGH percent of the budget they are paused first (the requested mode becomes off at the next
+   present, mfx_latch releases what they hold) and resumed once the use plus what the pause freed is under MFX_BP_LOW
+   percent. After MFX_BP_MAX pauses they stay off for the session (each rebuild costs memory; key 2 turns them on again). */
+#define MFX_BP_HIGH 95
+#define MFX_BP_LOW 85
+#define MFX_BP_MAX 3
+static int g_bp_saved, g_bp_count, g_bp_measured, g_bp_said;
+static uint64_t g_bp_tick, g_bp_used_at, g_bp_freed;
+static void bp_pause(uint64_t used, uint64_t budget, const char *why) {
+    int on = atomic_load(&g_on), req = atomic_load(&g_req);
+    if (g_bp_paused || (!on && !req)) return;
+    g_bp_paused = 1; g_bp_saved = req ? req : on; g_bp_count++; g_bp_tick = g_tick; g_bp_used_at = used; g_bp_measured = 0; g_bp_freed = 0;
+    atomic_store(&g_req, MFX_OFF);
+    MLOG("near the GPU memory budget: interpolation paused (%s: %llu of %llu MB, %llu%%; per-object motion too; resumes under %d%%)",
+         why, (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), (unsigned long long)(used * 100 / budget), MFX_BP_LOW);
+}
+void mfx_present_tick(uint64_t used, uint64_t budget) {
+    pthread_once(&g_once, mfx_init);
+    g_tick++;
+    if (g_nret) retire_drain(0);
+    if (!budget) return;
+    if (!g_bp_paused) { if (used > budget / 100 * MFX_BP_HIGH) bp_pause(used, budget, "present"); return; }
+    if (!g_bp_measured && !g_nret && g_tick - g_bp_tick > MFX_RETIRE_TICKS + 2) {   // what the pause gave back
+        g_bp_measured = 1; g_bp_freed = g_bp_used_at > used ? g_bp_used_at - used : 0;
+        MLOG("the pause freed about %llu MB of GPU memory (%llu MB now)", (unsigned long long)(g_bp_freed >> 20), (unsigned long long)(used >> 20));
+    }
+    if (!g_bp_measured || used + g_bp_freed >= budget / 100 * MFX_BP_LOW) return;
+    if (g_bp_count >= MFX_BP_MAX) { if (!g_bp_said++) MLOG("paused %d times near the GPU memory budget: interpolation stays off for this session (key 2 turns it on again)", g_bp_count); return; }
+    g_bp_paused = 0; atomic_store(&g_req, g_bp_saved);
+    MLOG("back under %d%% of the GPU memory budget (%llu of %llu MB, %llu MB expected back): interpolation resumed, %s",
+         MFX_BP_LOW, (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), (unsigned long long)(g_bp_freed >> 20), mfx_mode_name(g_bp_saved));
+}
+/* gpu_budget_check over the budget (by at most 5%): 1 while the optional features are being released (the pause starts
+   here if it had not), so the overrun they cause does not stop the game; 0: nothing optional left, the check fails. */
+int mfx_budget_grace(uint64_t used, uint64_t budget) {
+    pthread_once(&g_once, mfx_init);
+    if (!g_bp_paused) { if (!atomic_load(&g_on) && !atomic_load(&g_req)) return 0; bp_pause(used, budget, "over the budget"); return 1; }
+    return g_tick - g_bp_tick <= MFX_RETIRE_TICKS + 30;
 }

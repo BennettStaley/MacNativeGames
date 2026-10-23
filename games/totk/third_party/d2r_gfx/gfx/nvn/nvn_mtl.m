@@ -314,6 +314,12 @@ void mtl_gpu_memory(uint64_t *used, uint64_t *budget) { *used = g_dev ? (uint64_
 static void gpu_budget_check(const char *where) {
     uint64_t budget = gpu_budget_bytes(); if (!budget) return;
     uint64_t cur = (uint64_t)g_dev.currentAllocatedSize; if (cur <= budget) return;
+    /* TOTK_MFX: optional frame interpolation / per-object motion go first (paused near the budget at each present,
+       mfx_present_tick); an overrun of at most 5% while they are being released does not stop the game. */
+    if (cur <= budget / 20 * 21 && mfx_budget_grace(cur, budget)) {
+        static uint64_t said; if (!said++ || said % 256 == 0) MLOG("[mfx] %s: GPU allocated %llu MB over the budget of %llu MB while frame interpolation is released; going on", where, (unsigned long long)(cur >> 20), (unsigned long long)(budget >> 20));
+        return;
+    }
     res_site_report(16);
     MDIE("%s: GPU allocated %llu MB exceeds the budget of %llu MB; all four kernel panics happened at about 15 GB resident, refusing to keep submitting (adjust with TOTK_GPU_BUDGET_MB)", where, (unsigned long long)(cur >> 20), (unsigned long long)(budget >> 20));
 }
@@ -13974,6 +13980,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     }
     PD("X ser=%llu%s", t->serial, interp >= 0 ? " (MetalFX interpolated frame before it)" : "");
     id<MTLTexture> src = interp >= 0 ? mfx_output(interp) : tex_mtl(t);   // TOTK_MFX: the interpolated frame shown one tick before this game frame
+    if (!src && interp >= 0) return 0;   // TOTK_MFX: interpolation turned off / paused since (its outputs released); the game frame follows
     if (!src) { RED_ONCE(8, "present texture has no MTLTexture"); return 0; }
     if (interp < 0) anom_present(src, frame);   // TOTK_ANOMALY
     /* One-frame temporal fallback (TOTK_FLASH_GUARD=1, off by default): a same-queue readback of the picture's centre
@@ -14547,7 +14554,8 @@ static int mfx_present_frame(const tex_t *t, double period, int discard) {
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     taa_frame_end();   // TOTK_TAA: next frame's jitter, this frame's depth and camera forgotten (also while off: key 5)
     int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard) : -1;
-    if (mfx_latch() && !mfx_enabled()) { g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = 0; BOTW_MFX_FRAME_RESET() }   // key 2 / flag mfx_interp: the next frame is fully on or off
+    if (g_dev) mfx_present_tick((uint64_t)g_dev.currentAllocatedSize, gpu_budget_bytes());   // TOTK_MFX: retired resources released; paused near the GPU memory budget
+    if (mfx_latch() && !mfx_enabled()) { g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = 0; BOTW_MFX_FRAME_RESET() om_release(); }   // key 2 / flag mfx_interp / budget pause: the next frame is fully on or off; per-object motion's arenas released
     if (t && !mfx_enabled() && (uw_ratio() || g_pp_sharpen || g_pp_aa >= 2 || g_fx_hud)) uw_note_present(t);   // key 4 / sharpen: the canvas search (TOTK_MFX does it in mfx_present_frame)
     pp_latch();   // picture settings for the next frame (totk_post.h)
     mtl_wb_eager();

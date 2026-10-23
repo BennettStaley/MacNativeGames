@@ -18,21 +18,52 @@
    - Identity across frames: (vertex shader, vertex buffer of attribute 0, index buffer, first vertex / base vertex,
      count, instances, vertex range, primitive) and the ordinal among the pass's draws with those (om_key). The previous
      frame's table gives that draw's offset in the previous arena; a new or resized draw writes OBJMV_NONE (camera motion).
-   - Arenas: three private buffers (TOTK_OBJ_MOTION_MB each, default 64 MiB = 4M positions), one per game frame in turn:
-     this frame writes one and reads the previous frame's, the third was last used two frames ago.
+   - Arenas: three private buffers, one per game frame in turn: this frame writes one and reads the previous frame's,
+     the third was last used two frames ago. They start at 16 MiB each (1M positions) and double at the end of a frame
+     whose draws did not fit, up to TOTK_OBJ_MOTION_MB (default 64); a growth costs one frame of camera-only motion (the
+     previous frame's positions were in the old arena). Released (deferred past the GPU's use) when interpolation turns
+     off or pauses (om_release).
+   - What is stored: an indexed draw stores the vertex range its indices actually use (om_irange: min / max index of
+     the index buffer, scanned once per (index buffer, count, type) and every OM_IR_AGE frames again), not the whole
+     bound vertex buffer, which in TOTK is often a large shared pool range (the first boot test: 2.5M motion draws in
+     600 frames, 87% over 3 x 64 MiB). Draws of more than TOTK_OBJ_MOTION_DRAW_MAX positions (vertices x instances,
+     default 65536: terrain, large static meshes, dense instanced foliage) store nothing and keep the camera motion,
+     which is exact for what does not move independently of the camera; characters, props and cloth fit.
    Camera cuts need nothing here: totk_mfx.m does not interpolate across one, and the frame after has valid positions. */
 #define OM_ATT 6
 #define OM_VBUF 13               // vertex buffer slot of struct totk_om_draw (translated vertex functions use 0, 14 layer, 16-30 attributes)
 #define OM_TAB 65536             // draws per frame table (power of two)
 #define OM_MAX_DRAW (1u << 21)   // positions of one draw at most (32 MiB)
 typedef struct { uint64_t key; uint32_t off, n, gen; } om_ent;
+#define OM_IR 16384              // index range cache (power of two)
+#define OM_IR_AGE 600            // frames before an index range is scanned again (index buffers rewritten in place)
+typedef struct { uint64_t ibuf; uint32_t count, itype, lo, hi; uint64_t frame; int ok; } om_ir;
 static struct {
     __unsafe_unretained id<MTLTexture> depth;   // this frame's G-buffer depth (the game's texture, alive for the frame)
     int cleared, ar;                            // the motion target was cleared this frame; ar: this frame's arena
-    id<MTLBuffer> arena[3]; uint64_t gpu[3]; uint32_t cap, used, prev_used;
+    id<MTLBuffer> arena[3]; uint64_t gpu[3]; uint32_t cap, used, prev_used, mb, mb_max, draw_max;
+    uint64_t want;                               // positions this frame's draws asked for (fitting or not)
     om_ent tab[2][OM_TAB]; int t; uint32_t gen;   // tab[t]: this frame's draws, tab[t ^ 1] the previous frame's
-    uint64_t frames, draws, matched, fresh, overflow, unknown;
+    uint64_t frames, draws, matched, fresh, overflow, unknown, big, grown;
+    om_ir ir[OM_IR]; uint64_t ir_scans;
 } g_om;
+static void om_arenas(uint32_t mb) {   // three arenas of mb MiB; the old ones are released after the GPU's use
+    for (int i = 0; i < 3; i++) { if (g_om.arena[i]) defer_obj_release(g_om.arena[i]); g_om.arena[i] = nil; g_om.gpu[i] = 0; }
+    for (int i = 0; i < 3; i++) {
+        g_om.arena[i] = [g_dev newBufferWithLength:(NSUInteger)mb << 20 options:MTLResourceStorageModePrivate];
+        if (!g_om.arena[i]) MDIE("TOTK_OBJ_MOTION: position arena of %u MiB", mb);
+        res_add(g_om.arena[i]); g_om.gpu[i] = g_om.arena[i].gpuAddress;
+    }
+    g_om.mb = mb; g_om.cap = (uint32_t)(((uint64_t)mb << 20) / 16);
+    g_om.gen += 2;   // positions in the old arenas are gone: no draw of the previous frame matches
+}
+// Interpolation off or paused (mfx_latch at the present): the arenas go; the next motion draw starts again at 16 MiB.
+static void om_release(void) {
+    if (!g_om.arena[0]) return;
+    uint64_t b = 0; for (int i = 0; i < 3; i++) { b += g_om.arena[i].allocatedSize; defer_obj_release(g_om.arena[i]); g_om.arena[i] = nil; g_om.gpu[i] = 0; }
+    g_om.cap = g_om.used = g_om.prev_used = 0; g_om.mb = 0; g_om.want = 0; g_om.gen += 2; g_om.depth = nil; g_om.cleared = 0;
+    MLOG("[mfx] TOTK_OBJ_MOTION: position arenas released (%llu MB)", (unsigned long long)(b >> 20));
+}
 static void om_note_depth(id<MTLTexture> dt) { g_om.depth = dt; }
 static int om_role(int prim) {   // a draw of a motion pass that writes motion
     if (!(prim == 4 || prim == 5 || prim == 7) || !S.ds.dt || S.ms.a2c) return 0;
@@ -58,11 +89,20 @@ static void om_frame_end(void) {   // at the game's present
     if (!mfx_obj_motion_on()) return;
     g_om.depth = nil; g_om.cleared = 0;
     if (!g_om.used && !g_om.draws) return;   // no motion pass yet
+    uint64_t want = g_om.want; g_om.want = 0;
     g_om.t ^= 1; g_om.gen++; g_om.ar = (g_om.ar + 1) % 3; g_om.prev_used = g_om.used; g_om.used = 0; g_om.frames++;
+    if (g_om.arena[0] && want > g_om.cap && g_om.mb < g_om.mb_max) {   // this frame's draws did not fit: grow (up to the cap)
+        uint32_t mb = g_om.mb; while (mb < g_om.mb_max && ((uint64_t)mb << 20) / 16 < want + want / 4) mb *= 2;
+        if (mb > g_om.mb_max) mb = g_om.mb_max;
+        MLOG("[mfx] TOTK_OBJ_MOTION: %llu positions wanted, %u fit: position arenas %u -> %u MiB each (cap %u, TOTK_OBJ_MOTION_MB)",
+             (unsigned long long)want, g_om.cap, g_om.mb, mb, g_om.mb_max);
+        om_arenas(mb); g_om.grown++;
+    }
     if (g_om.frames % 600 == 0)
-        MLOG("[mfx] TOTK_OBJ_MOTION: up to frame %llu: %llu motion draws, %llu matched the previous frame, %llu new, %llu without a vertex range, %llu over the arena (%u of %u positions last frame)",
+        MLOG("[mfx] TOTK_OBJ_MOTION: up to frame %llu: %llu motion draws, %llu matched the previous frame, %llu new, %llu without a vertex range, %llu over %u positions (camera motion), %llu over the arena (%u of %u positions last frame, arenas %u MiB each, %llu index ranges scanned)",
              (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)g_om.draws, (unsigned long long)g_om.matched, (unsigned long long)g_om.fresh,
-             (unsigned long long)g_om.unknown, (unsigned long long)g_om.overflow, g_om.prev_used, g_om.cap);
+             (unsigned long long)g_om.unknown, (unsigned long long)g_om.big, g_om.draw_max, (unsigned long long)g_om.overflow, g_om.prev_used, g_om.cap, g_om.mb,
+             (unsigned long long)g_om.ir_scans);
 }
 static uint64_t om_mix(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); h *= 0xff51afd7ed558ccdull; return h ^ (h >> 33); }
 static om_ent *om_find(int t, uint64_t key, uint32_t gen, int make) {
@@ -75,17 +115,37 @@ static om_ent *om_find(int t, uint64_t key, uint32_t gen, int make) {
     return NULL;
 }
 typedef struct { uint64_t cur, prev; uint32_t nv, bv, bi, flags, cap, pad; } om_draw;   // = struct totk_om_draw in MSL
+/* The vertices an indexed draw uses: lo..hi of its indices (primitive restart values left out). 0: unknown (8-bit
+   indices, memory not readable, written by pending GPU work) and the bound vertex buffer is taken as before. */
+static int om_irange(const p_draw_idx *di, uint32_t *lo, uint32_t *hi) {
+    if (!di->ibuf || di->count <= 0 || (di->itype != 1 && di->itype != 2)) return 0;
+    uint64_t h = om_mix(om_mix(di->ibuf, (uint64_t)(uint32_t)di->count), (uint64_t)di->itype);
+    om_ir *c = &g_om.ir[h & (OM_IR - 1)];
+    uint64_t now = g_om.frames;
+    if (c->ibuf == di->ibuf && c->count == (uint32_t)di->count && c->itype == (uint32_t)di->itype && now - c->frame < OM_IR_AGE) { *lo = c->lo; *hi = c->hi; return c->ok; }
+    uint64_t isz = di->itype == 1 ? 2 : 4, n = (uint64_t)(uint32_t)di->count;
+    if (pend_hits(di->ibuf, n * isz)) return 0;   // being written on the GPU: not cached, asked again next time
+    void *m; uint64_t o; const uint8_t *ib = NULL;
+    if (mtl_addr(di->ibuf, n * isz, &m, &o) && (ib = [(__bridge id<MTLBuffer>)m contents])) ib += o;
+    uint32_t l = UINT32_MAX, u = 0;
+    if (ib && isz == 2) { const uint16_t *x = (const uint16_t *)ib; for (uint64_t k = 0; k < n; k++) { uint32_t v = x[k]; if (v == 0xffff) continue; if (v < l) l = v; if (v > u) u = v; } }
+    else if (ib) { const uint32_t *x = (const uint32_t *)ib; for (uint64_t k = 0; k < n; k++) { uint32_t v = x[k]; if (v == 0xffffffffu) continue; if (v < l) l = v; if (v > u) u = v; } }
+    c->ibuf = di->ibuf; c->count = (uint32_t)di->count; c->itype = (uint32_t)di->itype; c->frame = now; c->ok = ib && l <= u; c->lo = l; c->hi = u;
+    g_om.ir_scans++;
+    *lo = l; *hi = u; return c->ok;
+}
 // Before a motion draw: its constants (buffer OM_VBUF). flags 1: store positions, 2: prev[] holds the previous frame's.
 static void om_bind(id<MTL4RenderCommandEncoder> en, NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     if (!g_om.arena[0]) {
-        const char *e = getenv("TOTK_OBJ_MOTION_MB"); uint64_t mb = e ? strtoull(e, NULL, 10) : 64; if (mb < 4) mb = 4; if (mb > 1024) mb = 1024;
-        for (int i = 0; i < 3; i++) {
-            g_om.arena[i] = [g_dev newBufferWithLength:mb << 20 options:MTLResourceStorageModePrivate];
-            if (!g_om.arena[i]) MDIE("TOTK_OBJ_MOTION: position arena of %llu MiB", (unsigned long long)mb);
-            res_add(g_om.arena[i]); g_om.gpu[i] = g_om.arena[i].gpuAddress;
+        if (!g_om.mb_max) {
+            const char *e = getenv("TOTK_OBJ_MOTION_MB"); uint64_t mb = e ? strtoull(e, NULL, 10) : 64; if (mb < 4) mb = 4; if (mb > 1024) mb = 1024;
+            const char *d = getenv("TOTK_OBJ_MOTION_DRAW_MAX"); uint64_t dm = d ? strtoull(d, NULL, 10) : 65536; if (dm < 64) dm = 64; if (dm > OM_MAX_DRAW) dm = OM_MAX_DRAW;
+            g_om.mb_max = (uint32_t)mb; g_om.draw_max = (uint32_t)dm;
         }
-        g_om.cap = (uint32_t)((mb << 20) / 16); g_om.gen = 1;
-        MLOG("[mfx] TOTK_OBJ_MOTION: three position arenas of %llu MiB (%u positions each)", (unsigned long long)mb, g_om.cap);
+        uint32_t mb = g_om.mb_max < 16 ? g_om.mb_max : 16;
+        om_arenas(mb); if (!g_om.gen) g_om.gen = 1;
+        MLOG("[mfx] TOTK_OBJ_MOTION: three position arenas of %u MiB (%u positions each; they grow to %u MiB when needed); draws of more than %u positions keep the camera motion",
+             mb, g_om.cap, g_om.mb_max, g_om.draw_max);
     }
     om_draw p = {0};
     uint32_t inst = 1, nv = 0, bv = 0, bi = 0, count = 0; uint64_t ib = 0, vb = 0; int prim = 0;
@@ -94,13 +154,16 @@ static void om_bind(id<MTL4RenderCommandEncoder> en, NvProg *pr, const p_draw *d
     if (dw) { prim = dw->prim; count = (uint32_t)dw->count; bv = (uint32_t)dw->first; bi = (uint32_t)dw->base_instance; inst = dw->instances > 1 ? (uint32_t)dw->instances : 1; nv = count; }
     else if (di) {
         prim = di->prim; count = (uint32_t)di->count; bv = (uint32_t)di->base_vertex; bi = (uint32_t)di->base_instance; inst = di->instances > 1 ? (uint32_t)di->instances : 1; ib = di->ibuf;
-        if (st >= 0 && st < 16 && S.stream[st].stride && S.vbuf[st].size) nv = (uint32_t)(S.vbuf[st].size / S.stream[st].stride);
+        uint32_t lo, hi;
+        if (om_irange(di, &lo, &hi)) { nv = hi - lo + 1; bv += lo; }   // [[vertex_id]] - bv is then the index - lo
+        else if (st >= 0 && st < 16 && S.stream[st].stride && S.vbuf[st].size) nv = (uint32_t)(S.vbuf[st].size / S.stream[st].stride);
         else if (di->itype <= 1) nv = di->itype == 0 ? 256 : 65536;
     }
     uint64_t need = (uint64_t)nv * inst;
     g_om.draws++;
     if (!nv || need > OM_MAX_DRAW) g_om.unknown++;
-    else if (g_om.used + need > g_om.cap) g_om.overflow++;
+    else if (need > g_om.draw_max) g_om.big++;
+    else if (g_om.want += need, g_om.used + need > g_om.cap) g_om.overflow++;
     else {
         uint64_t base = om_mix(om_mix(om_mix(om_mix((uint64_t)(uintptr_t)(__bridge void *)pr->sh[0], vb), ib), ((uint64_t)bv << 32) | count), ((uint64_t)inst << 32) | nv);
         base = om_mix(base, (uint64_t)prim);

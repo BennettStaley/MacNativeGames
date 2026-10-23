@@ -41,6 +41,12 @@ void mfx_note_gpu(double ms);   // GPU time of one interpolation, for the statis
 void mfx_frame_abort(void);
 id<MTLTexture> mfx_output(int slot);   // RGBA8Unorm view of the sRGB output, like the swapchain textures
 void mfx_stats(char *out, size_t n);
+// At every game present (also while off): releases retired textures / interpolators (an old size or configuration) and
+// pauses interpolation and per-object motion above 95% of the GPU memory budget (resumed under 85%). used / budget:
+// the device's allocated bytes and gpu_budget_bytes (0: no budget).
+void mfx_present_tick(uint64_t used, uint64_t budget);
+// gpu_budget_check over the budget: 1 while interpolation is being paused / released (the overrun is tolerated briefly).
+int mfx_budget_grace(uint64_t used, uint64_t budget);
 void mfx_mv_log(void);
 int mfx_dump_due(void);
 void mfx_dump(long frame, id<MTLTexture> swap_prev, id<MTLTexture> swap_cur);   // TOTK_MFX_DUMP=<dir>: scenes, depth, motion and output of three frames while the camera turns (diagnostic)   // TOTK_MFX_MVLOG=<n>: motion texture median every n interpolated frames (diagnostic)
