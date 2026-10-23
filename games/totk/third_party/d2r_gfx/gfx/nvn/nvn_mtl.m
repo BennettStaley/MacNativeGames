@@ -34,6 +34,7 @@ static uint64_t g_gen_shown;            // interpolated frames handed to the scr
 
 #include "nvn_dirty.h"
 #include "nvn_depth_clear.h"
+#include "nvn_fbread.h"
 #include "nvn_refl.h"
 #include "nvn_texture_plan.h"
 #include "fps_overlay.h"
@@ -4296,6 +4297,8 @@ static void lp_finish(void);
 // if during continuation a draw needs to sample them, or a clear arrives, the pass is ended before it, returning to the separate semantics. Copies / dispatches end the render encoder anyway
 static int g_enc_mode;          // How the current encoder was opened (rp_begin_ex argument: 0 all attachments 1 only for clears 2 depth omitted)
 static int g_rt_range_active, g_rt_range_pending;
+static int att_fb_on(void);
+static uint64_t g_fb_draws, g_fb_kept, g_fb_refused;   // TOTK_ATT_FB: draws given the tile-reading variant / of them kept in a continued pass / refusals (att_fb_take)
 static int g_rt_merged;         // The current pass has already been continued (at least one same-target SetRenderTargets was merged in)
 static uint64_t g_rt_merge_n;   // Cumulative continuation count
 /* TOTK_PASS_CONTINUE=1 (experimental, default off): in a pass continued across a same-target SetRenderTargets
@@ -4476,6 +4479,9 @@ static void rp_end(void) { if (g_enc) {
     if (pass_cont_on()) { uint64_t f = atomic_load(&g_cur_frame); if (f >= g_pc_log_frame + 600) { g_pc_log_frame = f;
         MLOG("[totk] TOTK_PASS_CONTINUE: %llu render passes ended, %llu same-target continuations; sampling draws in a continued pass: %llu stayed in it, %llu still ended it (attachment drawn earlier in the pass)",
              (unsigned long long)g_stat_pass, (unsigned long long)g_rt_merge_n, (unsigned long long)g_pc_kept, (unsigned long long)g_pc_split); } }
+    if (att_fb_on()) { static uint64_t lf; uint64_t f = atomic_load(&g_cur_frame); if (f >= lf + 600) { lf = f;
+        MLOG("[totk] [fb-fetch] through frame %llu: %llu draws read their own attachments from the tile (%llu of them kept a continued pass open), %llu sampling draws refused",
+             (unsigned long long)f, (unsigned long long)g_fb_draws, (unsigned long long)g_fb_kept, (unsigned long long)g_fb_refused); } }
     sd_finish(); enc_r_end(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_pc_merged = 0; g_lay.active = 0;
     /* Diagnostic: inspect each full-size HDR render target immediately after its
        producer pass, on the same Metal 4 queue and before later passes reuse it. */
@@ -4963,6 +4969,7 @@ typedef struct { int n; int aid[8]; unsigned axes[8]; float col[8][4]; samp_par 
     NSString *src, *src_path; NSDictionary<NSNumber *, NSString *> *io; NSMutableDictionary<NSString *, id<MTLFunction>> *vpatch; id<MTLFunction> mfx_fn[8]; uint8_t mfx_tried[8]; NSMutableDictionary<NSString *, id<MTLFunction>> *bpatch; int border_seen;
     // TOTK (upstream #286): the last results of border_key (per stage, under the registry lock), fs_fn_border (per nodepth, g_bpatch_lock) and vs_fn_for (4 entries, g_vpatch_lock), so a draw that binds what the previous one bound builds no key strings
     border_sig bk_sig[2]; NSString *bk_str[2]; NSString *fb_key[2]; id<MTLFunction> fb_fn[2];
+    uint8_t fbr_outs, fbr_outs_ok;   // TOTK: colour outputs [[color(n)]] the fragment MSL declares (bit n), fs_color_outs
     NvShader *vf_fs[4]; NSString *vf_bkey[4]; id<MTLFunction> vf_fn[4]; int vf_layered[4]; uint8_t vf_ok[4], vf_next; } @end   // TOTK: MSL source, user varyings (locn -> type), patched vertex functions   // bflib: readable-tile version <key>_bf (merge B step 2)
 @implementation NvShader @end
 /* TOTK: a shader's MSL source is needed only to build derived functions (varying patches, layered vertex, depth-less and
@@ -6519,6 +6526,7 @@ static MTLBlendOperation bop(int e) { switch (e) { case 2: return MTLBlendOperat
 
 // Pipeline: cached by (program, target formats, blend / write mask, vertex layout, sample count)
 static const uint8_t *g_pso_lmap; static id<MTLFunction> g_pso_fsfn; static pso_fz_desc g_pso_fz, g_fz_desc;
+static id<MTLFunction> g_pso_fbfn;   // TOTK: this draw's fragment function reading its own attachments from the tile (att_fb_take), nil = none
 static os_unfair_lock g_fz_fn_lock = OS_UNFAIR_LOCK_INIT;
 static NSMutableDictionary<NSString *, id<MTLFunction>> *g_bf_fn_cache;
 static NSMutableDictionary<NSString *, id<MTLLibrary>> *g_bf_lib_cache;
@@ -6709,6 +6717,45 @@ static id<MTLFunction> fs_fn_border_with(NvShader *fs, int nodepth, NSString *bk
     };
     if (variant_defer([NSString stringWithFormat:@"fs %s %@", fs->key, key], ^{ make(); })) return nil;
     fn = make();
+    return fn == VARIANT_NONE ? nil : fn;
+}
+/* TOTK: the colour outputs a fragment function declares (bit n = [[color(n)]] in its main0_out), 0xff when its MSL is not
+   available (counted as writing every slot). Read once per shader. */
+static uint8_t fs_color_outs(NvShader *fs) {
+    if (!fs) return 0;
+    if (fs->fbr_outs_ok) return fs->fbr_outs;
+    if (!sh_has_src(fs)) return 0xff;
+    NSString *src = sh_src(fs); uint8_t m = 0;
+    NSRange h = [src rangeOfString:@"struct main0_out\n{\n"];
+    if (h.location != NSNotFound) {
+        NSRange e = [src rangeOfString:@"};" options:0 range:NSMakeRange(NSMaxRange(h), src.length - NSMaxRange(h))];
+        NSString *body = e.location == NSNotFound ? @"" : [src substringWithRange:NSMakeRange(NSMaxRange(h), e.location - NSMaxRange(h))];
+        NSRegularExpression *c = [NSRegularExpression regularExpressionWithPattern:@"\\[\\[color\\(([0-7])\\)\\]\\]" options:0 error:nil];
+        for (NSTextCheckingResult *r in [c matchesInString:body options:0 range:NSMakeRange(0, body.length)]) m |= (uint8_t)(1u << [[body substringWithRange:[r rangeAtIndex:1]] intValue]);
+    }
+    fs->fbr_outs = m; fs->fbr_outs_ok = 1; return m;
+}
+/* The fragment function reading the given attachments from the tile (nvn_fbread.h), nil when it cannot be made. Built on
+   the submit thread when a draw first needs it, never in the background: the draw has given up the store before it
+   (att_fb_take), so it cannot be drawn with the plain function meanwhile. Ported from upstream PR #155 (feeeei). */
+static id<MTLFunction> fs_fn_fbread(NvShader *fs, const int aid[], const int att[], int n) {
+    if (!fs || !sh_has_src(fs) || fs->writes_depth || n <= 0) return nil;
+    NSMutableString *key = [NSMutableString stringWithString:@"fbread;"];
+    for (int i = 0; i < n; i++) [key appendFormat:@"%d:%d;", aid[i], att[i]];
+    os_unfair_lock_lock(&g_bpatch_lock); id fn = fs->bpatch[key]; os_unfair_lock_unlock(&g_bpatch_lock);
+    if (fn) return fn == VARIANT_NONE ? nil : fn;
+    NSString *src = nvn_fbread_src(sh_src(fs), fs->fn.name, aid, att, n);
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();   // about 90 ms cold on an M4 Max (PR #155); Metal's cache keeps it afterwards
+    NSError *err = nil; id<MTLLibrary> lib = src ? variant_library(src, &err) : nil;
+    fn = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
+    if (fn) { static int logged; if (logged++ < 32) MLOG("[totk] [fb-fetch] shader %s: reads %d of its own attachments from the tile (%s, %.1f ms)", fs->key, n, key.UTF8String, (CFAbsoluteTimeGetCurrent() - t0) * 1e3); }
+    else { static int warned; if (warned++ < 8) { if (src) MLOG("[red] [fb-fetch] shader %s: tile-reading variant (%s) does not compile: %s", fs->key, key.UTF8String, err.localizedDescription.UTF8String);
+                                                  else MLOG("[totk] [fb-fetch] shader %s keeps sampling memory (%s): the textures are not only sampled", fs->key, key.UTF8String); } }
+    os_unfair_lock_lock(&g_bpatch_lock);
+    if (!fs->bpatch) fs->bpatch = [NSMutableDictionary dictionary];
+    if (!fs->bpatch[key]) fs->bpatch[key] = fn ? fn : VARIANT_NONE;
+    fn = fs->bpatch[key];
+    os_unfair_lock_unlock(&g_bpatch_lock);
     return fn == VARIANT_NONE ? nil : fn;
 }
 static id<MTLFunction> vs_fn_variant(NvShader *vs, NvShader *fs, int layered, NSString *bkey, border_in b, NSString **cache_key);
@@ -7265,6 +7312,10 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     g_vprobe = probe || plain; g_vmissing = 0;
     NSString *vrec = nil, *frec = nil;   // the border recipes of this key (pso_adopt)
     __unsafe_unretained id<MTLFunction> bfn = !g_pso_lmap && !g_mfx.role ? fs_fn_border(fs, k.dfmt == 0, &frec) : nil;   // TOTK: sampler border colour emulation
+    // TOTK: or the variant reading the draw's own attachments from the tile (att_fb_take). Unlike a border variant it is never
+    // left out for the plain function: the draw gave up the store before it, so it waits for it or is deferred.
+    int fbread = !bfn && !g_pso_lmap && !g_mfx.role && g_pso_fbfn;
+    if (fbread) bfn = g_pso_fbfn;
     if (bfn) k.fsfn = (__bridge void *)bfn;
     { float bc[8][4]; int ba[8], bn; unsigned axes[8]; if (border_key(vs, 0, bc, ba, axes, &bn)) {
         k.a2c |= PSO_VBORDER;
@@ -7275,13 +7326,13 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     } }
     g_vprobe = 0;
     if (g_vmissing && !plain) { g_pso_deferred = 1; return nil; }
-    int bordered = bfn || (k.a2c & PSO_VBORDER);
-    if (g_vmissing) { bfn = nil; k.fsfn = NULL; k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; }
+    int bordered = (bfn && !fbread) || (k.a2c & PSO_VBORDER);
+    if (g_vmissing) { if (!fbread) { bfn = nil; k.fsfn = NULL; } k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; }
     __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
     if (cached) { if (g_vmissing) atomic_fetch_add_explicit(&g_stat_variant_plain, 1, memory_order_relaxed); return cached; }
     NSString *brec = !g_vmissing && bordered ? [NSString stringWithFormat:@"%@\t%@", (k.a2c & PSO_VBORDER) && vrec ? vrec : @"-", bfn && frec ? frec : @"-"] : nil;
     if (plain && !g_vmissing && bordered && apso_defer(&k, vs, fs, bfn, brec)) {   // the border pipeline is compiling: the plain one meanwhile
-        bfn = nil; k.fsfn = NULL; k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; brec = nil;
+        if (!fbread) { bfn = nil; k.fsfn = NULL; } k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; brec = nil;
         atomic_fetch_add_explicit(&g_stat_variant_plain, 1, memory_order_relaxed);
         cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
         if (cached) return cached;
@@ -9330,6 +9381,104 @@ static int att_unstored_read(const uint64_t *rs, int n) {
         if (has_ser(rs, n, g_sd[i].ser) && (!g_sd[i].load || (g_sd_plain >> i & 1))) return 1;
     return 0;
 }
+/* TOTK_ATT_FB=1 (alias TOTK_FB_FETCH=1; default off): a draw whose fragment stage samples colour attachments of its own pass
+   reads them from the tile ([[color(n)]], nvn_fbread.h) wherever the sampled texel is the fragment's own pixel, instead of
+   the pass being stored and reopened first. Ported from upstream PR #155 (feeeei), extended to continued passes.
+   TOTK_ATT_FB_WRITTEN=1 also reads slots the draw itself writes (PR #155's behaviour, which fixes the overlapping-decal
+   squares); by default such a slot keeps the store, because a tile read there also sees the same draw's earlier fragments. */
+static int att_fb_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_ATT_FB"), *f = getenv("TOTK_FB_FETCH"); on = (e && !strcmp(e, "1")) || (f && !strcmp(f, "1"));
+        if (on) MLOG("TOTK_ATT_FB=1: draws read the attachments of their own pass from the tile at their own pixel (fb-fetch)"); }
+    return on;
+}
+static int att_fb_written_ok(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_ATT_FB_WRITTEN"); on = e && !strcmp(e, "1"); } return on; }
+static const char *g_fb_why;   // why att_fb_take left a draw's attachment reads alone (pass-end diagnostics), NULL = took them all
+/* Whether colour slot j of the draw is written: declared by the fragment function and not masked off. */
+static int draw_writes_slot(NvShader *fs, int j) { return j >= 0 && j < 8 && (fs_color_outs(fs) >> j & 1) && ((S.chmask.mask >> (4 * j)) & 0xf); }
+/* The colour attachments among rs (the attachments the draw samples, draw_att_reads) that its fragment stage can read from the
+   tile instead: each is sampled only by plain sample calls of the fragment stage, through a view that is the attachment itself
+   (level 0, layer 0, its format), at the same colour index in the open encoder, and (unless TOTK_ATT_FB_WRITTEN=1) is not
+   written by the draw. They are removed from rs, so they no longer store the pass first; returns the fragment function for
+   the draw, or nil (rs unchanged, g_fb_why says why). *all: every attachment the draw binds anywhere was taken. */
+static id<MTLFunction> att_fb_take(NvProg *pr, uint64_t *rs, int *n, int *all) {
+    NvShader *fs = pr ? pr->sh[1] : nil; *all = 0; g_fb_why = NULL;
+#define FB_NO(w) do { g_fb_why = (w); g_fb_refused++; return nil; } while (0)
+    if (!att_fb_on()) { g_fb_why = "off"; return nil; }
+    if (!*n) return nil;
+    if (!fs) FB_NO("no-fs");
+    if (fs->writes_depth) FB_NO("depth-out");
+    if (!R.has_rt || g_pso_lmap || g_mfx.role || g_fz.active || g_lay.active || g_rt_range_active) FB_NO("pass-kind");
+    { float bc[8][4]; int ba[8], bn; unsigned bx[8]; if (border_key(fs, 1, bc, ba, bx, &bn)) FB_NO("border"); }   // one specialised fragment function per draw (a border variant)
+    int aid[8], att[8], k = 0, nt = 0; uint64_t took[8];
+    for (int i = 0; i < fs->rf.nb; i++) { const nvn_rbind *b = &fs->rf.b[i]; uint64_t h;
+        if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? S.img[1][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 ? S.tex[1][b->reg] : 0; else continue;
+        uint64_t ser = h ? h_ser(h) : 0;
+        if (!ser || !has_ser(rs, *n, ser)) continue;
+        if (b->kind != NVN_RB_TEX) FB_NO("not-texture");
+        if (k == 8) FB_NO("too-many");
+        int j = -1; for (int m = 0; m < R.rt.n && m < 8; m++) if (R.rt.color[m] && R.rt.color[m]->serial == ser) { j = m; break; }
+        if (j < 0) FB_NO("depth-att");
+        if (!att_fb_written_ok() && draw_writes_slot(fs, j)) FB_NO("written");   // Ryujinx_Optime's rule: never tile-read a slot the draw writes
+        uint64_t s_; int lv, sl; rt_sub(&R.rt, j, &s_, &lv, &sl);
+        if (lv || sl) FB_NO("level-layer");
+        if (g_enc) {   // the open encoder (continued or not) must hold this texture at colour index j, level 0 layer 0
+            int ok = 0; for (int q = 0; q < g_nsd; q++) if (!g_sd[q].depth && g_sd[q].ser == ser && g_sd[q].idx == j && !g_sd[q].lv && !g_sd[q].sl) ok = 1;
+            if (!ok) FB_NO("enc-slot"); }
+        int tid = (int)(h & 0xfffff); void *tv_ = NULL; if (tid) tex_fast_rid(tid, &tv_); __unsafe_unretained id<MTLTexture> tv = (__bridge id<MTLTexture>)tv_;
+        uint32_t apf = tv.parentTexture ? (uint32_t)tv.parentTexture.pixelFormat : (uint32_t)tv.pixelFormat; uint8_t swz[4];   // as fz_p2_draw
+        if (R.rt.has_cview[j] && R.rt.cview[j].set_format && !(nvn_fmt_to_mtl(R.rt.cview[j].format, &apf, swz) && apf)) FB_NO("view");
+        if (!tv || tv.textureType != MTLTextureType2D || (tv.parentTexture && (tv.parentRelativeLevel || tv.parentRelativeSlice)) || tv.pixelFormat != (MTLPixelFormat)apf) FB_NO("view");
+        aid[k] = b->aid; att[k] = j; k++;
+        if (!has_ser(took, nt, ser)) took[nt++] = ser;
+    }
+    if (!k) FB_NO("none");
+    for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh == fs || sh->stage >= 6) continue;   // other stages read memory
+        for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h;
+            if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? S.img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 ? S.tex[sh->stage][b->reg] : 0; else continue;
+            if (h && has_ser(took, nt, h_ser(h))) FB_NO("other-stage"); } }
+    id<MTLFunction> fn = fs_fn_fbread(fs, aid, att, k);
+    if (!fn) FB_NO("msl");
+#undef FB_NO
+    int m = 0; for (int i = 0; i < *n; i++) if (!has_ser(took, nt, rs[i])) rs[m++] = rs[i];
+    *n = m;
+    if (!m) {   // every attachment bound in any slot of any stage (draw_samples_rt's walk, typed buffers too) was taken
+        uint64_t cand[18]; int nc = 0;
+        for (int q = 0; q < R.rt.n && q < 8; q++) if (R.rt.color[q]) cand[nc++] = R.rt.color[q]->serial;
+        if (R.rt.depth) cand[nc++] = R.rt.depth->serial;
+        if (g_enc) for (int q = 0; q < g_nsd && nc < 18; q++) cand[nc++] = g_sd[q].ser;
+        int rest = 0;
+        for (int st = 0; st < 5 && !rest; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh->stage >= 6) continue;
+            for (int i = 0; i < sh->rf.nb && !rest; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h;
+                if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? S.img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 ? S.tex[sh->stage][b->reg] : 0; else continue;
+                uint64_t ser = h ? h_ser(h) : 0; if (ser && has_ser(cand, nc, ser) && !has_ser(took, nt, ser)) rest = 1; } }
+        *all = !rest;
+    }
+    g_fb_draws++; return fn;
+}
+/* Pass-end diagnostics for samples-drawn-att: per attachment the draw still samples, "c<index>:<format>:w<write mask>:o<declared
+   output>" (d = depth / stencil, ? = not in the targets), and why the tile read did not take it. Interned, because the
+   TOTK_PASS_GPU table keeps the pointer until the frame is written. */
+static const char *att_split_why(const char *base, NvProg *pr, const uint64_t *rs, int n) {
+    char b[256]; int o = snprintf(b, sizeof b, "%s[", base);
+    NvShader *fs = pr ? pr->sh[1] : nil;
+    for (int i = 0; i < n && o < (int)sizeof b - 40; i++) {
+        int j = -1; for (int m = 0; m < R.rt.n && m < 8; m++) if (R.rt.color[m] && R.rt.color[m]->serial == rs[i]) { j = m; break; }
+        if (j < 0) { o += snprintf(b + o, sizeof b - o, "%s%s", i ? ";" : "", R.rt.depth && R.rt.depth->serial == rs[i] ? "d" : "?"); continue; }
+        id<MTLTexture> t = tex_mtl(R.rt.color[j]); MTLPixelFormat pf = t ? t.pixelFormat : MTLPixelFormatInvalid; const char *fn = NULL;
+        switch (pf) { case MTLPixelFormatR32Float: fn = "R32Float"; break; case MTLPixelFormatRGBA8Unorm: fn = "RGBA8Unorm"; break; case MTLPixelFormatRGBA8Unorm_sRGB: fn = "RGBA8sRGB"; break;
+            case MTLPixelFormatBGRA8Unorm: fn = "BGRA8Unorm"; break; case MTLPixelFormatRGB10A2Unorm: fn = "RGB10A2Unorm"; break; case MTLPixelFormatRG11B10Float: fn = "RG11B10Float"; break;
+            case MTLPixelFormatRGBA16Float: fn = "RGBA16Float"; break; case MTLPixelFormatRG16Float: fn = "RG16Float"; break; case MTLPixelFormatR16Float: fn = "R16Float"; break;
+            case MTLPixelFormatRG16Unorm: fn = "RG16Unorm"; break; case MTLPixelFormatR8Unorm: fn = "R8Unorm"; break; case MTLPixelFormatRG8Unorm: fn = "RG8Unorm"; break; default: break; }
+        char fb[16]; if (!fn) { snprintf(fb, sizeof fb, "fmt%lu", (unsigned long)pf); fn = fb; }
+        o += snprintf(b + o, sizeof b - o, "%sc%d:%s:w%x:o%d", i ? ";" : "", j, fn, (unsigned)((S.chmask.mask >> (4 * j)) & 0xf), fs ? (fs_color_outs(fs) >> j & 1) : 0);
+    }
+    if (o < (int)sizeof b - 24) snprintf(b + o, sizeof b - o, "]fb=%s", !att_fb_on() ? "off" : g_fb_why ? g_fb_why : "partial");
+    static char *tab[512]; static int nt;
+    for (int i = 0; i < nt; i++) if (!strcmp(tab[i], b)) return tab[i];
+    if (nt == 512) return base;
+    return tab[nt++] = strdup(b);
+}
 // ---------- Store lookahead index: at the start of a submit do one linear scan in replay order and record events per texture; when a render pass ends, binary-search each attachment for "the first valid event afterwards" to decide ----------
 // Replaces the original "scan the whole remainder forward at every render pass end" (pass count x command count, 49 render passes per frame in camp). Cross-checked per attachment against the original scan: after 0 mismatches over the 17 pages of the screenshot gate + a camp run with about 340,000 attachment decisions (about 46,000 redundant), the original scan was removed.
 // Events (seq = replay sequence number): READ a draw / dispatch reads this texture per program reflection; ATT it is a current attachment at a draw; CLEAR cleared as a whole block while an attachment; COPY / CLRTEX either end of a copy / the cleared texture.
@@ -11163,20 +11312,28 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         static int once2; if (!once2++) MLOG("Same-target continuation: the depth / stencil plane a draw needs is not attached in the continued pass, splitting here (first case pass %llu)", g_stat_pass);
         PD("M %llu a draw in the continued pass needs a depth / stencil plane that is not attached: split here", g_stat_pass); RP_WHY("cont-ds-plane"); rp_end(); }
     if (g_rt_range_active && (!rt_range_pr_ro(pr) || !S.ds.dt || S.ds.dw || S.ds.st)) { RP_WHY("rt-range"); rp_end(); }   // The external write visibility at the original encoder boundary is not removed
+    // TOTK_ATT_FB: the attachments this draw samples (draw_att_reads) that its fragment stage reads from the tile instead
+    // (att_fb_take) leave att_rs: they need no store first, and when they are all of them the continued pass stays open.
+    uint64_t att_rs[ATT_READS_MAX]; int att_n = 0, fb_all = 0; id<MTLFunction> fb_fn = nil;
+    if (att_fb_on()) { att_n = att_store_on() ? draw_att_reads(pr, att_rs) : 0; if (att_n) fb_fn = att_fb_take(pr, att_rs, &att_n, &fb_all); }
     int pc_kept = 0;   // TOTK_PASS_CONTINUE: this sampling draw was let into the continued pass (att_unstored_read below decides)
     if (g_rt_merged && draw_samples_rt(pr)) {
-        if (g_pc_merged && !g_lay.active && !g_fz.active && !g_rt_range_active) pc_kept = 1;
+        if (fb_fn && fb_all) { g_fb_kept++; PD("M %llu a draw in the continued pass reads its attachments from the tile only: not split (TOTK_ATT_FB)", g_stat_pass); }
+        else if (g_pc_merged && !g_lay.active && !g_fz.active && !g_rt_range_active) pc_kept = 1;
         else { static int once; if (!once++) MLOG("same-target continuation: a draw in the continued pass samples an attachment, split here (first case: pass %llu)", g_stat_pass);
             PD("M %llu a draw in the continued pass samples an attachment: split here", g_stat_pass); RP_WHY("cont-samples-att"); rp_end(); } }
     // TOTK: the draw samples an attachment whose pixels are still only in tile memory: store them first (att_unstored_read).
     // Not in the second half of a fused pass: it reads the first half's pixels from tile memory by construction (fz_p2_draw).
-    uint64_t att_rs[ATT_READS_MAX]; int att_n = att_store_on() ? draw_att_reads(pr, att_rs) : 0;
-    if (pc_kept && !att_n) {   // the two binding walks disagree: end the pass as without TOTK_PASS_CONTINUE
+    if (!att_fb_on()) att_n = att_store_on() ? draw_att_reads(pr, att_rs) : 0;
+    if (pc_kept && !att_n) {   // the two binding walks disagree (or the tile reads took only some): end the pass as without TOTK_PASS_CONTINUE
         PD("M %llu a draw in the continued pass samples an attachment (attachment reads not recognised): split here", g_stat_pass); RP_WHY("cont-samples-att"); rp_end(); pc_kept = 0; }
     if (!(g_fz.active && g_fz.phase == 2) && att_unstored_read(att_rs, att_n)) {
         static int once; if (!once++) MLOG("[totk] a draw samples an attachment its pass drew: the pass is stored first (first: pass %llu)", g_stat_pass);
-        if (pc_kept) { g_pc_split++; pc_kept = 0; RP_WHY("cont-samples-drawn-att"); } else RP_WHY("samples-drawn-att");
-        PD("M %llu draw samples an attachment drawn in this pass, storing first then drawing", g_stat_pass); rp_flush(); }
+        const char *why = pc_kept ? "cont-samples-drawn-att" : "samples-drawn-att";
+        if (pc_kept) { g_pc_split++; pc_kept = 0; }
+        if (passdump() || pt_active()) why = att_split_why(why, pr, att_rs, att_n);   // which attachment / format, whether the draw writes it, why no tile read
+        RP_WHY(why);
+        PD("M %llu draw samples an attachment drawn in this pass, storing first then drawing: %s (fs %s)", g_stat_pass, why, pr->sh[1] ? pr->sh[1]->key : "-"); rp_flush(); }
     if (pc_kept) { g_pc_kept++; PD("M %llu a draw in the continued pass samples only attachments not drawn yet: not split (TOTK_PASS_CONTINUE)", g_stat_pass); }
     static id<MTLFunction> fz_fn;   // Specialized fragment function for this draw of the later pass in a merged render pass (nil = use the original version)
     if (g_fz.active && g_enc && g_fz.phase == 2 && !fz_p2_draw(pr, dw, di, g_fz.lmap2, &fz_fn)) {   // Cannot be proven: end the merged render pass (the earlier pass's result is stored as usual) and reopen with the later pass's original targets
@@ -11235,7 +11392,8 @@ frz_plain:;
     if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
     static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass;
-    if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }   // Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
+    if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }
+    if (fb_fn != g_pso_fbfn) { g_pso_fbfn = fb_fn; g_pso_dirty = 1; }   // TOTK: the tile-reading variant (att_fb_take) is part of the pipeline   // Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
     if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || (pr->sh[1] && pr->sh[1]->border_seen) || (pr->sh[0] && pr->sh[0]->border_seen)) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // The next draw fetches again according to its own situation
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
