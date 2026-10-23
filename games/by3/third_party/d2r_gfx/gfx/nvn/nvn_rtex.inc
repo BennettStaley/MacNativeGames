@@ -1,15 +1,15 @@
-// nvn_rtex.inc —— 运行时外推的着色器（由 nvn_mtl.m 在 rp_end / m4_end / res_add / args_dirty_all / blit 等定义之后 #include）
+// nvn_rtex.inc - the runtime extrapolation shader (#included by nvn_mtl.m after rp_end / m4_end / res_add / args_dirty_all / blit etc. are defined)
 //
 // int rt_ex_encode(dst_hdr, dst_ds, src_hdr, src_ds, vp_prev[16], vp_cur[16], unit_bits, ui_bits)
-//   在当前 MTL4 命令缓冲 g_cb 上编一个渲染通道（全屏一个三角形），把上一全画帧的不透明 HDR 与深度按本帧相机外推进 dst_hdr / dst_ds：
-//   反向映射：目标像素 q → 源像素 p，用源深度做 2 次不动点迭代；M = inv(vp_prev) · vp_cur 在 CPU 上双精度算（1e4 量级平移下单精度逆矩阵会差出 0.01 像素）。
-//   非洞：五抽头 Catmull-Rom，按 2×2 核心纹素的最小 / 最大值夹住防振铃，再按位移的小数相位补锐化（相位 0.5 最强、整数相位为 0，强度 k = 0.5）。
-//   洞（源 2×2 核心的模板含 unit_bits | ui_bits：旧单位位置 / 界面挖空）：沿 8 个方向每 4 像素往外找第一个非洞、非纯黑的像素（最远 24 步），
-//   按 1/距离² 加权平均；深度取其中最近那个。洞和屏边新露出（源越界）的像素由片元导出模板 0x80，之后的区域后处理据此重算。
-//   本帧界面挡住的像素（界面模板趟已写 0x2）按模板测试跳过。
-// 返回 1 = 编了；0 = 尺寸不齐 / 建不出管线（调用方 rt_copy_prev 先用 rx_setup 预检，建不出就整局退回原画法）。
-// 调用前后：本函数先 rp_end() 收掉当前渲染通道与拷贝编码器；编完置 args_dirty_all() / g_pso_dirty / g_dss_dirty，游戏下一个绘制按「读入」重开它的通道。
-// 资源：src_hdr / src_ds 由调用方建并 res_add；src_ds 要能开 X32_Stencil8 视图（建时带 MTLTextureUsagePixelFormatView）。
+//   Encodes one render pass (one full-screen triangle) on the current MTL4 command buffer g_cb that extrapolates the last fully drawn frame's opaque HDR and depth with this frame's camera into dst_hdr / dst_ds:
+//   Inverse mapping: destination pixel q -> source pixel p, 2 fixed-point iterations using the source depth; M = inv(vp_prev) * vp_cur is computed on the CPU in double precision (with translations around 1e4 a single-precision inverse is off by 0.01 pixel).
+//   Non-holes: five-tap Catmull-Rom, clamped to the min / max of the 2x2 core texels against ringing, then sharpened by the fractional phase of the shift (strongest at phase 0.5, 0 at integer phases, strength k = 0.5).
+//   Holes (stencil of the source 2x2 core contains unit_bits | ui_bits: old unit positions / UI cut-outs): search outward along 8 directions every 4 pixels for the first non-hole, non-black pixel (at most 24 steps),
+//   weighted by 1/distance^2; depth takes the nearest of them. Holes and pixels newly exposed at the screen edge (source out of bounds) get stencil 0x80 exported by the fragment, and the later region post-processing recomputes them.
+//   Pixels covered by this frame's UI (the UI stencil pass already wrote 0x2) are skipped by the stencil test.
+// Returns 1 = encoded; 0 = sizes do not match / pipeline cannot be built (the caller rt_copy_prev pre-checks with rx_setup and falls back to the original drawing for the whole session if it cannot be built).
+// Before / after: this function first calls rp_end() to close the current render pass and copy encoder; afterwards it sets args_dirty_all() / g_pso_dirty / g_dss_dirty, and the game's next draw reopens its pass with "load".
+// Resources: src_hdr / src_ds are created and res_add'ed by the caller; src_ds must allow an X32_Stencil8 view (created with MTLTextureUsagePixelFormatView).
 // nvn_rtex.inc - shaders for runtime extrapolation (#included by nvn_mtl.m after the definitions of rp_end / m4_end / res_add / args_dirty_all / blit etc.)
 // int rt_ex_encode(dst_hdr, dst_ds, src_hdr, src_ds, vp_prev[16], vp_cur[16], unit_bits, ui_bits)
 //   Encodes one render pass (a single fullscreen triangle) on the current MTL4 command buffer g_cb, extrapolating the opaque HDR and depth of the previous fully drawn frame into dst_hdr / dst_ds by this frame's camera:
@@ -32,7 +32,7 @@ static const char *k_rx_msl =
 "vertex VO rx_vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); VO o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
 "struct K { float4x4 M; uint hole; float amount; float2 pad; };\n"
 "static float4 cr_w(float t) { return float4(((-0.5 * t + 1.0) * t - 0.5) * t, (1.5 * t - 2.5) * t * t + 1.0, ((-1.5 * t + 2.0) * t + 0.5) * t, (0.5 * t - 0.5) * t * t); }\n"
-"static uint stv(texture2d<uint> s, int2 p) { uint4 v = s.read(uint2(p)); return v.r | v.g; }\n"   // X32_Stencil8 视图：模板值在哪个分量随实现，r | g 两处都取（另一处为 0） | X32_Stencil8 view: which component holds the stencil value is implementation-dependent, take both r | g (the other one is 0)
+"static uint stv(texture2d<uint> s, int2 p) { uint4 v = s.read(uint2(p)); return v.r | v.g; }\n"   // X32_Stencil8 view: which component holds the stencil value is implementation-dependent, take both r | g (the other one is 0)
 "static float zproj(float4x4 M, float2 p, float z, int W, int H) { float4 c = M * float4((p.x + 0.5) / W * 2 - 1, 1 - (p.y + 0.5) / H * 2, z, 1); return c.z / c.w; }\n"
 "struct O1 { float4 c [[color(0)]]; float d [[depth(any)]]; uint s [[stencil]]; };\n"
 "fragment O1 rx_fs1(VO in [[stage_in]], texture2d<float> hdr [[texture(0)]], depth2d<float> dep [[texture(1)]], texture2d<uint> stc [[texture(2)]], constant K& k [[buffer(0)]]) {\n"
@@ -52,13 +52,13 @@ static const char *k_rx_msl =
 "  if (!(s4 & k.hole)) {\n"
 "    float3 t00 = hdr.read(uint2(b0)).rgb, t10 = hdr.read(uint2(b0 + int2(1, 0))).rgb, t01 = hdr.read(uint2(b0 + int2(0, 1))).rgb, t11 = hdr.read(uint2(b0 + int2(1, 1))).rgb;\n"
 "    float3 lo = min(min(t00, t10), min(t01, t11)), hc = max(max(t00, t10), max(t01, t11)), avg = (t00 + t10 + t01 + t11) * 0.25;\n"
-"    float2 sp = p + 0.5; float2 tp1 = floor(sp - 0.5) + 0.5; float2 f = sp - tp1;\n"   // 五抽头 Catmull-Rom（双线性取样合并中间两抽头、丢四角） | Five-tap Catmull-Rom (bilinear sampling merges the two middle taps, the four corners are dropped)
+"    float2 sp = p + 0.5; float2 tp1 = floor(sp - 0.5) + 0.5; float2 f = sp - tp1;\n"   // Five-tap Catmull-Rom (bilinear sampling merges the two middle taps, the four corners are dropped)
 "    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f), w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);\n"
 "    float2 w12 = w1 + w2, t12 = tp1 + w2 / w12, t0 = tp1 - 1.0, t3 = tp1 + 2.0;\n"
 "    float3 acc = hdr.sample(ls, float2(t12.x, t0.y)).rgb * (w12.x * w0.y) + hdr.sample(ls, float2(t0.x, t12.y)).rgb * (w0.x * w12.y) + hdr.sample(ls, t12).rgb * (w12.x * w12.y)\n"
 "               + hdr.sample(ls, float2(t3.x, t12.y)).rgb * (w3.x * w12.y) + hdr.sample(ls, float2(t12.x, t3.y)).rgb * (w12.x * w3.y);\n"
 "    float wt = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y; float3 cr = clamp(acc / wt, lo, hc);\n"
-"    o.c = float4(max(cr + k.amount * (cr - avg), 0.0), 1); o.d = zproj(k.M, p, dep.read(uint2(cp)), W, H); return o; }\n"   // 按小数相位补锐化并进同一趟（邻域取 2×2 核心的均值） | Sharpening compensation by fractional phase is folded into the same pass (the neighborhood takes the mean of the 2×2 core)
+"    o.c = float4(max(cr + k.amount * (cr - avg), 0.0), 1); o.d = zproj(k.M, p, dep.read(uint2(cp)), W, H); return o; }\n"   // Sharpening compensation by fractional phase is folded into the same pass (the neighborhood takes the mean of the 2×2 core)
 "  const int2 dirs[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1) };\n"
 "  float3 sum = 0; float wsum = 0; int bestr = 1000; int2 bests = cp;\n"
 "  for (int d = 0; d < 8; d++) for (int r = 1; r <= 24; r++) { int2 s = cp + dirs[d] * (4 * r);\n"
@@ -70,28 +70,28 @@ static const char *k_rx_msl =
 "  o.c = float4(hdr.read(uint2(cp)).rgb, 1); o.d = zproj(k.M, p, dep.read(uint2(cp)), W, H); return o;\n"
 "}\n";
 static int rx_setup(MTLPixelFormat fc, MTLPixelFormat fds) {
-    if (getenv("DM_RT_TEST_NOPSO")) return 0;   // 测试：当作这台设备建不出外推管线（验整局退回原画法） | Test: pretend this device cannot build the extrapolation pipeline (verifies the whole run falls back to the original drawing method)
+    if (getenv("DM_RT_TEST_NOPSO")) return 0;   // Test: pretend this device cannot build the extrapolation pipeline (verifies the whole run falls back to the original drawing method)
     if (g_rx_pso1 && g_rx_fmt_c == fc && g_rx_fmt_ds == fds) return 1;
     static int failed; if (failed) return 0;
     NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(k_rx_msl) options:nil error:&e];
-    if (!lib) { MLOG("【红】运行时外推：着色器编译失败 %s", e.localizedDescription.UTF8String); failed = 1; return 0; }
+    if (!lib) { MLOG("[red] runtime extrapolation: shader compile failed %s", e.localizedDescription.UTF8String); failed = 1; return 0; }
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = [lib newFunctionWithName:@"rx_vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"rx_fs1"];
     pd.colorAttachments[0].pixelFormat = fc; pd.depthAttachmentPixelFormat = fds;
     if (fds == MTLPixelFormatDepth32Float_Stencil8) pd.stencilAttachmentPixelFormat = fds;
     g_rx_pso1 = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
-    if (!g_rx_pso1) { MLOG("【红】运行时外推：管线建不出 %s", e.localizedDescription.UTF8String); g_rx_pso1 = nil; failed = 1; return 0; }
+    if (!g_rx_pso1) { MLOG("[red] runtime extrapolation: pipeline cannot be built %s", e.localizedDescription.UTF8String); g_rx_pso1 = nil; failed = 1; return 0; }
     MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new]; dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES;
-    if (fds == MTLPixelFormatDepth32Float_Stencil8) { MTLStencilDescriptor *sd = [MTLStencilDescriptor new]; sd.stencilCompareFunction = MTLCompareFunctionEqual; sd.readMask = 0x2; sd.writeMask = 0x80; sd.depthStencilPassOperation = MTLStencilOperationReplace;   // 洞 / 屏外新进来的像素由片元导出 0x80，后面 LDR 区域据此重算   // 本帧被界面挡住的像素（界面模板趟已写 0x2）不算 | Hole pixels / pixels newly entering from off-screen get 0x80 exported by the fragment, and the later LDR region is recomputed accordingly   // Pixels covered by this frame's UI (the UI stencil pass already wrote 0x2) do not count
+    if (fds == MTLPixelFormatDepth32Float_Stencil8) { MTLStencilDescriptor *sd = [MTLStencilDescriptor new]; sd.stencilCompareFunction = MTLCompareFunctionEqual; sd.readMask = 0x2; sd.writeMask = 0x80; sd.depthStencilPassOperation = MTLStencilOperationReplace;   // Hole pixels / pixels newly entering from off-screen get 0x80 exported by the fragment, and the later LDR region is recomputed accordingly   // Pixels covered by this frame's UI (the UI stencil pass already wrote 0x2) do not count
         dd.frontFaceStencil = sd; dd.backFaceStencil = sd; }
     g_rx_dss = [g_dev newDepthStencilStateWithDescriptor:dd];
     if (!g_rx_args) { MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 3; ad.maxBufferBindCount = 1;
         g_rx_args = [g_dev newArgumentTableWithDescriptor:ad error:&e];
         for (int i = 0; i < 3; i++) { g_rx_const[i] = [g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared]; res_add(g_rx_const[i]); } }
-    if (!g_rx_args || !g_rx_dss) { MLOG("【红】运行时外推：参数表 / 深度状态建不出"); g_rx_pso1 = nil; failed = 1; return 0; }
-    g_rx_fmt_c = fc; g_rx_fmt_ds = fds; MLOG("运行时外推：着色器建好（颜色格式 %lu，深度格式 %lu）", (unsigned long)fc, (unsigned long)fds);
+    if (!g_rx_args || !g_rx_dss) { MLOG("[red] runtime extrapolation: argument table / depth state cannot be built"); g_rx_pso1 = nil; failed = 1; return 0; }
+    g_rx_fmt_c = fc; g_rx_fmt_ds = fds; MLOG("runtime extrapolation: shaders built (colour format %lu, depth format %lu)", (unsigned long)fc, (unsigned long)fds);
     return 1;
 }
-static void rx_inv4(const double *m, double *o) {   // 4×4 求逆（伴随矩阵法，双精度） | 4×4 inverse (adjugate method, double precision)
+static void rx_inv4(const double *m, double *o) {   // 4×4 inverse (adjugate method, double precision)
     double inv[16];
     inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
     inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
@@ -116,32 +116,32 @@ int rt_ex_encode(id<MTLTexture> dst_hdr, id<MTLTexture> dst_ds, id<MTLTexture> s
                  const float vp_prev[16], const float vp_cur[16], uint32_t unit_bits, uint32_t ui_bits) {
     if (!dst_hdr || !dst_ds || !src_hdr || !src_ds || !vp_prev || !vp_cur || !g_cb) return 0;
     if (src_hdr.width != dst_hdr.width || src_hdr.height != dst_hdr.height || src_ds.width != src_hdr.width || src_ds.height != src_hdr.height
-        || dst_ds.width != dst_hdr.width || dst_ds.height != dst_hdr.height) return 0;   // 换了分辨率（读取画面 / 动态比例）：这帧不外推 | Resolution changed (loading screen / dynamic scale): no extrapolation this frame
+        || dst_ds.width != dst_hdr.width || dst_ds.height != dst_hdr.height) return 0;   // Resolution changed (loading screen / dynamic scale): no extrapolation this frame
     if (!rx_setup(dst_hdr.pixelFormat, dst_ds.pixelFormat)) return 0;
     if (g_rx_stv_src != src_ds) {
         if (g_rx_stv) defer_obj_release(g_rx_stv);
         g_rx_stv = [src_ds newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
-        if (!g_rx_stv) { static int n; if (!n++) MLOG("【红】运行时外推：开不出模板视图（src_ds 要带 PixelFormatView 用途）"); return 0; }
+        if (!g_rx_stv) { static int n; if (!n++) MLOG("[red] runtime extrapolation: cannot make a stencil view (src_ds needs PixelFormatView usage)"); return 0; }
         res_add(g_rx_stv); g_rx_stv_src = src_ds;
     }
-    // 常量：M = inv(vp_prev) · vp_cur（行向量：clip_cur = (ndc_prev, z, 1) · M）；Metal 的 float4x4 按列存，行向量矩阵的第 i 行正好当第 i 列 ⇒ 着色器里写 M * v
+    // Constants: M = inv(vp_prev) * vp_cur (row vectors: clip_cur = (ndc_prev, z, 1) * M); Metal's float4x4 is column-major, so row i of the row-vector matrix becomes column i => the shader writes M * v
     // Constant: M = inv(vp_prev) · vp_cur (row vectors: clip_cur = (ndc_prev, z, 1) · M); Metal's float4x4 is stored by column, and row i of the row-vector matrix serves exactly as column i ⇒ write M * v in the shader
     double a[16], b[16], ia[16], m[16];
     for (int i = 0; i < 16; i++) { a[i] = vp_prev[i]; b[i] = vp_cur[i]; }
     rx_inv4(a, ia);
     for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) { double s = 0; for (int k = 0; k < 4; k++) s += ia[r * 4 + k] * b[k * 4 + c]; m[r * 4 + c] = s; }
-    // 小数相位：世界原点（任一点皆可，正交 + 平移全屏一致）在两帧屏幕上的像素位移 d = 目标 − 源；反向映射的源 = 目标 − d
+    // Fractional phase: pixel shift d = destination - source of the world origin (any point works; orthographic + translation is uniform across the screen) between the two frames; inverse-mapped source = destination - d
     // Fractional phase: pixel displacement on screen between the two frames of the world origin (any point works; orthographic + translation is uniform across the screen), d = destination − source; the source of the backward mapping = destination − d
     double W = dst_hdr.width, H = dst_hdr.height;
-    double c0x = m[12] / m[15], c0y = m[13] / m[15];   // 源 NDC 原点 (0, 0, 0, 1) 投到本帧 | Source NDC origin (0, 0, 0, 1) projected into this frame
-    double dx = c0x / 2 * W, dy = -c0y / 2 * H, sx = -dx, sy = -dy;   // 源相对目标的偏移（像素） | Offset of the source relative to the destination (pixels)
+    double c0x = m[12] / m[15], c0y = m[13] / m[15];   // Source NDC origin (0, 0, 0, 1) projected into this frame
+    double dx = c0x / 2 * W, dy = -c0y / 2 * H, sx = -dx, sy = -dy;   // Offset of the source relative to the destination (pixels)
     double fx = sx - floor(sx), fy = sy - floor(sy), amount = 0.5 * 2 * (fx * (1 - fx) + fy * (1 - fy));
     float *k = g_rx_const[g_rx_ci].contents;
     for (int i = 0; i < 16; i++) k[i] = (float)m[i];
     ((uint32_t *)k)[16] = unit_bits | ui_bits; k[17] = (float)amount;
     id<MTLBuffer> cbuf = g_rx_const[g_rx_ci]; g_rx_ci = (g_rx_ci + 1) % 3;
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
-    // 单趟：外推 + 补洞 + 按小数相位补锐化 → dst_hdr；深度写进 dst_ds；本帧界面挡住的像素按模板跳过（模板不写）
+    // Single pass: extrapolate + fill holes + sharpen by fractional phase -> dst_hdr; depth written to dst_ds; pixels covered by this frame's UI are skipped by stencil (stencil not written)
     // Single pass: extrapolation + hole filling + sharpening compensation by fractional phase → dst_hdr; depth is written into dst_ds; pixels covered by this frame's UI are skipped by stencil (stencil not written)
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.colorAttachments[0].texture = dst_hdr; rp.colorAttachments[0].loadAction = MTLLoadActionLoad; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
@@ -158,7 +158,7 @@ int rt_ex_encode(id<MTLTexture> dst_hdr, id<MTLTexture> dst_ds, id<MTLTexture> s
     return 1;
 }
 
-// 正交相机下两帧之间整幅平移的像素量（取整）：目标 = 源 + (dx, dy)
+// Whole-frame pixel shift between two frames under an orthographic camera (rounded): destination = source + (dx, dy)
 // Whole-image translation in pixels between two frames under an orthographic camera (rounded): destination = source + (dx, dy)
 static void rt_shift_px(const float vp_prev[16], const float vp_cur[16], double W, double H, int *dx, int *dy) {
     double a[16], b[16], ia[16], m[16];

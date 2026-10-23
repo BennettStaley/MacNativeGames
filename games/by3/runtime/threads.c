@@ -1,16 +1,6 @@
 /* Adapted from pinned D2R Mobile host/hle_thread.c, MIT.
  * Game-specific diagnostics and optional timing accounting removed.
  * Core affinity is virtual bookkeeping; Darwin schedules pthreads. */
-// Horizon 内核的线程与同步 SVC，原生实现：每个客体线程 = 一个宿主 pthread，跑在 SDK 给的客体栈上。
-// SDK 的 nn::os 原样运行，只把它下面的「内核」换成宿主：
-//   线程   0x08 CreateThread 0x09 StartThread 0x0A ExitThread 0x0B SleepThread 0x0C/0x0D 优先级 0x0E/0x0F 核掩码
-//          0x10 GetCurrentProcessorNumber 0x25 GetThreadId 0x19 CancelSynchronization
-//   锁     0x1A ArbitrateLock 0x1B ArbitrateUnlock（标签字 = 持有者句柄 | 0x40000000 有等待者）
-//   条件   0x1C WaitProcessWideKeyAtomic 0x1D SignalProcessWideKey
-//   地址   0x34 WaitForAddress 0x35 SignalToAddress
-//   事件   0x45 CreateEvent 0x11 SignalEvent 0x12 ClearEvent 0x17 ResetSignal 0x18 WaitSynchronization 0x16 CloseHandle
-// 语义按公开 Horizon 内核行为（Atmosphère mesosphère 的 KConditionVariable / KAddressArbiter / KSynchronization）。
-// 所有等待挂在一把全局锁 G 上，每线程一个条件变量；先求正确，性能后量。
 // Thread and synchronization SVCs of the Horizon kernel, implemented natively: each guest thread = one host pthread, running on the guest stack given by the SDK.
 // The SDK's nn::os runs as is; only the "kernel" underneath it is replaced by the host:
 //   Threads    0x08 CreateThread 0x09 StartThread 0x0A ExitThread 0x0B SleepThread 0x0C/0x0D priority 0x0E/0x0F core mask
@@ -32,7 +22,7 @@
 #include <pthread/qos.h>
 #include <dlfcn.h>
 
-#define R_TIMEOUT     0xEA01u   // 内核模块 1，描述 117 | Kernel module 1, description 117
+#define R_TIMEOUT     0xEA01u   // Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
 #define R_BAD_HANDLE  0xE401u   // 114
 #define R_BAD_STATE   0xFA01u   // 125
@@ -45,19 +35,18 @@ typedef struct event { int signaled; int refs; } event_t;
 typedef struct thr {
     uint32_t handle; uint64_t id;
     uint64_t entry, arg, stack_top; uint64_t host_context[2]; int prio, core; uint64_t mask;
-    uint64_t born_ns, exit_ns; uint32_t born_tick, exit_tick;   // 建立 / 退出的时刻与当时的游戏拍（现场导出用：作业工人是不是在卡住前退的） | Time of creation / exit and the game tick at that time (for the state dump: did the job worker exit before the stall)
+    uint64_t born_ns, exit_ns; uint32_t born_tick, exit_tick;   // Time of creation / exit and the game tick at that time (for the state dump: did the job worker exit before the stall)
     int started, exited, cancel;
     pthread_t pt; pthread_cond_t cv;
-    // 当前等待：kind 0=无 1=锁 2=条件 3=地址 4=同步对象
     // Current wait: kind 0=none 1=lock 2=condition 3=address 4=synchronization object
     int wkind, woke; uint64_t waddr, wkey; uint32_t wtag; int64_t wres;
-    uint64_t wseq;             // 登记等待的先后序号：同优先级先到先醒（与 Horizon 内核 KThread 等待树同序） | Sequence number of wait registration: at equal priority first come, first woken (same order as the Horizon kernel's KThread wait tree)
-    struct thr *next;          // 等待链 | Wait chain
-    struct thr *all;           // 全部线程链（现场导出用） | All-threads chain (for the state dump)
+    uint64_t wseq;             // Sequence number of wait registration: at equal priority first come, first woken (same order as the Horizon kernel's KThread wait tree)
+    struct thr *next;          // Wait chain
+    struct thr *all;           // All-threads chain (for the state dump)
     int last_svc; uint64_t last_lr, last_fp;
-    int closed;                // 句柄已关：与 exited 同时成立才释放对象（Horizon：线程对象随最后一个引用消失） | Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
-    uint64_t nsvc;             // SVC 次数（现场导出用） | SVC count (for the state dump)
-    mach_port_t mport;         // 宿主线程端口（取 CPU 时间） | Host thread port (to get CPU time)
+    int closed;                // Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
+    uint64_t nsvc;             // SVC count (for the state dump)
+    mach_port_t mport;         // Host thread port (to get CPU time)
     uint32_t qos;
     int cur_core;              // virtual core held while running guest code, -1 while blocked / not started
     int preempt;               // a higher-priority thread waits for this thread's core
@@ -73,36 +62,34 @@ static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 static struct { int type; void *obj; } g_h[MAX_H];
 static pthread_key_t g_keythr;
 static uint64_t g_next_id = 0x51;
-static thr_t *g_wait;          // 全部在等的线程（锁 / 条件 / 地址 / 同步） | All waiting threads (lock / condition / address / synchronization)
+static thr_t *g_wait;          // All waiting threads (lock / condition / address / synchronization)
 
-static uint32_t h_new(int type, void *obj) {     // 调用方持 G | Caller holds G
+static uint32_t h_new(int type, void *obj) {     // Caller holds G
     for (int i = 1; i < MAX_H; i++) if (!g_h[i].type) { g_h[i].type = type; g_h[i].obj = obj; return 0x1000 + i; }
-    die("句柄表满");
+    die("handle table full");
 }
-static void *h_peek(uint32_t h, int type) {      // 只查不报 | Lookup only, no report
+static void *h_peek(uint32_t h, int type) {      // Lookup only, no report
     if (h == H_CUR_THREAD && type == O_THREAD) return (g_keythr ? pthread_getspecific(g_keythr) : NULL);
     unsigned i = h - 0x1000;
     if (i == 0 || i >= MAX_H || g_h[i].type != type) return NULL;
     return g_h[i].obj;
 }
-static void *h_get(uint32_t h, int type) {       // 查不到即报（句柄错是真错误） | Reports if not found (a wrong handle is a real error)
+static void *h_get(uint32_t h, int type) {       // Reports if not found (a wrong handle is a real error)
     void *o = h_peek(h, type);
-    if (!o) LOG("句柄无效 %#x（要类型 %d）", h, type);
+    if (!o) LOG("invalid handle %#x (wanted type %d)", h, type);
     return o;
 }
 static thr_t *cur(void) {
     thr_t *t = (g_keythr ? pthread_getspecific(g_keythr) : NULL);
-    if (!t) die("非客体线程调用了线程 SVC");
+    if (!t) die("thread SVC called from a non-guest thread");
     return t;
 }
 
-// ---------- 等待原语（持 G 调用）----------
 // ---------- Wait primitives (called holding G) ----------
 static void wait_unlink(thr_t *t) {
     for (thr_t **p = &g_wait; *p; p = &(*p)->next) if (*p == t) { *p = t->next; break; }
     t->next = NULL;
 }
-// 按内核顺序挑等待者：优先级数值小者优先，同优先级先登记者优先（持 G）。kind 1 按锁地址、2 按条件键、3 按地址匹配
 // Pick a waiter in kernel order: numerically lower priority first, at equal priority the earlier registered first (holding G). kind 1 matches by lock address, 2 by condition key, 3 by address
 static uint64_t g_wseq;
 static thr_t *pick(int kind, uint64_t a) {
@@ -114,7 +101,6 @@ static thr_t *pick(int kind, uint64_t a) {
     return b;
 }
 static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv); }
-// 挂起直到被唤醒或超时（ns<0 无限、0 立即超时）；返回 wres 或 R_TIMEOUT
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
 static int64_t block_inner(thr_t *t, int kind, int64_t ns);
 // ---------- Virtual cores ----------
@@ -194,13 +180,11 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     return t->wres;
 }
 
-// ---------- 锁 ----------
 // ---------- Locks ----------
 static inline uint32_t ld32(uint64_t a) { return __atomic_load_n((uint32_t *)a, __ATOMIC_SEQ_CST); }
 static inline void st32(uint64_t a, uint32_t v) { __atomic_store_n((uint32_t *)a, v, __ATOMIC_SEQ_CST); }
 static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic_compare_exchange_n((uint32_t *)a, exp, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
 
-// 释放 addr 处的锁：交给等在它上面的第一个线程，或清零（持 G）
 // Release the lock at addr: hand it to the first thread waiting on it, or clear it to zero (holding G)
 static void lock_handoff(uint64_t addr) {
     thr_t *w = pick(1, addr); int more = 0;
@@ -209,7 +193,6 @@ static void lock_handoff(uint64_t addr) {
     st32(addr, w->wtag | (more ? WAITERS_BIT : 0));
     wake(w, 0);
 }
-// 让 t 去拿 addr 处的锁：空闲就直接拿到并唤醒，否则置等待者位并转为锁等待（持 G）
 // Make t take the lock at addr: if free, it gets it directly and is woken, otherwise set the waiters bit and turn into a lock wait (holding G)
 static void lock_acquire_for(thr_t *t, uint64_t addr, uint32_t tag) {
     uint32_t v = ld32(addr);
@@ -217,17 +200,16 @@ static void lock_acquire_for(thr_t *t, uint64_t addr, uint32_t tag) {
         if (v == 0) { if (cas32(addr, &v, tag)) { wake(t, 0); return; } continue; }
         if (cas32(addr, &v, v | WAITERS_BIT)) break;
     }
-    t->wkind = 1; t->waddr = addr; t->wtag = tag;      // 仍在 g_wait 里，改为锁等待 | Still in g_wait, changed to a lock wait
-    t->wseq = ++g_wseq;                                  // 内核把它新插进锁持有者的等待队列：同优先级排在已有锁等待者之后 | The kernel inserts it anew into the lock owner's wait queue: at equal priority it goes after the existing lock waiters
+    t->wkind = 1; t->waddr = addr; t->wtag = tag;      // Still in g_wait, changed to a lock wait
+    t->wseq = ++g_wseq;                                  // The kernel inserts it anew into the lock owner's wait queue: at equal priority it goes after the existing lock waiters
 }
 
-// ---------- 线程 ----------
 // ---------- Threads ----------
 extern void dm_thread_enter(uint64_t entry, uint64_t arg, uint64_t sp,uint64_t *host_context);
 extern _Noreturn void runtime_thread_leave(const uint64_t *host_context,void *arg,void(*fn)(void *));   // entry.S
-uint32_t (*dm_thread_tick_fn)(void);   // 取当前游戏拍；diag.c 初始化时登记（单测不登记，拍号记 0） | Gets the current game tick; registered when diag.c initializes (unit tests do not register it, the tick number is recorded as 0)
+uint32_t (*dm_thread_tick_fn)(void);   // Gets the current game tick; registered when diag.c initializes (unit tests do not register it, the tick number is recorded as 0)
 void crash_thread_init(void);
-void guest_thread_init(void);   // thread.c：每线程 TSD 槽（门、x18、TLS、TLR）唯一设置点 | thread.c: the single place that sets the per-thread TSD slots (gate, x18, TLS, TLR)
+void guest_thread_init(void);   // thread.c: the single place that sets the per-thread TSD slots (gate, x18, TLS, TLR)
 __attribute__((weak)) void runtime_hle_stack_set(uintptr_t top) { (void)top; }   // standalone thread probe: no host-stack switch
 static void *thread_main(void *p) {
     thr_t *t = p;
@@ -240,10 +222,10 @@ static void *thread_main(void *p) {
     guest_thread_init();
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); core_take(t); pthread_mutex_unlock(&G);
     { volatile char marker = 0; runtime_hle_stack_set((uintptr_t)&marker - 1024); }   // host services of this thread run below this frame
-    dm_thread_enter(t->entry, t->arg, t->stack_top,t->host_context);   // 不返回：客体须经 ExitThread 退出 | Does not return: the guest must exit through ExitThread
-    die("客体线程入口返回");
+    dm_thread_enter(t->entry, t->arg, t->stack_top,t->host_context);   // Does not return: the guest must exit through ExitThread
+    die("guest thread entry returned");
 }
-static void thr_free(thr_t *t) {   // 持 G；从全部线程链摘下并释放 | Holding G; unlink from the all-threads chain and free
+static void thr_free(thr_t *t) {   // Holding G; unlink from the all-threads chain and free
     for (thr_t **p = &g_all; *p; p = &(*p)->all) if (*p == t) { *p = t->all; break; }
     pthread_cond_destroy(&t->cv); free(t);
 }
@@ -251,12 +233,11 @@ static void thr_free(thr_t *t) {   // 持 G；从全部线程链摘下并释放 
 static _Noreturn void thread_exit_on_host(void *argument) {
     thr_t *t=argument;
     t->exit_ns = now_ns(); t->exit_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
-    // 这里不打日志：退出发生在客体线程自己的栈上（有的只有十几 KiB），带浮点的 printf 会把栈撑爆（真机冒烟：LibcurlResolver 退出时 SIGBUS，回溯 fprintf → __dtoa）。时刻只记下来，现场导出时再打
     // No logging here: the exit happens on the guest thread's own stack (some are only a dozen or so KiB), and a printf with floating point would blow the stack (real-device smoke test: SIGBUS when LibcurlResolver exits, backtrace fprintf → __dtoa). Only the time is recorded, and it is printed later in the state dump
     pthread_mutex_lock(&G);
     core_put(t);
     t->exited = 1;
-    for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4) wake(w, -1); w = n; }   // 同步等待者重查 | Synchronization waiters re-check
+    for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4) wake(w, -1); w = n; }   // Synchronization waiters re-check
     pthread_setspecific(g_keythr, NULL);
     if (t->closed) thr_free(t);
     pthread_mutex_unlock(&G);
@@ -266,9 +247,8 @@ static _Noreturn void thread_exit(thr_t *t) {
  if(t->host_context[0])runtime_thread_leave(t->host_context,t,thread_exit_on_host);
  thread_exit_on_host(t);
 }
-void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon 要求 ExitThread）"); }
+void dm_thread_returned(void) { die("guest thread entry function returned (Horizon requires ExitThread)"); }
 
-// 主线程登记，返回其句柄（交给 nnosInitialize 作主线程句柄）
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
 uint32_t svc_thread_main_init(void) {
     pthread_key_create(&g_keythr, NULL);
@@ -283,7 +263,7 @@ uint32_t svc_thread_main_init(void) {
     return t->handle;
 }
 
-static _Atomic uint64_t g_main_yield_n, g_main_yield_ns;   // 只有客体主线程写；诊断行在同一线程读 | Written only by the guest main thread; the diagnostic line reads it on the same thread
+static _Atomic uint64_t g_main_yield_n, g_main_yield_ns;   // Written only by the guest main thread; the diagnostic line reads it on the same thread
 void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = g_main_yield_n; *ns = g_main_yield_ns; }
 uint32_t dm_guest_work_qos(unsigned *count) {
     uint32_t qos = QOS_CLASS_UNSPECIFIED; unsigned n = 0;
@@ -298,9 +278,8 @@ uint32_t dm_guest_work_qos(unsigned *count) {
     return qos;
 }
 
-// ---------- 同步对象 ----------
 // ---------- Synchronization objects ----------
-static int sig_obj(uint32_t h, int *bad) {    // 1=已触发（持 G） | 1 = signaled (holding G)
+static int sig_obj(uint32_t h, int *bad) {    // 1 = signaled (holding G)
     unsigned i = h - 0x1000;
     if (h == H_CUR_THREAD) return 0;
     if (i == 0 || i >= MAX_H) { *bad = 1; return 0; }
@@ -322,7 +301,6 @@ void dm_guest_clock_advanced(void) {
     pthread_mutex_unlock(&G);
 }
 
-// 处理线程 / 同步类 SVC；返回 1 = 已处理
 // Handle thread / synchronization SVCs; returns 1 = handled
 /* Yield back-off (after nxnative e06a8ec / b703be2). On the Switch a yield with nothing else runnable costs nothing; here
    a guest loop that polls and yields becomes a host busy spin (on the iPhone the system logged about 1,300 wake-ups a
@@ -351,7 +329,7 @@ int svc_thread(int num, uint64_t *regs) {
     { thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++; } }
 
     switch (num) {
-    case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
+    case 0x08: {  // CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
         if(!regs[1]||!regs[3]||(regs[3]&15)||(int)regs[4]<28||(int)regs[4]>59||(int)regs[5]<-3||(int)regs[5]>2){regs[0]=R_BAD_STATE;return 1;}
         thr_t *t = calloc(1, sizeof *t);
         if(!t)die("thread allocation");
@@ -362,7 +340,7 @@ int svc_thread(int num, uint64_t *regs) {
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
         pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8 << 20);   // also the host-service stack of this guest thread
-        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);   // 退出即回收宿主资源（客体经句柄等待，不 join） | Host resources are reclaimed on exit (the guest waits through the handle, no join)
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);   // Host resources are reclaimed on exit (the guest waits through the handle, no join)
         if (pthread_create(&t->pt, &a, thread_main, t)) die("pthread_create");
         pthread_attr_destroy(&a);
         LOG("CreateThread h=%#x entry=%#llx sp=%#llx", t->handle,t->entry,t->stack_top);
@@ -376,7 +354,7 @@ int svc_thread(int num, uint64_t *regs) {
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }
     case 0x0A: thread_exit(cur()); return 1;
-    case 0x0B: {  // SleepThread(x0 ns)；0/-1/-2 = 各类让出 | SleepThread(x0 ns); 0/-1/-2 = the various kinds of yield
+    case 0x0B: {  // SleepThread(x0 ns); 0/-1/-2 = the various kinds of yield
         int64_t ns = (int64_t)regs[0];
 
         thr_t *self = cur();
@@ -385,7 +363,7 @@ int svc_thread(int num, uint64_t *regs) {
             uint64_t deadline = guest_ns() + (uint64_t)ns;
             while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
         } else if (ns > 0) { struct timespec ts = {ns / 1000000000, ns % 1000000000}; nanosleep(&ts, 0); }
-        else {   // 让出（0 / -1 / -2）。主线程的让出次数与耗时记账：游戏渲染任务图「等全部做完」是纯轮询 + 让出（main+0x15ee898），量它占一帧多少 | Yield (0 / -1 / -2). Count and time of the main thread's yields are recorded: the game's render task graph "wait for everything to finish" is pure polling + yield (main+0x15ee898); measure how much of a frame it takes
+        else {   // Yield (0 / -1 / -2). Count and time of the main thread's yields are recorded: the game's render task graph "wait for everything to finish" is pure polling + yield (main+0x15ee898); measure how much of a frame it takes
             thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL);
             uint64_t y0 = now_ns();
             if (me && me->nsvc != me->yrun_svc + 1) me->yrun_ns = y0;   // another SVC since the last yield: a new run
@@ -410,7 +388,7 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x0D: { if(regs[1]<28||regs[1]>59){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) t->prio = (int)regs[1]; regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
     case 0x0E: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[2], O_THREAD);
                  regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)(uint32_t)t->core : 0; regs[2] = t ? t->mask : 0;pthread_mutex_unlock(&G); return 1; }
-    case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)：-1 = 用进程缺省、-2/-3 = 不改理想核；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask): -1 = use the process default, -2/-3 = leave the ideal core unchanged; the host only keeps the bookkeeping
+    case 0x0F: {  // SetThreadCoreMask(w0, w1 ideal core, x2 mask): -1 = use the process default, -2/-3 = leave the ideal core unchanged; the host only keeps the bookkeeping
         pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
         if (t) { int c = (int)regs[1]; if (c >= 0) t->core = c; else if (c == -1) t->core = 0; if (regs[2]) t->mask = regs[2];
                  if (t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); } }   // migrate off a core no longer allowed
@@ -419,7 +397,7 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x10: { thr_t *t = cur(); regs[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? t->cur_core : t->core); return 1; }   // GetCurrentProcessorNumber
     case 0x25: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? t->id : 0;pthread_mutex_unlock(&G); return 1; }
 
-    case 0x1A: {  // ArbitrateLock(w0 持有者句柄, x1 地址, w2 本线程标签) | ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)
+    case 0x1A: {  // ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)
         thr_t *t = cur(); uint64_t addr = regs[1];
         pthread_mutex_lock(&G);
         int64_t r = 0;
@@ -428,19 +406,15 @@ int svc_thread(int num, uint64_t *regs) {
         regs[0] = (uint64_t)r; return 1;
     }
     case 0x1B: pthread_mutex_lock(&G); lock_handoff(regs[0]); pthread_mutex_unlock(&G); regs[0] = 0; return 1;
-    case 0x1C: {  // WaitProcessWideKeyAtomic(x0 锁地址, x1 条件键, w2 标签, x3 超时) | WaitProcessWideKeyAtomic(x0 lock address, x1 condition key, w2 tag, x3 timeout)
+    case 0x1C: {  // WaitProcessWideKeyAtomic(x0 lock address, x1 condition key, w2 tag, x3 timeout)
         thr_t *t = cur(); uint64_t addr = regs[0], key = regs[1];
         pthread_mutex_lock(&G);
-        // 顺序要紧：先置条件键 = 1，再放互斥锁。SDK 的 InternalConditionVariable::Signal 在用户态先读条件键、为 0 就不发 svc 0x1D；
-        // 用户态抢互斥锁也不经过 G。原先先 lock_handoff 后置键：放锁后、置键前，别的线程可在用户态抢到锁、改完条件、读到键 0 就不唤醒，
-        // 本线程随后挂上去永远等不到（并行负载下资源表读写锁 main+0x320e5e0 卡死：读者计数 0、锁空闲、写者条件键 1、写者仍在等）。
-        // 挂进等待链在 block 里、仍持 G：svc 0x1D 要取 G，不会落在这之前
         // The order matters: first set the condition key = 1, then release the mutex. The SDK's InternalConditionVariable::Signal first reads the condition key in user mode, and does not issue svc 0x1D if it is 0;
         // grabbing the mutex in user mode does not go through G either. It used to do lock_handoff first and set the key after: after the release and before the key was set, another thread could grab the lock in user mode, change the condition, read key 0 and not wake anyone,
         // and this thread would then link itself in and wait forever (under parallel load the resource table read-write lock main+0x320e5e0 deadlocked: reader count 0, lock free, writer condition key 1, writer still waiting).
         // Linking into the wait chain happens inside block, still holding G: svc 0x1D has to take G, so it cannot land before this
 #ifdef DM_TEST_HOOKS
-#define CV_TEST_HOOK() { extern void (*dm_test_cv_after_release)(void); if (dm_test_cv_after_release) dm_test_cv_after_release(); }   // 单测：紧跟放锁之后、挂链之前 | Unit test: right after releasing the lock, before linking into the wait chain
+#define CV_TEST_HOOK() { extern void (*dm_test_cv_after_release)(void); if (dm_test_cv_after_release) dm_test_cv_after_release(); }   // Unit test: right after releasing the lock, before linking into the wait chain
 #else
 #define CV_TEST_HOOK()
 #endif
@@ -448,26 +422,26 @@ int svc_thread(int num, uint64_t *regs) {
         st32(key, 1);
         t->wkey = key; t->waddr = addr; t->wtag = (uint32_t)regs[2];
         lock_handoff(addr); CV_TEST_HOOK();
-#else   // 仅单测 t_condvar 的负对照：还原修复前「先放锁、后置键」的顺序 | Negative control for the unit test t_condvar only: restores the pre-fix order "release the lock first, set the key after"
+#else   // Negative control for the unit test t_condvar only: restores the pre-fix order "release the lock first, set the key after"
         lock_handoff(addr); CV_TEST_HOOK();
         st32(key, 1);
         t->wkey = key; t->waddr = addr; t->wtag = (uint32_t)regs[2];
 #endif
-        int64_t r = block(t, 2, (int64_t)regs[3]);   // 超时：不重新拿锁（用户态自己拿） | Timeout: the lock is not re-acquired (user mode takes it itself)
+        int64_t r = block(t, 2, (int64_t)regs[3]);   // Timeout: the lock is not re-acquired (user mode takes it itself)
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
-    case 0x1D: {  // SignalProcessWideKey(x0 条件键, w1 个数，<=0 全部) | SignalProcessWideKey(x0 condition key, w1 count, <=0 all)
+    case 0x1D: {  // SignalProcessWideKey(x0 condition key, w1 count, <=0 all)
         uint64_t key = regs[0]; int cnt = (int)regs[1], n = 0;
         pthread_mutex_lock(&G);
-        for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2 | In kernel order; once turned into a lock wait or woken it is no longer kind 2
+        for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // In kernel order; once turned into a lock wait or woken it is no longer kind 2
         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
         if (!left) st32(key, 0);
         pthread_mutex_unlock(&G);
         regs[0] = 0; return 1;
     }
 
-    case 0x34: {  // WaitForAddress(x0 地址, w1 类型, w2 值, x3 超时)：0 小于则等、1 小于则减一再等、2 相等则等 | WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 wait if less than, 1 decrement if less than then wait, 2 wait if equal
+    case 0x34: {  // WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 wait if less than, 1 decrement if less than then wait, 2 wait if equal
         thr_t *t = cur(); uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2];
         pthread_mutex_lock(&G);
         int64_t r; uint32_t v = ld32(addr);
@@ -478,7 +452,7 @@ int svc_thread(int num, uint64_t *regs) {
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
-    case 0x35: {  // SignalToAddress(x0 地址, w1 类型, w2 值, w3 个数)：0 唤醒、1 相等则加一并唤醒、2 相等则按等待数改值并唤醒 | SignalToAddress(x0 address, w1 type, w2 value, w3 count): 0 wake, 1 increment if equal and wake, 2 if equal modify the value by waiter count and wake
+    case 0x35: {  // SignalToAddress(x0 address, w1 type, w2 value, w3 count): 0 wake, 1 increment if equal and wake, 2 if equal modify the value by waiter count and wake
         uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2]; int cnt = (int)regs[3];
         pthread_mutex_lock(&G);
         int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 3 && w->waddr == addr) nw++;
@@ -498,28 +472,27 @@ int svc_thread(int num, uint64_t *regs) {
         regs[0] = (uint64_t)r; return 1;
     }
 
-    case 0x45: {  // CreateEvent(→w1 写端, w2 读端) | CreateEvent(→w1 write end, w2 read end)
+    case 0x45: {  // CreateEvent(→w1 write end, w2 read end)
         event_t *e = calloc(1, sizeof *e); e->refs = 2;
         pthread_mutex_lock(&G); uint32_t hw = h_new(O_EVENT_W, e), hr = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G);
         regs[0] = 0; regs[1] = hw; regs[2] = hr; return 1;
     }
-    case 0x11: case 0x12: case 0x17: {  // SignalEvent(写端) / ClearEvent(任一端) / ResetSignal(读端，未触发报错) | SignalEvent(write end) / ClearEvent(either end) / ResetSignal(read end, error if not signaled)
+    case 0x11: case 0x12: case 0x17: {  // SignalEvent(write end) / ClearEvent(either end) / ResetSignal(read end, error if not signaled)
         pthread_mutex_lock(&G);
-        // SignalEvent 只认写端；ClearEvent 两端都认；ResetSignal 只认读端
         // SignalEvent accepts only the write end; ClearEvent accepts both ends; ResetSignal accepts only the read end
         uint32_t h = (uint32_t)regs[0];
         event_t *e = num == 0x11 ? h_peek(h, O_EVENT_W) : num == 0x17 ? h_peek(h, O_EVENT_R)
                    : (h_peek(h, O_EVENT_W) ? h_peek(h, O_EVENT_W) : h_peek(h, O_EVENT_R));
         int64_t r = 0;
         if (!e) { r = (num == 0x17 && h_peek(h, O_THREAD)) ? R_BAD_STATE : R_BAD_HANDLE;
-                  if (r == R_BAD_HANDLE) LOG("事件 SVC %#x 句柄无效 %#x", num, h); }
+                  if (r == R_BAD_HANDLE) LOG("event SVC %#x: invalid handle %#x", num, h); }
         else if (num == 0x11) { e->signaled = 1; wake_sync_waiters(); }
         else if (num == 0x17 && !e->signaled) r = R_BAD_STATE;
         else e->signaled = 0;
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
-    case 0x18: {  // WaitSynchronization(→w1 下标; x1 句柄数组, w2 个数, x3 超时) | WaitSynchronization(→w1 index; x1 handle array, w2 count, x3 timeout)
+    case 0x18: {  // WaitSynchronization(→w1 index; x1 handle array, w2 count, x3 timeout)
         thr_t *t = cur(); const uint32_t *hs = (const uint32_t *)regs[1]; int n = (int)regs[2]; int64_t ns = (int64_t)regs[3];
         if(n<0||n>64||(!hs&&n)){regs[0]=R_BAD_STATE;return 1;}
         int64_t deadline = ns > 0 ? (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns()) + ns : 0;
@@ -539,14 +512,14 @@ int svc_thread(int num, uint64_t *regs) {
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; regs[1] = idx >= 0 ? (uint64_t)idx : 0; return 1;
     }
-    case 0x19: {  // CancelSynchronization(w0 线程) | CancelSynchronization(w0 thread)
+    case 0x19: {  // CancelSynchronization(w0 thread)
         pthread_mutex_lock(&G);
         thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
         if (t) { t->cancel = 1; if (t->wkind == 4) wake(t, -1); }
         pthread_mutex_unlock(&G);
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }
-    case 0x16: {  // CloseHandle(w0)：事件两端都关才释放；线程句柄关闭后槽位回收，对象在线程也退出后释放 | CloseHandle(w0): an event is freed only when both ends are closed; after a thread handle is closed the slot is recycled, and the object is freed once the thread has also exited
+    case 0x16: {  // CloseHandle(w0): an event is freed only when both ends are closed; after a thread handle is closed the slot is recycled, and the object is freed once the thread has also exited
         pthread_mutex_lock(&G);
         unsigned i = (uint32_t)regs[0] - 0x1000;int valid=0;
         if (i > 0 && i < MAX_H && (g_h[i].type == O_EVENT_R || g_h[i].type == O_EVENT_W)) {
@@ -571,9 +544,6 @@ int svc_thread(int num, uint64_t *regs) {
     return 0;
 }
 
-// ---------- 服务层的 SystemEvent ----------
-// 真机：服务把内核事件的读端交给客户端，客体经 SDK nn::os 等待。宿主：在客体线程上调 SDK 自己的
-// CreateSystemEvent(跨进程=true)，SDK 经 SVC 0x45 建出内核事件；记下写端句柄，之后任何线程（含宿主音频线程）都可触发。
 // ---------- SystemEvent of the service layer ----------
 // Real device: the service hands the read end of a kernel event to the client, and the guest waits on it through SDK nn::os. Host: on a guest thread, call the SDK's own
 // CreateSystemEvent(inter-process=true), and the SDK creates the kernel event through SVC 0x45; the write-end handle is recorded, after which any thread (including the host audio thread) can signal it.
@@ -584,27 +554,27 @@ static uint32_t se_find(void *ev) {
     for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) return g_se[i].wh;
     return 0;
 }
-void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线程上调（要执行 SDK 代码） | Must be called on a guest thread (it has to execute SDK code)
+void hle_bind_system_event(void *ev, int autoclear) {      // Must be called on a guest thread (it has to execute SDK code)
     pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
     if (wh) return;
-    if (!(g_keythr ? pthread_getspecific(g_keythr) : NULL)) die("hle_bind_system_event 须在客体线程上调用");
+    if (!(g_keythr ? pthread_getspecific(g_keythr) : NULL)) die("hle_bind_system_event must be called on a guest thread");
     static uint32_t (*create)(void *, int, int); static uint32_t (*getw)(const void *);
     if (!create) { create = guest_sym("_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb");
                    getw = guest_sym("_ZN2nn2os30GetWritableHandleOfSystemEventEPKNS0_15SystemEventTypeE"); }
     uint32_t r = create(ev, autoclear, 1);
-    if (r) die("CreateSystemEvent 失败 %#x", r);
+    if (r) die("CreateSystemEvent failed %#x", r);
     wh = getw(ev);
     pthread_mutex_lock(&g_se_lock);
-    if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent 绑定表满");
+    if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent binding table full");
     g_se[g_nse].ev = ev; g_se[g_nse++].wh = wh;
     pthread_mutex_unlock(&g_se_lock);
 }
-void hle_signal_system_event(void *ev) {   // 未绑定的按手动清除即时绑定（只能在客体线程上发生） | An unbound one is bound on the spot as manual-clear (can only happen on a guest thread)
+void hle_signal_system_event(void *ev) {   // An unbound one is bound on the spot as manual-clear (can only happen on a guest thread)
     pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
     if (!wh) { hle_bind_system_event(ev, 0); pthread_mutex_lock(&g_se_lock); wh = se_find(ev); pthread_mutex_unlock(&g_se_lock); }
     pthread_mutex_lock(&G);
     event_t *e = h_get(wh, O_EVENT_W);
-    if (!e) die("SystemEvent 写端句柄失效 %#x", wh);
+    if (!e) die("SystemEvent write-end handle invalid %#x", wh);
     e->signaled = 1; wake_sync_waiters();
     pthread_mutex_unlock(&G);
 }

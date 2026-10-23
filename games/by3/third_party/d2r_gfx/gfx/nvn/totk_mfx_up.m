@@ -230,6 +230,6 @@ void mfxup_stats(int ci, char *out, size_t n) {
     if (ci < 0 || ci >= MFXUP_NCTX) { snprintf(out, n, "?"); return; }
     const ctx_t *c = &g_c[ci];
     cfg_t z = {0}; const cfg_t *k = c->cur >= 0 ? &c->cache[c->cur].cfg : &z;
-    snprintf(out, n, "MetalFX 空间放大（%s）：%llu 次，未放大 %llu 次（其中等后台建放大器 %llu 次）（%lux%lu → %lux%lu）", g_name[ci], (unsigned long long)c->done,
+    snprintf(out, n, "MetalFX spatial upscale (%s): %llu times, not upscaled %llu times (%llu waiting for the background scaler build) (%lux%lu -> %lux%lu)", g_name[ci], (unsigned long long)c->done,
              (unsigned long long)c->refused, (unsigned long long)c->waited, (unsigned long)k->in_w, (unsigned long)k->in_h, (unsigned long)k->out_w, (unsigned long)k->out_h);
 }

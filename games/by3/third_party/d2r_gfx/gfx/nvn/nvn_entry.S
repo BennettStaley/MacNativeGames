@@ -1,6 +1,6 @@
     .arch_extension lse
-// 未实现 NVN 函数的公共入口：跳板进来时 x16 = 本函数的槽地址（nvn_slot[i]）。
-// 调 nvn_unimpl_c(slot, x0, x1, x2) 报红记名，返回 0。
+// Common entry for unimplemented NVN functions: on entry from the trampoline x16 = this function's slot address (nvn_slot[i]).
+// Calls nvn_unimpl_c(slot, x0, x1, x2) to report it in red with its name, returns 0.
 // Common entry for unimplemented NVN functions: when the thunk comes in, x16 = this function's slot address (nvn_slot[i]).
 // Calls nvn_unimpl_c(slot, x0, x1, x2) to report a failure and log the name, returns 0.
     .text
@@ -17,10 +17,10 @@ _nvn_unimpl_entry:
     ldp x29, x30, [sp], #16
     ret
 
-// 计时包装入口（DM_NVN_PROF=1 时槽表指向这里）：跳板进来时 x16 = 本函数槽地址。
-// 保存 x0-x7 / q0-q7（NVN 函数无栈传参，生成器已核），取 mach_absolute_time → 调真实现（nvn_real[i]）→ 再取，
-// 差值原子累加到 nvn_prof_ticks[i]（mach 时基单位）；返回值 x0/x1、q0-q3 原样带回。
-// 不用 cntvct_el0：本机实测它与系统时基不成固定比例（cntfrq 报 1 GHz，同区间增量比 98.9），不能换算成时间。
+// Timing wrapper entry (the slot table points here with DM_NVN_PROF=1): on entry from the trampoline x16 = this function's slot address.
+// Saves x0-x7 / q0-q7 (NVN functions take no stack arguments, checked by the generator), reads mach_absolute_time -> calls the real implementation (nvn_real[i]) -> reads it again,
+// and atomically adds the difference to nvn_prof_ticks[i] (mach timebase units); return values x0/x1, q0-q3 are passed back unchanged.
+// Not cntvct_el0: measured on this machine it has no fixed ratio to the system timebase (cntfrq reports 1 GHz, increment ratio over the same interval 98.9), so it cannot be converted to time.
 // Timing wrapper entry (the slot table points here when DM_NVN_PROF=1): when the thunk comes in, x16 = this function's slot address.
 // Save x0-x7 / q0-q7 (NVN functions pass no arguments on the stack, verified by the generator), take mach_absolute_time -> call the real implementation (nvn_real[i]) -> take it again,
 // atomically add the difference to nvn_prof_ticks[i] (mach timebase units); return values x0/x1, q0-q3 are passed back unchanged.
@@ -42,7 +42,7 @@ _nvn_prof_entry:
     adrp x9, _nvn_slot@PAGE
     add x9, x9, _nvn_slot@PAGEOFF
     sub x16, x16, x9
-    lsr x16, x16, #4                 // 槽号 i | Slot index i
+    lsr x16, x16, #4                 // Slot index i
     str x16, [sp, #80]
     bl _mach_absolute_time
     str x0, [sp, #88]

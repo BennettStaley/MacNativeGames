@@ -325,7 +325,7 @@ static void dump_tex(id<MTLCommandQueue> q, id<MTLTexture> t, NSUInteger bpp, co
     [e copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toBuffer:b destinationOffset:0 destinationBytesPerRow:w * bpp destinationBytesPerImage:w * h * bpp];
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     char path[1024]; snprintf(path, sizeof path, "%s/mfx-%llu-%s-%lux%lu.bin", dir, (unsigned long long)n, name, (unsigned long)w, (unsigned long)h);
-    FILE *f = fopen(path, "wb"); if (f) { fwrite(b.contents, 1, w * h * bpp, f); fclose(f); } else MLOG("【红】dump: cannot write %s", path);
+    FILE *f = fopen(path, "wb"); if (f) { fwrite(b.contents, 1, w * h * bpp, f); fclose(f); } else MLOG("[red] dump: cannot write %s", path);
 }
 static const char *g_dump_dir; static uint64_t g_turning; static double g_dump_step;
 int mfx_dump_due(void) {   // called after each encode; 1 = dump this frame (the caller first waits for the GPU)
@@ -379,7 +379,7 @@ static double gpu_pct(double q) {
     return a[(int)(q * (n - 1))];
 }
 void mfx_stats(char *out, size_t n) {
-    snprintf(out, n, "插值帧 %llu / 游戏帧 %llu（MetalFX GPU p50 %.2f / p95 %.2f ms；两帧间隔 %.1f ms）；未插：缺输入 %llu（画面 %llu 相机 %llu 深度 %llu UI %llu）、首帧 / 历史重置 %llu、镜头切换 %llu、命令缓冲忙 %llu",
+    snprintf(out, n, "interpolated frames %llu / game frames %llu (MetalFX GPU p50 %.2f / p95 %.2f ms; frame interval %.1f ms); not interpolated: missing input %llu (colour %llu camera %llu depth %llu UI %llu), first frame / history reset %llu, camera cut %llu, command buffer busy %llu",
              (unsigned long long)g.made, (unsigned long long)g.frames, gpu_pct(0.5), gpu_pct(0.95), g.dt * 1e3, (unsigned long long)g.skip_input, (unsigned long long)g.miss[0], (unsigned long long)g.miss[1],
              (unsigned long long)g.miss[2], (unsigned long long)g.miss[3],
              (unsigned long long)g.skip_first, (unsigned long long)g.skip_cut, (unsigned long long)g.skip_busy);
