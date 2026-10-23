@@ -6,7 +6,7 @@
    choose, ← → change, Page Up / Down or LT / RT page, never wrapping round); Escape or B goes back one level and closes
    the menu only from the section bar. Q / E, Tab or the shoulder buttons switch tabs. Reset this tab (R, X on the bar)
    and Reset everything… (Shift-R, Y on the bar, then confirm) set settings back; cheats, mods, saves and the spawner's
-   favorites are never reset. While it is open the game reads a neutral controller (runtime_input_hold). Content › Mods is
+   favorites are never reset. While it is open the game reads no buttons or keys, only the controller sticks (runtime_input_hold). Content › Mods is
    runtime/mods_panel_mac.h (the installed mods and the GameBanana browser; the sidebar widens while it shows), Tools ›
    Spawn is runtime/spawn_panel_mac.h, and Tools › Cheats lists the community
    cheat list the game downloads (cheat_db_fetch.h; shown by group through cheat_catalog.h, variants as one choice, the ones
@@ -964,7 +964,7 @@ static NSTextField *settings_help_label(NSView *v) {   /* a setting row's help t
 /* ---- controller ---- */
 
 - (void)poll {
-    uint64_t now = 0; float ly = 0, lx = 0;
+    uint64_t now = 0;
     for (GCController *c in GCController.controllers) {
         GCExtendedGamepad *p = c.extendedGamepad; if (!p) continue;
         if (p.dpad.up.isPressed) now |= 1; if (p.dpad.down.isPressed) now |= 2;
@@ -974,10 +974,8 @@ static NSTextField *settings_help_label(NSView *v) {   /* a setting row's help t
         if (p.buttonMenu.isPressed) now |= 256;
         if (p.buttonX.isPressed) now |= 512; if (p.buttonY.isPressed) now |= 1024;
         if (p.leftTrigger.value > 0.5f) now |= 2048; if (p.rightTrigger.value > 0.5f) now |= 4096;
-        if (fabsf(p.leftThumbstick.yAxis.value) > fabsf(ly)) ly = p.leftThumbstick.yAxis.value;
-        if (fabsf(p.leftThumbstick.xAxis.value) > fabsf(lx)) lx = p.leftThumbstick.xAxis.value;
+        /* the sticks are left to the game (runtime_input_hold): the menu navigates with the d-pad only */
     }
-    if (ly > 0.6f) now |= 1; if (ly < -0.6f) now |= 2; if (lx < -0.6f) now |= 4; if (lx > 0.6f) now |= 8;
     uint64_t edge = now & ~padPrev; padPrev = now;
     double t = CACurrentMediaTime();
     /* held direction or trigger, repeated */
