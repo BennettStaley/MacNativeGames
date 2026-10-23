@@ -402,7 +402,7 @@ static uint64_t g_pool_query_checked;
    is unchanged. Only a pool no other pool overlaps is kept, so a hit is the pool the locked search returns; it is already
    resident (pool_res ran), and only its removal takes it out of the residency set, which bumps the generation.
    TOTK_POOL_TLS=0 or flag pool_tls 0 turns it off; TOTK_POOL_TLS_CHECK=1 or flag pool_tls_check 1 compares every hit with
-   the locked search. */
+   the locked search. 32 entries halved the misses (10% -> 5%) but the longer scan cost as much, no net gain (2026-10-23). */
 #define POOL_TLS_N 8
 typedef struct { uintptr_t lo, hi, base; void *buf; uint64_t gpu, gen; } pool_tls_ent;
 static _Thread_local pool_tls_ent g_ptls[POOL_TLS_N];
@@ -1363,7 +1363,7 @@ static id<MTL4ComputeCommandEncoder> blit_buffer(id<MTLBuffer> src, NSUInteger s
     (void)src; (void)so; (void)dst; (void)d; (void)n; return blit_kind(1); }
 
 /* TOTK: collect and copy the uniform ranges a submission binds (see usnap_t). */
-static size_t arena_alloc(size_t n, id<MTLBuffer> *buf);
+static size_t arena_alloc(size_t n, __strong id<MTLBuffer> *buf);
 static void pend_materialize(uint64_t a, uint8_t *out, size_t n, int depth);
 static void pend_overlay(uint64_t a, uint8_t *out, size_t n, int depth);
 static void pend_materialize_x(uint64_t a, uint8_t *out, size_t n, int depth, int wait);
@@ -1614,7 +1614,7 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
 
 // TOTK: uniform updates carry their data inline in the (host-owned) recording; stage it in this submit's
 // argument arena (shared Metal memory) and copy on the GPU timeline like any other buffer copy.
-static size_t arena_alloc(size_t n, id<MTLBuffer> *buf);
+static size_t arena_alloc(size_t n, __strong id<MTLBuffer> *buf);
 /* TOTK: inline uniform updates without splitting the render pass (renaming).
    The game updates small uniform ranges between draws about 200 times per frame (nvnCommandBufferUpdateUniformBuffer).
    Each one used to be a GPU copy, which ended the render pass: a copy encoder in between and the pass reopened with every
@@ -5994,7 +5994,9 @@ static NvArena *arena_new(void) {
 static uint64_t g_arena_epoch; // A cached GPU address is valid only for its submission.
 void arena_begin(void) { g_arena_epoch++; if (!g_arenas) { g_arenas = [NSMutableArray array]; g_sub_arenas = [NSMutableArray array]; } g_cur_arena = nil; }
 void arena_commit(uint64_t fence) { for (NvArena *a in g_sub_arenas) { a->fence = fence; [g_arenas addObject:a]; } [g_sub_arenas removeAllObjects]; g_cur_arena = nil; }
-static size_t arena_alloc(size_t n, id<MTLBuffer> *buf) {
+/* TOTK: the buffer out-parameters here and in driver_bank_gpu / widen_u8_gpu are __strong: an unqualified id * is
+   __autoreleasing under ARC, which put the arena buffer in the autorelease pool at every call (a few per draw). */
+static size_t arena_alloc(size_t n, __strong id<MTLBuffer> *buf) {
     n = (n + 255) & ~(size_t)255;
     if (!g_cur_arena || g_cur_arena->used + n > (size_t)(4 << 20)) {   // every arena is 4 MiB (arena_new); was a buf.length message per allocation
         pthread_mutex_lock(&g_mu); g_cur_arena = arena_new(); pthread_mutex_unlock(&g_mu);
@@ -7814,7 +7816,7 @@ static void driver_bank_fill(uint8_t *d, int bank, int stage) {
         for (int r = 0; r < 32; r++) { uint32_t th = (uint32_t)S.tex[stage][r]; memcpy(d + 0x20 + 8 * r, &th, 4); }   /* TOTK: combined handle table (BindTexture) */
     }
 }
-static uint64_t driver_bank_gpu(int bank, int stage, id<MTLBuffer> *out) {
+static uint64_t driver_bank_gpu(int bank, int stage, __strong id<MTLBuffer> *out) {
     // S002 live A/B/A/B found no reliable gain. Keep the original allocation path as
     // the default, without computing or copying a cache key when the experiment is off.
     if (!driver_cache_on()) {
@@ -9862,7 +9864,7 @@ static struct { const p_draw_idx *di; __unsafe_unretained id<MTLBuffer> buf; siz
 static int g_draw_depth;
 static int wide_find(const p_draw_idx *di) { if (g_wide_sub != g_sub_serial) { g_nwide = 0; g_wide_sub = g_sub_serial; } for (int i = 0; i < g_nwide; i++) if (g_wide[i].di == di) return i; return -1; }
 /* Widens count 8-bit indices at GPU address src (range checked by the caller) into this submit's arena. */
-static void widen_u8_gpu(uint64_t src, uint32_t count, id<MTLBuffer> *out, size_t *off) {
+static void widen_u8_gpu(uint64_t src, uint32_t count, __strong id<MTLBuffer> *out, size_t *off) {
     static id<MTLComputePipelineState> ps; static id<MTL4ArgumentTable> at;
     if (!ps) {
         NSError *e = nil;
