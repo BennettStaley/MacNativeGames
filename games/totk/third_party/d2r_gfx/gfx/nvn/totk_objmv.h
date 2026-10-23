@@ -232,16 +232,29 @@ static NSString *om_vs_src(NvShader *vs, NvShader *fs, NSString **why) {
          "      out.totk_om_c = out.%@; out.totk_om_p = totk_om_q; return out; }", vid, iid, pos, pos];
     return [src stringByReplacingOccurrencesOfString:@"return out;" withString:store];
 }
+/* TOTK_OBJ_MOTION_DIAG (diagnostic, default 0): the motion draws still use the motion variants (same vertex functions,
+   same extra varyings and attachment 6), but the fragment variant writes a constant: 1 OBJMV_NONE (the interpolation then
+   uses the camera motion everywhere, as without TOTK_OBJ_MOTION), 2 a zero motion. Flicker that stays with =1 comes from
+   the changed G-buffer draws (geometry / depth), flicker that goes away comes from the motion values. */
+static int om_diag(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_OBJ_MOTION_DIAG"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 0;
+                 if (v) MLOG("[mfx] TOTK_OBJ_MOTION_DIAG=%d: motion variants drawn, motion written as %s", v, v == 1 ? "none (camera motion)" : "zero"); }
+    return v;
+}
 static NSString *om_fs_src(NvShader *fs, NSString **why) {
     NSString *src = sh_src(fs), *head = @"struct main0_out\n{\n", *entry = @"fragment main0_out main0(", *ihead = @"struct main0_in\n{\n";
     if ([src rangeOfString:head].location == NSNotFound || [src rangeOfString:entry].location == NSNotFound || [src rangeOfString:@"return out;"].location == NSNotFound) { *why = @"no main0_out / entry / return out"; return nil; }
     if ([src rangeOfString:[NSString stringWithFormat:@"[[color(%d)]]", OM_ATT]].location != NSNotFound) { *why = @"writes colour 6 itself"; return nil; }
     NSString *helper = [NSString stringWithFormat:
         @"static inline float2 totk_om_motion(float4 c, float4 p) {\n"
+         "%@"
          "    if (!(p.w > 1e-6) || !(c.w > 1e-6)) return float2(%.1f);\n"
          "    float2 d = p.xy / p.w - c.xy / c.w;\n"
          "    if (any(isnan(d)) || any(isinf(d)) || any(abs(d) > 1.0)) return float2(%.1f);\n"
-         "    return d;\n}\n\n", OBJMV_NONE, OBJMV_NONE];
+         "    return d;\n}\n\n",
+        om_diag() == 1 ? [NSString stringWithFormat:@"    return float2(%.1f);   // TOTK_OBJ_MOTION_DIAG=1\n", OBJMV_NONE] : om_diag() == 2 ? @"    return float2(0.0);   // TOTK_OBJ_MOTION_DIAG=2\n" : @"",
+        OBJMV_NONE, OBJMV_NONE];
     NSString *iname = @"in";
     if ([src rangeOfString:ihead].location != NSNotFound) {
         NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"main0_in\\s+(\\w+)\\s*\\[\\[stage_in\\]\\]" options:0 error:nil];
