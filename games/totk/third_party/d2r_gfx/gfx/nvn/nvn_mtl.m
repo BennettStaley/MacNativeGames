@@ -2742,6 +2742,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "mfx_upscale")) { mfxup_set(v < 0 ? !mfxup_enabled() : v); return; }   // TOTK_MFX_UPSCALE at run time (manual key 3 picture mode)
     if (!strcmp(name, "mfx_interp")) { mfx_set(v); return; }
     if (!strcmp(name, "mfx_mv_dyn")) { mfx_set_mv_dyn(v); return; }
+    if (!strcmp(name, "mfx_debug_view")) { mfx_debug_view_set(v); return; }   // TOTK_MFX_DEBUG_VIEW at run time (setting graphics.mfx_debug_view)
     if (!strcmp(name, "link_pause")) { void mtl_link_pause(int on); mtl_link_pause(v); MLOG("[flag] link_pause = %d (the display link stops calling back, as when the system stalls it)", v != 0); return; }   // tests the display-link rescue
     if (!strcmp(name, "draw_log")) { extern _Atomic long g_draw_log; atomic_store(&g_draw_log, v); MLOG("[flag] draw_log: every draw and dispatch of the next %d frames", v); return; }
     if (!strcmp(name, "uw_log")) { extern _Atomic long g_uw_log; atomic_store(&g_uw_log, v); MLOG("[flag] uw_log: canvas draws of the next %d frames", v); return; }   // key 4 UI squeeze diagnostic
@@ -14798,7 +14799,7 @@ void mtl_present_discard(int on) { atomic_store(&g_present_discard, on != 0); if
    per-frame state. Returns the output slot or -1. */
 static id<MTL4CommandAllocator> g_mfx_alloc[3]; static id<MTL4CommandBuffer> g_mfx_cb[3]; static _Atomic int g_mfx_busy[3];
 static id<MTLTexture> g_mfx_swap_prev;   // TOTK_MFX_DUMP: copy of the previous presented image
-static int mfx_present_frame_body(const tex_t *t, double period, int discard) {
+static int mfx_present_frame_body(const tex_t *t, double period, int discard, const int crop[4]) {
     if (t) uw_note_present(t);
     int slot = mfx_frame_prepare(period);
     if (slot >= 0) {
@@ -14813,6 +14814,8 @@ static int mfx_present_frame_body(const tex_t *t, double period, int discard) {
             if (!heap) { MTL4CounterHeapDescriptor *hd = [MTL4CounterHeapDescriptor new]; hd.type = MTL4CounterHeapTypeTimestamp; hd.count = 6;
                          NSError *e = nil; heap = [g_dev newCounterHeapWithDescriptor:hd error:&e]; hz = (double)[g_dev queryTimestampFrequency]; }
             NSArray *frame_resources = mfx_frame_encode(cb, slot, heap, (NSUInteger)a * 2);
+            NSArray *dbg = mfx_debug_encode(cb, slot, t ? tex_mtl(t) : nil, crop);   // TOTK_MFX_DEBUG_VIEW (nil while off)
+            if (dbg) frame_resources = [frame_resources arrayByAddingObjectsFromArray:dbg];
             [cb endCommandBuffer];
             atomic_store(&g_mfx_busy[a], 1);
             TotkCommitOptions *o = [TotkCommitOptions new];
@@ -14820,7 +14823,7 @@ static int mfx_present_frame_body(const tex_t *t, double period, int discard) {
             [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
                 // Capturing the payload keeps this frame's inputs/output and
                 // interpolator alive even across a canvas/configuration change.
-                if (frame_resources.count != MFX_FRAME_RESOURCES) MDIE("invalid interpolation resource lifetime payload");   // mfx_frame_encode (totk_mfx.h)
+                if (frame_resources.count < MFX_FRAME_RESOURCES) MDIE("invalid interpolation resource lifetime payload");   // mfx_frame_encode (totk_mfx.h), plus the debug view's resources when it is on
                 sysload_note_gpu(f.GPUStartTime, f.GPUEndTime);   // the load line's game GPU share includes the interpolation
                 if (f.error) MLOG("[red] [mfx] interpolation command buffer error: %s", f.error.description.UTF8String);
                 else if (h && fq > 0) { NSData *d = [h resolveCounterRange:NSMakeRange((NSUInteger)a * 2, 2)]; const MTL4TimestampHeapEntry *t = d.bytes;
@@ -14854,12 +14857,12 @@ static int mfx_present_frame_body(const tex_t *t, double period, int discard) {
     if (++g_mfx.frames % 300 == 0) { char b[256]; mfx_stats(b, sizeof b); MLOG("[mfx] up to frame %llu: %s", (unsigned long long)atomic_load(&g_cur_frame), b); }
     return slot;
 }
-static int mfx_present_frame(const tex_t *t, double period, int discard) {
-    @autoreleasepool { return mfx_present_frame_body(t, period, discard); }
+static int mfx_present_frame(const tex_t *t, double period, int discard, const int crop[4]) {
+    @autoreleasepool { return mfx_present_frame_body(t, period, discard, crop); }
 }
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     taa_frame_end();   // TOTK_TAA: next frame's jitter, this frame's depth and camera forgotten (also while off: key 5)
-    int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard) : -1;
+    int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard, crop) : -1;
     if (g_dev) mfx_present_tick((uint64_t)g_dev.currentAllocatedSize, gpu_budget_bytes());   // TOTK_MFX: retired resources released; paused near the GPU memory budget
     if (mfx_latch() && !mfx_enabled()) { g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = 0; BOTW_MFX_FRAME_RESET() om_release(); }   // key 2 / flag mfx_interp / budget pause: the next frame is fully on or off; per-object motion's arenas released
     if (t && !mfx_enabled() && (uw_ratio() || g_pp_sharpen || g_pp_aa >= 2 || g_fx_hud)) uw_note_present(t);   // key 4 / sharpen: the canvas search (TOTK_MFX does it in mfx_present_frame)

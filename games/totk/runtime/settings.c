@@ -134,6 +134,7 @@ static int apply_live(const SettingDef *d, int v) {
     (void)runtime_render_request;
     if (!strncmp(d->key, "display.", 8)) return d->apply == SET_LIVE ? display_apply(d->key) : 0;
     if (!strcmp(d->key, "graphics.interpolation")) dm_gfx_set_flag("mfx_interp", v);
+    else if (!strcmp(d->key, "graphics.mfx_debug_view")) dm_gfx_set_flag("mfx_debug_view", v);
     else if (!strcmp(d->key, "graphics.fov")) runtime_fov_set(v);
     else if (!strcmp(d->key, "graphics.fog")) runtime_fog_set(v);
     else if (!strcmp(d->key, "graphics.shadow_res")) return runtime_shadow_res_set(v);
