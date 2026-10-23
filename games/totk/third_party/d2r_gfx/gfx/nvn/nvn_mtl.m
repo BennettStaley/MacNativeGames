@@ -222,12 +222,22 @@ static struct { uint64_t adds, removes, live_bytes; _Atomic uint64_t alive, aliv
 static char g_alloc_track_key;
 static NSMapTable *g_res_site_of;   // resource (weak key) -> NSNumber source line
 static uint64_t g_res_live_bytes;
+static uint64_t g_res_dedup_skips, g_res_commits, g_res_commit_calls;   // under g_res_mu
+static int res_dedup_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_RES_DEDUP"); v = !(e && !strcmp(e, "0")); MLOG("TOTK_RES_DEDUP=%d：%s | %s", v, v ? "重复登记 / 撤销非成员不再标记驻留集待提交" : "每次登记 / 撤销都标记驻留集待提交（旧行为）", v ? "re-adding a member or removing a non-member no longer marks the residency set for a commit" : "every add / remove marks the residency set for a commit (old)"); }
+    return v;
+}
 static void res_add_at(id<MTLResource> r, int site) {
     if (!r) return;
     if (site < 0 || site >= RES_SITES) site = 0;
     pthread_mutex_lock(&g_res_mu);
-    [g_res addAllocation:(id<MTLAllocation>)r];
     if (!g_res_objects) { g_res_objects = [NSHashTable weakObjectsHashTable]; g_res_site_of = [NSMapTable weakToStrongObjectsMapTable]; }
+    /* TOTK (tvc97 3a5d46f, after nxnative df7badd): g_res_objects mirrors g_res exactly (only res_add_at / res_remove_body
+       change g_res; an object in g_res is alive, so its weak entry is there). Adding a member again changes nothing and no
+       longer marks the set for a commit. TOTK_RES_DEDUP=0 restores the old always-dirty path. */
+    if (res_dedup_on() && [g_res_objects containsObject:r]) { g_res_dedup_skips++; pthread_mutex_unlock(&g_res_mu); return; }
+    [g_res addAllocation:(id<MTLAllocation>)r];
     if (![g_res_objects containsObject:r]) {
         uint64_t sz = (uint64_t)r.allocatedSize;
         [g_res_objects addObject:r]; [g_res_site_of setObject:@(site) forKey:r];
@@ -244,6 +254,7 @@ static void res_add_at(id<MTLResource> r, int site) {
 static void res_remove_body(id<MTLResource> r) {
     if (!r) return;
     pthread_mutex_lock(&g_res_mu);
+    if (res_dedup_on() && ![g_res_objects containsObject:r]) { g_res_dedup_skips++; pthread_mutex_unlock(&g_res_mu); return; }   // not a member: nothing to remove (see res_add_at)
     [g_res removeAllocation:(id<MTLAllocation>)r];
     if ([g_res_objects containsObject:r]) {
         int site = ((NSNumber *)[g_res_site_of objectForKey:r]).intValue; uint64_t sz = (uint64_t)r.allocatedSize;
@@ -321,7 +332,10 @@ static void res_check(id r, const char *what, int reg) {
 static void res_commit(void) {
     gpu_budget_check("提交驻留集");
     pthread_mutex_lock(&g_res_mu);
-    if (g_res_dirty) { if (!nogpu()) [g_res commit]; g_res_dirty = 0; }
+    g_res_commit_calls++;
+    if (g_res_dirty) { if (!nogpu()) [g_res commit]; g_res_dirty = 0; g_res_commits++; }
+    if (!(g_res_commit_calls & 16383)) MLOG("驻留集提交：%llu 次检查，实际提交 %llu 次，跳过重复登记 / 撤销 %llu 次 | residency: %llu checks, %llu commits, %llu redundant adds/removes skipped",
+        (unsigned long long)g_res_commit_calls, (unsigned long long)g_res_commits, (unsigned long long)g_res_dedup_skips, (unsigned long long)g_res_commit_calls, (unsigned long long)g_res_commits, (unsigned long long)g_res_dedup_skips);
     pthread_mutex_unlock(&g_res_mu);
 }
 
