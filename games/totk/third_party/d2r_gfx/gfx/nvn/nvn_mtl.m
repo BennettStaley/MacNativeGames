@@ -2410,7 +2410,7 @@ static void pkg_owned_locked(uint64_t k) { id o = hm_get_id(&g_by_serial, &k); i
    so the result outlives a temporary texture object finalized before the submission runs); an invalidate over its
    memory waits for the GPU and writes every level back in the NVN layout, unless the CPU has written the memory since
    the rendering (then the CPU's bytes are newer). Runtime switch: TOTK_INPUT_FILE "flag writeback 0|1" (default 1). */
-typedef struct { tex_t t; uint64_t stamp; void *obj; uint8_t *snap; uint32_t snap_n; } wb_ent;   // snap: the texture's own bytes when the rendering was noted (small targets only)
+typedef struct { tex_t t; uint64_t stamp, fence; void *obj; uint8_t *snap; uint32_t snap_n; } wb_ent;   // snap: the texture's own bytes when the rendering was noted (small targets only); fence: of the submission that rendered it last
 static nvn_hmap g_wb = {.klen = 8};   // serial -> wb_ent * (g_smu): rendered since the last write-back
 static _Atomic int g_wb_on = 1;
 /* TOTK: fill the driver segment c0 for vertex and compute shaders (thread-group counts, uniform / storage address tables,
@@ -2545,6 +2545,8 @@ static void wb_ent_free(wb_ent *e) { if (!e) return; if (e->obj) { defer_obj_rel
 enum { WB_SNAP_MAX = 256 * 1024 };
 static int wb_exact_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_WB_EXACT"); v = !(e && !strcmp(e, "0")); } return v; }
 static uint64_t g_wb_exact_rescued;
+/* TOTK_WB_FENCE=0: a write-back waits for all GPU work submitted so far, as before (wb_write_list). */
+static int wb_fence_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_WB_FENCE"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_WB_FENCE=0: write-backs wait for all submitted GPU work"); } return v; }
 static void wb_snap(wb_ent *e) {
     if (!wb_exact_on() || !e->t.mem || e->t.L.size > WB_SNAP_MAX) { free(e->snap); e->snap = NULL; e->snap_n = 0; return; }
     uint32_t n = (uint32_t)e->t.L.size; if (e->snap_n != n) { free(e->snap); e->snap = malloc(n); e->snap_n = e->snap ? n : 0; }
@@ -2560,9 +2562,9 @@ static void wb_note(const tex_t *t) {
     nvn_dirty_protect(t->mem, t->L.size);
     pthread_mutex_lock(&g_smu);
     wb_ent *e = nvn_hm_get(&g_wb, &k);
-    if (e) { e->stamp = stamp; e->t = *t; wb_snap(e); pthread_mutex_unlock(&g_smu); return; }
+    if (e) { e->stamp = stamp; e->t = *t; e->fence = g_fence + 1; wb_snap(e); pthread_mutex_unlock(&g_smu); return; }
     e = calloc(1, sizeof *e); if (!e) MDIE("write-back record");
-    e->t = *t; e->stamp = stamp; e->obj = (void *)CFBridgingRetain(o); wb_snap(e);
+    e->t = *t; e->stamp = stamp; e->fence = g_fence + 1; e->obj = (void *)CFBridgingRetain(o); wb_snap(e);   // rendered in the submission being replayed, committed as g_fence + 1
     nvn_hm_put(&g_wb, &k, e);
     pthread_mutex_unlock(&g_smu);
 }
@@ -2617,10 +2619,30 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     wb_write_list(list, nl, 0);
 }
 /* Writes the listed renderings back to memory (the entries are freed); force: even over CPU writes since the render. */
+static void wb_write_list_(wb_ent **list, int nl, int force);
+/* Time the game's thread spends in write-backs, logged every 5 s with any: calls, average and longest. */
 static void wb_write_list(wb_ent **list, int nl, int force) {
     if (!nl) return;
+    static uint64_t calls, total_ns, max_ns, since;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    wb_write_list_(list, nl, force);
+    uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), d = t1 - t0;
+    calls++; total_ns += d; if (d > max_ns) max_ns = d; if (!since) since = t0;
+    if (t1 - since > 5000000000ull) {
+        MLOG("[writeback] last %.1f s: %llu calls holding the game's thread %.2f ms in all (%.3f ms average, %.2f ms longest)", (t1 - since) / 1e9,
+             (unsigned long long)calls, total_ns / 1e6, total_ns / 1e6 / (double)calls, max_ns / 1e6);
+        calls = total_ns = max_ns = 0; since = t1;
+    }
+}
+static void wb_write_list_(wb_ent **list, int nl, int force) {
     { extern void nvn_x_drain(void) __attribute__((weak)); if (nvn_x_drain) nvn_x_drain(); }   // translation thread: nothing queued overtakes this read-back (as for ReadTexels)
-    mtl_finish_gpu();
+    /* The GPU work these renderings came from: the submissions that rendered them last, not everything submitted since.
+       Waiting for all of it (mtl_finish_gpu) held the game's thread for the frame in flight on every write-back, ~440 a
+       second in Breath of the Wild once its reticle targets were written back (2026-10-21: frame times far less even).
+       The game waits for its own sync before it invalidates, so these have usually completed already. */
+    uint64_t need = 0; for (int i = 0; i < nl; i++) if (list[i]->fence > need) need = list[i]->fence;
+    if (!wb_fence_on()) mtl_finish_gpu();
+    else { if (need) mtl_wait(need, UINT64_MAX); up_pending_wait(1000); }
     /* Freshness is decided for every entry before anything is written back (a write-back marks its pages written), and
        of several renderings of the same memory (texture objects over it) only the newest is written back. */
     int fresh[512];
