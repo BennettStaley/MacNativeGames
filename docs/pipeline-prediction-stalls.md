@@ -31,7 +31,7 @@ planes a pass attaches is decided only when it begins, `ds_scan`); wrong guesses
   (its draws are skipped, and its fragment stage may be absent); a fragment function that exports depth gets no
   guesses without the depth buffer (`pred_guess_wanted`: `ds_scan` attaches the depth buffer for it, so those
   guesses were never used, and `pso_desc` compiled their depth-less library on the submission thread); a
-  statistics line every 100 scans (`并行预编 至提交 …`: scans and the budget that ended them, pipelines started,
+  statistics line every 100 scans (`parallel precompile up to submission …`: scans and the budget that ended them, pipelines started,
   pipelines taken by draws and how long draws waited for them, guesses refused because the table was full, stale
   guesses freed).
 
