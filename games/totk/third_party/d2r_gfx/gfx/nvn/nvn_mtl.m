@@ -3763,8 +3763,14 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
             pk->csub = g_sub_serial;
             /* TOTK: no guest write anywhere since the last check of a tracked texture means clean, without looking the
                range up again (the lookup was a linear scan over ~3,700 pools, about 14% of the replay). */
-            int tracked = now == pk->seen && pk->tracked ? 1 : nvn_dirty_tracked(t->mem, t->L.size);
-            clean = tracked && (now == pk->seen || !nvn_dirty_since(t->mem, t->L.size, pk->stamp));
+            int tracked;
+            if (now == pk->seen && pk->tracked) { tracked = 1; clean = 1; }
+            else if (replay_fast() && now != pk->seen) {   /* TOTK_REPLAY_FAST: the same two answers from one range lookup, skipping 1 MB chunks not written since the stamp (nvn_dirty_check) */
+                int c = nvn_dirty_check(t->mem, t->L.size, pk->stamp); tracked = c >= 0; clean = c == 0;
+            } else {
+                tracked = nvn_dirty_tracked(t->mem, t->L.size);
+                clean = tracked && (now == pk->seen || !nvn_dirty_since(t->mem, t->L.size, pk->stamp));
+            }
             if (!clean && tracked && pkg_edge_clean(t, pk)) clean = 1;   // TOTK (#90): only a shared first / last page was written
             pk->seen = now; pk->tracked = tracked;
             }

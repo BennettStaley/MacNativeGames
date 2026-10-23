@@ -87,6 +87,32 @@ static void stamp_order(size_t pg) {
     EXPECT("#90: stamp after protect (old order): the writes are missed", 0, nvn_dirty_since(page, 16, after));
 }
 
+/* TOTK_REPLAY_FAST: nvn_dirty_check (one range lookup, 64-page chunks skipped when their highest generation is at or below
+   the stamp) must give nvn_dirty_tracked / nvn_dirty_since's answer. A 300-page pool (5 chunks) gets random writes in
+   rounds between protects; every round compares both over random sub-ranges and stamps. Control: an untracked address. */
+static void chunk_check(size_t pg) {
+    enum { NP = 300, ROUNDS = 40, QUERIES = 400 };
+    uint8_t *pool = mmap(NULL, NP * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (pool == MAP_FAILED) { perror("mmap"); g_fail++; return; }
+    nvn_dirty_add_range(pool, NP * pg);
+    uint64_t stamps[ROUNDS]; int diff = 0, dirty = 0, clean = 0; unsigned seed = 12345;
+    for (int rd = 0; rd < ROUNDS; rd++) {
+        stamps[rd] = nvn_dirty_now(); nvn_dirty_protect(pool, NP * pg);
+        int nw = (int)((seed = seed * 1103515245u + 12345u) >> 16) % 4;
+        for (int w = 0; w < nw; w++) { size_t pgi = ((seed = seed * 1103515245u + 12345u) >> 16) % NP; pool[pgi * pg + 8] ^= 1; }
+        for (int qn = 0; qn < QUERIES; qn++) {
+            size_t lo = ((seed = seed * 1103515245u + 12345u) >> 16) % (NP * pg), len = 1 + ((seed = seed * 1103515245u + 12345u) >> 16) % (NP * pg - lo);
+            uint64_t st = stamps[((seed = seed * 1103515245u + 12345u) >> 16) % (rd + 1)];
+            int want = nvn_dirty_tracked(pool + lo, len) ? nvn_dirty_since(pool + lo, len, st) : -1, got = nvn_dirty_check(pool + lo, len, st);
+            diff += want != got; dirty += want == 1; clean += want == 0;
+        }
+    }
+    EXPECT("chunked check: answers differing from tracked + since", 0, diff);
+    EXPECT("chunked check: both dirty and clean answers were exercised", 1, dirty > 100 && clean > 100);
+    uint8_t local[16];
+    EXPECT("chunked check: untracked memory answers -1 (control)", -1, nvn_dirty_check(local, sizeof local, 0));
+}
+
 int main(void) {
     g_negative = getenv("TOTK_PROBE_NEGATIVE") != NULL;
     struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = on_signal; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
@@ -131,6 +157,7 @@ int main(void) {
     EXPECT("an untouched one in between is clean", 0, nvn_dirty_since(many + (size_t)(MANY / 2) * pg, 16, s2));
     if (busy_protect(pg)) return 2;
     stamp_order(pg);
+    chunk_check(pg);
     printf("{\"status\":\"%s\",\"checks\":%d,\"failed\":%d}\n", g_fail ? "fail" : "pass", g_checks, g_fail);
     return g_fail != 0;
 }

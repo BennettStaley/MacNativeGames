@@ -10,6 +10,7 @@ int nvn_dirty_tracked(const void *addr, size_t len);
 void nvn_dirty_protect(const void *addr, size_t len);              // Set the covered pages read-only
 uint64_t nvn_dirty_now(void);                                      // Current generation: taken before upload, as the stamp of that content
 int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp);
+int nvn_dirty_check(const void *addr, size_t len, uint64_t stamp);  // TOTK: -1 untracked, else nvn_dirty_since (one range lookup, chunk-level skip)
 void *nvn_dirty_gpu_write_begin(void *addr, size_t len);   // write guest memory on behalf of the GPU: not counted as a CPU write
 void nvn_dirty_gpu_write_end(void *tok);
 typedef struct { uintptr_t page; uint64_t pc, lr; uint32_t src; } nvn_dirty_rec;   // src 0: guest write (fault), 1: host write
