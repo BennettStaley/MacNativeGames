@@ -138,7 +138,7 @@ static int cg_copy_kernel(int out, const cg_group *g, const cg_temp *tp, __stron
     g_cg.kcopies++; return 1;
 }
 static void cg_member_state(const cg_member *m) {   // the member's state, as at its draw
-    memcpy(&S, m->S_, sizeof S); R.sc = m->sc; R.has_sc = m->has_sc; args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
+    memcpy(&S, m->S_, sizeof S); R.sc = m->sc; R.has_sc = m->has_sc; args_dirty_all(); (PSO_DIRTY(), g_dss_dirty = 1);
 }
 static void cg_member_draw(const cg_member *m) { draw(m->idx ? NULL : &m->dw, m->idx ? &m->di : NULL); }
 static void cg_flush_plain(cg_group *g) {   // each member in its own pass, in record order
@@ -194,7 +194,7 @@ static void cg_flush(void) {
     for (int i = 0; i < g_cg.ng; i++) cg_flush_group(&g_cg.g[i]);
     g_cg.ns_flush += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
     g_cg.ng = 0; g_cg_pending = 0; g_cg.take_seq = ~0ull;
-    memcpy(&S, saveS, sizeof S); R = saveR; args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
+    memcpy(&S, saveS, sizeof S); R = saveR; args_dirty_all(); (PSO_DIRTY(), g_dss_dirty = 1);
     g_exec_next = en0; g_cg.replaying = 0;
 }
 // The first draw of a cube-face-set pass: snapshot it into its group. 0 = not taken (the caller draws it, after landing

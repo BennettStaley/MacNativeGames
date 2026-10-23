@@ -185,7 +185,7 @@ static int pp_pass(int fn, id<MTLTexture> dst, int clear, __unsafe_unretained id
     [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; m4_end(en);
     return 1;
 }
-static void pp_done_encoding(void) { args_dirty_all(); g_pso_dirty = g_dss_dirty = 1; }
+static void pp_done_encoding(void) { args_dirty_all(); (PSO_DIRTY(), g_dss_dirty = 1); }
 static int pp_aa_ready(MTLPixelFormat pf) {   // shaders that do not build: the game's picture stays
     return g_pp_aa != 3 ? pp_pso(g_pp_aa == 1 ? PP_COPY : PP_FXAA, pf) != nil
                         : pp_pso(PP_EDGE, MTLPixelFormatRG8Unorm) && pp_pso(PP_WEIGHT, MTLPixelFormatRGBA8Unorm) && pp_pso(PP_BLEND, pf);
@@ -346,7 +346,7 @@ static int fx_draw(__unsafe_unretained NvProg *pr) {
            does everything but write pixels (occlusion queries counting over it see the same samples), and the first
            one still ends the scene (sharpening, MetalFX). */
         if (!g_fx_masked) { g_fx_saved_mask = S.chmask.mask; g_fx_masked = 1; }
-        S.chmask.mask = 0; g_pso_dirty = 1; g_postfx.hud_n++;
+        S.chmask.mask = 0; PSO_DIRTY(); g_postfx.hud_n++;
         return 0;
     }
     if (!fs) return 0;

@@ -139,7 +139,7 @@ int rt_ex_encode(id<MTLTexture> dst_hdr, id<MTLTexture> dst_ds, id<MTLTexture> s
     [g_rx_args setAddress:cbuf.gpuAddress atIndex:0];
     [en setViewport:(MTLViewport){0, 0, W, H, 0, 1}]; [en setRenderPipelineState:g_rx_pso1]; [en setDepthStencilState:g_rx_dss]; [en setStencilReferenceValue:0];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; m4_end(en);
-    args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
+    args_dirty_all(); (PSO_DIRTY(), g_dss_dirty = 1);
     return 1;
 }
 

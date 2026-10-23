@@ -170,6 +170,7 @@ static int lc_keeps(uint32_t op) {
         case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
         case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_BLEND_COLOR: case OP_COPY_STRIDE:
         case OP_RASTER_DISCARD: case OP_RENDER_ENABLE: case OP_RENDER_COND: case OP_BARRIER: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL:
+        case OP_DISCARD_COLOR: case OP_DISCARD_DS:   // TOTK_DISCARD: a cleared target may become undefined; landing the clear later is still correct
         case OP_UPDATE_UB: return 1;
         default: return 0;
     }

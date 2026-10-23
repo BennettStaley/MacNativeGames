@@ -1119,7 +1119,7 @@ static void cg_flush(void); static int cg_op_safe(unsigned op); static int cg_rt
 static void skv_set(int on); static int skv_retest(void);   // invisible-draw skipping: runtime switch (flag skip_invisible) and the retest period
 static uint64_t g_sub_serial;   // Submission index (used by the parallel precompile's 'predict only once per submission')
 static void pt_apply_request(void);
-static int g_sub_chunks; static uint64_t g_chunk_mark, g_stat_draw; static void chunk_cfg(void);   // mid-submission commits, defined before mtl_sub_commit
+static int g_sub_chunks; static uint64_t g_chunk_mark, g_chunk_t0, g_stat_draw; static void chunk_cfg(void);   // mid-submission commits, defined before mtl_sub_commit
 static int g_nupd, g_nshadow; static inline int upd_guard(uint64_t lo, uint64_t hi);   // renamed uniform updates, defined with mtl_sub_update
 void mtl_sub_begin(void) {
     g_fc_begin0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -1154,7 +1154,7 @@ void mtl_sub_begin(void) {
     [g_alloc4[alloc_i] reset];
     [g_cb beginCommandBufferWithAllocator:g_alloc4[alloc_i]];
     g_commit_blocks = [NSMutableArray array];
-    chunk_cfg(); g_sub_chunks = 0; g_chunk_mark = g_stat_draw;
+    chunk_cfg(); g_sub_chunks = 0; g_chunk_mark = g_stat_draw; g_chunk_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (g_nupd) MDIE("renamed uniform updates left over from the previous submission");
     g_nshadow = 0;
     g_npost = 0; g_vis = nil; g_vis_n = 0; g_vis_cur = -1; pend_begin();
@@ -1384,9 +1384,10 @@ static inline void enc_r_address(id<MTL4RenderCommandEncoder> e, unsigned stage,
 }
 static inline void enc_r_vbuf(id<MTL4RenderCommandEncoder> e, NSUInteger i, uint64_t gpu) { enc_r_address(e, 0, i, gpu); }
 static inline void enc_r_args(id<MTL4RenderCommandEncoder> e, MTLRenderStages s, uint64_t gpu, NSUInteger i) { enc_r_address(e, s == MTLRenderStageVertex ? 0 : 1, i, gpu); }
-static inline void enc_r_draw(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_DRAW,.u={p,v,n}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n]; }
-static inline void enc_r_draw_instanced(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n, NSUInteger i, NSUInteger b) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INSTANCED,.u={p,v,n,i,b}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n instanceCount:i baseInstance:b]; }
-static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INDEXED,.u={p,n,t,gpu,len,i,(uint64_t)bv,bi}},1); else [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi]; }
+static uint64_t g_enc_draws;   // TOTK: draws encoded into any render encoder (sd_finish: TOTK_DISCARD / TOTK_EMPTY_PASS_DC)
+static inline void enc_r_draw(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n) { g_enc_draws++; if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_DRAW,.u={p,v,n}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n]; }
+static inline void enc_r_draw_instanced(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n, NSUInteger i, NSUInteger b) { g_enc_draws++; if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INSTANCED,.u={p,v,n,i,b}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n instanceCount:i baseInstance:b]; }
+static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi) { g_enc_draws++; if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INDEXED,.u={p,n,t,gpu,len,i,(uint64_t)bv,bi}},1); else [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi]; }
 static inline void enc_r_store(id<MTL4RenderCommandEncoder> e, int depth, MTLStoreAction action, NSUInteger index) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_STORE,.u={(uint64_t)depth,action,index}},0); else if (depth == 1) [e setDepthStoreAction:action]; else if (depth == 2) [e setStencilStoreAction:action]; else [e setColorStoreAction:action atIndex:index]; }
 static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; blit_close(); rs_sync(); pt_mark(g_cb, 'C', nil); id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; if (bar_start_on()) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; bar_full_begun(); [e setArgumentTable:g_ct]; return e; }
 static inline id<MTLComputeCommandEncoder> enc_c_begin_concurrent(id<MTLCommandBuffer> cb) { return [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]; }
@@ -2060,7 +2061,7 @@ static uint64_t g_stat_draw;
 static uint64_t g_pass_draw0;   // g_stat_draw when the current render pass opened (TOTK_TIMELINE)
 static int g_chunk_first = -1, g_chunk_size, g_sub_chunks;
 static _Atomic int g_chunk_first_request = -1, g_chunk_size_request = -1;
-static uint64_t g_chunk_mark, g_chunk_commits;
+static uint64_t g_chunk_mark, g_chunk_commits, g_chunk_time_commits;
 static void chunk_cfg(void) {
     // Apply control-thread requests only at submission boundaries. Encoder,
     // allocator, barriers and final fence lifetime remain on the replay thread.
@@ -2079,6 +2080,7 @@ static void chunk_cfg(void) {
     g_chunk_size = size; g_chunk_first = first;
 }
 uint64_t mtl_chunk_commits(void) { return g_chunk_commits; }
+uint64_t mtl_chunk_time_commits(void) { return g_chunk_time_commits; }
 void mtl_blit_stats(uint64_t v[6]) { v[0] = g_blit_opens; v[1] = g_blit_splits; v[2] = g_upd_n; v[3] = g_upd_split; v[4] = g_copy_n; v[5] = g_copy_split; }
 /* Mid-submission commits are numbered (g_split_seq); g_split_done is the highest one the GPU completed, so a readback
    can wait for the commit that ends right after its producer dispatch (fif_readback_wait; after DavidZande 6a87c04). */
@@ -2105,15 +2107,26 @@ static void mtl_sub_split(void) {
     q4_commit(g_cb, o);
     g_cb = [g_dev newCommandBuffer];
     [g_cb beginCommandBufferWithAllocator:g_alloc4[g_alloc_cur]];
-    g_sub_chunks++; g_chunk_commits++; g_chunk_mark = g_stat_draw;
+    g_sub_chunks++; g_chunk_commits++; g_chunk_mark = g_stat_draw; g_chunk_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (fc_first) { uint64_t fc4 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); g_fc_t[1] += fc0 - g_fc_snap_end; g_fc_t[2] += fc1 - fc0; g_fc_t[3] += fc2 - fc1; g_fc_t[4] += fc3 - fc2; g_fc_t[5] += fc4 - fc3; g_fc_n++; }
 }
+/* TOTK_CHUNK_US (default 300, 0 = off): besides the draw count, a split point also commits once this many microseconds
+   of replay have passed since the submission began or the last commit and at least 10 draws were replayed meanwhile
+   (Ryujinx AutoFlushCounter, 1.5 ms there), so the GPU gets work early when draws are slow to replay. Commits still
+   happen only where a new encoder is about to open: a render pass is never split. */
+static int chunk_us(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_CHUNK_US"); v = e ? atoi(e) : 300; if (v < 0) v = 0; MLOG("TOTK_CHUNK_US=%d: mid-submission commits also after %d us of replay (0 = by draw count only)", v, v); } return v; }
 // Called where a new encoder is about to be opened and none is open.
 static void chunk_maybe_split(void) {
     if (!g_chunk_size || !g_cb || g_enc || g_frz_on || tbdr_any() || pt_active()) return;
-    if (g_stat_draw - g_chunk_mark < (uint64_t)(g_sub_chunks ? g_chunk_size : g_chunk_first)) return;
+    uint64_t nd = g_stat_draw - g_chunk_mark; int by_time = 0;
+    if (nd < (uint64_t)(g_sub_chunks ? g_chunk_size : g_chunk_first)) {
+        int us = chunk_us();
+        if (!us || nd < 10 || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_chunk_t0 < (uint64_t)us * 1000ull) return;
+        by_time = 1;
+    }
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     mtl_sub_split();
+    if (by_time) g_chunk_time_commits++;
 }
 uint64_t mtl_sub_commit(void) {
     cg_flush();   // TOTK: cube-face-set groups still pending at the end of the submission (reason 4 in the stats line)
@@ -4212,6 +4225,11 @@ static struct { uint64_t canvas, last_c0, swap[4]; uint32_t swap_w, swap_h; int 
 static id<MTLRenderPipelineState> g_enc_pso; static id<MTLDepthStencilState> g_enc_dss;   // Already set on this encoder (not set again if identical)
 static int g_enc_vis, g_enc_has_vis;   // This encoder's current visibility count mode (0 off / slot number + 1), and whether a visibility buffer is attached
 static int g_pso_dirty = 1, g_dss_dirty = 1;   // Pipeline / depth-stencil related state was changed during replay
+/* TOTK_PSO_MRU: bumped with every change to an input of pso_key_fill (the bound program, blend / colour / write mask /
+   multisample state, vertex layout) and every wholesale replacement of S, so a pipeline remembered on the program
+   (pso_mru_find) is valid only while the generation it was found under is current. */
+static uint64_t g_pso_state_gen = 1;
+#define PSO_DIRTY() (g_pso_state_gen++, g_pso_dirty = 1)
 static uint64_t g_stat_args_enc, g_stat_args_reuse;   // Argument buffer: new-encode / reuse counts
 uint64_t g_draw_skip[16];   // TOTK: draws dropped in the replay, by reason (logged with the per-frame draw count)
 static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw, g_udc_saved_bytes;   // Bandwidth ledger: attachment load / store bytes, number of full load-store passes
@@ -4423,8 +4441,17 @@ void ts_after(void);
 // ---------- Store lookahead: at pass end, decide from the later commands of the same submission whether each attachment's write-back is redundant ----------
 // On TBDR every attachment is written back to memory in full when the pass ends; Switch (Maxwell immediate-mode rendering) has no such cost. If an attachment is cleared in full before being read, the write-back is redundant (DontCare).
 // For the decision see mtl_sub_index / sdx_decide; only what can be proven within the same submission is accepted, and anything still undecided at the end of the submission is always written back.
-typedef struct { uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy; const char *wkey; int wslot; } sd_att;   // depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth
-static sd_att g_sd[9]; static int g_nsd;
+typedef struct { uint64_t disc; uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy; const char *wkey; int wslot; } sd_att;   // depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth
+static sd_att g_sd[9]; static int g_nsd;   // disc (TOTK_DISCARD): g_enc_draws + 1 when the game discarded the attachment in this pass, 0 if not
+static uint64_t g_sd_draw0;   // g_enc_draws when this encoder opened (TOTK_EMPTY_PASS_DC)
+/* TOTK_DISCARD=2 (opt-in): a discard while no pass is open makes the next pass's Load of that subresource DontCare. */
+typedef struct { uint64_t ser; int lv, sl, k; } disc_pend;   // k: colour index, 8 depth-stencil
+static disc_pend g_disc_pend[9]; static int g_ndisc_pend;
+static uint64_t g_dc_stat[6];   // attachments marked in an open pass, stored DontCare by a discard, loads made DontCare, empty passes, their attachments stored DontCare
+void mtl_store_dc_stats(uint64_t v[6]) { memcpy(v, g_dc_stat, sizeof g_dc_stat); }
+static int discard_level(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_DISCARD"); v = e ? atoi(e) : 1; if (v < 0) v = 0; if (v != 1) MLOG("TOTK_DISCARD=%d: %s", v, v ? "discards also make the next pass's load DontCare" : "NVN discards ignored"); } return v; }
+static int empty_pass_dc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_EMPTY_PASS_DC"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_EMPTY_PASS_DC=0: empty render passes store their attachments"); } return v; }
+static void rt_sub(const p_set_rt *r, int k, uint64_t *ser, int *lv, int *sl);
 static unsigned g_sd_plain;   // TOTK: g_sd entries (bit i) written in this encoder by a draw that samples none of its attachments (att_unstored_read)
 static int g_udc_ab = -1, g_udc_ab_on;
 // Attachments this pass did not write (depth / stencil test only, color write mask 0, etc.) get their write-back changed to DontCare: the content is already in memory, saving one full write-back.
@@ -5036,6 +5063,15 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
             }
         }
     }
+    if (g_ndisc_pend) {   // TOTK_DISCARD=2: the game discarded these subresources before this pass: their contents are undefined, so nothing to load
+        for (int j = 0; j < g_ndisc_pend; j++) { const disc_pend *d = &g_disc_pend[j]; uint64_t ser; int lv, sl;
+            if (d->k < 8 && (d->k >= R.rt.n || !pd.colorAttachments[d->k].texture)) continue;
+            rt_sub(&R.rt, d->k, &ser, &lv, &sl); if (!ser || ser != d->ser || lv != d->lv || sl != d->sl) continue;
+            if (d->k < 8) { if (pd.colorAttachments[d->k].loadAction == MTLLoadActionLoad) { pd.colorAttachments[d->k].loadAction = MTLLoadActionDontCare; g_dc_stat[2]++; } }
+            else { if (pd.depthAttachment.texture && pd.depthAttachment.loadAction == MTLLoadActionLoad) { pd.depthAttachment.loadAction = MTLLoadActionDontCare; g_dc_stat[2]++; }
+                   if (pd.stencilAttachment.texture && pd.stencilAttachment.loadAction == MTLLoadActionLoad) { pd.stencilAttachment.loadAction = MTLLoadActionDontCare; g_dc_stat[2]++; } } }
+        g_ndisc_pend = 0;
+    }
     { /* TOTK measurement switches (pictures are wrong with them): TOTK_EXP_NOLOAD=1 turns every Load into DontCare,
          TOTK_EXP_NOSTORE=1 drops the depth/stencil store. They size the attachment traffic cost, nothing else. */
       static int nl = -1, ns = -1; if (nl < 0) { nl = getenv("TOTK_EXP_NOLOAD") != NULL; ns = getenv("TOTK_EXP_NOSTORE") != NULL; if (nl || ns) MLOG("[experiment] attachments NOLOAD=%d NOSTORE=%d (picture will be wrong, bandwidth measurement only)", nl, ns); }
@@ -5095,7 +5131,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
                    (unsigned long)stt.width, (unsigned long)stt.height, pd.stencilAttachment.loadAction == MTLLoadActionClear ? "clear" : "load");
     }
     if (natt && nload == natt) g_pass_full_rw++;
-    g_nsd = 0; g_sd_plain = 0;
+    g_nsd = 0; g_sd_plain = 0; g_sd_draw0 = g_enc_draws;
     {
         for (int i = 0; i < R.rt.n && i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i]; if (!c.texture) continue;
             g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.color[i]->serial; g_sd[g_nsd].bytes = att_bytes(c.texture, c.level); g_sd[g_nsd].lv = (uint32_t)c.level; g_sd[g_nsd].sl = (uint32_t)(c.texture.textureType == MTLTextureType3D ? c.depthPlane : c.slice); g_sd[g_nsd].idx = i; g_sd[g_nsd].load = c.loadAction == MTLLoadActionLoad; g_sd[g_nsd].wrote = R.clear_c[i] != 0; g_nsd++;
@@ -5256,7 +5292,9 @@ static int sh_has_src(NvShader *s) { return s && (s->src || s->src_path); }
     void *bar_sh[6]; uint8_t bar_vs, bar_wr;   // bar_*: bar_draw's view of sh[] (valid while sh[] is the same): vertex-side stages read textures / images / storage; a stage may write storage / images
     void *ar_sh[6]; uint8_t ar_n, ar_st[32], ar_reg[32], ar_img[32];   // ar_*: draw_att_reads' sampled texture / image slots of sh[] (valid while sh[] is the same; ar_n 255 = more than 32, scan the bindings)
     int missing, miss_has[2]; uint64_t miss_sig[2]; int exp_skip;
-    int keeps; uint64_t miss_gen; } @end   // TOTK (iOS, Mac async shaders): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip); keeps: a stage stores to memory or streams out (sph_keeps_memory), its draws are never skipped; miss_gen: totk_rt_ready_gen() when a stage was last found missing
+    int keeps; uint64_t miss_gen;
+    // TOTK_PSO_MRU (pso_mru_get): the last four final pipelines of this program with what they were found under
+    uint64_t mru_gen[4]; uint32_t mru_pass[4][13]; NvShader *mru_vs[4], *mru_fs[4]; NSString *mru_vb[4], *mru_fb[4]; id<MTLRenderPipelineState> mru_ps[4]; uint8_t mru_next; } @end   // TOTK (iOS, Mac async shaders): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip); keeps: a stage stores to memory or streams out (sph_keeps_memory), its draws are never skipped; miss_gen: totk_rt_ready_gen() when a stage was last found missing
 @implementation NvProg @end
 /* TOTK_EXP_SKIP_FS=<fragment key prefix>[,<prefix>...] (measurement only, 2026-10-16): drop every draw whose fragment shader key
    starts with one of the prefixes. A render pass whose draws are all dropped is never opened, so the GPU time saved is the
@@ -6517,7 +6555,7 @@ static void udc_note_draw(NvProg *pr) {
 }
 static void state_reset(void) {
     memset(&S, 0, sizeof S);
-    g_pso_dirty = g_dss_dirty = 1;
+    (PSO_DIRTY(), g_dss_dirty = 1);
     for (int i = 0; i < 8; i++) S.blend[i] = (blend_st){i, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD};
     S.color = (color_st){0, NVN_LOGIC_OP_COPY, NVN_ALPHA_FUNC_ALWAYS}; S.chmask.mask = 0xffffffffu;
     S.poly = (poly_st){NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0};
@@ -6674,7 +6712,7 @@ static void prog_resolve(NvProg *pr, int may_skip) {
         NSString *variant = totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), rt_local(pr->ctl[st], st), may_skip);
         if (!may_skip) async_why(pr, f0);
         if (!variant) continue;
-        prog_stage_set(pr, st, variant); pr->missing &= ~(1 << st); g_pso_dirty = 1;
+        prog_stage_set(pr, st, variant); pr->missing &= ~(1 << st); PSO_DIRTY();
     }
     pr->miss_gen = gen;
 }
@@ -7621,8 +7659,9 @@ static int apso_defer(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFuncti
     });
     return 1;
 }
+static int g_pso_final;   // pso_get returned the pipeline of its full key (no plain stand-in while a variant compiles): pso_mru_get may keep it
 static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRenderPassDescriptor *unused) {
-    (void)unused; g_pso_deferred = 0; apso_claim();
+    (void)unused; g_pso_deferred = 0; g_pso_final = 0; apso_claim();
     __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
     if (!vs) { RED_ONCE(13, "program has no vertex shader (or it is not mapped)"); return nil; }
     pso_key k; pso_key_fill(&k, vs, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, g_pso_lmap != NULL);
@@ -7655,10 +7694,11 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     int bordered = (bfn && !fbread) || (k.a2c & PSO_VBORDER);
     if (g_vmissing) { if (!fbread) { bfn = nil; k.fsfn = NULL; } k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; }
     __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
-    if (cached) { if (g_vmissing) atomic_fetch_add_explicit(&g_stat_variant_plain, 1, memory_order_relaxed); return cached; }
+    if (cached) { if (g_vmissing) atomic_fetch_add_explicit(&g_stat_variant_plain, 1, memory_order_relaxed); g_pso_final = !g_vmissing; return cached; }
+    int stand_in = g_vmissing;   // the plain pipeline stands in for a border one not compiled yet
     NSString *brec = !g_vmissing && bordered ? [NSString stringWithFormat:@"%@\t%@", (k.a2c & PSO_VBORDER) && vrec ? vrec : @"-", bfn && frec ? frec : @"-"] : nil;
     if (plain && !g_vmissing && bordered && apso_defer(&k, vs, fs, bfn, brec)) {   // the border pipeline is compiling: the plain one meanwhile
-        if (!fbread) { bfn = nil; k.fsfn = NULL; } k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; brec = nil;
+        if (!fbread) { bfn = nil; k.fsfn = NULL; } k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; brec = nil; stand_in = 1;
         atomic_fetch_add_explicit(&g_stat_variant_plain, 1, memory_order_relaxed);
         cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
         if (cached) return cached;
@@ -7687,6 +7727,39 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
     if (!ps) { static int said; if (said++ < 12) MLOG("[red] Render pipeline build failed: %s (vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d)", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("[red] Render pipeline build failed: further failures are not logged individually"); return nil; }
     pso_adopt(&k, vs, fs, bfn != nil, g_pso_lmap != NULL, ps, bt, 0, brec);
+    g_pso_final = !stand_in && !g_vmissing;
+    return ps;
+}
+/* TOTK_PSO_MRU (default on; =0 off): a program keeps its last four final pipelines (Ryujinx Program.TryGetGraphicsPipeline,
+   MoltenVK changePipeline). The draw path asked pso_get again at every pass change, every program change and, for a
+   shader that ever met an emulated border colour, at every draw: each time pso_key_fill, the border keys, fs_fn_border,
+   vs_fn_for and a hash lookup of the whole key. An entry holds every input of the key that is not the program itself:
+   g_pso_state_gen (bumped with every change to the pipeline state in S, PSO_DIRTY), the pass formats, sample count,
+   layered flag and MetalFX role, the vertex / fragment shader objects (prog_fit swaps variants), and the border keys
+   of both stages (the text holds every input of a border variant, border_parse). Only final pipelines are kept: a plain
+   stand-in while a border variant compiles, a deferred draw (nil) or a merged pass (g_pso_lmap) always go to pso_get. */
+static int pso_mru_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PSO_MRU"); v = e ? atoi(e) != 0 : 1; if (!v) MLOG("TOTK_PSO_MRU=0: pipeline MRU per program off"); } return v; }
+static uint64_t g_mru_hit, g_mru_miss;
+static int str_same(NSString *a, NSString *b) { return a == b || (a && b && [a isEqualToString:b]); }
+static __unsafe_unretained id<MTLRenderPipelineState> pso_mru_get(NvProg *pr) {
+    if (!pso_mru_on() || g_pso_lmap || !pr->sh[0]) return pso_get(pr, nil);
+    uint32_t sig[13]; memcpy(sig, g_pass.cfmt, sizeof g_pass.cfmt); sig[8] = g_pass.dfmt; sig[9] = g_pass.sfmt; sig[10] = g_pass.samples; sig[11] = (uint32_t)g_pass.layered; sig[12] = (uint32_t)g_mfx.role;
+    __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
+    NSString *vb = nil, *fb = nil;
+    if (atomic_load_explicit(&g_border_custom_any, memory_order_relaxed)) {   // the samplers bound now, as pso_get reads them
+        float bc[8][4]; int ba[8], bn; unsigned ax[8];
+        vb = border_key(vs, 0, bc, ba, ax, &bn);
+        if (!g_mfx.role && fs && sh_has_src(fs)) fb = border_key(fs, 1, bc, ba, ax, &bn);
+    }
+    for (int i = 0; i < 4; i++)
+        if (pr->mru_ps[i] && pr->mru_gen[i] == g_pso_state_gen && pr->mru_vs[i] == vs && pr->mru_fs[i] == fs && !memcmp(pr->mru_pass[i], sig, sizeof sig)
+            && str_same(pr->mru_vb[i], vb) && str_same(pr->mru_fb[i], fb)) { g_pso_deferred = 0; g_mru_hit++; return pr->mru_ps[i]; }
+    g_mru_miss++;
+    __unsafe_unretained id<MTLRenderPipelineState> ps = pso_get(pr, nil);
+    if (ps && g_pso_final) { int i = pr->mru_next++ & 3;
+        pr->mru_ps[i] = ps; pr->mru_gen[i] = g_pso_state_gen; pr->mru_vs[i] = vs; pr->mru_fs[i] = fs; memcpy(pr->mru_pass[i], sig, sizeof sig); pr->mru_vb[i] = vb; pr->mru_fb[i] = fb; }
+    { static uint64_t lf; uint64_t f = atomic_load(&g_cur_frame); if (f >= lf + 600) { lf = f;
+        MLOG("[totk] TOTK_PSO_MRU: %llu pipeline lookups answered by the program's MRU, %llu went to pso_get", (unsigned long long)g_mru_hit, (unsigned long long)g_mru_miss); } }
     return ps;
 }
 static NSString *warm_key(const char *s, size_t n) {
@@ -9048,29 +9121,44 @@ static uint64_t lay_gpu(int offset) {   // GPU address of the constant `offset` 
     return gpu + 4u * (uint64_t)offset;
 }
 void mtl_layer_stats(uint64_t v[4]) { v[0] = g_stat_pass; v[1] = g_lay.passes; v[2] = g_lay.merges; v[3] = g_lay.refused; }
+/* An attachment whose contents nobody needs after the pass (stored DontCare whatever the store lookahead says):
+   1 the game discarded it (TOTK_DISCARD) and the pass encoded no draw after that; 2 the pass encoded no draw at all and
+   the attachment was not cleared (TOTK_EMPTY_PASS_DC, Ryujinx FixupStoreActions): a loaded attachment then holds what
+   memory holds, and one loaded DontCare holds nothing. Not with block-render write-backs (copied from the attachment
+   after the pass). Metal leaves an attachment stored DontCare undefined; Apple GPUs keep a loaded, untouched one (the
+   UDC self-test, DM_NVN_UDC_SELFTEST). */
+static int sd_dead_ext(const sd_att *t, int empty) {
+    if (t->disc && t->disc - 1 == g_enc_draws) return 1;
+    if (empty && !t->wrote) return 2;
+    return 0;
+}
 static void sd_finish(void) {
     if (!g_nsd) return;
     int tb_st = tbdr_piece(TB_STORE), tb_udc = tbdr_piece(TB_UDC);
-    if (!tb_st && !tb_udc) {   // All store pieces off: always write back
-        for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i];
-            enc_r_store(g_enc, t->depth, MTLStoreActionStore, (NSUInteger)t->idx); }
+    int empty = g_enc_draws == g_sd_draw0 && !g_nblk_wb && empty_pass_dc_on();
+    if (empty) g_dc_stat[3]++;
+    if (!tb_st && !tb_udc) {   // All store pieces off: always write back (except sd_dead_ext)
+        for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i]; int ext = sd_dead_ext(t, empty);
+            if (ext) { g_dc_stat[ext == 1 ? 1 : 4]++; g_bw_store -= t->bytes; }
+            enc_r_store(g_enc, t->depth, ext ? MTLStoreActionDontCare : MTLStoreActionStore, (NSUInteger)t->idx); }
         g_nsd = 0; return; }
     uint8_t nst[9]; uint64_t tb_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (tb_st && sdx_decide(nst)) { for (int i = 0; i < g_nsd; i++) if (nst[i] == 2) g_sd[i].state = 2; else sd_need(&g_sd[i], nst[i] >> 2); }
     else for (int i = 0; i < g_nsd; i++) sd_need(&g_sd[i], 6);   // Pass ended outside the list / index unavailable: always write back
     g_tb_ns[TB_STORE] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tb_t0;
     for (int i = 0; i < g_nsd; i++) {
-        sd_att *t = &g_sd[i]; int udc_dead = tb_udc && udc_on() && t->load && !t->wrote;
+        sd_att *t = &g_sd[i]; int udc_dead = tb_udc && udc_on() && t->load && !t->wrote, ext = sd_dead_ext(t, empty);
+        if (ext) g_dc_stat[ext == 1 ? 1 : 4]++;
         // A color attachment written in the same pass as the window texture does not enter the ledger: it is a link in the present chain, not a transient attachment that is 'reset every frame before use'.
         // The in-run 'upscale' pass writes two textures at once - scene texture + window texture - and the UI composite was merged into the same pass, so in-run nobody reads back the scene texture; as soon as the game stops drawing 3D (loading screen)
         // a separate composite pass samples it afterwards instead. 'About to enter the loading screen' is only known after the previous frame was submitted, so prediction cannot stop it: on iPad true fullscreen every install hits it once on the first act change
         // (the 2732×2048 attachment of frame N was not written back and is sampled for 4 consecutive frames starting at frame N+1; the key is permanently disabled). At the iPhone aspect ratio the same-size key already sees a reader during the trial period and is silently disabled.
         int xv_win = 0; for (int k = 0; k < R.rt.n && k < 8; k++) if (R.rt.color[k] && xv_present(R.rt.color[k]->serial)) xv_win = 1;
-        uint64_t xtag = 0; int xvcand = xv_on() && !xv_win && t->depth == 0 && t->state != 2 && t->why == 5 && xv_first_good(t->ser, t->lv, t->sl) && !xv_present(t->ser)
+        uint64_t xtag = 0; int xvcand = !ext && xv_on() && !xv_win && t->depth == 0 && t->state != 2 && t->why == 5 && xv_first_good(t->ser, t->lv, t->sl) && !xv_present(t->ser)
                                         && !xv_disabled(xtag = xv_tag_pass(R.rt.color[t->idx], t->lv, t->idx, &R.rt));
         int xvdead = xvcand && xv_trial_get(xtag, 0) >= XV_TRIAL;   // Only after the trial period is the write-back really skipped
         if (xvcand && !xvdead) xv_set(t->ser, t->lv, t->sl, XV_PROBE, xtag);   // Trial period: write back as usual, only track the next touch
-        int dead = t->state == 2 || udc_dead || xvdead; MTLStoreAction sa = dead ? MTLStoreActionDontCare : MTLStoreActionStore;
+        int dead = t->state == 2 || udc_dead || xvdead || ext; MTLStoreAction sa = dead ? MTLStoreActionDontCare : MTLStoreActionStore;
         if (xvdead) { xv_set(t->ser, t->lv, t->sl, XV_INVALID, xtag); g_xv_dc++; }
         if (t->state == 2) g_tb_hit[TB_STORE]++; if (udc_dead) g_tb_hit[TB_UDC]++; if (xvdead) g_tb_hit[TB_XV]++;
         enc_r_store(g_enc, t->depth, sa, (NSUInteger)t->idx);
@@ -9129,7 +9217,7 @@ static int first_draw_covers(int i, id<MTLTexture> t, NSUInteger level) {
 static int state_op(uint32_t op, const void *a) {
     switch (op) {
         case OP_SCISSOR: R.sc = *(const p_scissor *)a; R.has_sc = 1; break;
-        case OP_BIND_PROGRAM: { const prog_t *np = ((const p_bind_program *)a)->prog; if (np != S.prog) { S.prog = np; g_pso_dirty = 1; args_program_changed(); } break; }
+        case OP_BIND_PROGRAM: { const prog_t *np = ((const p_bind_program *)a)->prog; if (np != S.prog) { S.prog = np; g_pso_dirty = 1; args_program_changed(); }   /* no generation bump: the program is the owner of its MRU (pso_mru_get) */ break; }
         case OP_BIND_STATE: {
             const p_bind_state *b = a; void *dst = NULL; size_t n = 0;
             blend_st bs;
@@ -9141,11 +9229,11 @@ static int state_op(uint32_t op, const void *a) {
                 case 4: dst = &S.poly; n = sizeof S.poly; break;
                 case 5: dst = &S.ds; n = sizeof S.ds; break;
             }
-            if (dst && memcmp(dst, b->bytes, n)) { memcpy(dst, b->bytes, n); if (b->kind == 5) g_dss_dirty = 1; else g_pso_dirty = 1; }
+            if (dst && memcmp(dst, b->bytes, n)) { memcpy(dst, b->bytes, n); if (b->kind == 5) g_dss_dirty = 1; else PSO_DIRTY(); }
             break;
         }
-        case OP_BIND_VATTR: { const p_bind_vattr *b = a; if (S.nattr != b->n || memcmp(S.attr, b->st, 4 * b->n)) { memcpy(S.attr, b->st, 4 * b->n); S.nattr = b->n; g_pso_dirty = 1; } break; }
-        case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; if (S.nstream != b->n || memcmp(S.stream, b->st, 8 * b->n)) { memcpy(S.stream, b->st, 8 * b->n); S.nstream = b->n; g_pso_dirty = 1; } break; }
+        case OP_BIND_VATTR: { const p_bind_vattr *b = a; if (S.nattr != b->n || memcmp(S.attr, b->st, 4 * b->n)) { memcpy(S.attr, b->st, 4 * b->n); S.nattr = b->n; PSO_DIRTY(); } break; }
+        case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; if (S.nstream != b->n || memcmp(S.stream, b->st, 8 * b->n)) { memcpy(S.stream, b->st, 8 * b->n); S.nstream = b->n; PSO_DIRTY(); } break; }
         case OP_BIND_VBUF: { const p_bind_vbuf *b = a; memcpy(&S.vbuf[b->first], b->r, sizeof *b->r * b->n); break; }
         case OP_BIND_UBO: { const p_bind_buf *b = a; if (b->stage < 6 && b->index < 16 && memcmp(&S.ubo[b->stage][b->index], b, sizeof *b)) { S.ubo[b->stage][b->index] = *b; args_dirty_stage(b->stage); } break; }
         case OP_BIND_SSBO: { const p_bind_buf *b = a; if (b->stage < 6 && b->index < 16 && memcmp(&S.ssbo[b->stage][b->index], b, sizeof *b)) { S.ssbo[b->stage][b->index] = *b; args_dirty_stage(b->stage); } break; }
@@ -9236,7 +9324,7 @@ static void shader_predict_rest(void) {
         if (hq.op == OP_CLEAR_COLOR || hq.op == OP_CLEAR_DS || hq.op == OP_RENDER_COND) continue;
         state_op(hq.op, aq);
     }
-    memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty; g_prog_for_draw = for_draw;
+    memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_pso_state_gen++; g_dss_dirty = dss_dirty; g_prog_for_draw = for_draw;
     g_sp_more = stop && (progs || urgent || queued);   // go on only after a scan that found something
     g_sp_budget.used_ns += bp_now() - started;
     g_sp_scans++; g_sp_ns += bp_now() - started; g_sp_progs += progs; g_sp_urgent += urgent; g_sp_queued += queued;
@@ -9340,7 +9428,7 @@ static void pso_predict_rest(void) {
     }
     (void)df; (void)sf;
     for (int i = 0; i < nb; i++) pso_pend_kick(&qb[i].k, (__bridge NvShader *)qb[i].vs, (__bridge NvShader *)qb[i].fs);
-    memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty;
+    memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_pso_state_gen++; g_dss_dirty = dss_dirty;
     static int logged; if (g_pp_kicked > (uint64_t)kicked0 && logged++ < 20) MLOG("Parallel precompile: %d draws left in this submit, %d pipelines handed to the background", draws, (int)g_pp_kicked - kicked0);
     g_pp_scans++; g_pp_scan_ns += bp_now() - started; if (stop) g_pp_stop[stop - 1]++;
     g_pp_more = stop != 0 && g_pp_kicked > (uint64_t)kicked0;   // go on only after a scan that kicked something
@@ -9416,7 +9504,7 @@ void dm_nvn_probe_prediction(void) {
             memcpy(uctl[s] + 0x704, &len, 4); memcpy(uctl[s] + 0x714, &s, 4); memset(ucode[s], 0x51 + (int)s, len);
             shader_key_of(uctl[s], ucode[s], len, k); ukey[s] = @(k); }
         static typeof(S) keep; memcpy(&keep, &S, sizeof S);
-        S.nattr = 1; S.attr[0].fmt = 0x0B;   // this draw's attribute 0 is an unsigned integer; the index lists a float variant first
+        S.nattr = 1; S.attr[0].fmt = 0x0B; g_pso_state_gen++;   // this draw's attribute 0 is an unsigned integer; the index lists a float variant first
         NSString *vf = [ukey[0] stringByAppendingString:@"-float"], *vu = [ukey[0] stringByAppendingString:@"-uint"], *pf = [ukey[1] stringByAppendingString:@"-any"];
         totk_rt_probe_index(ukey[0], @[@{@"variant": vf, @"deps": @{@"attr": @{@"0": @"float"}}}, @{@"variant": vu, @"deps": @{@"attr": @{@"0": @"uint"}}}]);
         totk_rt_probe_index(ukey[1], @[@{@"variant": pf, @"deps": @{}}]);
@@ -9460,7 +9548,7 @@ void dm_nvn_probe_prediction(void) {
         }
         serial_del(seen.serial); if (serial_ptr(unseen.serial)) serial_del(unseen.serial);
         [g_shcache removeObjectsForKeys:names]; totk_rt_probe_index(ukey[0], nil); totk_rt_probe_index(ukey[1], nil);
-        memcpy(&S, &keep, sizeof S);
+        memcpy(&S, &keep, sizeof S); g_pso_state_gen++;
     }
     // A depth-exporting fragment function gets the pass's depth buffer: guesses without it are never used.
     NvShader *depth_fs = [NvShader new], *color_fs = [NvShader new]; depth_fs->writes_depth = 1;
@@ -9515,7 +9603,7 @@ static void fz_probe_cov2(const p_set_rt *r2, const uint8_t *first, const int8_t
     }
     memcpy(&S, &Ssave, sizeof S); args_dirty_all(); R = Rsave;
     g_fd_dw = fdw; g_fd_di = fdi; g_fd_why = fdwhy;
-    g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty;
+    g_pso_dirty = pso_dirty; g_pso_state_gen++; g_dss_dirty = dss_dirty;
 }
 
 static int fz_load_covers(int i, id<MTLTexture> t, NSUInteger level) {
@@ -10078,10 +10166,10 @@ static void fz_check_run(const fuse_t *fz) {
     static typeof(S) Ssave; memcpy(&Ssave, &S, sizeof S); typeof(R) Rsave = R; const uint8_t *en0 = g_exec_next;
     g_fz_checking = 1; g_exec_next = NULL;   // Turn off all lookahead during the redraw (continuation / hoisting / merging / depth-stencil on demand): normal path
     R.rt = fz->rt2; memcpy(R.clear_c, fz->clr2, 8); memcpy(R.cc, fz->cc2, sizeof R.cc); R.clear_d = fz->cd2f; R.clear_s = fz->cs2f; R.cd = fz->cd2; R.cs = fz->cs2;
-    for (int i = 0; i < g_nfzs; i++) { fz_snap *z = &g_fzs[i]; memcpy(&S, z->S_, sizeof S); args_dirty_all(); R.sc = z->sc; R.has_sc = z->has_sc; g_pso_dirty = g_dss_dirty = 1;
+    for (int i = 0; i < g_nfzs; i++) { fz_snap *z = &g_fzs[i]; memcpy(&S, z->S_, sizeof S); args_dirty_all(); R.sc = z->sc; R.has_sc = z->has_sc; (PSO_DIRTY(), g_dss_dirty = 1);
         draw(z->idx ? NULL : &z->dw, z->idx ? &z->di : NULL); }
     rp_end();
-    memcpy(&S, &Ssave, sizeof S); args_dirty_all(); R = Rsave; g_exec_next = en0; g_fz_checking = 0; g_pso_dirty = g_dss_dirty = 1;
+    memcpy(&S, &Ssave, sizeof S); args_dirty_all(); R = Rsave; g_exec_next = en0; g_fz_checking = 0; (PSO_DIRTY(), g_dss_dirty = 1);
     for (int a = 0; a < na; a++) {
         id<MTLTexture> t = att[a], c = scr[a]; NSUInteger W = t.width, H = t.height, bpp = (NSUInteger)(att_bytes(t, 0) / (W * H));
         id<MTLBuffer> b1 = [g_dev newBufferWithLength:W * H * bpp options:MTLResourceStorageModeShared], b2 = [g_dev newBufferWithLength:W * H * bpp options:MTLResourceStorageModeShared];
@@ -10209,10 +10297,10 @@ static void defer_replay(void) {
         g_defer_cur = d; if (d->reset_between) g_vis_counting = 0;
         { static int once; if (!once++) MLOG("Deferred pass merge: first case pass %llu, group %d replays %d draws", g_stat_pass, gi, d->n); }   // With multiple groups, several groups may already have been created before the first replay, so it cannot be judged by g_defer_n == 1
         for (int i = 0; i < d->n; i++) { defer_snap *z = &d->snap[i]; static uint8_t lm[8]; for (int j = 0; j < 8; j++) lm[j] = d->lmap[j] == 0xff || d->lmap[j] >= 8 ? 0xff : z->pm[d->lmap[j]];
-            memcpy(&S, z->S_, sizeof S); args_dirty_all(); R.sc = z->sc; R.has_sc = z->has_sc; g_pso_dirty = g_dss_dirty = 1; g_pso_lmap = lm; draw(z->idx ? NULL : &z->dw, z->idx ? &z->di : NULL); }
+            memcpy(&S, z->S_, sizeof S); args_dirty_all(); R.sc = z->sc; R.has_sc = z->has_sc; (PSO_DIRTY(), g_dss_dirty = 1); g_pso_lmap = lm; draw(z->idx ? NULL : &z->dw, z->idx ? &z->di : NULL); }
         defer_release_one(d);
     }
-    g_vis_counting = vis; memcpy(&S, &save, sizeof S); args_dirty_all(); R.sc = sc; R.has_sc = has_sc; g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = g_dss_dirty = 1; g_exec_next = en0; g_defer_replaying = 0; g_defer_cur = &g_defer_slots[0];
+    g_vis_counting = vis; memcpy(&S, &save, sizeof S); args_dirty_all(); R.sc = sc; R.has_sc = has_sc; g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); (PSO_DIRTY(), g_dss_dirty = 1); g_exec_next = en0; g_defer_replaying = 0; g_defer_cur = &g_defer_slots[0];
 }
 static void defer_fallback(void) {
     if (g_defer_replaying || !defer_has_active()) return;
@@ -10221,10 +10309,10 @@ static void defer_fallback(void) {
     typeof(S) save; memcpy(&save, &S, sizeof S); p_set_rt rt = R.rt; g_defer_replaying = 1;
     for (int gi, after = 0; (gi = defer_next(0, after)) >= 0;) { defer_t *d = &g_defer_slots[gi]; after = d->born; g_defer_cur = d; R.rt = d->p_rt; R.has_rt = 1; memcpy(R.clear_c, d->clear_c, 8); memcpy(R.cc, d->cc, sizeof R.cc);
         R.clear_d = d->clear_d; R.clear_s = d->clear_s; R.cd = d->cd; R.cs = d->cs;
-        for (int i = 0; i < d->n; i++) { defer_snap *z = &d->snap[i]; memcpy(&S, z->S_, sizeof S); args_dirty_all(); R.sc = z->sc; R.has_sc = z->has_sc; g_pso_dirty = g_dss_dirty = 1; g_pso_lmap = z->pm; draw(z->idx ? NULL : &z->dw, z->idx ? &z->di : NULL); }
+        for (int i = 0; i < d->n; i++) { defer_snap *z = &d->snap[i]; memcpy(&S, z->S_, sizeof S); args_dirty_all(); R.sc = z->sc; R.has_sc = z->has_sc; (PSO_DIRTY(), g_dss_dirty = 1); g_pso_lmap = z->pm; draw(z->idx ? NULL : &z->dw, z->idx ? &z->di : NULL); }
         rp_end(); defer_release_one(d);
     }
-    memcpy(&S, &save, sizeof S); args_dirty_all(); R.rt = rt; g_defer_replaying = 0; g_defer_cur = &g_defer_slots[0];
+    memcpy(&S, &save, sizeof S); args_dirty_all(); g_pso_state_gen++; R.rt = rt; g_defer_replaying = 0; g_defer_cur = &g_defer_slots[0];
 }
 static const uint8_t *defer_cont(int *ci) {   // The next segment after a list ends (within the same submit): first the caller return stack, then the remaining handles of this submit; returns NULL when there are none left
     for (;;) { int k = (*ci)++;
@@ -10672,7 +10760,7 @@ static int bloomq_capture(void) {
     [g_bloomq_args setTexture:src.gpuResourceID atIndex:0]; [g_bloomq_args setSamplerState:g_bloomq_samp.gpuResourceID atIndex:0];
     float *p = g_bloomq_const[g_bloomq_i].contents; p[0] = g_bloomq.threshold; p[1] = g_bloomq.coeff_g; p[2] = g_bloomq.coeff_b; p[3] = src.width; p[4] = src.height; [g_bloomq_args setAddress:g_bloomq_const[g_bloomq_i].gpuAddress atIndex:0];
     [en setViewport:(MTLViewport){0,0,dst.width,dst.height,0,1}]; [en setRenderPipelineState:g_bloomq_pso]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; m4_end(en);
-    g_bloomq_i = (g_bloomq_i + 1) % 3; args_dirty_all(); g_pso_dirty = g_dss_dirty = 1; return 1;
+    g_bloomq_i = (g_bloomq_i + 1) % 3; args_dirty_all(); (PSO_DIRTY(), g_dss_dirty = 1); return 1;
 }
 // ---------- Drag-follow image for shop items: items on a vendor's shelf have no "picked up" state, so during a drag the replay layer takes "the draw that draws this item's icon", translates it to the finger at the end of the same pass and draws it once more ----------
 // In the UI pass each rectangle is one 4-vertex draw (20-byte vertices: position 3 floats + texture coordinates 2 floats; the position goes to clip coordinates through the matrix in vertex constant 0).
@@ -10742,11 +10830,11 @@ static void ghost_flush(void) {   // Before the render pass ends: translate the 
     float W = (float)g_pass.tw, H = (float)g_pass.th, ccx = (g_gh.r[0] + g_gh.r[2]) / 2, ccy = (g_gh.r[1] + g_gh.r[3]) / 2;
     { uint64_t v = 0; for (int i = 0; i < 4; i++) v |= (uint64_t)(uint16_t)(fminf(fmaxf(g_gh.r[i], 0), 1) * 65535 + .5f) << (16 * i); atomic_store(&g_ghost_found, v ? v : 1); }
     g_gh.busy = 1; typeof(S) save; memcpy(&save, &S, sizeof S); p_scissor sc = R.sc; int has_sc = R.has_sc;
-    memcpy(&S, c->S_, sizeof S); if (!S.has_vp) { S.vp[0][0] = S.vp[0][1] = 0; S.vp[0][2] = W; S.vp[0][3] = H; S.has_vp = 1; }
+    memcpy(&S, c->S_, sizeof S); g_pso_state_gen++; if (!S.has_vp) { S.vp[0][0] = S.vp[0][1] = 0; S.vp[0][2] = W; S.vp[0][3] = H; S.has_vp = 1; }
     S.vp[0][0] += (ax - ccx) * W; S.vp[0][1] += (ay - ccy) * H * (float)ui_hfrac(); R.has_sc = 0;
-    args_dirty_all(); g_pso_dirty = g_dss_dirty = 1; draw(&c->dw, NULL);
+    args_dirty_all(); (PSO_DIRTY(), g_dss_dirty = 1); draw(&c->dw, NULL);
     { static int once; if (!once++) MLOG("Carried-object follow image: first case pass %llu, %d candidates, taking the one whose texture is used %d times in this pass", g_stat_pass, g_gh.n, bn); }
-    memcpy(&S, &save, sizeof S); args_dirty_all(); R.sc = sc; R.has_sc = has_sc; g_pso_dirty = g_dss_dirty = 1; g_gh.busy = 0;
+    memcpy(&S, &save, sizeof S); args_dirty_all(); R.sc = sc; R.has_sc = has_sc; (PSO_DIRTY(), g_dss_dirty = 1); g_gh.busy = 0;
     for (int i = 0; i < g_gh.n; i++) free(g_gh.c[i].S_); g_gh.n = 0;
 }
 // TOTK: an 8-bit index buffer that GPU work earlier in this submit may have written is widened on the GPU timeline
@@ -11130,7 +11218,7 @@ static void skv_done(skv_item *l, int n, uint32_t frame) {   /* submission compl
     free(l);
 }
 static void draw(const p_draw *dw, const p_draw_idx *di) { g_draw_depth++; draw_inner(dw, di);
-    if (g_fx_masked) { S.chmask.mask = g_fx_saved_mask; g_fx_masked = 0; g_pso_dirty = 1; }   // hide the HUD: the UI draw's own colour mask again (totk_post.h fx_draw)
+    if (g_fx_masked) { S.chmask.mask = g_fx_saved_mask; g_fx_masked = 0; PSO_DIRTY(); }   // hide the HUD: the UI draw's own colour mask again (totk_post.h fx_draw)
     if (g_draw_depth == 1) nan_draw_probe(dw, di); g_draw_depth--; }
 // TOTK: an update makes the argument buffers of the stages whose bound uniform ranges overlap it stale.
 static void upd_dirty_stages(uint64_t lo, uint64_t hi) {
@@ -11543,7 +11631,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (pr && pr->missing && async_shaders()) { shader_predict_maybe(); prog_resolve(pr, draw_may_skip(pr)); }
     if (pr && pr->missing) { draw_skipped(); return; }   // TOTK (iOS): a stage is not translated yet; Mac (async shaders): still in the background
     if (g_nupd) upd_guard_draw(pr, di);   // TOTK: before any encoder or texture preparation of this draw
-    { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { draw_skipped(); return; } if (fit) g_pso_dirty = 1; }
+    { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { draw_skipped(); return; } if (fit) PSO_DIRTY(); }
     if (g_nlc) lc_take(pr);   // TOTK_LAZY_CLEAR: waiting clears become this pass's load actions or land now, before this draw prepares or reads any texture
     if (skv_on()) { g_skv_draws++; if (skv_check((__bridge const void *)pr, dw, di)) return; }   // measurement experiment: skip draws invisible in the last frames
     geometry_dump(pr, dw, di);
@@ -11742,17 +11830,17 @@ frz_plain:;
             if (r0 >= 0 && f >= r0 && f <= r1) MLOG("[mfx] role F%ld pass %llu draw role %d vs %s fs %s blend %#x count %u", f, g_stat_pass, r, pr && pr->sh[0] ? pr->sh[0]->key : "-", pr && pr->sh[1] ? pr->sh[1]->key : "-",
                                                      S.color.blend_en, dw ? dw->count : di ? di->count : 0);
         }
-        if (r != g_mfx.role) { g_mfx.role = r; g_pso_dirty = 1; }
+        if (r != g_mfx.role) { g_mfx.role = r; PSO_DIRTY(); }
     }
     if (g_mfx.want_cam) mfx_take_camera();
     if (defer_q_draw) defer_replay();
     if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
     static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass;
-    if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }
-    if (fb_fn != g_pso_fbfn) { g_pso_fbfn = fb_fn; g_pso_dirty = 1; }   // TOTK: the tile-reading variant (att_fb_take) is part of the pipeline   // Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
-    if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || (pr->sh[1] && pr->sh[1]->border_seen) || (pr->sh[0] && pr->sh[0]->border_seen)) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
-    if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // The next draw fetches again according to its own situation
+    if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; PSO_DIRTY(); }   // Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
+    if (fb_fn != g_pso_fbfn) { g_pso_fbfn = fb_fn; PSO_DIRTY(); }   // TOTK: the tile-reading variant (att_fb_take) is part of the pipeline (and of the MRU generation)
+    if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || (pr->sh[1] && pr->sh[1]->border_seen) || (pr->sh[0] && pr->sh[0]->border_seen)) { cur_ps = pso_mru_get(pr); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
+    if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); PSO_DIRTY(); }   // The next draw fetches again according to its own situation
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
     if (!ps && g_pso_deferred) { draw_skipped(); return; }   // async shaders: the pipeline is compiling in the background
     if (!ps) { g_draw_skip[9]++; static int failed_n; if (failed_n++ < 3) MLOG("[pipeline-draw] rt-depth=%p serial=%llu fmt=%#x pass-depth=%u dt=%u dw=%u fs-depth=%d", R.rt.depth, (unsigned long long)(R.rt.depth ? R.rt.depth->serial : 0), R.rt.depth ? R.rt.depth->d.format : 0, g_pass.dfmt, S.ds.dt, S.ds.dw, pr->sh[1] ? pr->sh[1]->writes_depth : 0); return; }
@@ -12736,6 +12824,26 @@ static int frz_op(unsigned op, const void *a) {   // Returns 1 = this operation 
     return 0;
 }
 
+/* TOTK_DISCARD: nvnCommandBufferDiscardColor(index) / DiscardDepthStencil() leave that bound target's contents
+   undefined (index -1: depth-stencil). In an open pass the attachment is marked (sd_att.disc) and sd_finish stores it
+   DontCare if no draw was encoded after the mark; a later draw or clear in the same pass keeps the store. With no pass
+   open, TOTK_DISCARD=2 also makes the next pass's Load of that subresource DontCare (dropped at any op other than state,
+   targets, clears and draws). Not while a layered pass, merged pass, deferred replay or hoisted clear is in play. */
+static void discard_op(int index) {
+    int lvl = discard_level();
+    if (!lvl || S.render_disabled || g_lay.active || g_fz.active || g_defer_replaying || g_hoist_n) return;   // conditional rendering off: conservatively not discarded
+    if (index >= 8 || (index >= 0 && (index >= R.rt.n || !R.rt.color[index])) || (index < 0 && !R.rt.depth)) return;
+    if (g_enc) {
+        uint64_t ser = index >= 0 ? R.rt.color[index]->serial : R.rt.depth->serial;
+        for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i];
+            if (t->ser == ser && (index >= 0 ? t->depth == 0 && t->idx == index : t->depth != 0)) { t->disc = g_enc_draws + 1; g_dc_stat[0]++; } }
+        return;
+    }
+    if (lvl < 2 || tbdr_any() || g_ndisc_pend >= 9) return;
+    disc_pend d = {.k = index >= 0 ? index : 8}; rt_sub(&R.rt, d.k, &d.ser, &d.lv, &d.sl);
+    if (d.ser) g_disc_pend[g_ndisc_pend++] = d;
+}
+
 void mtl_exec(const uint8_t *p) {
     static int inited; if (!inited) { inited = 1; state_reset(); }
     static int dump_all = -1; if (dump_all < 0) dump_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
@@ -12848,7 +12956,17 @@ void mtl_exec(const uint8_t *p) {
             case OP_CLEAR_TEX: clear_tex(a); break;
             case OP_DISPATCH: dispatch(a); break;
             case OP_BARRIER: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;
+            case OP_DISCARD_COLOR: discard_op(((const p_flag *)a)->value < 0 ? 8 : ((const p_flag *)a)->value); break;   // a negative index is ignored (8)
+            case OP_DISCARD_DS: discard_op(-1); break;
             default: break;
+        }
+        if (g_ndisc_pend) switch (h.op) {   // TOTK_DISCARD=2: only state, targets, clears and draws keep a pending load discard
+            case OP_SET_RT: case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_DRAW: case OP_DRAW_IDX: case OP_DISCARD_COLOR: case OP_DISCARD_DS:
+            case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
+            case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
+            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_BLEND_COLOR: case OP_COPY_STRIDE: case OP_DEPTH_CLAMP:
+            case OP_RENDER_ENABLE: case OP_RASTER_DISCARD: case OP_RENDER_COND: break;
+            default: g_ndisc_pend = 0;
         }
         p += h.size;
     }
@@ -15819,7 +15937,7 @@ int mtl_probe_vertex_streams(void) {
         g_arg_bind_cache_negative=cache_mode && getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE"))==15;
         atomic_store(&g_vertex_streams_on,mode);g_vertex_streams_negative=mode && getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE"))==9;
         mtl_sub_begin();mtl_exec((const uint8_t *)&end);
-        S.nattr=4;memset(S.attr,0,sizeof S.attr);memset(S.stream,0,sizeof S.stream);
+        S.nattr=4;g_pso_state_gen++;memset(S.attr,0,sizeof S.attr);memset(S.stream,0,sizeof S.stream);
         S.attr[0]=(va_st){.fmt=0x2e,.stream=2};S.attr[3]=(va_st){.fmt=scenario==2?0:0x2e,.stream=scenario==1?7:5};
         memset(S.vbuf,0,sizeof S.vbuf);
         for(unsigned i=0;i<15;i++){S.stream[i].stride=16;S.vbuf[i]=(NVNbufferRange){.address=(uint64_t)(uintptr_t)mem+512,.size=48};}
@@ -15988,7 +16106,7 @@ int mtl_probe_arg_epoch(void) {
     if (arg_epoch_safe(unsafe)) MDIE("argument epoch accepted writable storage"); checked++;
     MLOG("argument epoch probe: %llu extra reuses, %llu shadow comparisons",(unsigned long long)g_arg_epoch_extra,(unsigned long long)g_arg_epoch_verified);
     g_arg_epoch_negative=0; atomic_store(&g_arg_epoch_on,0);atomic_store(&g_arg_epoch_check,0);
-    memset(&S,0,sizeof S);args_dirty_all();mtl_pool_del(mem);res_remove(texture);res_remove(rb);free(mem);return checked;
+    memset(&S,0,sizeof S);args_dirty_all();g_pso_state_gen++;mtl_pool_del(mem);res_remove(texture);res_remove(rb);free(mem);return checked;
 }
 
 #include "nvn_tex_slots_probe.h"
