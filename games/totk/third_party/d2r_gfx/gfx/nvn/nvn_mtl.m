@@ -5575,6 +5575,31 @@ static int totk_msl_fast_mask(void) {
              m & MSLF_DIV ? "divide" : "", m == (MSLF_DIV | MSLF_FUNCS) ? " and fast::" : "", m & MSLF_FUNCS ? "log2/exp2/sqrt/rsqrt" : "");
     return atomic_load(&v);
 }
+/* Invariant vertex positions (MTLCompileOptions.preserveInvariance), on by default with TOTK_OBJ_MOTION=1;
+   TOTK_PRESERVE_INVARIANCE=0 / 1 turns it off / on regardless. TOTK draws a depth prepass and then the G-buffer pass with
+   an EQUAL depth test, the two with different vertex functions. Without TOTK_OBJ_MOTION those functions are compiled by
+   the same compiler from MSL that computes the position the same way, and they agree (docs/how-it-works.md, Early
+   fragment tests). The per-object motion vertex variant (totk_objmv.h) is a third function, compiled at runtime from
+   rewritten source that also stores the position to memory and passes it on as two more varyings, while the prepass's
+   function usually comes precompiled from the app's shader-libs (offline toolchain): nothing makes its position
+   bit-identical (the translated shaders are full of fma(), whose scheduling may differ), so the EQUAL test failed on
+   scattered pixels of the G-buffer draws and textures / meshes flickered (user, 2026-10-23). Every translated vertex
+   output is declared [[position, invariant]], and Metal guarantees the same position across functions only when all of
+   them are compiled with preserveInvariance. So with it on every translated shader is compiled with it, the precompiled
+   shader libraries (built without it) are skipped like another math mode, and pipelines go to an archive folder of their
+   own (par_dir). Cost: the first launch with it compiles the shaders at runtime (Metal caches them after that), and
+   vertex functions may run a little slower. */
+static int totk_preserve_invariance(void) {
+    static _Atomic int v = -1; int m = atomic_load(&v);
+    if (m >= 0) return m;
+    const char *e = getenv("TOTK_PRESERVE_INVARIANCE");
+    m = e && *e ? atoi(e) != 0 : mfx_obj_motion_on();
+    int expect = -1;
+    if (atomic_compare_exchange_strong(&v, &expect, m) && m)
+        MLOG("Vertex positions compiled invariant (preserveInvariance%s): precompiled shader libraries skipped, pipeline archive in its own folder",
+             e && *e ? ", TOTK_PRESERVE_INVARIANCE=1" : ", for TOTK_OBJ_MOTION; TOTK_PRESERVE_INVARIANCE=0 turns it off");
+    return atomic_load(&v);
+}
 static MTLCompileOptions *totk_precise_opts(void) {
     /* Made once and published only when complete: the warm-up compiles on several threads (2026-10-18), and a thread must
        never get the options before mathMode is set (that would compile with fast math). */
@@ -5584,6 +5609,7 @@ static MTLCompileOptions *totk_precise_opts(void) {
         int m = totk_math_mode();
         if (@available(macOS 15.0, *)) x.mathMode = m == 2 ? MTLMathModeFast : m == 1 ? MTLMathModeRelaxed : MTLMathModeSafe;
         else x.fastMathEnabled = m == 2;   // no relaxed mode before macOS 15 / iOS 18: relaxed compiles as safe there
+        if (totk_preserve_invariance()) x.preserveInvariance = YES;   // see totk_preserve_invariance
         o = x;
     });
     return o;
@@ -5786,7 +5812,7 @@ static _Atomic uint64_t g_rt_prebuilt, g_rt_compiled;   // TOTK: translated vari
    MSL, so only an exact match is used. Metal's own cache of libraries compiled here does not follow the app to a folder
    whose path has another length (measured: a full 4.5-minute warm-up again); these files move with the app. */
 static NSString *shader_lib_prebuilt_path(NSData *src) {
-    if (totk_math_mode() || totk_msl_fast_mask()) return nil;   // built with safe math (totk_precise_opts) from the unmodified source
+    if (totk_math_mode() || totk_msl_fast_mask() || totk_preserve_invariance()) return nil;   // built with safe math (totk_precise_opts) from the unmodified source, without preserveInvariance
     static NSString *dir; static dispatch_once_t once; dispatch_once(&once, ^{   // TOTK_SHADER_LIBS: the app's game-data store (launcher.m)
         const char *libs = getenv("TOTK_SHADER_LIBS"); dir = libs && *libs ? @(libs) : exe_rel("shader-libs"); });
     unsigned char md[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(src.bytes, (CC_LONG)src.length, md);
@@ -5820,7 +5846,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
         // iOS: the variant precompiled on the Mac (ios/tools/build_metallibs.sh, same options) if it came in shaders.pack;
         // those are safe-math builds, so another TOTK_MATH_MODE compiles the source instead
         NSString *rt_lib = totk_rt_file([pc stringByAppendingString:@".metallib"]);
-        if (!totk_math_mode() && !totk_msl_fast_mask() && [NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("[red] Failed to load precompiled shader library %s: %s (compiling at runtime instead)", pc.UTF8String, e.localizedDescription.UTF8String); else atomic_fetch_add(&g_rt_prebuilt, 1); }
+        if (!totk_math_mode() && !totk_msl_fast_mask() && !totk_preserve_invariance() && [NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("[red] Failed to load precompiled shader library %s: %s (compiling at runtime instead)", pc.UTF8String, e.localizedDescription.UTF8String); else atomic_fetch_add(&g_rt_prebuilt, 1); }
         }
         if (!lib) { NSData *raw = [NSData dataWithContentsOfFile:rt_src options:0 error:&e];
 #if !TARGET_OS_IPHONE
