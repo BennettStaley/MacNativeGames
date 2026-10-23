@@ -398,8 +398,7 @@ static void crash(int num,siginfo_t *info,void *context) {
  }
  if((num==SIGBUS||num==SIGSEGV)&&runtime_fault_guard){sigjmp_buf *g=runtime_fault_guard;runtime_fault_guard=NULL;siglongjmp(*g,1);}   /* guarded host read of guest memory (uniform snapshot copies) */
  if(runtime_gfx_fault(info->si_addr,(u->uc_mcontext->__es.__esr>>6)&1,context))return;
- /* 以上都是能恢复的故障；从这里起是真崩溃，只有第一个崩溃的线程往下打印（crash_gate.h，15 s 打不完就退出）
-    Everything above is a recoverable fault; from here on it is a crash, and only the first crashing thread goes on to print (crash_gate.h; exits if the dump takes 15 s) */
+ /* Everything above is a recoverable fault; from here on it is a crash, and only the first crashing thread goes on to print (crash_gate.h; exits if the dump takes 15 s) */
  crash_gate(num,15);
  uint64_t pc=u->uc_mcontext->__ss.__pc,fp=u->uc_mcontext->__ss.__fp;
  signal_hex("[totk] signal=",num);signal_hex("fault=",(uintptr_t)info->si_addr);signal_hex("esr=",u->uc_mcontext->__es.__esr);
@@ -540,7 +539,7 @@ static void boot(void) {
 /* Host aborts (e.g. Metal validation assertions) print the host call stack before the process ends. */
 #include <execinfo.h>
 static void abort_report(int num) {
- crash_gate(num,15);   /* 别的线程的崩溃报告先打完 | another thread's crash report finishes first */
+ crash_gate(num,15);   /* another thread's crash report finishes first */
  void *frames[64];int n=backtrace(frames,64);write(2,"[totk] host abort, call stack:\n",31);backtrace_symbols_fd(frames,n,2);
  signal(SIGABRT,SIG_DFL);raise(SIGABRT);
 }

@@ -225,7 +225,7 @@ static uint64_t g_res_live_bytes;
 static uint64_t g_res_dedup_skips, g_res_commits, g_res_commit_calls;   // under g_res_mu
 static int res_dedup_on(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_RES_DEDUP"); v = !(e && !strcmp(e, "0")); MLOG("TOTK_RES_DEDUP=%d：%s | %s", v, v ? "重复登记 / 撤销非成员不再标记驻留集待提交" : "每次登记 / 撤销都标记驻留集待提交（旧行为）", v ? "re-adding a member or removing a non-member no longer marks the residency set for a commit" : "every add / remove marks the residency set for a commit (old)"); }
+    if (v < 0) { const char *e = getenv("TOTK_RES_DEDUP"); v = !(e && !strcmp(e, "0")); MLOG("TOTK_RES_DEDUP=%d: %s", v, v ? "re-adding a member or removing a non-member no longer marks the residency set for a commit" : "every add / remove marks the residency set for a commit (old)"); }
     return v;
 }
 static void res_add_at(id<MTLResource> r, int site) {
@@ -334,8 +334,8 @@ static void res_commit(void) {
     pthread_mutex_lock(&g_res_mu);
     g_res_commit_calls++;
     if (g_res_dirty) { if (!nogpu()) [g_res commit]; g_res_dirty = 0; g_res_commits++; }
-    if (!(g_res_commit_calls & 16383)) MLOG("驻留集提交：%llu 次检查，实际提交 %llu 次，跳过重复登记 / 撤销 %llu 次 | residency: %llu checks, %llu commits, %llu redundant adds/removes skipped",
-        (unsigned long long)g_res_commit_calls, (unsigned long long)g_res_commits, (unsigned long long)g_res_dedup_skips, (unsigned long long)g_res_commit_calls, (unsigned long long)g_res_commits, (unsigned long long)g_res_dedup_skips);
+    if (!(g_res_commit_calls & 16383)) MLOG("residency: %llu checks, %llu commits, %llu redundant adds/removes skipped",
+        (unsigned long long)g_res_commit_calls, (unsigned long long)g_res_commits, (unsigned long long)g_res_dedup_skips);
     pthread_mutex_unlock(&g_res_mu);
 }
 
@@ -1276,7 +1276,7 @@ static void pt_finish(id cb, TotkCommitOptions *o, uint64_t frame) {
         const char *fp = getenv("TOTK_PASS_GPU_FILE"); FILE *ff = fp ? fopen(fp, "a") : NULL;
         // with a file the per-encoder rows go only there (one summary line per frame stays in the log)
         for (int k = 0; k < m && k < 40 && !fp; k++) { int i = ord[k]; const pt_ent *p = &ents[i]; uint64_t dn = (i + 1 < n ? ents[i + 1].draw0 : draws_end) - p->draw0;
-            MLOG("[pass-gpu]   #%d %c %.3f ms 绘制 %llu %ux%u fmt %u 色 %u 深 %u 读入 %u 写回 %u %s 结束因 %s", i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->nstore, p->key[0] ? p->key : "-", p->why ? p->why : "-"); }
+            MLOG("[pass-gpu]   #%d %c %.3f ms draws %llu %ux%u fmt %u color %u depth %u load %u store %u %s ended-by %s", i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->nstore, p->key[0] ? p->key : "-", p->why ? p->why : "-"); }
         if (ff) { for (int i = 0; i + 1 < n; i++) { const pt_ent *p = &ents[i]; uint64_t dn = ents[i + 1].draw0 - p->draw0;
                       fprintf(ff, "%llu\t%d\t%c\t%.4f\t%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%s\t%s\n", (unsigned long long)frame, i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->key[0] ? p->key : "-", p->why ? p->why : "-"); }
                   fclose(ff); }
@@ -2629,7 +2629,7 @@ static void wb_back_batch(wb_ent **ents, id<MTLTexture> __strong *mts, int n, si
        by the thousands per lap). */
     @autoreleasepool {
     id<MTLBuffer> buf = [g_dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-    if (!buf) { for (int i = 0; i < n; i++) { MLOG("【红】GPU 写回内存失败 ser=%llu 格式 %#x", (unsigned long long)ents[i]->t.serial, ents[i]->t.d.format); wb_ent_free(ents[i]); } return; }
+    if (!buf) { for (int i = 0; i < n; i++) { MLOG("[red] GPU write-back to memory failed ser=%llu format %#x", (unsigned long long)ents[i]->t.serial, ents[i]->t.d.format); wb_ent_free(ents[i]); } return; }
     id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = enc_b_begin(cb);
     size_t at = 0, lp, lr;
     for (int i = 0; i < n; i++) {
@@ -2656,8 +2656,8 @@ static void wb_back_batch(wb_ent **ents, id<MTLTexture> __strong *mts, int n, si
             at += (lp * lr + 255) & ~(size_t)255;
         }
         nvn_dirty_gpu_write_end(tok);
-        if (ok) { uint64_t d = ++g_wb_done; if (d <= 8 || d % 500 == 0) MLOG("[writeback] ser=%llu %ux%u nvnfmt=%#x lv%u：GPU 渲染结果写回内存（累计 %llu 张 / %llu MB，CPU 已改写而跳过 %llu 张）", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, (unsigned long long)d, (unsigned long long)(g_wb_bytes >> 20), (unsigned long long)g_wb_skip_cpu); }
-        else MLOG("【红】GPU 写回内存失败 ser=%llu 格式 %#x", (unsigned long long)t->serial, t->d.format);
+        if (ok) { uint64_t d = ++g_wb_done; if (d <= 8 || d % 500 == 0) MLOG("[writeback] ser=%llu %ux%u nvnfmt=%#x lv%u: GPU rendering written back to memory (%llu textures / %llu MB so far, %llu skipped because the CPU had rewritten them)", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, (unsigned long long)d, (unsigned long long)(g_wb_bytes >> 20), (unsigned long long)g_wb_skip_cpu); }
+        else MLOG("[red] GPU write-back to memory failed ser=%llu format %#x", (unsigned long long)t->serial, t->d.format);
         wb_ent_free(e);
     }
     }
@@ -4373,7 +4373,7 @@ static uint64_t g_rt_merge_n;   // 累计续用次数 | Cumulative continuation 
 static int g_pc_merged; static uint64_t g_pc_kept, g_pc_split, g_pc_log_frame;
 static int att_store_on(void);
 static int pass_cont_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PASS_CONTINUE"); v = e && atoi(e) > 0;
-    if (v) MLOG("【实验】TOTK_PASS_CONTINUE=1：续用通道里采样附件的绘制只在附件像素还在 tile 里时切开 | a sampling draw ends a continued pass only when the attachment it samples was drawn in the pass"); } return v; }
+    if (v) MLOG("[experiment] TOTK_PASS_CONTINUE=1: a sampling draw ends a continued pass only when the attachment it samples was drawn in the pass"); } return v; }
 static void pc_note_continue(void) {
     if (!pass_cont_on() || !att_store_on()) return;
     g_pc_merged = 1; for (int i = 0; i < g_nsd; i++) if (g_sd[i].wrote) g_sd_plain |= 1u << i;
@@ -4538,7 +4538,7 @@ static void rp_end(void) { if (g_enc) {
 #endif
     if (totk_tl_on()) totk_tl(TL_PASS_END, g_stat_pass, g_stat_draw - g_pass_draw0);
     { const char *why = g_end_why ? g_end_why : "other"; g_end_why = NULL;
-      PD("W %llu 通道结束 原因=%s 绘制=%llu 续用=%d", g_stat_pass, why, (unsigned long long)(g_stat_draw - g_pass_draw0), g_rt_merged);
+      PD("W %llu pass end reason=%s draws=%llu continued=%d", g_stat_pass, why, (unsigned long long)(g_stat_draw - g_pass_draw0), g_rt_merged);
       if (g_pt_n && g_pt[g_pt_n - 1].kind == 'R' && pt_active()) g_pt[g_pt_n - 1].why = why; }
     if (pass_cont_on()) { uint64_t f = atomic_load(&g_cur_frame); if (f >= g_pc_log_frame + 600) { g_pc_log_frame = f;
         MLOG("[totk] TOTK_PASS_CONTINUE: %llu render passes ended, %llu same-target continuations; sampling draws in a continued pass: %llu stayed in it, %llu still ended it (attachment drawn earlier in the pass)",
@@ -5042,7 +5042,7 @@ typedef struct { int n; int aid[8]; unsigned axes[8]; float col[8][4]; samp_par 
     NSString *src, *src_path; NSDictionary<NSNumber *, NSString *> *io; NSMutableDictionary<NSString *, id<MTLFunction>> *vpatch; id<MTLFunction> mfx_fn[8]; uint8_t mfx_tried[8]; NSMutableDictionary<NSString *, id<MTLFunction>> *bpatch; int border_seen;
     // TOTK (upstream #286): the last results of border_key (per stage, under the registry lock), fs_fn_border (per nodepth, g_bpatch_lock) and vs_fn_for (4 entries, g_vpatch_lock), so a draw that binds what the previous one bound builds no key strings
     border_sig bk_sig[2]; NSString *bk_str[2]; NSString *fb_key[2]; id<MTLFunction> fb_fn[2];
-    NvShader *vf_fs[4]; NSString *vf_bkey[4]; id<MTLFunction> vf_fn[4]; int vf_layered[4]; uint8_t vf_ok[4], vf_next; } @end   // TOTK: MSL source, user varyings (locn -> type), patched vertex functions   // bflib：可读 tile 版本 <键>_bf（合并 B 第 2 步） | bflib: readable-tile version <key>_bf (merge B step 2)
+    NvShader *vf_fs[4]; NSString *vf_bkey[4]; id<MTLFunction> vf_fn[4]; int vf_layered[4]; uint8_t vf_ok[4], vf_next; } @end   // TOTK: MSL source, user varyings (locn -> type), patched vertex functions   // bflib: readable-tile version <key>_bf (merge B step 2)
 @implementation NvShader @end
 /* TOTK: a shader's MSL source is needed only to build derived functions (varying patches, layered vertex, depth-less and
    MetalFX UI fragment variants). The Mac keeps it; iOS keeps only the path and reads it when needed (thousands of sources
@@ -5383,7 +5383,7 @@ static void refl_mark_stores(NvShader *o, NSArray *bs, NSString *src) {
    the binding's name in the MSL is a read "<name>)._m0[<integer>]" of the translator's "float4 _m0[4096]" block, or its
    declaration in the argument struct; anything else (a computed / dynamic index, the block passed to a function or taken
    by reference, another block layout, no MSL source) keeps the whole binding. TOTK_CB_EXTENT=1: on (default off). */
-static int cb_extent_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_CB_EXTENT"); v = e && !strcmp(e, "1"); if (v) MLOG("TOTK_CB_EXTENT=1：uniform 副本只复制着色器读到的范围 | uniform copies take only the bytes the shader reads"); } return v; }
+static int cb_extent_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_CB_EXTENT"); v = e && !strcmp(e, "1"); if (v) MLOG("TOTK_CB_EXTENT=1: uniform copies take only the bytes the shader reads"); } return v; }
 static uint32_t cb_extent_of(const char *s, const char *name, const char *type) {
     if (!s || !name || !type || !*name) return 0;
     char decl[96]; snprintf(decl, sizeof decl, "struct %s\n{\n    float4 _m0[4096];\n};", type);
@@ -5709,13 +5709,13 @@ static void shader_key_of(const uint8_t *control, const void *code, uint32_t len
     CC_SHA256_Update(&ctx,code,length);CC_SHA256_Final(md,&ctx);
     for(unsigned j=0;j<32;j++)snprintf(key+2*j,3,"%02x",md[j]);
 }
-/* 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly */
+/* Last result: same object, same serial and unchanged serial table means it is used directly */
 static const prog_t *g_pg_lp; static uint64_t g_pg_lser, g_pg_lgen; static NvProg *g_pg_lpr;
 #define lp g_pg_lp
 #define lser g_pg_lser
 #define lgen g_pg_lgen
 #define lpr g_pg_lpr
-static __unsafe_unretained NvProg *prog_get_arc(const prog_t *cp) {   // 只在提交线程调用 | Called only on the submit thread
+static __unsafe_unretained NvProg *prog_get_arc(const prog_t *cp) {   // Called only on the submit thread
     prog_t *p = (prog_t *)cp;
     uint64_t gen = g_ser_gen;
     if (p == lp && p->serial == lser && lpr && (gen == lgen || ser_unaffected(lgen, gen, lser))) { lgen = gen; return lpr; }
@@ -6414,7 +6414,7 @@ static void async_why(const NvProg *pr, uint64_t fresh_before) {
     if (why == 3) { int color = 0; for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i] && (S.chmask.mask >> (4 * i) & 0xf)) color = 1; why = color ? 4 : 3; }
     if (why == 1) nc[(S.ds.dt && S.ds.dw) ? 0 : S.ds.st ? 1 : !R.has_rt ? 2 : 3]++;   // in counting: writes depth / stencil test / no target / colour into a cube, array or 3D target
     n[why]++;
-    if (++total % 100 == 0) MLOG("[async-why] 当场翻译 %llu 个：程序写内存 %llu，遮挡计数中 %llu（写深度 %llu、开模板 %llu、无目标 %llu、颜色写非 2D %llu），无渲染目标 %llu，不写颜色 %llu，只写立方体 / 数组 / 3D %llu",
+    if (++total % 100 == 0) MLOG("[async-why] %llu translated on the spot: program writes memory %llu, inside an occlusion count %llu (depth write %llu, stencil on %llu, no target %llu, colour write not 2D %llu), no render target %llu, no colour write %llu, writes only cube / array / 3D %llu",
         (unsigned long long)total, (unsigned long long)n[0], (unsigned long long)n[1], (unsigned long long)nc[0], (unsigned long long)nc[1], (unsigned long long)nc[2], (unsigned long long)nc[3],
         (unsigned long long)n[2], (unsigned long long)n[3], (unsigned long long)n[4]);
 }
@@ -7413,7 +7413,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     else {
         static int frame_us = -1; if (frame_us < 0) frame_us = env_us("TOTK_PSO_PREDICT_FRAME_US", 4000);
         if (!scan_budget_left(&g_pp_budget, frame_us)) { if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; g_pp_rescans = 0; g_pp_more = 0; } }   // this frame's scans are spent
-        else if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; g_pp_rescans = 0; g_pp_more = 0; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
+        else if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; g_pp_rescans = 0; g_pp_more = 0; pso_predict_rest(); }   // First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
         else if (g_pp_more && g_pp_rescans < pso_rescans()) { g_pp_rescans++; pso_predict_rest(); }   // TOTK: the last scan stopped early: go on from here
         MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, bfn ? bfn : g_pso_fsfn, g_pso_lmap != NULL);
         ps = pso_new(d, pso_archive_key(&k, vs, fs, g_pso_lmap != NULL), &e); g_pp_sync++;
@@ -7743,7 +7743,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                         WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = vkey; item->fs_key = fkey; item->vs = vs; item->fs = fs; item->fsfn = fsfn; item->pso = k; item->object = ps;
                         warm_enqueue(item); g_warm_rps++;
                     } else if ([c[0] isEqualToString:@"B"] && c.count >= 4) {
-                        if (!warm_border(c, dict)) MLOG("【红】预热：边框色管线没建成（%s / %s）", c[2].UTF8String, c[3].UTF8String);
+                        if (!warm_border(c, dict)) MLOG("[red] warm-up: a border-colour pipeline was not built (%s / %s)", c[2].UTF8String, c[3].UTF8String);
                     } else if ([c[0] isEqualToString:@"C"] && c.count >= 2) {
                         NSString *key = c[1]; if (!key.length) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                         NvShader *cs = warm_shader(dict, key, 5);
@@ -9101,7 +9101,7 @@ static void pso_predict_rest(void) {
              (unsigned long long)g_pp_stop[0], (unsigned long long)g_pp_stop[1], (unsigned long long)g_pp_stop[2],
              (unsigned long long)g_pp_kicked, (unsigned long long)g_pp_taken, (unsigned long long)waits, wait_ns / 1e6,
              (unsigned long long)g_pp_sync, (unsigned long long)full, (unsigned long long)freed, busy);
-        MLOG("并行预编 至提交 %llu：扫描到程序或绑定变体还没解析的绘制 %llu 次，其中用已加载的着色器预测 %llu 次（查找共 %.1f ms）；为后台建管线描述符共 %.1f ms，缺补丁函数先交给后台编的猜测 %llu 条；后台为预测开编着色器库 %llu 个，绘制领用 %llu 个（等它编完 %llu 次共 %.1f ms）",
+        MLOG("parallel precompile up to submission %llu: %llu draws scanned whose program or binding variant was not resolved yet, %llu of them predicted from loaded shaders (lookups %.1f ms in all); %.1f ms building pipeline descriptors for the background, %llu guesses handed to the background while their patch function was missing; %llu shader libraries started in the background for predictions, %llu taken by draws (waited for %llu times, %.1f ms in all)",
              (unsigned long long)g_sub_serial, (unsigned long long)g_pp_unseen, (unsigned long long)g_pp_unseen_hit, g_pp_unseen_ns / 1e6, g_pp_desc_ns / 1e6, (unsigned long long)g_pp_vdefer,
              (unsigned long long)g_plib_kicked, (unsigned long long)g_plib_taken, (unsigned long long)g_plib_waits, g_plib_wait_ns / 1e6);
     }
@@ -11373,23 +11373,23 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     // The continued render pass may have been opened with fewer depth / stencil attachments (open modes 2 / 3 / 4): if the plane this draw needs is not attached, split before it (on reopen, attach per the new lookahead)
     if (g_rt_merged && g_enc_mode != 0 && (((S.ds.dt || S.ds.dw) && !g_pass.hd) || (S.ds.st && !g_pass.hs))) {
         static int once2; if (!once2++) MLOG("同目标续用：续用通道内绘制要的深度 / 模板平面没挂，在此切开（首例 通道 %llu）", g_stat_pass);
-        PD("M %llu 续用通道内绘制要的深度 / 模板平面没挂，在此切开", g_stat_pass); RP_WHY("cont-ds-plane"); rp_end(); }
-    if (g_rt_range_active && (!rt_range_pr_ro(pr) || !S.ds.dt || S.ds.dw || S.ds.st)) { RP_WHY("rt-range"); rp_end(); }   // 原encoder边界的外部写可见性不删 | The external write visibility at the original encoder boundary is not removed
+        PD("M %llu a draw in the continued pass needs a depth / stencil plane that is not attached: split here", g_stat_pass); RP_WHY("cont-ds-plane"); rp_end(); }
+    if (g_rt_range_active && (!rt_range_pr_ro(pr) || !S.ds.dt || S.ds.dw || S.ds.st)) { RP_WHY("rt-range"); rp_end(); }   // The external write visibility at the original encoder boundary is not removed
     int pc_kept = 0;   // TOTK_PASS_CONTINUE: this sampling draw was let into the continued pass (att_unstored_read below decides)
     if (g_rt_merged && draw_samples_rt(pr)) {
         if (g_pc_merged && !g_lay.active && !g_fz.active && !g_rt_range_active) pc_kept = 1;
-        else { static int once; if (!once++) MLOG("同目标续用：续用通道内绘制要采样附件，在此切开（首例 通道 %llu）", g_stat_pass);
-            PD("M %llu 续用通道内绘制要采样附件，在此切开", g_stat_pass); RP_WHY("cont-samples-att"); rp_end(); } }
+        else { static int once; if (!once++) MLOG("same-target continuation: a draw in the continued pass samples an attachment, split here (first case: pass %llu)", g_stat_pass);
+            PD("M %llu a draw in the continued pass samples an attachment: split here", g_stat_pass); RP_WHY("cont-samples-att"); rp_end(); } }
     // TOTK: the draw samples an attachment whose pixels are still only in tile memory: store them first (att_unstored_read).
     // Not in the second half of a fused pass: it reads the first half's pixels from tile memory by construction (fz_p2_draw).
     uint64_t att_rs[ATT_READS_MAX]; int att_n = att_store_on() ? draw_att_reads(pr, att_rs) : 0;
     if (pc_kept && !att_n) {   // the two binding walks disagree: end the pass as without TOTK_PASS_CONTINUE
-        PD("M %llu 续用通道内绘制要采样附件（附件读认不出），在此切开", g_stat_pass); RP_WHY("cont-samples-att"); rp_end(); pc_kept = 0; }
+        PD("M %llu a draw in the continued pass samples an attachment (attachment reads not recognised): split here", g_stat_pass); RP_WHY("cont-samples-att"); rp_end(); pc_kept = 0; }
     if (!(g_fz.active && g_fz.phase == 2) && att_unstored_read(att_rs, att_n)) {
         static int once; if (!once++) MLOG("[totk] a draw samples an attachment its pass drew: the pass is stored first (first: pass %llu)", g_stat_pass);
         if (pc_kept) { g_pc_split++; pc_kept = 0; RP_WHY("cont-samples-drawn-att"); } else RP_WHY("samples-drawn-att");
         PD("M %llu 绘制采样本通道画过的附件，先写回再画", g_stat_pass); rp_flush(); }
-    if (pc_kept) { g_pc_kept++; PD("M %llu 续用通道内绘制只采样没画过的附件，不切（TOTK_PASS_CONTINUE）", g_stat_pass); }
+    if (pc_kept) { g_pc_kept++; PD("M %llu a draw in the continued pass samples only attachments not drawn yet: not split (TOTK_PASS_CONTINUE)", g_stat_pass); }
     static id<MTLFunction> fz_fn;   // 合并通道后一个通道本次绘制的特化片元函数（nil = 用原版本） | Specialized fragment function for this draw of the later pass in a merged render pass (nil = use the original version)
     if (g_fz.active && g_enc && g_fz.phase == 2 && !fz_p2_draw(pr, dw, di, g_fz.lmap2, &fz_fn)) {   // 证不出：结束合并通道（前一个通道的结果照常写回），按后一个通道的原目标重开 | Cannot be proven: end the merged render pass (the earlier pass's result is stored as usual) and reopen with the later pass's original targets
         static int once3; if (!once3++) MLOG("可读 tile 通道合并：后一个通道的绘制证不出，退回分开（首例 通道 %llu）", g_stat_pass);
@@ -11421,7 +11421,7 @@ frz_plain:;
     }
     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
     if (g_enc && g_lay.active && !lay_draw_ok(pr, dw, di)) {   // TOTK: this draw cannot write its layer: end the layered pass, draw in a plain one
-        PD("L %llu 分层通道内的绘制不能写层号，在此切开", g_stat_pass); RP_WHY("layer-refuse"); rp_end(); g_lay.refuse = 1; g_lay.refused++; }
+        PD("L %llu a draw in the layered pass cannot write the layer index: split here", g_stat_pass); RP_WHY("layer-refuse"); rp_end(); g_lay.refuse = 1; g_lay.refused++; }
     if (g_pp_sharpen || g_pp_aa >= 2) pp_ui_hook(pr);   // sharpen / AA without a game FXAA draw: the canvas before the UI (totk_post.h)
     if (!g_mfx.scene_done && g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas && pr && pr->sh[0] && MFX_UI_DRAW(pr) && mfx_enabled())
         mfx_snapshot_scene();   // TOTK_MFX: first UI draw into the canvas: copy the finished scene first
@@ -12162,7 +12162,7 @@ static int copy_t2t_astc(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
 static void copy_t2t(const p_copy_t2t *c) {
     if (c->src) xv_check(c->src->serial, c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, "贴图拷贝源");
-    if (g_enc) RP_WHY("copy-t2t"); rp_flush();   // 挂起的纯清除通道先落地（零源候选在通道结束时才进集合）；下面 blit() 本来也会结束通道 | Land the pending pure-clear render pass first (zero-source candidates only enter the set when the render pass ends); the blit() below would end the render pass anyway
+    if (g_enc) RP_WHY("copy-t2t"); rp_flush();   // Land the pending pure-clear render pass first (zero-source candidates only enter the set when the render pass ends); the blit() below would end the render pass anyway
     if (c->dst) zskip_del(c->dst->serial);
     if (c->src && c->dst && c->sr.xoffset == 0 && c->sr.yoffset == 0 && c->dr.xoffset == 0 && c->dr.yoffset == 0
         && c->sr.width == (int)c->src->d.width && c->sr.height == (int)c->src->d.height && c->dr.width == (int)c->dst->d.width && c->dr.height == (int)c->dst->d.height) {
@@ -12540,7 +12540,7 @@ void mtl_exec(const uint8_t *p) {
                    costs ~50 us of GPU time on the M4. The checks in draw_inner (missing depth/stencil plane, sampling an
                    attachment) and in the clear ops still end the continued pass where needed. TOTK_RT_CONTINUE=0 turns it off. */
                 static int rt_cont = -1; if (rt_cont < 0) { const char *e = getenv("TOTK_RT_CONTINUE"); rt_cont = !(e && !strcmp(e, "0")); }
-                if (g_enc && g_enc_mode != 1 && !pend && R.has_rt && (tbdr_on() || rt_cont) && rt_same(&R.rt, r)) { g_rt_merged = 1; pc_note_continue(); if (!g_rt_merge_n++) MLOG("同目标续用：首例 通道 %llu", g_stat_pass); PD("M %llu 同目标续用通道", g_stat_pass); R.rt = *r; break; }
+                if (g_enc && g_enc_mode != 1 && !pend && R.has_rt && (tbdr_on() || rt_cont) && rt_same(&R.rt, r)) { g_rt_merged = 1; pc_note_continue(); if (!g_rt_merge_n++) MLOG("same-target continuation: first case: pass %llu", g_stat_pass); PD("M %llu same-target continued pass", g_stat_pass); R.rt = *r; break; }
                 if (!(pend && lc_push())) { RP_WHY(pend ? "set-rt+clear" : "set-rt"); rp_flush(); }   // TOTK_LAZY_CLEAR: clears with no draw wait for the next pass that attaches their targets
                 R.rt = *r; R.has_rt = 1; break;
             }
@@ -12551,7 +12551,7 @@ void mtl_exec(const uint8_t *p) {
                          (unsigned long long)R.rt.color[c->index]->serial, R.rt.color[c->index]->d.width, R.rt.color[c->index]->d.height, R.rt.color[c->index]->d.format, c->mask,
                          c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3], S.render_disabled ? " (rendering disabled)" : "");
                 if (S.render_disabled) { g_draw_skip[12]++; PD("E clear c%d skipped: rendering disabled", c->index); break; }   // TOTK: SetRenderEnable(false) / conditional
-                if (g_rt_merged) { RP_WHY("cont-clear"); rp_end(); }   // 续用的通道里来了清除：在此结束，清除照旧挂到下一个通道开头 | A clear arrived in a continued render pass: end it here, and the clear is attached to the start of the next render pass as usual
+                if (g_rt_merged) { RP_WHY("cont-clear"); rp_end(); }   // A clear arrived in a continued render pass: end it here, and the clear is attached to the start of the next render pass as usual
                 if (c->index < 0 || c->index >= R.rt.n || !R.rt.color[c->index]) { RED_ONCE(5, "清色目标 %d 无效", c->index); break; }
                 if (g_enc || c->mask != 0xf || !scissor_full(R.rt.color[c->index], &R.rt.cview[c->index], R.rt.has_cview[c->index])) { if ((c->mask & 0xf) && !S.render_disabled) clear_quad(c); break; }
                 R.clear_c[c->index] = 1; R.cc[c->index] = MTLClearColorMake(c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3]);
