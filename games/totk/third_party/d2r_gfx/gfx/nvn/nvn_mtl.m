@@ -1067,6 +1067,12 @@ void *objc_autoreleasePoolPush(void); void objc_autoreleasePoolPop(void *);
 static void *g_sub_pool;
 static int g_ruler_truth = -1, g_ruler_pending;
 static int tbdr_on(void);
+/* TOTK: the pieces of the DM_NVN_TBDR bundle, each switchable alone with DM_NVN_TBDR_<NAME>=1 (all off by default;
+   DM_NVN_TBDR=1 still turns every piece on). See tbdr_piece near tbdr_on. TB_IDX is not a switch: it only carries
+   the time spent building the per-submission lookahead index (mtl_sub_index), which STORE / XV / DEFER / FUSE need. */
+enum { TB_STORE, TB_UDC, TB_XV, TB_LOAD, TB_DS, TB_HOIST, TB_DEFER, TB_FUSE, TB_ZSKIP, TB_RANGE, TB_GUARDS, TB_N, TB_IDX = TB_N };
+static int tbdr_piece(int k); static int tbdr_any(void); static void tb_log(void);
+static uint64_t g_tb_hit[TB_N + 1], g_tb_ns[TB_N + 1], g_tb_drop;
 
 /* TOTK: cube-face-set pass groups (nvn_cube_group.h, included before draw_inner): the consecutive one-triangle passes that
    fill the six faces of a cube level through six attachments are landed as one layered pass per format / level size. */
@@ -1095,6 +1101,7 @@ void mtl_sub_begin(void) {
     mtl_init(); g_sub_serial++;
     { static int ka; if (!ka) { ka = 1; keepalive_start(); } atomic_store(&g_last_sub_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); }
     if (tbdr_on() == 0 && g_ruler_pending) { g_ruler_truth = 0; g_ruler_pending = 0; MLOG("DM_NVN_RULER：切到被测模式"); }
+    tb_log();
     defer_drain();
     defer_reset();
     warm_claim();
@@ -2048,7 +2055,7 @@ static void mtl_sub_split(void) {
 }
 // Called where a new encoder is about to be opened and none is open.
 static void chunk_maybe_split(void) {
-    if (!g_chunk_size || !g_cb || g_enc || g_frz_on || tbdr_on() || pt_active()) return;
+    if (!g_chunk_size || !g_cb || g_enc || g_frz_on || tbdr_any() || pt_active()) return;
     if (g_stat_draw - g_chunk_mark < (uint64_t)(g_sub_chunks ? g_chunk_size : g_chunk_first)) return;
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     mtl_sub_split();
@@ -3983,7 +3990,7 @@ void zskip_test_add(const char *key, int ubo_slot, int vec, int comp) {
 }
 int zskip_test_count(void) { return g_zskip_count; }
 static int g_zskip_env = -1;   // DM_NVN_ZSKIP 的缓存（−1 = 未读）。本函数每次绘制都调，getenv 在提交路径占过约 8%；单测运行中切开关后把它置回 −1 | Cache of DM_NVN_ZSKIP (−1 = not read). This function is called on every draw, and getenv once took about 8% of the submit path; unit tests set it back to −1 after toggling the switch mid-run
-static int zskip_on(void) { if (g_zskip_env < 0) { const char *e = getenv("DM_NVN_ZSKIP"); g_zskip_env = !e || strcmp(e, "0"); } return g_zskip_env && tbdr_on(); }
+static int zskip_on(void) { if (g_zskip_env < 0) { const char *e = getenv("DM_NVN_ZSKIP"); g_zskip_env = !e || strcmp(e, "0"); } return g_zskip_env && tbdr_piece(TB_ZSKIP); }
 static void zskip_clear(void) { g_zskip_n = 0; memset(g_zskip_cand_ok, 0, sizeof g_zskip_cand_ok); }
 static void zskip_del(uint64_t ser) { for (int i = 0; i < g_zskip_n;) if (g_zskip_zero[i].ser == ser) g_zskip_zero[i] = g_zskip_zero[--g_zskip_n]; else i++; }
 static int zskip_has(uint64_t ser, int lv, int sl) { for (int i = 0; i < g_zskip_n; i++) if (g_zskip_zero[i].ser == ser && g_zskip_zero[i].level == lv && g_zskip_zero[i].slice == sl) return 1; return 0; }
@@ -4258,6 +4265,45 @@ static int udc_on(void) {
 // TOTK defaults to the conservative attachment/load/store path.
 // DM_NVN_TBDR=1 enables experimental D2R pass rewriting for equivalence diagnostics.
 static int tbdr_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TBDR"), *r = getenv("DM_NVN_RULER"); v = e && !strcmp(e, "1"); g_ruler_truth = r && !strcmp(r, "1"); if (!v) MLOG("TOTK: TBDR pass optimizations disabled; DM_NVN_TBDR=1 opts into experimental pass rewriting"); } return v && !g_ruler_truth; }
+/* TOTK: per-piece switches for measuring the bundle one piece at a time. DM_NVN_TBDR_<NAME>=1 turns on one piece:
+     STORE  store lookahead: a store becomes DontCare when the same submission fully clears the attachment before reading it
+     UDC    attachments loaded and never written in the pass store DontCare (DM_NVN_UNWRITTEN_DC=0 still vetoes it)
+     XV     cross-submission ledger: undecided colour stores skipped after a trial period (implies STORE)
+     LOAD   load elision: Load -> DontCare when the pass's first draw provably covers the whole attachment
+     DS     depth / stencil attached only when a lookahead finds the pass needs them
+     HOIST  clear-only passes between a pass and its same-target continuation run before it
+     DEFER  pass deferral (DM_NVN_DEFER)
+     FUSE   readable-tile pass merging
+     ZSKIP  zero-source draw skipping (DM_NVN_ZSKIP)
+     RANGE  range continuation (also needs DM_NVN_RT_RANGE=1)
+     GUARDS only the side effects every piece brings: mid-submission commits, async shaders and layered passes off
+   Any piece also applies GUARDS (those features assume the TBDR rewrites are off). The remaining DM_NVN_TBDR users
+   (world freeze, runtime extrapolation, NOFXAA, bloom 1/4, same-target continuation) still follow DM_NVN_TBDR only. */
+static const char *const g_tb_name[TB_N + 1] = { "STORE", "UDC", "XV", "LOAD", "DS", "HOIST", "DEFER", "FUSE", "ZSKIP", "RANGE", "GUARDS", "IDX" };
+static int g_tb_mask = -1;
+static int tb_mask(void) {
+    if (g_tb_mask < 0) { int m = 0; char n[48];
+        for (int k = 0; k < TB_N; k++) { snprintf(n, sizeof n, "DM_NVN_TBDR_%s", g_tb_name[k]); const char *e = getenv(n); if (e && !strcmp(e, "1")) m |= 1 << k; }
+        if (m >> TB_XV & 1) m |= 1 << TB_STORE;
+        g_tb_mask = m;
+        if (m) { char l[160]; int o = 0; for (int k = 0; k < TB_N; k++) if (m >> k & 1) o += snprintf(l + o, sizeof l - o, " %s", g_tb_name[k]); MLOG("TOTK: TBDR pieces on:%s (with GUARDS)", l); } }
+    return g_tb_mask;
+}
+static int tbdr_piece(int k) { return tbdr_on() || ((tb_mask() >> k & 1) && !g_ruler_truth); }
+static int tbdr_any(void) { return tbdr_on() || (tb_mask() && !g_ruler_truth); }
+static void tb_log(void) {   // one line every 600 frames while any piece is on: per-piece hits and CPU time since the last line
+    static uint64_t last_f, hit0[TB_N + 1], ns0[TB_N + 1], drop0;
+    uint64_t f = atomic_load(&g_cur_frame); if (!tbdr_any() || f / 600 == last_f / 600) return;
+    uint64_t df = f > last_f ? f - last_f : 1; last_f = f;
+    { static int z0; g_tb_hit[TB_ZSKIP] += (uint64_t)(g_zskip_count - z0); z0 = g_zskip_count; }
+    char l[900]; int o = 0;
+    for (int k = 0; k <= TB_N; k++) { if (k == TB_GUARDS) continue;
+        o += snprintf(l + o, sizeof l - o, " %s %llu/%.2fms", g_tb_name[k], (unsigned long long)(g_tb_hit[k] - hit0[k]), (g_tb_ns[k] - ns0[k]) / 1e6 / df);
+        hit0[k] = g_tb_hit[k]; ns0[k] = g_tb_ns[k]; }
+    MLOG("[tbdr] frame %llu, over %llu frames (hits / CPU ms per frame):%s; passes dropped without Metal targets %llu",
+         (unsigned long long)f, (unsigned long long)df, l, (unsigned long long)(g_tb_drop - drop0));
+    drop0 = g_tb_drop;
+}
 int dm_nvn_ruler_truth(void) { tbdr_on(); return g_ruler_truth; }   // 视觉尺子真值阶段（宿主侧的被测设置据此让开，如 3D 渲染比例） | Visual ruler ground-truth phase (host-side settings under test yield accordingly, e.g. the 3D render scale)
 static int rt_range_on(void) { static int v = -1; if (v < 0) { const char *e=getenv("DM_NVN_RT_RANGE"); v=e && !strcmp(e,"1"); } return v; }   // 窄候选，缺省关 | Narrow candidate, off by default
 static uint64_t g_sd_dead_bytes, g_sd_n_dead, g_sd_n_all;
@@ -4332,7 +4378,7 @@ static int xv_first_good(uint64_t ser, uint32_t lv, uint32_t sl) { for (int i = 
 static int xv_present(uint64_t ser) { for (int i = 0; i < g_xv_npresent; i++) if (g_xv_present[i] == ser) return 1; return 0; }
 static void xv_forward(void);
 static int tbdr_on(void);
-static int xv_on(void) { static int off = -1; if (off < 0) { const char *e = getenv("DM_NVN_XV"); off = e && !strcmp(e, "0"); } return !off && tbdr_on(); }
+static int xv_on(void) { static int off = -1; if (off < 0) { const char *e = getenv("DM_NVN_XV"); off = e && !strcmp(e, "0"); } return !off && tbdr_piece(TB_XV); }
 void mtl_xv_window_tex(uint64_t serial) { if (!xv_present(serial) && g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = serial; }   // 窗口（交换链）贴图：永不进账本 | Window (swapchain) texture: never enters the ledger
 void xv_test_counts(int *dc, int *viol) { if (dc) *dc = (int)g_xv_dc; if (viol) *viol = (int)g_xv_viol; }
 static void sd_finish(void);
@@ -4793,7 +4839,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
         any = 1;
         pd.colorAttachments[i].loadAction = R.clear_c[i] ? MTLLoadActionClear : MTLLoadActionLoad;
         pd.colorAttachments[i].clearColor = R.cc[i];
-        int cov = tbdr_on() && !R.clear_c[i] && (g_fd_dw || g_fd_di) && fz_load_covers(i, pd.colorAttachments[i].texture, pd.colorAttachments[i].level);
+        int cov = tbdr_piece(TB_LOAD) && !R.clear_c[i] && (g_fd_dw || g_fd_di) && fz_load_covers(i, pd.colorAttachments[i].texture, pd.colorAttachments[i].level);
         if (!R.clear_c[i] && (g_fd_dw || g_fd_di) && !cov) PD("Q %llu c%d 读入不可省 why=%d", g_stat_pass + 1, i, g_fd_why);
         if (cov) {
             static int probe = -1; if (probe < 0) { probe = getenv("DM_NVN_LOADPROBE") ? atoi(getenv("DM_NVN_LOADPROBE")) : 0; if (probe) MLOG("DM_NVN_LOADPROBE：读入可省的附件改清成哨兵色并回读核对"); }
@@ -4802,7 +4848,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
                 if (!g_lp) g_lp = [NSMutableArray array];
                 [g_lp addObject:@[pd.colorAttachments[i].texture, @(pd.colorAttachments[i].level), @(pd.colorAttachments[i].slice), @(g_stat_pass + 1), @(i), @(R.rt.color[i]->serial), @(pm)]]; }
             else pd.colorAttachments[i].loadAction = MTLLoadActionDontCare;
-            g_fd_n++;
+            g_fd_n++; g_tb_hit[TB_LOAD]++;
         }
         xv_touch_add(R.rt.color[i]->serial, (uint32_t)pd.colorAttachments[i].level, (uint32_t)pd.colorAttachments[i].slice,
                      pd.colorAttachments[i].loadAction != MTLLoadActionLoad);
@@ -4855,6 +4901,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
         PD("P %llu none %lux%lu (no render target)", g_stat_pass + 1, (unsigned long)w, (unsigned long)h);
     }
     if (!any) {
+        g_tb_drop++;
         static int n; if (n++ < 8) {   /* TOTK: report what the attachments were (the pass is skipped, its draws are lost) */
             for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) MLOG("【红】pass without Metal targets (clear_only %d): color %d serial %llu format %#x %ux%u target %d view %s%#x -> %s", clear_only, i,
                 (unsigned long long)R.rt.color[i]->serial, R.rt.color[i]->d.format, R.rt.color[i]->d.width, R.rt.color[i]->d.height, R.rt.color[i]->d.target,
@@ -5648,7 +5695,7 @@ static int async_shaders(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("TOTK_ASYNC_SHADERS");
-        on = !(e && !strcmp(e, "0")) && totk_rt_can_translate() && !tbdr_on();
+        on = !(e && !strcmp(e, "0")) && totk_rt_can_translate() && !tbdr_any();
         if (on) totk_rt_set_ready_hook(async_ready);
         MLOG("[async-shaders] %s", on ? "on: new shaders and pipelines are prepared in the background" : "off");
     }
@@ -8716,7 +8763,7 @@ static const uint8_t *g_exec_cur;   // 回放中当前这条操作（含） | Th
 static void sd_need(sd_att *t, int why) { if (!t->state) { t->state = 1; t->why = (uint8_t)why; } }   // why：1 绘制作贴图读 2 作附件先画后清 3 拷贝 4 清贴图 5 扫到末尾未定 6 无起点 / 索引不可用 | why: 1 a draw reads it as a texture 2 as an attachment, drawn before cleared 3 copy 4 texture clear 5 scanned to the end undecided 6 no start point / index unavailable
 static int sdx_decide(uint8_t st[9]);   // 写回前瞻判定（索引见 mtl_sub_index） | Store lookahead decision (for the index see mtl_sub_index)
 // ---------- TOTK: layered passes (see g_lay) ----------
-static int lay_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_LAYER_MERGE"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_LAYER_MERGE=0：分层通道合并关闭"); } return v && !tbdr_on(); }
+static int lay_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_LAYER_MERGE"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_LAYER_MERGE=0: layered pass merging off"); } return v && !tbdr_any(); }
 // One colour target, no depth, a view selecting one layer: *layer = that layer.
 static int lay_single(const p_set_rt *r, int *layer) {
     if (r->n != 1 || !r->color[0] || r->depth || !r->has_cview[0] || !r->cview[0].set_layers || r->cview[0].nlayers != 1) return 0;
@@ -8788,15 +8835,17 @@ static uint64_t lay_gpu(int offset) {   // GPU address of the constant `offset` 
 void mtl_layer_stats(uint64_t v[4]) { v[0] = g_stat_pass; v[1] = g_lay.passes; v[2] = g_lay.merges; v[3] = g_lay.refused; }
 static void sd_finish(void) {
     if (!g_nsd) return;
-    if (!tbdr_on()) {   // 优化全关：一律写回 | All optimizations off: always write back
+    int tb_st = tbdr_piece(TB_STORE), tb_udc = tbdr_piece(TB_UDC);
+    if (!tb_st && !tb_udc) {   // All store pieces off: always write back
         for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i];
             enc_r_store(g_enc, t->depth, MTLStoreActionStore, (NSUInteger)t->idx); }
         g_nsd = 0; return; }
-    uint8_t nst[9];
-    if (sdx_decide(nst)) { for (int i = 0; i < g_nsd; i++) if (nst[i] == 2) g_sd[i].state = 2; else sd_need(&g_sd[i], nst[i] >> 2); }
+    uint8_t nst[9]; uint64_t tb_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (tb_st && sdx_decide(nst)) { for (int i = 0; i < g_nsd; i++) if (nst[i] == 2) g_sd[i].state = 2; else sd_need(&g_sd[i], nst[i] >> 2); }
     else for (int i = 0; i < g_nsd; i++) sd_need(&g_sd[i], 6);   // 列表外结束的通道 / 索引不可用：一律写回 | Pass ended outside the list / index unavailable: always write back
+    g_tb_ns[TB_STORE] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tb_t0;
     for (int i = 0; i < g_nsd; i++) {
-        sd_att *t = &g_sd[i]; int udc_dead = udc_on() && t->load && !t->wrote;
+        sd_att *t = &g_sd[i]; int udc_dead = tb_udc && udc_on() && t->load && !t->wrote;
         // 与窗口贴图写在同一个通道里的颜色附件不进账本：它是出图链上的一环，不是「每帧先重置再用」的瞬态附件。
         // 局内「放大」通道一次写两张——场景贴图 + 窗口贴图，界面合成并进了同一通道，所以局内没人回读场景贴图；游戏一停画 3D（读取画面）
         // 就改由单独的合成通道回头采它。「要进读取画面」在上一帧提交之后才知道，预判拦不住：iPad 真全屏每个安装第一次换幕必撞一次
@@ -8812,6 +8861,7 @@ static void sd_finish(void) {
         if (xvcand && !xvdead) xv_set(t->ser, t->lv, t->sl, XV_PROBE, xtag);   // 试用期：照常写回，只跟踪下一次触碰 | Trial period: write back as usual, only track the next touch
         int dead = t->state == 2 || udc_dead || xvdead; MTLStoreAction sa = dead ? MTLStoreActionDontCare : MTLStoreActionStore;
         if (xvdead) { xv_set(t->ser, t->lv, t->sl, XV_INVALID, xtag); g_xv_dc++; }
+        if (t->state == 2) g_tb_hit[TB_STORE]++; if (udc_dead) g_tb_hit[TB_UDC]++; if (xvdead) g_tb_hit[TB_XV]++;
         enc_r_store(g_enc, t->depth, sa, (NSUInteger)t->idx);
         g_sd_n_all++; if (dead) { g_sd_n_dead++; g_sd_dead_bytes += t->bytes; g_bw_store -= t->bytes; if (udc_dead) g_udc_saved_bytes += t->bytes; }
         if (!t->state) t->why = 5;
@@ -9576,7 +9626,8 @@ static void sdx_walk(const uint8_t *p, int depth) {
     }
 }
 void mtl_sub_index(const uint64_t *h, int n) {   // 提交开始（hle_nvn.c QueueSubmitCommands）：建本次提交的写回前瞻索引 | Start of submit (hle_nvn.c QueueSubmitCommands): build this submit's store lookahead index
-    g_xv_ntouch = 0; g_sdx_n = g_sdx_nop = 0; g_rtx_n = g_drx_n = 0; g_exec_seq = 0; g_sdx_ok = tbdr_on();
+    g_xv_ntouch = 0; g_sdx_n = g_sdx_nop = 0; g_rtx_n = g_drx_n = 0; g_exec_seq = 0; g_sdx_ok = tbdr_piece(TB_STORE) || tbdr_piece(TB_DEFER) || tbdr_piece(TB_FUSE);
+    uint64_t tb_t0 = g_sdx_ok ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     if (!g_sdx_ok) { g_xv_n = 0; g_xv_block = 1; return; }   // 索引不可用：账本清空、本次提交不新增（没法核下一次触碰） | Index unavailable: clear the ledger and add nothing in this submit (the next touch cannot be verified)
     g_xv_block = 0;
     memset(g_sdx_hk, 0, sizeof g_sdx_hk); g_sdx_nb = 0;
@@ -9587,7 +9638,7 @@ void mtl_sub_index(const uint64_t *h, int n) {   // 提交开始（hle_nvn.c Que
                                      for (int k = 0; k < 32; k++) g_pp_slot[st][128 + k] = S.img[st][k] ? h_ser(S.img[st][k]) : 0; }
     g_sdx_ren = 1;
     for (int i = 0; i < n && g_sdx_ok; i++) sdx_walk((const uint8_t *)h[i], 0);
-    if (!g_sdx_ok) return;
+    if (!g_sdx_ok) { g_tb_ns[TB_IDX] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tb_t0; return; }
     // 计数排序到桶：事件本按序号追加，同一序号内 READ 先于 ATT（同一绘制先判读后判附件），稳定散列后桶内有序
     // Counting sort into buckets: events are appended in sequence-number order, and within the same sequence number READ precedes ATT (the same draw is judged for reads first, then attachments), so after a stable scatter each bucket is ordered
     memset(g_sdx_bcnt, 0, (g_sdx_nb + 1) * sizeof *g_sdx_bcnt);
@@ -9596,6 +9647,7 @@ void mtl_sub_index(const uint64_t *h, int n) {   // 提交开始（hle_nvn.c Que
     for (uint32_t b = 0; b < g_sdx_nb; b++) g_sdx_bcnt[b] = g_sdx_bst[b];
     for (uint32_t i = 0; i < g_sdx_n; i++) g_sdx_tmp[g_sdx_bcnt[sdx_bucket(g_sdx[i].ser, 0)]++] = g_sdx[i];
     sdx_ev *t = g_sdx; g_sdx = g_sdx_tmp; g_sdx_tmp = t;
+    g_tb_hit[TB_IDX]++; g_tb_ns[TB_IDX] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tb_t0;
     xv_forward();
 }
 static void sdx_seq(const uint8_t *p) {   // mtl_exec 每条操作：序号与索引核对（不符即作废，余下一律写回） | Every operation in mtl_exec: check the sequence number against the index (on mismatch invalidate, and store everything for the rest)
@@ -9796,9 +9848,9 @@ static int prog_samples_ser(const prog_t *pg, uint64_t tex[6][128], uint64_t img
 static int g_defer_env_ab, g_defer_env_off;   // 环境开关：每次提交开始（defer_reset）读一次，热路径不调 getenv | Environment switches: read once at the start of each submit (defer_reset); the hot path does not call getenv
 static void defer_env(void) { const char *x = getenv("DM_NVN_DEFER_AB"), *e = getenv("DM_NVN_DEFER"); g_defer_env_ab = x && !strcmp(x, "1"); g_defer_env_off = e && !strcmp(e, "0"); }
 static int defer_on(void) {
-    if (!g_defer_env_ab) return tbdr_on() && !g_defer_env_off;
+    if (!g_defer_env_ab) return tbdr_piece(TB_DEFER) && !g_defer_env_off;
     if (g_defer_ab < 0) { g_defer_ab = 0; g_defer_ab_on = 0; }
-    return tbdr_on() && (g_defer_ab || g_defer_ab_on); }
+    return tbdr_piece(TB_DEFER) && (g_defer_ab || g_defer_ab_on); }
 static int defer_handle_sub(uint64_t h, const p_set_rt *r, int k, int cover) {
     int tid = (int)(h & 0xfffff); if (!tid || tid >= g_ntreg || !g_treg[tid].ok) return 0;
     uint64_t ser; int lv, sl; rt_sub(r, k, &ser, &lv, &sl); if (!ser || g_treg[tid].t.serial != ser) return 0;
@@ -10073,7 +10125,7 @@ static void fuse_try(void) {
             case OP_SET_RT: {
                 int pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i];
                 if (rt_same(&R.rt, a)) {
-                    if (g_enc_mode == 1 || pend || !R.has_rt || !tbdr_on() || nreuse >= 8) return;
+                    if (g_enc_mode == 1 || pend || !R.has_rt || !tbdr_piece(TB_FUSE) || nreuse >= 8) return;
                     reuse[nreuse++] = p; continue;
                 }
                 r2 = a; r2op = p; continue;
@@ -11407,14 +11459,16 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
 #endif
     int defer_q_draw = !g_enc && !g_defer_replaying && g_defer_natq > 0;   // Q 开通道的这次绘制：通道照常经 hoist_try / fuse_try 开好后，先回放 P 再画本次 | The draw that opens Q's render pass: after the render pass is opened as usual through hoist_try / fuse_try, replay P first and then draw this one
     if (g_frz_state) goto frz_plain;   // 世界冻结的完整帧 / 冻结帧：不前提、不推迟、不合并（跳通道的状态机要看到每一条设目标） | Full frame / frozen frame of world freeze: no hoisting, no deferral, no merging (the pass-skipping state machine must see every set-target)
-    if (!g_enc && tbdr_on()) hoist_try();   // 先把夹在本通道与其续用之间的纯清除通道提前做掉（rp_begin_ex 之前，不占本通道） | First hoist and execute the pure-clear render passes sandwiched between this render pass and its continuation (before rp_begin_ex, not occupying this render pass)
+    if (!g_enc && tbdr_piece(TB_HOIST)) { uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), n0 = g_hoist_groups; hoist_try(); g_tb_hit[TB_HOIST] += g_hoist_groups - n0; g_tb_ns[TB_HOIST] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; }   // First hoist and execute the pure-clear render passes sandwiched between this render pass and its continuation (before rp_begin_ex, not occupying this render pass)
     // 推迟判定在 hoist_try 之后：被提前的纯清除通道在前瞻里跳过，P 的同目标续段才认得出来
     // The deferral decision comes after hoist_try: hoisted pure-clear render passes are skipped in the lookahead, and only then can P's same-target continuation segment be recognized
-    if (!g_enc && tbdr_on() && !defer_has_in_p() && !g_defer_replaying && !g_fz.active && !g_fz_checking && g_exec_next) { defer_try(dw, di); if (g_defer_cur->active && g_defer_cur->in_p) { g_draw_skip[7]++; return; } }
-    if (!g_enc && tbdr_on() && !g_fz_checking) fuse_try();   // 可读 tile 通道合并缺省开；结构 / 本像素证明不成立仍退回普通通道，CHECK 重画时不重入 | Readable tile render pass merge is on by default; when the structure / same-pixel proof does not hold it still falls back to a normal render pass, and it is not re-entered during the CHECK redraw
+    if (!g_enc && tbdr_piece(TB_DEFER) && !defer_has_in_p() && !g_defer_replaying && !g_fz.active && !g_fz_checking && g_exec_next) { uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); defer_try(dw, di); g_tb_ns[TB_DEFER] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; if (g_defer_cur->active && g_defer_cur->in_p) { g_draw_skip[7]++; g_tb_hit[TB_DEFER]++; return; } }
+    if (!g_enc && tbdr_piece(TB_FUSE) && !g_fz_checking) { uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), n0 = g_fz_n; fuse_try(); g_tb_hit[TB_FUSE] += g_fz_n - n0; g_tb_ns[TB_FUSE] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; }   // Readable tile render pass merge is on by default; when the structure / same-pixel proof does not hold it still falls back to a normal render pass, and it is not re-entered during the CHECK redraw
 frz_plain:;
-    int need = g_enc || !tbdr_on() ? 3 : pass_ds_need(), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 都不挂 3 只挂模板 4 只挂深度 | 2 attach neither, 3 attach stencil only, 4 attach depth only
+    uint64_t tb_t0 = g_enc || !tbdr_piece(TB_DS) ? 0 : clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    int need = !tb_t0 ? 3 : pass_ds_need(), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 attach neither, 3 attach stencil only, 4 attach depth only
     int skip_d = mode != 0;
+    if (tb_t0) { g_tb_ns[TB_DS] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tb_t0; if (need != 3) g_tb_hit[TB_DS]++; }   // passes opened without depth or stencil
     if (!g_enc && !g_cg.replaying && cg_on()) {   // TOTK: cube-face-set pass groups (nvn_cube_group.h)
         if (cg_take(pr, dw, di)) return;
         if (g_cg.ng) cg_flush();   // every other draw runs after the pending groups (order, and reads of their cubes)
@@ -12529,9 +12583,9 @@ void mtl_exec(const uint8_t *p) {
                 if (defer_begin_q(p)) break;
                 int pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i];
                 if (g_enc && g_lay.active && !pend && lay_continue(r)) break;   // TOTK: another layer of the layered pass
-                if (g_enc && !pend && R.has_rt && tbdr_on() && rt_range_same(&R.rt,r)) {
-                    g_rt_merged = g_rt_range_active = g_rt_range_pending = 1; R.rt = *r; break; }
-                if (g_enc && g_fz.active && g_fz.phase == 1 && fz_reuse_op(p) && !pend && g_enc_mode != 1 && R.has_rt && tbdr_on() && rt_same(&g_fz.rt1, r)) {
+                if (g_enc && !pend && R.has_rt && tbdr_piece(TB_RANGE) && rt_range_same(&R.rt,r)) {
+                    g_tb_hit[TB_RANGE]++; g_rt_merged = g_rt_range_active = g_rt_range_pending = 1; R.rt = *r; break; }
+                if (g_enc && g_fz.active && g_fz.phase == 1 && fz_reuse_op(p) && !pend && g_enc_mode != 1 && R.has_rt && tbdr_piece(TB_FUSE) && rt_same(&g_fz.rt1, r)) {
                     g_rt_merged = 1; if (!g_rt_merge_n++) MLOG("同目标续用：首例 通道 %llu", g_stat_pass); PD("M %llu 同目标续用通道", g_stat_pass); break; }
                 // 不续用只为清除开的通道；少挂深度 / 模板的可续用（绘制前核平面）
                 // Do not continue a render pass opened only for a clear; one with fewer depth / stencil attachments can be continued (check the planes before drawing)
