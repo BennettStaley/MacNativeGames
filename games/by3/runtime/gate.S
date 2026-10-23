@@ -21,7 +21,6 @@ _runtime_gate:
     sub sp, sp, #16
     stp x16, xzr, [sp]
 2:  ldp x16, x17, [x16]
-    // 开 256 字节帧，保存 x0..x30（x0..x29 成对，x30 单独），门可读改 x0..x30
     // Open a 256-byte frame and save x0..x30 (x0..x29 in pairs, x30 alone); the gate may read and modify x0..x30
     sub sp, sp, #800
     stp x0, x1, [sp, #0]
@@ -62,7 +61,7 @@ _runtime_gate:
     str x9, [sp, #776]
     mrs x9, fpcr
     str x9, [sp, #784]
-    mov x0, x30              // 返回点 = 门标识 | Return point = gate identifier
+    mov x0, x30              // Return point = gate identifier
     mov x1, sp               // regs
     bl _runtime_dispatch
     ldr x9, [sp, #808]          // give the host stack back to this thread
@@ -94,8 +93,6 @@ _runtime_gate:
     ldp q26, q27, [sp, #672]
     ldp q28, q29, [sp, #704]
     ldp q30, q31, [sp, #736]
-    // 门可改任意通用寄存器：svc 出参在 x0..x8，mrs cntpct 的目标可以是任意 xN（sdk 33 处里 14 处是 x19..x23）
-    // ⇒ x0..x29 全部回读（x18 是苹果平台寄存器，客体的 x18 已改写到线程槽，跳过不碰）
     // A gate may modify any general-purpose register: svc out-parameters are in x0..x8, and the target of mrs cntpct can be any xN (14 of the 33 sites in sdk are x19..x23)
     // ⇒ read back all of x0..x29 (x18 is the Apple platform register; the guest's x18 has been rewritten to the thread slot, so skip it and leave it alone)
     ldp x0, x1, [sp, #0]

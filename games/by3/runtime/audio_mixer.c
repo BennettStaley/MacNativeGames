@@ -55,7 +55,7 @@ static _Atomic float device_volume = 1.0f;
 static unsigned audio_revision(const AudioRenderer *r) { unsigned byte=r->revision>>24;return byte>='0'?byte-'0':0; }
 static void report_once(Mixer *m, unsigned bit, const char *msg, int value) {
     if (m->reported & (1u << bit)) return;
-    m->reported |= 1u << bit; fprintf(stderr, "[totk-audio] 【红】%s (%d)\n", msg, value);
+    m->reported |= 1u << bit; fprintf(stderr, "[totk-audio] [red] %s (%d)\n", msg, value);
 }
 
 /* Diagnostic recording is optional. The render thread only copies to pre-touched
@@ -100,7 +100,7 @@ static int prefill_blocks(void) {   // read once before the device starts (audio
     static int blocks = -2;
     if (blocks == -2) {
         const char *e = getenv("TOTK_AUDIO_PREFILL_MS"); int b = prefill_blocks_for(e);
-        if (b < 0) { fprintf(stderr, "[totk-audio] 【红】TOTK_AUDIO_PREFILL_MS=%s is not 0..500 ms: using 20\n", e); b = 4; }
+        if (b < 0) { fprintf(stderr, "[totk-audio] [red] TOTK_AUDIO_PREFILL_MS=%s is not 0..500 ms: using 20\n", e); b = 4; }
         fprintf(stderr, "[totk-audio] output starts after %d ms of queued audio (TOTK_AUDIO_PREFILL_MS%s)\n", b * 5, e && *e ? "" : ", default");
         blocks = b;
     }
@@ -139,13 +139,13 @@ static void output_open(Mixer *m, int rate) {
     AudioComponentDescription d = {kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput, kAudioUnitManufacturer_Apple, 0, 0};
 #endif
     AudioComponent c = AudioComponentFindNext(NULL, &d);
-    if (!c || AudioComponentInstanceNew(c, &m->unit)) { fprintf(stderr, "[totk-audio] 【红】no default output device: mixing without sound\n"); return; }
+    if (!c || AudioComponentInstanceNew(c, &m->unit)) { fprintf(stderr, "[totk-audio] [red] no default output device: mixing without sound\n"); return; }
     AudioStreamBasicDescription f = {(Float64)rate, kAudioFormatLinearPCM, kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, 8, 1, 8, 2, 32, 0};
     AURenderCallbackStruct cb = {pull, m};
     if (AudioUnitSetProperty(m->unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f) ||
         AudioUnitSetProperty(m->unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb) ||
         AudioUnitInitialize(m->unit) || AudioOutputUnitStart(m->unit)) {
-        fprintf(stderr, "[totk-audio] 【红】CoreAudio output setup failed: mixing without sound\n"); AudioComponentInstanceDispose(m->unit); return;
+        fprintf(stderr, "[totk-audio] [red] CoreAudio output setup failed: mixing without sound\n"); AudioComponentInstanceDispose(m->unit); return;
     }
     m->unit_ok = 1; fprintf(stderr, "[totk-audio] CoreAudio output %d Hz stereo\n", rate);
 }
@@ -538,7 +538,7 @@ static void mix_effects(AudioRenderer *r, int mix) {
         if(e->type==8) { mix_capture(r,mix,e);continue; }
         if(e->type==7) { mix_limiter(r,mix,id); continue; }
         if(e->type!=5) {
-            if(e->enabled && e->type<32 && !(m->effect_reported&(1u<<e->type))) { m->effect_reported|=1u<<e->type; fprintf(stderr,"[totk-audio] 【红】effect type %u not implemented\n",e->type); }
+            if(e->enabled && e->type<32 && !(m->effect_reported&(1u<<e->type))) { m->effect_reported|=1u<<e->type; fprintf(stderr,"[totk-audio] [red] effect type %u not implemented\n",e->type); }
             continue;
         }
         Reverb3dParam *p=&s->param; float *input[6]={0},*output[6]={0};

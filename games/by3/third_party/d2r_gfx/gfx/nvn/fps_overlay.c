@@ -78,7 +78,7 @@ static void draw_text(uint8_t *out, int stride, const char *text, int n, int sca
     }
 }
 
-/* A line with characters the 5x7 font does not have (Chinese labels, user 2026-10-17: "MetalFX已开启", "新着色器 N / 总计 M")
+/* A line with characters the 5x7 font does not have (non-ASCII labels such as an earlier translated "MetalFX on" or "New shaders N / total M")
    in the system font (CoreText), with the same box height, padding and colours as the pixel font at this scale; the
    scale drops until the line fits the texture. */
 static void raster_line_ct(const char *text, int highlight, int scale, uint8_t *out, int tex_w, int tex_h, int *box_w, int *box_h) {
@@ -156,7 +156,7 @@ void fps_overlay_text(const fps_overlay_info *info, char *text, size_t n) {
     static int render = -1; if (render < 0) { const char *e = getenv("BY3_HUD_RENDER"); render = e && !strcmp(e, "1"); }
     char rs[16] = "";
     if (render && info->render_w > 0) { size_text(rs, sizeof rs - 3, info->render_w, info->render_h); strcat(rs, " > "); }
-    snprintf(text, n, "FPS %s%s  %s%s%s%s", fps, gen, rs, ss, info->mfx ? TOTK_UI("  MetalFX已开启", "  MetalFX on") : "", info->big ? "  2K" : "");
+    snprintf(text, n, "FPS %s%s  %s%s%s%s", fps, gen, rs, ss, info->mfx ? "  MetalFX on" : "", info->big ? "  2K" : "");
 }
 
 void fps_overlay_raster(const fps_overlay_info *info, int scale, uint8_t *out, int *box_w, int *box_h) {
@@ -209,7 +209,7 @@ void shader_overlay_text(char *out, size_t n, uint64_t fresh, int64_t total, uin
     char t[16];
     (void)pipelines;   // user 2026-10-17: the pipeline count is not shown
     if (total < 0) snprintf(t, sizeof t, "--"); else snprintf(t, sizeof t, "%lld", (long long)(total > 999999 ? 999999 : total));
-    snprintf(out, n, TOTK_UI("新着色器 %llu / 总计 %s", "New shaders %llu / total %s"), (unsigned long long)(fresh > 99999 ? 99999 : fresh), t);
+    snprintf(out, n, "New shaders %llu / total %s", (unsigned long long)(fresh > 99999 ? 99999 : fresh), t);
 }
 
 /* A count's rate, re-measured every half second (game presents; interpolated frames shown). stale_s > 0: a gap longer

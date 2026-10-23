@@ -127,7 +127,7 @@ static unsigned show_keyboard(void *out_string, const void *arg_ptr) {
     if (init_len > 0 && work && init_off >= 0 && (uint64_t)init_off + (uint64_t)init_len * 2 <= work_size)
         utf16_to_utf8((const uint16_t *)(uintptr_t)(work + (uint64_t)init_off), (size_t)(init_len > KB_LIMIT ? KB_LIMIT : init_len), initial, sizeof initial);
     char prompt[sizeof header + sizeof guide + 8];
-    snprintf(prompt, sizeof prompt, "%s%s%s", *header ? header : *guide ? guide : *sub ? sub : TOTK_UI("输入文字","Enter text"),
+    snprintf(prompt, sizeof prompt, "%s%s%s", *header ? header : *guide ? guide : *sub ? sub : "Enter text",
              *header && (*guide || *sub) ? " — " : "", *header ? (*guide ? guide : sub) : "");
 
     char text[KB_LIMIT * 4 + 1] = ""; int confirmed = 0;
@@ -180,7 +180,7 @@ static void *selftest_thread(void *unused) {
     uint8_t *arg = calloc(1, ARG_SIZE); uint16_t *out = calloc(1, 0x7d4); uint8_t *work = calloc(1, 0x1000);
     if (!arg || !out || !work) runtime_fail("keyboard self-test allocation");
     uint32_t max = 9, disabled = 0x12c; uint64_t w = (uint64_t)(uintptr_t)work, ws = 0x1000;
-    static const uint16_t title[] = {0x6d4b, 0x8bd5, 0xff1a, 0x7ed9, 0x9a6c, 0x53d6, 0x540d, 0};   /* 测试：给马取名 */
+    static const uint16_t title[] = {0x6d4b, 0x8bd5, 0xff1a, 0x7ed9, 0x9a6c, 0x53d6, 0x540d, 0};   /* "Test: name the horse" */
     memcpy(arg + KB_HEADER, title, sizeof title); memcpy(arg + KB_MAX_LEN, &max, 4); memcpy(arg + KB_DISABLED, &disabled, 4);
     memcpy(arg + ARG_WORK, &w, 8); memcpy(arg + ARG_WORK_SIZE, &ws, 8);
     uint64_t str[2] = { (uint64_t)(uintptr_t)out, 0x7d4 };
@@ -237,8 +237,8 @@ static void *probe_thread(void *unused) {
         {2, 0, 9, 0, 0x12c, 0, NULL, "ABCDEFGHIJKL", "ABCDEFGHI", 0},             /* at most 9 */
         {2, 0, 9, 0, 0x12c, 0, NULL, "a@b%c\\d e/f", "abcd e/f", 0},             /* '@' '%' '\' disabled */
         {2, 0, 9, 0, 0x12c, 0, NULL, "<cancel>", "", SWKBD_CANCELED},
-        {0, 2, 0, 0, 0, 1, NULL, "小马Ab", "小马Ab", 0},                          /* UTF-8 out (checked below) */
-        {0, 2, 3, 0, 0, 0, NULL, "小马🐴", "小马", 0},                            /* no half surrogate pair */
+        {0, 2, 0, 0, 0, 1, NULL, "\u5c0f\u9a6cAb", "\u5c0f\u9a6cAb", 0},                          /* UTF-8 out (checked below) */
+        {0, 2, 3, 0, 0, 0, NULL, "\u5c0f\u9a6c\U0001F434", "\u5c0f\u9a6c", 0},                            /* no half surrogate pair */
         {0, 2, 0, 0, 0, 0, "Zelda", "<initial>", "Zelda", 0},                     /* initial text from the work buffer */
         {0, 1, 0, 0, 0, 0, NULL, "a1b2c3", "123", 0},                            /* number pad */
         {0, 2, 9, 3, 0, 0, NULL, "ab", "", SWKBD_CANCELED},                       /* shorter than the minimum */
@@ -246,7 +246,7 @@ static void *probe_thread(void *unused) {
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
         memset(arg, 0, ARG_SIZE); memset(wbuf, 0, 0x1000); memset(out, 0x55, 0x7d4);
         make(arg, cases[i].preset);
-        static const uint16_t title[] = {0x540d, 0x5b57, 0};   /* 名字 */
+        static const uint16_t title[] = {0x540d, 0x5b57, 0};   /* "name" */
         static const uint16_t hint[] = {'h', 'i', 'n', 't', 0};
         header(arg, title); guide(arg, hint);
         memcpy(arg + KB_TYPE, &cases[i].type, 4); memcpy(arg + KB_MAX_LEN, &cases[i].max, 4); memcpy(arg + KB_MIN_LEN, &cases[i].min, 4);

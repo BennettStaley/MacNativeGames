@@ -35,7 +35,7 @@
    which still aborts at the first cutscene there. Build libvpx for iOS (or use VideoToolbox's VP9) to enable this file. */
 void *runtime_movie_override(const char *name) {
     static int said;
-    if (!said && strstr(name, "5movie7Decoder")) { said = 1; fprintf(stderr, "[movie] 本构建没有 libvpx：过场影片走原库（遇到过场会中止）\n"); }
+    if (!said && strstr(name, "5movie7Decoder")) { said = 1; fprintf(stderr, "[movie] this build has no libvpx: cutscenes use the original library (a cutscene will abort)\n"); }
     return NULL;
 }
 void movie_host_tick(void) {}
@@ -195,12 +195,12 @@ static int decode_one(Movie *m, Signals *s, const Pending *p) {
         vpx_codec_err_t e = vpx_codec_decode(&m->vpx, m->in[p->index] + p->offset, (unsigned)p->size, NULL, 0);
         if (e != VPX_CODEC_OK) {
             m->errors++; m->last_error = ST_ERROR; note(m, s, EV_ERROR);
-            if (m->errors <= 4) LOG("【红】VP9 decode error on a %d-byte frame at %lld us: %s", p->size, (long long)p->time, vpx_codec_error_detail(&m->vpx) ? vpx_codec_error_detail(&m->vpx) : vpx_codec_err_to_string(e));
+            if (m->errors <= 4) LOG("[red] VP9 decode error on a %d-byte frame at %lld us: %s", p->size, (long long)p->time, vpx_codec_error_detail(&m->vpx) ? vpx_codec_error_detail(&m->vpx) : vpx_codec_err_to_string(e));
         } else {
             vpx_codec_iter_t it = NULL; const vpx_image_t *img;
             while ((img = vpx_codec_get_frame(&m->vpx, &it)) != NULL) {
                 if (img->fmt != VPX_IMG_FMT_I420 || (int)img->d_w != m->w || (int)img->d_h != m->h) {
-                    LOG("【红】VP9 frame %ux%u format %d differs from the configured %dx%d I420", img->d_w, img->d_h, img->fmt, m->w, m->h);
+                    LOG("[red] VP9 frame %ux%u format %d differs from the configured %dx%d I420", img->d_w, img->d_h, img->fmt, m->w, m->h);
                     runtime_fail("movie decoder: unexpected VP9 frame layout");
                 }
                 int slot = free_out(m); if (slot < 0) runtime_fail("movie decoder: output slots counted wrong");
@@ -248,7 +248,7 @@ static void h_ctor(void *obj, int type, int format, int mode, int priority) {
     pthread_mutex_lock(&g_lock); int i = 0;
     while (i < MAX_MOVIES && g_movies[i] && g_movies[i]->guest != obj) i++;
     if (i == MAX_MOVIES) runtime_fail("movie decoder table full");
-    if (g_movies[i]) { LOG("【红】decoder object %p reused without destruction", obj); release_codec(g_movies[i]); free(g_movies[i]); }
+    if (g_movies[i]) { LOG("[red] decoder object %p reused without destruction", obj); release_codec(g_movies[i]); free(g_movies[i]); }
     g_movies[i] = m; pthread_mutex_unlock(&g_lock);
     ((void **)obj)[0] = G.vptr; ((void **)obj)[1] = m;
     LOG("VP9 decoder %p on the host (libvpx %s), output format %d", obj, vpx_codec_version_str(), format);
@@ -272,11 +272,11 @@ typedef int (*md_fn)(void *, void *);
 static int h_configure(void *obj, void *format) {
     Movie *m = find(obj); if (!m) return ((md_fn)G.orig[MOVIE_CONFIGURE])(obj, format);
     if (!format) return ST_NULL;
-    if (m->format != FORMAT_NV12) { LOG("【红】output format %d not implemented on the host (NV12 = 4 only)", m->format); return ST_UNSUPPORTED; }
+    if (m->format != FORMAT_NV12) { LOG("[red] output format %d not implemented on the host (NV12 = 4 only)", m->format); return ST_UNSUPPORTED; }
     const char *mime = NULL; int w = 0, h = 0;
     G.md_find_string(format, "mime", &mime); G.md_find_int32(format, "width", &w); G.md_find_int32(format, "height", &h);
     if (!mime || strcmp(mime, "video/x-vnd.on2.vp9") || w <= 0 || h <= 0 || w > 8192 || h > 8192 || (w | h) & 1) {
-        LOG("【红】configure: mime %s %dx%d not supported", mime ? mime : "(none)", w, h); return ST_UNSUPPORTED;
+        LOG("[red] configure: mime %s %dx%d not supported", mime ? mime : "(none)", w, h); return ST_UNSUPPORTED;
     }
     pthread_mutex_lock(&m->mu);
     release_codec(m); m->w = w; m->h = h;
@@ -398,7 +398,7 @@ static int h_get_output(void *obj, int index, void *buf) {
         int bytes = m->out_bytes[index]; uint8_t *dst = G.buf_base(buf);
         if (!bytes) st = ST_OK;
         else if (dst && G.buf_capacity(buf) >= (size_t)bytes) { memcpy(dst, m->out[index], (size_t)bytes); G.buf_set_range(buf, 0, bytes); st = ST_OK; }
-        else LOG("【红】output buffer of %zu bytes for a %d-byte frame", G.buf_capacity(buf), bytes);
+        else LOG("[red] output buffer of %zu bytes for a %d-byte frame", G.buf_capacity(buf), bytes);
     }
     pthread_mutex_unlock(&m->mu); return st;
 }

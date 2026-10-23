@@ -27,19 +27,19 @@ static uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1)
 static uint8_t *vm_fresh(uint64_t span) {
     mach_vm_address_t a = 0;
     kern_return_t kr = mach_vm_allocate(mach_task_self(), &a, span, VM_FLAGS_ANYWHERE);
-    if (kr != KERN_SUCCESS) { LOG("【红】vpool: mach_vm_allocate(%#llx) failed kr=%d", span, kr); return NULL; }
+    if (kr != KERN_SUCCESS) { LOG("[red] vpool: mach_vm_allocate(%#llx) failed kr=%d", span, kr); return NULL; }
     return (uint8_t *)(uintptr_t)a;
 }
 
 int totk_vpool_init(pool_t *o) {
     int phys = (o->flags & F_PHYSICAL) != 0, virt = (o->flags & F_VIRTUAL) != 0;
     o->game_mem = o->mem; o->host = NULL; o->span = 0;
-    if (phys == virt) { LOG("【红】vpool: pool flags %#x must be exactly one of PHYSICAL/VIRTUAL", o->flags); return 0; }
-    if (!o->size || o->size % TOTK_VPOOL_PAGE) { LOG("【红】vpool: pool size %#llx not a multiple of 64 KiB", o->size); return 0; }
-    if (virt && o->mem) { LOG("【红】vpool: virtual pool given storage %p", (void *)o->mem); return 0; }
-    if (phys && !o->mem) { LOG("【红】vpool: physical pool without storage"); return 0; }
+    if (phys == virt) { LOG("[red] vpool: pool flags %#x must be exactly one of PHYSICAL/VIRTUAL", o->flags); return 0; }
+    if (!o->size || o->size % TOTK_VPOOL_PAGE) { LOG("[red] vpool: pool size %#llx not a multiple of 64 KiB", o->size); return 0; }
+    if (virt && o->mem) { LOG("[red] vpool: virtual pool given storage %p", (void *)o->mem); return 0; }
+    if (phys && !o->mem) { LOG("[red] vpool: physical pool without storage"); return 0; }
     if (phys && !(o->flags & F_CPU_NO_ACCESS)) {
-        if ((uintptr_t)o->mem % host_page()) { LOG("【红】vpool: CPU-visible physical pool %p not %#llx aligned; cannot alias", (void *)o->mem, host_page()); return 0; }
+        if ((uintptr_t)o->mem % host_page()) { LOG("[red] vpool: CPU-visible physical pool %p not %#llx aligned; cannot alias", (void *)o->mem, host_page()); return 0; }
         return 1;   // aliases the game storage directly
     }
     o->span = round_up(o->size, host_page());
@@ -58,14 +58,14 @@ int totk_vpool_fini(pool_t *o) {
 
 static int check_request(const pool_t *v, const totk_mapping_request *r, int i) {
     uint64_t end = (uint64_t)r->virtual_offset + r->size;
-    if (r->virtual_offset < 0 || r->physical_offset < 0 || !r->size) { LOG("【红】vpool: request %d negative/empty range", i); return 0; }
-    if ((r->virtual_offset | r->physical_offset | r->size) % TOTK_VPOOL_PAGE) { LOG("【红】vpool: request %d not 64 KiB aligned (v=%#llx p=%#llx n=%#llx)", i, r->virtual_offset, r->physical_offset, r->size); return 0; }
-    if (end < r->size || end > v->size) { LOG("【红】vpool: request %d exceeds virtual pool (%#llx > %#llx)", i, end, v->size); return 0; }
+    if (r->virtual_offset < 0 || r->physical_offset < 0 || !r->size) { LOG("[red] vpool: request %d negative/empty range", i); return 0; }
+    if ((r->virtual_offset | r->physical_offset | r->size) % TOTK_VPOOL_PAGE) { LOG("[red] vpool: request %d not 64 KiB aligned (v=%#llx p=%#llx n=%#llx)", i, r->virtual_offset, r->physical_offset, r->size); return 0; }
+    if (end < r->size || end > v->size) { LOG("[red] vpool: request %d exceeds virtual pool (%#llx > %#llx)", i, end, v->size); return 0; }
     if (!r->physical_pool) return 1;   // unmap
     const pool_t *p = (const pool_t *)(const void *)r->physical_pool;
-    if (p->magic != POOL_MAGIC || !(p->flags & F_PHYSICAL)) { LOG("【红】vpool: request %d source %p is not a physical pool", i, (const void *)p); return 0; }
+    if (p->magic != POOL_MAGIC || !(p->flags & F_PHYSICAL)) { LOG("[red] vpool: request %d source %p is not a physical pool", i, (const void *)p); return 0; }
     uint64_t pend = (uint64_t)r->physical_offset + r->size;
-    if (pend < r->size || pend > p->size) { LOG("【红】vpool: request %d exceeds physical pool (%#llx > %#llx)", i, pend, p->size); return 0; }
+    if (pend < r->size || pend > p->size) { LOG("[red] vpool: request %d exceeds physical pool (%#llx > %#llx)", i, pend, p->size); return 0; }
     return 1;
 }
 
@@ -92,20 +92,20 @@ static int apply_request(pool_t *v, const totk_mapping_request *r) {
         vm_prot_t cur, max;
         kr = mach_vm_remap(mach_task_self(), &dst, r->size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
                            (mach_vm_address_t)(uintptr_t)(p->mem + r->physical_offset), FALSE, &cur, &max, VM_INHERIT_NONE);
-        if (kr == KERN_SUCCESS && (cur & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) { LOG("【红】vpool: alias lost RW (prot=%d)", cur); return 0; }
+        if (kr == KERN_SUCCESS && (cur & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) { LOG("[red] vpool: alias lost RW (prot=%d)", cur); return 0; }
         if (kr == KERN_SUCCESS) vmap_note((uintptr_t)(v->mem + r->virtual_offset), r->size, (uintptr_t)(p->mem + r->physical_offset));
     }
     if (!r->physical_pool && kr == KERN_SUCCESS) vmap_note((uintptr_t)(v->mem + r->virtual_offset), r->size, 0);
     if (kr != KERN_SUCCESS || dst != (mach_vm_address_t)(uintptr_t)(v->mem + r->virtual_offset)) {
-        LOG("【红】vpool: remap at %#llx size %#llx failed kr=%d", (unsigned long long)dst, r->size, kr);
+        LOG("[red] vpool: remap at %#llx size %#llx failed kr=%d", (unsigned long long)dst, r->size, kr);
         return 0;
     }
     return 1;
 }
 
 int totk_vpool_map(pool_t *v, int count, const totk_mapping_request *r) {
-    if (!v || v->magic != POOL_MAGIC || !(v->flags & F_VIRTUAL) || !v->mem) { LOG("【红】vpool: MapVirtual target %p is not a virtual pool", (void *)v); return 0; }
-    if (count < 0 || (count && !r)) { LOG("【红】vpool: invalid request count %d", count); return 0; }
+    if (!v || v->magic != POOL_MAGIC || !(v->flags & F_VIRTUAL) || !v->mem) { LOG("[red] vpool: MapVirtual target %p is not a virtual pool", (void *)v); return 0; }
+    if (count < 0 || (count && !r)) { LOG("[red] vpool: invalid request count %d", count); return 0; }
     for (int i = 0; i < count; i++) if (!check_request(v, &r[i], i)) return 0;
     pthread_mutex_lock(&g_map_mu);
     // GPU page tables of the old zero-copy buffer and dirty-page protections refer to the replaced pages.
