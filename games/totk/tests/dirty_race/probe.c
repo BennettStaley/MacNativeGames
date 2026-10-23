@@ -12,6 +12,7 @@
 #include "../../third_party/d2r_gfx/gfx/nvn/nvn_dirty.c"
 #undef mprotect
 #include <errno.h>
+#include <time.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -113,6 +114,43 @@ static void chunk_check(size_t pg) {
     EXPECT("chunked check: untracked memory answers -1 (control)", -1, nvn_dirty_check(local, sizeof local, 0));
 }
 
+/* Frames in flight (nvn_dirty_guard): a write to a page a submission still in flight reads waits until that fence is
+   complete; a thread marked nowait (GPU completion callbacks) and a write after completion do not wait; the write still
+   counts as dirty. TOTK_PROBE_NEGATIVE=2: the "completed fence" is raised before the write, so it must not wait (shows
+   the timing check can tell the two apart). */
+static _Atomic uint64_t g_fdone;
+static uint64_t fdone(void) { return atomic_load(&g_fdone); }
+static uint8_t *g_gp; static _Atomic uint64_t g_wrote_at, g_done_at;
+static uint64_t mono_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+static void *guard_writer(void *arg) { (void)arg; g_gp[0] = 7; atomic_store(&g_wrote_at, mono_ns()); return NULL; }
+static void *guard_nowait_writer(void *arg) { (void)arg; nvn_dirty_guard_nowait(); g_gp[(size_t)arg] = 9; atomic_store(&g_wrote_at, mono_ns()); return NULL; }
+static void guard_check_probe(size_t pg, int negative) {
+    g_gp = mmap(NULL, 4 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (g_gp == MAP_FAILED) { perror("mmap"); exit(2); }
+    nvn_dirty_add_range(g_gp, 4 * pg);
+    nvn_dirty_guard_init(fdone, 0);
+    uint64_t stamp = nvn_dirty_now();
+    EXPECT("guard: a tracked range can be guarded", 1, nvn_dirty_guard(g_gp, 4 * pg, 5));
+    EXPECT("guard: the range carries the submission's fence", 5, nvn_dirty_range_fence(g_gp));
+    atomic_store(&g_fdone, negative ? 5 : 4); atomic_store(&g_wrote_at, 0);
+    pthread_t t; pthread_create(&t, NULL, guard_writer, NULL);
+    usleep(30000);
+    uint64_t at = mono_ns(); atomic_store(&g_done_at, at); atomic_store(&g_fdone, 5);
+    pthread_join(t, NULL);
+    EXPECT("guard: the write waited for the fence", 1, atomic_load(&g_wrote_at) >= at);   /* negative control: fails */
+    EXPECT("guard: the write landed", 7, g_gp[0]);
+    EXPECT("guard: the write counts as dirty", 1, nvn_dirty_since(g_gp, 16, stamp));
+    if (negative) return;
+    /* A completion-callback thread never waits for its own submission. */
+    EXPECT("guard: re-guarded with a newer fence", 1, nvn_dirty_guard(g_gp, 4 * pg, 6));
+    atomic_store(&g_wrote_at, 0);
+    pthread_create(&t, NULL, guard_nowait_writer, (void *)(2 * pg)); pthread_join(t, NULL);
+    EXPECT("guard: a nowait thread wrote while fence 6 is pending", 9, g_gp[2 * pg]);
+    uint64_t v[6]; nvn_dirty_guard_stats(v);
+    EXPECT("guard: one fault wait counted", 1, v[0]);
+    atomic_store(&g_fdone, 6);
+}
+
 int main(void) {
     g_negative = getenv("TOTK_PROBE_NEGATIVE") != NULL;
     struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = on_signal; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
@@ -122,6 +160,7 @@ int main(void) {
     if (g_page == MAP_FAILED) { perror("mmap"); return 2; }
     nvn_dirty_add_range(g_page, 2 * pg);
     if (!g_fault || !g_prep) { printf("dirty race probe: the tracker did not register its hooks\n"); return 2; }
+    { const char *ng = getenv("TOTK_PROBE_NEGATIVE"); if (ng && atoi(ng) == 2) { guard_check_probe(pg, 1); printf("guard probe (negative control): %s\n", g_fail ? "detected as expected" : "NOT detected"); return g_fail ? 3 : 1; } }
     uint64_t stamp = nvn_dirty_now();
     pthread_t tb; pthread_create(&tb, NULL, thread_b, NULL);
     atomic_store(&g_armed, 1);
@@ -158,6 +197,7 @@ int main(void) {
     if (busy_protect(pg)) return 2;
     stamp_order(pg);
     chunk_check(pg);
+    guard_check_probe(pg, 0);
     printf("{\"status\":\"%s\",\"checks\":%d,\"failed\":%d}\n", g_fail ? "fail" : "pass", g_checks, g_fail);
     return g_fail != 0;
 }

@@ -18,3 +18,10 @@ int nvn_dirty_recent(uintptr_t lo, uintptr_t hi, nvn_dirty_rec *out, int max);  
 void nvn_dirty_stats(uint64_t *faults, uint64_t *preps);           // Cumulative: number of page faults triggered by game writes, number of pages unprotected before host writes
 void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns);   // Cumulative: this module's mprotect call count, pages covered, time spent
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total); // Currently live slots, slot table high-water mark, total number of registrations
+// TOTK frames in flight: CPU writes wait for the GPU submissions that still read the page (see nvn_dirty.c)
+void nvn_dirty_guard_init(uint64_t (*done)(void), int audit);      // done: highest completed submission fence (atomic read); audit: count would-be waits, never wait (unsafe)
+int nvn_dirty_guard(const void *addr, size_t len, uint64_t fence);  // the submission ending with fence reads [addr, addr+len) zero-copy: 0 = untracked, cannot be guarded
+void nvn_dirty_guard_nowait(void);                                 // this thread never waits in the guard (GPU completion callbacks)
+uint64_t nvn_dirty_range_fence(const void *mem);                   // newest guarded fence of the range holding mem (0: none)
+void nvn_dirty_guard_stats(uint64_t v[6]);                         // cumulative: waits, ns waited, waits timed out, guard calls, calls with nothing to protect, untracked ranges
+void nvn_dirty_guard_audit(uint64_t *n, uint64_t sample[8]);      // audit mode: writes that would have waited, last pages written

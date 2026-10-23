@@ -226,9 +226,14 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
 #endif
     return o->mem != NULL;
 }
+static int fif_env(void);   /* TOTK_FRAMES_IN_FLIGHT, below */
 NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
     pool_t *o = (pool_t *)p;
-    if (o->mem && !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS)) { mtl_present_flush_mem(o->mem, o->size, 0); x_drain(); nvn_dirty_remove_range(o->mem); mtl_pool_del(o->mem); }
+    if (o->mem && !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS)) { mtl_present_flush_mem(o->mem, o->size, 0); x_drain();
+        /* TOTK frames in flight: the game's own fence wait may have returned one frame early, so the pool's last reader can
+           still be on the GPU; the memory goes back to the game when this returns. Untracked pools wait for everything. */
+        if (fif_env() > 1) { int fif_guard_on(void); uint64_t f = fif_guard_on() && nvn_dirty_tracked(o->mem, 1) ? nvn_dirty_range_fence(o->mem) : mtl_last_fence(); if (f) mtl_wait(f, UINT64_MAX); }
+        nvn_dirty_remove_range(o->mem); mtl_pool_del(o->mem); }
     totk_vpool_fini(o); o->magic = 0;
 }
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
@@ -600,11 +605,35 @@ static int synclog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK
 /* TOTK_FRAMES_IN_FLIGHT=2 (experimental, off by default): every frame the game's main thread waits for the fence the render
    thread set on the frame it just submitted, so the GPU never has the next frame queued while it finishes this one and
    idles ~2 ms a frame waiting for our replay (2026-10-22, M3 Pro, TOTK_TIMELINE). With 2, a wait on the newest fence of a
-   fence-sync object waits for the fence that object held one frame earlier instead: the GPU runs up to one frame behind
-   the game. Unsafe if the game rewrites memory the GPU still reads for that frame; for measurement and visual checks. */
+   fence-sync object waits for the fence that object held one frame earlier instead: the GPU runs at most one frame behind
+   the game (the previous fence of the same object; never further). Safety (nvn_mtl.m "frames in flight", nvn_dirty.c
+   guard): CPU writes to pool pages a submission in flight reads wait in the fault handler, readbacks (pool invalidates)
+   wait for their GPU producer, completion-time writes skip destinations the game rewrote, pool finalize waits for the
+   pool's last reader. A lag over submissions that recorded counter reports (TOTK_FIF_COUNTERS=1 lags anyway) or read a
+   pool the guard could not cover falls back to the real fence. Synchronous replay only (the translation thread's tokens
+   are not lagged). TOTK_FIF_GUARD=0: the old unguarded measurement mode; TOTK_FIF_AUDIT=1: guarded pages and readbacks
+   only count what would have waited (unsafe, answers whether TOTK multi-buffers its dynamic data). */
 static int fif_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_FRAMES_IN_FLIGHT"); v = e ? atoi(e) : 1; if (v > 1) LOG("[nvn] TOTK_FRAMES_IN_FLIGHT=%d: fence waits on the newest submission wait for the previous frame's fence (experimental)", v); } return v; }
+int fif_guard_on(void); uint32_t mtl_fence_flags(uint64_t after, uint64_t upto); void mtl_fif_stats(uint64_t v[10], uint64_t sample[4][2]);
+static void fif_log(uint64_t lagged, uint64_t fb_cnt, uint64_t fb_ung) {
+    static uint64_t last_lag, last_g[6], last_m[10], last_a; static uint64_t t_last;
+    uint64_t g[6], m[10], smp[4][2], an, as[8]; nvn_dirty_guard_stats(g); mtl_fif_stats(m, smp); nvn_dirty_guard_audit(&an, as);
+    uint64_t now = now_ns();
+    if (t_last && now - t_last < 5000000000ull) return;
+    double nf = (double)(lagged + fb_cnt + fb_ung - last_lag); if (nf < 1) nf = 1;
+    LOG("[fif] last %.1f s: %llu waits lagged one frame, %llu fell back to the real fence (%llu counter reports, %llu unguarded pools); guard: %llu fault waits (%.3f a frame, %.3f ms a frame, %llu over 2 s), %.1f pools guarded a submission, %llu untracked; readbacks of in-flight GPU writes %llu of %llu checked (%.3f ms a frame, %llu for a whole submission), %llu early-commit shaders; completion writes skipped as stale %llu",
+        t_last ? (now - t_last) / 1e9 : 0.0, (unsigned long long)lagged, (unsigned long long)(fb_cnt + fb_ung), (unsigned long long)fb_cnt, (unsigned long long)fb_ung,
+        (unsigned long long)(g[0] - last_g[0]), (g[0] - last_g[0]) / nf, (g[1] - last_g[1]) / 1e6 / nf, (unsigned long long)(g[2] - last_g[2]),
+        m[0] > last_m[0] ? (double)(m[1] - last_m[1]) / (double)(m[0] - last_m[0]) : 0.0, (unsigned long long)(g[5] - last_g[5]),
+        (unsigned long long)(m[5] - last_m[5]), (unsigned long long)(m[4] - last_m[4]), (m[6] - last_m[6]) / 1e6 / nf, (unsigned long long)(m[7] - last_m[7]), (unsigned long long)m[8], (unsigned long long)(m[9] - last_m[9]));
+    if (getenv("TOTK_FIF_AUDIT")) LOG("[fif] audit: %llu CPU writes to pages a submission in flight reads (%.2f a frame), sample pages %#llx %#llx %#llx %#llx; readbacks of in-flight GPU writes sample %#llx+%llu %#llx+%llu",
+        (unsigned long long)(an - last_a), (an - last_a) / nf, (unsigned long long)as[0], (unsigned long long)as[1], (unsigned long long)as[2], (unsigned long long)as[3],
+        (unsigned long long)smp[0][0], (unsigned long long)smp[0][1], (unsigned long long)smp[1][0], (unsigned long long)smp[1][1]);
+    last_lag = lagged + fb_cnt + fb_ung; memcpy(last_g, g, sizeof g); memcpy(last_m, m, sizeof m); last_a = an; t_last = now;
+}
 static uint64_t fif_target(const NVNsync *s, uint64_t fence) {
-    static struct { const NVNsync *s; uint64_t prev; } t[8]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static _Atomic uint64_t n_lag;
+    static struct { const NVNsync *s; uint64_t prev; } t[8]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static _Atomic uint64_t n_lag, n_fb_cnt, n_fb_ung;
+    static int cnt_ok = -1; if (cnt_ok < 0) { const char *e = getenv("TOTK_FIF_COUNTERS"); cnt_ok = e && atoi(e) > 0; }
     uint64_t r = fence;
     pthread_mutex_lock(&mu);
     int i = 0; while (i < 8 && t[i].s && t[i].s != s) i++;
@@ -612,7 +641,14 @@ static uint64_t fif_target(const NVNsync *s, uint64_t fence) {
     if (t[i].s == s && t[i].prev && t[i].prev < fence) r = t[i].prev;
     if (t[i].s != s || t[i].prev < fence) { t[i].s = s; t[i].prev = fence; }
     pthread_mutex_unlock(&mu);
-    if (r != fence && (atomic_fetch_add(&n_lag, 1) + 1) % 6000 == 1) LOG("[nvn] frames in flight: %llu fence waits moved one frame back", (unsigned long long)atomic_load(&n_lag));
+    if (r != fence && fif_guard_on()) {
+        uint32_t fl = mtl_fence_flags(r, fence);
+        if (fl & 2) { atomic_fetch_add(&n_fb_ung, 1); r = fence; }
+        else if ((fl & 1) && !cnt_ok) { atomic_fetch_add(&n_fb_cnt, 1); r = fence; }
+    }
+    if (r != fence) atomic_fetch_add(&n_lag, 1);
+    if (fif_guard_on()) fif_log(atomic_load(&n_lag), atomic_load(&n_fb_cnt), atomic_load(&n_fb_ung));
+    else if (r != fence && atomic_load(&n_lag) % 6000 == 1) LOG("[nvn] frames in flight (unguarded): %llu fence waits moved one frame back", (unsigned long long)atomic_load(&n_lag));
     return r;
 }
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
