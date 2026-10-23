@@ -94,6 +94,33 @@ The same game memory can be reached through two Metal buffers, each with its own
 
 `make -C games/totk probe-gpu-copy-alias` replays 256 dependent copies and fills over 64 KiB through two no-copy buffers over one allocation and through a virtual pool's view, across encoder boundaries, and compares every byte with the same steps done on the CPU (524,288 checks). With `TOTK_PROBE_NEGATIVE=1` the copies lose the alias visibility: on an M4 every run read a stale byte (byte 512 read 125 instead of 207). TOTK 1.0.0 makes no buffer copies in the world; 1.1.2 and 1.4.3 make one per frame. Whether that copy reaches its memory through two buffers has not been traced, and no visible defect has been attributed to the missing visibility.
 
+## Decals that read the G-buffer they blend into (TOTK_ATT_FB, opt-in)
+
+Ground decals and the terrain material blend into the G-buffer by hand: in the pass that holds the albedo, normal and R32F
+attachments, each draw samples those attachments at its own pixel and writes them back. The Switch renders straight to
+memory, so a decal sees the decals drawn before it. An Apple GPU keeps the pass in tile memory, and a sample reads memory,
+so `att_unstored_read` stores the pass before such a draw and reopens it (the `samples-drawn-att` pass-end reason): every
+store and reload of the full-size G-buffer costs bandwidth.
+
+With `TOTK_ATT_FB=1` (alias `TOTK_FB_FETCH=1`; default off) such a draw instead reads those attachments from the tile
+(`[[color(n)]]`, programmable blending) whenever the sampled texel is the fragment's own pixel, through a rewritten fragment
+function (`nvn_fbread.h`, `att_fb_take`; ported from upstream PR #155 by feeeei); other texels are sampled from memory as
+before, and so is any sample with a texel offset. The attachments it reads this way need no store first, and a draw in a
+continued pass whose attachment reads are all tile reads no longer ends it. Refused (the old path): a texture also gathered,
+read or queried; a non-fragment stage reading it; the depth attachment; a view that is not the attachment itself (level 0,
+layer 0, its format) or not at the same colour index in the open encoder; a fused, layered or range pass; a border-colour
+variant, a depth output or a MetalFX role. By default a slot the draw itself writes (declared `[[color(n)]]` output and a
+non-zero write mask) is refused too, because a tile read there also sees the same draw's earlier fragments;
+`TOTK_ATT_FB_WRITTEN=1` allows it, as PR #155 does (it removes the 32 x 32 squares overlapping decals leave on the floor in
+Ukouh Shrine). The variant is compiled from MSL on the submit thread the first time its shader is met (about 90 ms cold on
+an M4 Max), never in the background: the draw has given up the store before it.
+
+`make -C games/totk probe-fbread` draws four overlapping decals in SPIRV-Cross form in one pass over memory holding 0, each
+adding 0.25 to what it samples at its own pixel. Rewritten, all 49,152 pixels reach 1.0; the original function, the negative
+control, reaches 1.0 in none. A sample one texel to the side, or at the own pixel with a texel offset, still reads memory
+(0.25; on an M3 Pro a few tile-edge pixels read a neighbouring tile the GPU had already stored), and a texture that is also
+`read()` is refused.
+
 ## The build (build_app.py)
 
 1. Detect XCI (HFS0 secure partition) or NSP (PFS0) by its header. Read the base Program NCA in place, extract ExeFS,

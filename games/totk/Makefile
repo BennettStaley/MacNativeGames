@@ -414,6 +414,14 @@ $(RENDER_PROBE_DIR)/depth16-clear-probe: tests/depth16_clear/probe.m third_party
 probe-depth16-clear: $(RENDER_PROBE_DIR)/depth16-clear-probe
 	$(GAME_SLOT_RUN) "$(RENDER_PROBE_DIR)/depth16-clear-probe"
 
+.PHONY: probe-fbread
+# Decals reading the attachment they write (nvn_fbread.h): overlapping draws see each other only through the tile read.
+$(RENDER_PROBE_DIR)/fbread-probe: tests/fbread/probe.m third_party/d2r_gfx/gfx/nvn/nvn_fbread.h
+	@mkdir -p "$(RENDER_PROBE_DIR)"
+	xcrun clang -std=c11 -O2 -Wall -Wextra -Werror -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn tests/fbread/probe.m -framework Metal -framework Foundation -o "$@"
+probe-fbread: $(RENDER_PROBE_DIR)/fbread-probe
+	$(GAME_SLOT_RUN) "$(RENDER_PROBE_DIR)/fbread-probe"
+
 # The picture-settings shaders (anti-aliasing, sharpening) on a synthetic picture; no game data.
 .PHONY: probe-post-aa
 $(RENDER_PROBE_DIR)/post-aa-probe: tests/post_aa/probe.m third_party/d2r_gfx/gfx/nvn/totk_post_msl.h third_party/d2r_gfx/gfx/nvn/smaa_tables.h
