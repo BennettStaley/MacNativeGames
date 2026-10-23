@@ -24,7 +24,7 @@
 
 static int cg_on(void) {
     int v = atomic_load(&g_cg_on);
-    if (v < 0) { const char *e = getenv("TOTK_CUBE_MERGE"); v = !(e && !strcmp(e, "0")); atomic_store(&g_cg_on, v); if (!v) MLOG("TOTK_CUBE_MERGE=0：立方体面通道合并关闭"); }
+    if (v < 0) { const char *e = getenv("TOTK_CUBE_MERGE"); v = !(e && !strcmp(e, "0")); atomic_store(&g_cg_on, v); if (!v) MLOG("TOTK_CUBE_MERGE=0: cube-face pass merging off"); }
     return v && lay_on();
 }
 // A SetRenderTargets that is the six faces of one cube level: the same cube in all six slots, slot i viewing layer i,
@@ -79,12 +79,12 @@ static int cg_reads_pending(void) {
 }
 static cg_temp *cg_temps(MTLPixelFormat pf, uint32_t w, uint32_t h, const cg_member *m0) {
     for (int i = 0; i < g_cg.ntemps; i++) { cg_temp *t = &g_cg.temps[i]; if (t->pf == pf && t->w == w && t->h == h) return t; }
-    if (g_cg.ntemps >= CG_TEMPS) { static int once; if (!once++) MLOG("[cube-merge] 临时贴图组已满（%d 种格式 / 尺寸），更多的组按原样回放", CG_TEMPS); return NULL; }
+    if (g_cg.ntemps >= CG_TEMPS) { static int once; if (!once++) MLOG("[cube-merge] temp texture groups full (%d formats / sizes); further groups replay as-is", CG_TEMPS); return NULL; }
     cg_temp *t = &g_cg.temps[g_cg.ntemps]; memset(t, 0, sizeof *t); t->pf = pf; t->w = w; t->h = h;
     MTLTextureDescriptor *d = [MTLTextureDescriptor new]; d.textureType = MTLTextureType2DArray; d.pixelFormat = pf; d.width = w; d.height = h; d.arrayLength = CG_MAX;
     d.mipmapLevelCount = 1; d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
     for (int f = 0; f < 6; f++) {
-        id<MTLTexture> tex = [g_dev newTextureWithDescriptor:d]; if (!tex) { MLOG("【红】[cube-merge] 建不出 %ux%u 格式 %lu 的临时贴图，更多的组按原样回放", w, h, (unsigned long)pf); return NULL; }
+        id<MTLTexture> tex = [g_dev newTextureWithDescriptor:d]; if (!tex) { MLOG("[red] [cube-merge] cannot create a %ux%u format %lu temp texture; further groups replay as-is", w, h, (unsigned long)pf); return NULL; }
         if (!g_cg_hold) g_cg_hold = [NSMutableArray array]; [g_cg_hold addObject:tex];   // the struct holds an unretained pointer: the array keeps the temps alive
         tex.label = [NSString stringWithFormat:@"cube-merge temp %ux%u f%d", w, h, f]; res_add(tex); t->t[f] = tex;
         tex_t *fk = &t->fake[f]; memset(fk, 0, sizeof *fk); fk->serial = 0xffffff00ull + (uint64_t)g_cg.ntemps * 8 + (uint64_t)f;   // reserved serials, below the probes' 0xffffffb0
@@ -92,7 +92,7 @@ static cg_temp *cg_temps(MTLPixelFormat pf, uint32_t w, uint32_t h, const cg_mem
         serial_put(fk->serial, t->t[f]);
     }
     g_cg.ntemps++;
-    MLOG("[cube-merge] 临时贴图组 %d：%ux%u 格式 %lu，6 x %d 层", g_cg.ntemps, w, h, (unsigned long)pf, CG_MAX);
+    MLOG("[cube-merge] temp texture group %d: %ux%u format %lu, 6 x %d layers", g_cg.ntemps, w, h, (unsigned long)pf, CG_MAX);
     return t;
 }
 /* The copies between the cube levels and the temps: one compute dispatch per direction and group (12 textures through an
@@ -113,7 +113,7 @@ static id<MTLComputePipelineState> cg_pso(int out) {
     if (failed) return nil;
     if (!ps[out]) { NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(k_cg_copy_msl) options:nil error:&e];
         id<MTLFunction> fn = lib ? [lib newFunctionWithName:out ? @"cg_out" : @"cg_in"] : nil; ps[out] = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&e] : nil;
-        if (!ps[out]) { failed = 1; MLOG("【红】[cube-merge] 拷贝计算核建不出：%s（改用 blit 拷贝）", e.localizedDescription.UTF8String); return nil; } }
+        if (!ps[out]) { failed = 1; MLOG("[red] [cube-merge] copy compute kernel cannot be built: %s (using blit copies)", e.localizedDescription.UTF8String); return nil; } }
     return ps[out];
 }
 static id<MTL4ArgumentTable> cg_table(void) {
@@ -179,8 +179,8 @@ static void cg_flush_group(cg_group *g) {
     g_cg.ns_out += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t2;
     for (int c = 0; c < g->n; c++) { const tex_t *t = g->m[c].rt.color[0]; gpu_owned_mark(t->serial); if (t->mem && tex_mirrored(t)) wb_note(t); }   // what rp_begin_ex notes for a rendered-into texture
     g_cg.merged_passes++; g_cg.merged_members += (uint64_t)g->n;
-    if (!g_cg.merged_passes_logged++) MLOG("[cube-merge] 首个合并通道：%d 个 %ux%u 立方体级（格式 %lu）并成一个分层通道", g->n, g->w, g->h, (unsigned long)tp->pf);
-    PD("G %llu 立方体面通道合并：%d 个成员 %ux%u", g_stat_pass, g->n, g->w, g->h);
+    if (!g_cg.merged_passes_logged++) MLOG("[cube-merge] first merged pass: %d %ux%u cube levels (format %lu) merged into one layered pass", g->n, g->w, g->h, (unsigned long)tp->pf);
+    PD("G %llu cube-face pass merge: %d members %ux%u", g_stat_pass, g->n, g->w, g->h);
 }
 static void cg_flush_reason(int why) { if (why >= 0 && why < 8) g_cg.reason[why]++; }
 static void cg_flush(void) {
@@ -229,16 +229,16 @@ static int cg_take_(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     if (!m->S_) { m->S_ = malloc(sizeof S); if (!m->S_) MDIE("cube-merge member state"); }
     memcpy(m->S_, &S, sizeof S);
     g_cg.take_seq = g_cg.rt_seq; g_cg.taken++; g_cg_pending = 1;
-    PD("G %llu 立方体面通道暂存：ser=%llu lv%d %ux%u（组 %d 第 %d 个）", g_stat_pass + 1, (unsigned long long)m->ser, lv, w, h, (int)(g - g_cg.g), g->n);
+    PD("G %llu cube-face pass staged: ser=%llu lv%d %ux%u (group %d member %d)", g_stat_pass + 1, (unsigned long long)m->ser, lv, w, h, (int)(g - g_cg.g), g->n);
     return 1;
 }
 static void cg_stats_line(void) {
     if (!g_cg.taken && !g_cg.ntemps) return;
-    MLOG("[nvn] 立方体面通道合并 至提交 %llu：暂存 %llu 次绘制，合成 %llu 个分层通道（%llu 次绘制），单独回放 %llu 次，计算核拷贝 %llu 次、blit 拷贝 %llu 次（拷出退回 blit %llu 组）；落地于 目标 %llu / 命令 %llu / 读取 %llu / 第二次绘制 %llu / 提交结束 %llu / 组满 %llu",
+    MLOG("[nvn] cube-face pass merge to submit %llu: staged %llu draws, built %llu layered passes (%llu draws), replayed %llu alone, kernel copies %llu, blit copies %llu (copy-out fell back to blit %llu groups); flushed on target %llu / command %llu / read %llu / second draw %llu / submit end %llu / group full %llu",
          (unsigned long long)g_sub_serial, (unsigned long long)g_cg.taken, (unsigned long long)g_cg.merged_passes, (unsigned long long)g_cg.merged_members, (unsigned long long)g_cg.plain_members,
          (unsigned long long)g_cg.kcopies, (unsigned long long)g_cg.copies, (unsigned long long)g_cg.blit_out, (unsigned long long)g_cg.reason[0], (unsigned long long)g_cg.reason[1], (unsigned long long)g_cg.reason[2], (unsigned long long)g_cg.reason[3],
          (unsigned long long)g_cg.reason[4], (unsigned long long)g_cg.reason[5]);
-    MLOG("[nvn] 立方体面通道合并 CPU（每次提交平均，ms）：判定与暂存 %.3f / 落地 %.3f（拷入 %.3f / 成员绘制 %.3f / 拷出 %.3f）",
+    MLOG("[nvn] cube-face pass merge CPU (mean per submit, ms): decide and stage %.3f / flush %.3f (copy in %.3f / member draws %.3f / copy out %.3f)",
          (double)g_cg.ns_take / 1800 / 1e6, (double)g_cg.ns_flush / 1800 / 1e6, (double)g_cg.ns_in / 1800 / 1e6, (double)g_cg.ns_draw / 1800 / 1e6, (double)g_cg.ns_out / 1800 / 1e6);
     g_cg.taken = g_cg.merged_passes = g_cg.merged_members = g_cg.plain_members = g_cg.copies = g_cg.kcopies = g_cg.blit_out = 0; memset(g_cg.reason, 0, sizeof g_cg.reason);
     g_cg.ns_take = g_cg.ns_flush = g_cg.ns_in = g_cg.ns_draw = g_cg.ns_out = 0;

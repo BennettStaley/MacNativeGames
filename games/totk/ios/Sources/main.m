@@ -13,6 +13,7 @@
 #import "touch_pad.h"
 #import "settings_menu.h"
 #import "saves_menu.h"
+#import "power.h"
 #include "controller_map.h"
 #include "settings.h"
 
@@ -173,6 +174,7 @@ static void audio_observe(void) {
     for (NSString *name in @[@"save", @"temp", @"shader-cache", @"game-slot", @"mods"]) [fm createDirectoryAtPath:[docs stringByAppendingPathComponent:name] withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *log = [docs stringByAppendingPathComponent:@"log.txt"];
     if (freopen(log.fileSystemRepresentation,"w",stderr)) setvbuf(stderr,NULL,_IOLBF,0);
+    power_memory_report();   // memory left to the app, and whether the profile granted the memory entitlements (power.m)
     setenv("TOTK_ROMFS",[res stringByAppendingPathComponent:@"romfs"].fileSystemRepresentation,1);
     setenv("TOTK_OPERATION_MODE","handheld",1);
     // Game language: the Settings app (Settings.bundle › TOTK_LANG) stores the choice in our defaults; empty means the
@@ -231,6 +233,7 @@ static void audio_observe(void) {
     /* The player's settings (runtime/settings.c): the app is its own launcher, so the start-time ones become variables here. */
     settings_init([docs stringByAppendingPathComponent:@"settings.txt"].fileSystemRepresentation);
     settings_observe(settings_changed);
+    power_observe();   // heat and Low Power Mode hold the frame rate at 30 (power.m)
     chdir(docs.fileSystemRepresentation);
     host_argv[0] = strdup("TOTK"); host_argv[1] = strdup(res.fileSystemRepresentation); host_argv[2] = strdup("boot");
     return YES;   // the window is made when the window scene connects (TOTKSceneDelegate)

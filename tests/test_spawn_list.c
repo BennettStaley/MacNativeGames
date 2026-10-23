@@ -98,7 +98,14 @@ int main(void) {
     check(spawn_picks_format(&p, text, 10) > 10, "a short buffer reports the full length");
     spawn_picks_parse(&again, "# c\nfavorite Item_Fruit_A\r\nfavorite Item_Fruit_A\nfavorite ../etc\nrecent Obj_Rock\nrecent Obj_Rock\nbogus line\nrecent\n");
     check(again.nfav == 1 && again.nrecent == 1 && !strcmp(again.fav[0], "Item_Fruit_A"), "bad, repeated and CRLF lines");
-    spawn_picks_parse(&again, NULL); check(!again.nfav && !again.nrecent, "no file: nothing picked");
+    spawn_picks_parse(&again, NULL); check(!again.nfav && !again.nrecent && again.place == SPAWN_PLACE_FRONT, "no file: nothing picked");
+    /* the Place choice: kept as "place <word>", in front when missing or unknown */
+    p.place = SPAWN_PLACE_ABOVE; spawn_picks_format(&p, text, sizeof text);
+    check(strstr(text, "\nplace above\n") != NULL, "the place is written");
+    spawn_picks_parse(&again, text); check(again.place == SPAWN_PLACE_ABOVE && again.nfav == p.nfav, "the place is read back");
+    p.place = SPAWN_PLACE_FRONT; spawn_picks_format(&p, text, sizeof text);
+    check(!strstr(text, "place "), "in front (the default) is not written");
+    spawn_picks_parse(&again, "place feet\r\nplace sideways\n"); check(again.place == SPAWN_PLACE_FEET, "an unknown place line is skipped");
 
     /* the files: spawn-picks.txt beside the profile, the actor list */
     char path[1024];

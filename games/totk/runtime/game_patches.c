@@ -461,8 +461,8 @@ int runtime_output_mode_cycle(void) {
     extern void dm_gfx_set_flag(const char *name, int value);
     int next_full, next_mfx;
     const char *name;
-    if (full) { next_full = 0; next_mfx = 0; name = "关闭 2K"; }
-    else if (mfxup_output_enabled()) { next_full = 1; next_mfx = 0; name = "原生 2K"; }
+    if (full) { next_full = 0; next_mfx = 0; name = "2K off"; }
+    else if (mfxup_output_enabled()) { next_full = 1; next_mfx = 0; name = "native 2K"; }
     else { next_full = 0; next_mfx = 1; name = "MetalFX 2K"; }
     if (full != next_full) runtime_output_res_toggle();
     dm_gfx_set_flag("mfx_output", next_mfx);

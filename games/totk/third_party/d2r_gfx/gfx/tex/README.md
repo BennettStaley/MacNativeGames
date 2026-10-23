@@ -1,7 +1,5 @@
 # dm/gfx/tex — texture format mapping, block-linear deswizzling, BC decompression
 
-中文：[README.zh-CN.md](README.zh-CN.md)
-
 The part of the graphics layer that deals with texture data, called by the replay layer `../nvn/nvn_mtl.m`. It does three things:
 
 1. converts NVN texture format numbers to Metal pixel formats;

@@ -190,7 +190,7 @@ static void *sampler(void *arg) {
         }
         pthread_mutex_lock(&g_mu); g_cur = s; g_have = nc > 0; pthread_mutex_unlock(&g_mu);
         memcpy(b0, b1, sizeof b0); memcpy(t0, t1, sizeof t0); w0 = w1; g0 = g1;
-        if (k % 60 == 0) { char t[128]; sysload_text(t, sizeof t, &s); fprintf(stderr, "[totk-gfx] [负载] %s（T 是最忙的线程：%s；括号里是游戏自己的 GPU 工作，不算保活）\n", t, s.thread_name); }   // every 30 s
+        if (k % 60 == 0) { char t[128]; sysload_text(t, sizeof t, &s); fprintf(stderr, "[totk-gfx] [load] %s (T is the busiest thread: %s; parentheses show the game's own GPU work, excluding keep-alive)\n", t, s.thread_name); }   // every 30 s
     }
     return NULL;
 }

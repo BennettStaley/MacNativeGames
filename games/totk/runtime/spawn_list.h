@@ -76,6 +76,7 @@ enum { SPAWN_FAV_MAX = 200, SPAWN_RECENT_MAX = 20 };
 typedef struct {
     char fav[SPAWN_FAV_MAX][SPAWN_NAME_MAX]; int nfav;            /* in the order they were marked */
     char recent[SPAWN_RECENT_MAX][SPAWN_NAME_MAX]; int nrecent;   /* newest first */
+    int place;                                                    /* SPAWN_PLACE_*: the Place popup */
 } SpawnPicks;
 
 static inline int spawn_picks_is_favorite(const SpawnPicks *p, const char *name) {
@@ -104,7 +105,8 @@ static inline void spawn_picks_add_recent(SpawnPicks *p, const char *name) {
     memmove(p->recent[1], p->recent[0], (size_t)at * sizeof p->recent[0]);
     strcpy(p->recent[0], name);
 }
-/* spawn-picks.txt: "favorite <name>" and "recent <name>" lines (recents newest first), '#' comments. Bad lines are
+/* spawn-picks.txt: "favorite <name>" and "recent <name>" lines (recents newest first), "place front|above|far|feet",
+   '#' comments. Bad lines are
    skipped, so a damaged file loses only those. */
 static inline void spawn_picks_parse(SpawnPicks *p, const char *text) {
     memset(p, 0, sizeof *p);
@@ -120,7 +122,7 @@ static inline void spawn_picks_parse(SpawnPicks *p, const char *text) {
                 int seen = 0;
                 for (int i = 0; i < p->nrecent; i++) seen |= !strcmp(p->recent[i], line + 7);
                 if (!seen) strcpy(p->recent[p->nrecent++], line + 7);
-            }
+            } else if (!strncmp(line, "place ", 6) && spawn_place_parse(line + 6) >= 0) p->place = spawn_place_parse(line + 6);
         }
         text = eol ? eol + 1 : text + len;
     }
@@ -129,9 +131,10 @@ static inline void spawn_picks_parse(SpawnPicks *p, const char *text) {
 static inline int spawn_picks_format(const SpawnPicks *p, char *out, size_t n) {
     size_t used = 0;
 #define SPAWN_PUT(...) do { int k = snprintf(out + (used < n ? used : n), used < n ? n - used : 0, __VA_ARGS__); if (k > 0) used += (size_t)k; } while (0)
-    SPAWN_PUT("# The Spawn tab's favorites and recents (newest first). The game rewrites this file.\n");
+    SPAWN_PUT("# The Spawn tab's favorites, recents (newest first) and placement. The game rewrites this file.\n");
     for (int i = 0; i < p->nfav; i++) SPAWN_PUT("favorite %s\n", p->fav[i]);
     for (int i = 0; i < p->nrecent; i++) SPAWN_PUT("recent %s\n", p->recent[i]);
+    if (p->place > 0 && p->place < SPAWN_PLACE_COUNT) SPAWN_PUT("place %s\n", SPAWN_PLACE_WORDS[p->place]);
 #undef SPAWN_PUT
     return (int)used;
 }

@@ -514,7 +514,7 @@ int runtime_output_mode_cycle(void) {
     int next = !mfxup_enabled();
     dm_gfx_set_flag("mfx_output", next);
     dm_gfx_set_flag("mfx_upscale", next);
-    fprintf(stderr, "[botw] key 3: %s\n", next ? "MetalFX 2K" : "关闭 2K");
+    fprintf(stderr, "[botw] key 3: %s\n", next ? "MetalFX 2K" : "2K off");
     return 1;
 }
 float runtime_aspect_now(void) { return 0; }

@@ -5,7 +5,8 @@
    in every 1.4.3 session (loader.c runtime_frame_controller_return_pc); the survey's own commands stay test-only, and in
    normal play only the menu's Spawn tab queues requests (the input file's "spawn" needs TOTK_SURVEY=1).
 
-   1.4.3 addresses (game_version.h, GAME_SPAWN_*), found from 1.0.0, whose symbols are public (totk-lotuskit
+   1.0.0 uses the public symbols directly (same entry check, 105 callers). 1.2.1 (lotuskit: 0xab92cc, sInstance 0x4722920)
+   waits for a 1.2.1 main to check against. 1.4.3 addresses (game_version.h, GAME_SPAWN_*), found from 1.0.0, whose symbols are public (totk-lotuskit
    syms/exking/engine/actor/ActorMgr.py, from dt-12345/totk_syms):
      requestCreateActorAsync 1.0.0 0xa5fdf8 -> 1.4.3 0x599670: the only target that the mapped callers agree on
        (scripts/map_version_sites.py, by callers), 108 direct callers in 1.4.3 against 105 in 1.0.0, the same 12 calls
@@ -28,13 +29,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(TOTK_GAME_V143) && !defined(GAME_BOTW)
+#if defined(GAME_SPAWN_REQUEST_CREATE) && !defined(GAME_BOTW)
 #define SPAWN_SUPPORTED 1
 #endif
 
 _Atomic int runtime_spawn_waiting;
 static _Atomic int spawn_commands;   /* the input file's "spawn" lines: test profiles only (world_survey.c) */
 static _Atomic(RuntimeSpawnObserver) spawn_observer;
+static _Atomic int spawn_place;   /* SPAWN_PLACE_*: the Spawn tab's Place popup */
+void runtime_spawn_set_placement(int place) { if (place >= 0 && place < SPAWN_PLACE_COUNT) atomic_store(&spawn_place, place); }
+int runtime_spawn_placement(void) { return atomic_load(&spawn_place); }
 void runtime_spawn_allow_commands(void) { atomic_store(&spawn_commands, 1); }
 void runtime_spawn_observe(RuntimeSpawnObserver fn) { atomic_store(&spawn_observer, fn); }
 #ifdef SPAWN_SUPPORTED
@@ -50,14 +54,15 @@ static int actor_exists(const char *name) {
 }
 #endif
 
-int runtime_spawn_actor(const char *name, int count) {
+int runtime_spawn_actor(const char *name, int count) { return runtime_spawn_actor_at(name, count, runtime_spawn_placement()); }
+int runtime_spawn_actor_at(const char *name, int count, int place) {
 #ifndef SPAWN_SUPPORTED
-    (void)name; (void)count;
+    (void)name; (void)count; (void)place;
     return SPAWN_ERR_UNSUPPORTED;
 #else
     if (!atomic_load(&spawn_enabled)) return SPAWN_ERR_DISABLED;
     pthread_mutex_lock(&spawn_lock);
-    int r = spawn_queue_push(&spawn_queue, name, count, actor_exists);
+    int r = spawn_queue_push_at(&spawn_queue, name, count, place, actor_exists);
     pthread_mutex_unlock(&spawn_lock);
     if (r == SPAWN_OK) {   /* waiting first, then the frame-end wake-up (world_survey.c clears them in the other order) */
         atomic_store(&runtime_spawn_waiting, 1);
@@ -84,16 +89,22 @@ int runtime_spawn_command(const char *line) {
         fprintf(stderr, "[spawn] rejected: the input file's spawn needs TOTK_SURVEY=1 on a test profile (players use the Spawn tab)\n");
         return 1;
     }
-    char name[SPAWN_NAME_MAX + 1] = {0}; int count = 1, used = 0;
-    if (!(sscanf(line, "spawn %96s %d %n", name, &count, &used) == 2 && used && !line[used])) {
-        count = 1; used = 0;
-        if (!(sscanf(line, "spawn %96s %n", name, &used) == 1 && used && !line[used])) {
-            fprintf(stderr, "[spawn] rejected: expected spawn <actor name> [count 1..%d]\n", SPAWN_COUNT_MAX);
-            return 1;
+    char name[SPAWN_NAME_MAX + 1] = {0}, word[16] = {0}; int count = 1, used = 0, place = runtime_spawn_placement();
+    if (sscanf(line, "spawn %96s %d %15s %n", name, &count, word, &used) == 3 && used && !line[used]) {
+        if ((place = spawn_place_parse(word)) < 0) used = 0;
+    } else {
+        used = 0;
+        if (!(sscanf(line, "spawn %96s %d %n", name, &count, &used) == 2 && used && !line[used])) {
+            count = 1; used = 0;
+            if (!(sscanf(line, "spawn %96s %n", name, &used) == 1 && used && !line[used])) used = 0;
         }
     }
-    int r = runtime_spawn_actor(name, count);
-    if (r == SPAWN_OK) fprintf(stderr, "[spawn] queued name=%s count=%d\n", name, count);
+    if (!used) {
+        fprintf(stderr, "[spawn] rejected: expected spawn <actor name> [count 1..%d [front|above|far|feet]]\n", SPAWN_COUNT_MAX);
+        return 1;
+    }
+    int r = runtime_spawn_actor_at(name, count, place);
+    if (r == SPAWN_OK) fprintf(stderr, "[spawn] queued name=%s count=%d place=%s\n", name, count, SPAWN_PLACE_WORDS[place]);
     else fprintf(stderr, "[spawn] refused name=%.96s count=%d: %s\n", spawn_name_valid(name) ? name : "(invalid)", count, spawn_error_text(r));
     return 1;
 }
@@ -137,7 +148,7 @@ static const char *result_text(uint32_t r) {
     return r < sizeof names / sizeof *names ? names[r] : "?";
 }
 
-/* Every 1.4.3 session: the call is only made for requests the player (the Spawn tab) or a test queued. */
+/* Every 1.0.0 and 1.4.3 session (the same entry check for both): the call is only made for requests the player (the Spawn tab) or a test queued. */
 int runtime_spawn_init(Module *m) {
     static const uint32_t entry[] = {0xa9ba7bfd, 0xa9016ffc, 0x910003fd, 0xa90267fa, 0xa9035ff8, 0xa90457f6, 0xa9054ff4};
     if (strcmp(m->name, "main") || GAME_SPAWN_REQUEST_CREATE + sizeof entry > m->text_end || GAME_SPAWN_ACTOR_MGR + 8u > m->size ||
@@ -164,7 +175,7 @@ static void spawn_one(const SpawnRequest *r, const float base[3], float fx, floa
     unsigned created = 0; uint32_t last = 0;
     for (int k = 0; k < r->count; ++k) {
         float off[3];
-        spawn_offset(k, r->count, fx, fz, 3.0f, off);
+        spawn_place_offset(k, r->count, fx, fz, r->place, off);
         CreateArg arg;
         memset(&arg, 0, sizeof arg);
         for (int c = 0; c < 3; c++) arg.position[c] = base[c] + off[c];
@@ -181,8 +192,8 @@ static void spawn_one(const SpawnRequest *r, const float base[3], float fx, floa
         created += ok; last = result;
         if (!ok) break;   /* the same name fails the same way again */
     }
-    fprintf(stderr, "[spawn] name=%s requested=%d created=%u result=%u(%s) at=%.2f,%.2f,%.2f frame=%llu\n", r->name, r->count,
-            created, last, result_text(last), base[0], base[1], base[2], (unsigned long long)frame);
+    fprintf(stderr, "[spawn] name=%s requested=%d created=%u result=%u(%s) place=%s at=%.2f,%.2f,%.2f frame=%llu\n", r->name,
+            r->count, created, last, result_text(last), SPAWN_PLACE_WORDS[r->place], base[0], base[1], base[2], (unsigned long long)frame);
     if (observer) {
         char why[96];
         snprintf(why, sizeof why, "the game refused it (%s)", result_text(last));

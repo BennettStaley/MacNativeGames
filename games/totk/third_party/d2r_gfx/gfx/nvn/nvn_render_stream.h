@@ -25,6 +25,7 @@ enum {
     RS_DRAW, RS_INSTANCED, RS_INDEXED, RS_STORE,
     RS_BEGIN,   /* u[0] = retained MTL4RenderPassDescriptor, u[1] = vertex table, u[2] = fragment table, u[3] = command buffer, u[4] = barrier at start, u[5] = visibility options */
     RS_END,     /* end the encoder (barrier at end if u[0], visibility options u[1]) */
+    RS_VERTEX_WAIT,   /* TOTK_BARRIER_NARROW=1 (bar_draw): later vertex work waits for earlier vertex and fragment work; u[0] = visibility options */
 };
 enum { RS_SPIN_NS = 200000 };   /* B waits (wfe) this long on an empty queue before sleeping on the semaphore. During a replay A never pauses
                                    for that long, so B sleeps in the frame gap and wakes (~30 us) at the next submission. The waits are wfe / sev,
@@ -77,6 +78,7 @@ static void rs_apply(id<MTL4RenderCommandEncoder> *enc, id<MTL4ArgumentTable> *v
             if (u[0] == 2) [e barrierAfterStages:MTLStageVertex | MTLStageFragment beforeQueueStages:MTLStageFragment | MTLStageBlit | MTLStageDispatch visibilityOptions:(MTL4VisibilityOptions)u[1]];   /* TOTK_BARRIER_NARROW: later vertex stages do not wait */
             else if (u[0]) [e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:(MTL4VisibilityOptions)u[1]];
             [e endEncoding]; *enc = nil; break;
+        case RS_VERTEX_WAIT: [e barrierAfterQueueStages:MTLStageVertex | MTLStageFragment beforeStages:MTLStageVertex visibilityOptions:(MTL4VisibilityOptions)u[0]]; break;
         case RS_PSO: [e setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)(void *)(uintptr_t)u[0]]; if (u[0]) CFRelease((CFTypeRef)(uintptr_t)u[0]); break;
         case RS_DSS: [e setDepthStencilState:(__bridge id<MTLDepthStencilState>)(void *)(uintptr_t)u[0]]; if (u[0]) CFRelease((CFTypeRef)(uintptr_t)u[0]); break;
         case RS_VIEWPORT: { MTLViewport v; memcpy(&v, u, sizeof v); [e setViewport:v]; break; }
@@ -179,7 +181,7 @@ static int rs_stream_pass(void) {
         pthread_t thread; pthread_attr_t attr; pthread_attr_init(&attr); pthread_attr_setstacksize(&attr, 1 << 20);
         if (pthread_create(&thread, &attr, rs_worker, NULL)) MDIE("render stream worker creation failed");
         pthread_detach(thread); g_rs_created = 1;
-        MLOG("[nvn] 编码线程：渲染通道的 Metal 编码在独立线程上（TOTK_RENDER_STREAM=1；flag render_stream 0 关）");
+        MLOG("[nvn] encoder thread: render-pass Metal encoding runs on its own thread (TOTK_RENDER_STREAM=1; flag render_stream 0 turns it off)");
     }
     return 1;
 }
@@ -208,8 +210,8 @@ static void rs_sub_end(void) {
     if (++g_rs_subs % 1800 == 0) {
         static uint64_t last_busy, last_full, last_packets, last_sync;
         uint64_t busy = atomic_load(&g_rs_b_busy_ns);
-        MLOG("[nvn] 编码线程 至提交 %llu：通道 %llu，包 %llu（近 1800 次提交每次 %.0f 个），等待 %llu 次 / 平均 %.1f µs / 最长 %.1f µs / 近 1800 次每次 %.3f ms，"
-             "环满 %llu 次 / 近 1800 次每次等 %.3f ms，线程入睡 %llu 次，编码线程忙 近 1800 次每次 %.3f ms",
+        MLOG("[nvn] encoder thread to submit %llu: passes %llu, packets %llu (%.0f per submit over the last 1800), waits %llu / mean %.1f µs / max %.1f µs / %.3f ms per submit over the last 1800, "
+             "ring full %llu / %.3f ms wait per submit over the last 1800, thread slept %llu times, encoder thread busy %.3f ms per submit over the last 1800",
              (unsigned long long)g_rs_subs, (unsigned long long)g_rs_passes, (unsigned long long)g_rs_packets, (double)(g_rs_packets - last_packets) / 1800.0,
              (unsigned long long)g_rs_syncs, g_rs_syncs ? (double)g_rs_sync_ns / (double)g_rs_syncs / 1e3 : 0.0, (double)g_rs_sync_max_ns / 1e3,
              (double)(g_rs_sync_ns - last_sync) / 1800.0 / 1e6, (unsigned long long)g_rs_full_waits, (double)(g_rs_full_ns - last_full) / 1800.0 / 1e6,

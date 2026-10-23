@@ -173,8 +173,8 @@ static void describe_holder(char *out, size_t n) {
     long long since = kv_num(p, "since"), expect = kv_num(p, "expect_s"), gp = kv_num(p, "game_pid");
     long long held = since ? (long long)time(NULL) - since : 0;
     char left[64] = "";
-    if (expect > held) snprintf(left, sizeof left, "，预计还要约 %lld 分钟", (expect - held + 59) / 60);
-    snprintf(out, n, "%s（%s）占用中，已 %lld 分 %lld 秒%s，游戏 pid %lld", who, what, held / 60, held % 60, left, gp);
+    if (expect > held) snprintf(left, sizeof left, ", about %lld min left", (expect - held + 59) / 60);
+    snprintf(out, n, "%s (%s) holds it, for %lld min %lld s%s, game pid %lld", who, what, held / 60, held % 60, left, gp);
 }
 
 /* The user's game: stop an agent's game that holds the slot. The marker comes first, so the agent's script can tell a
@@ -195,11 +195,11 @@ static void preempt_holder(void) {
         char extra[300]; snprintf(extra, sizeof extra, "target_owner=%s target_pid=%d target_purpose=%s", who, gp, what);
         history("preempt", extra);
         if (live) kill(gp, SIGTERM);
-        fprintf(stderr, "[game-slot] 用户要玩：停止 %s 的游戏（%s，pid %d），它的测试稍后会自动重跑\n", who, what, gp);
+        fprintf(stderr, "[game-slot] the user wants to play: stopping %s's game (%s, pid %d); its test reruns automatically later\n", who, what, gp);
         snprintf(done_token, sizeof done_token, "%s", tok); sent_at = time(NULL); killed = 0;
     } else if (live && !killed && time(NULL) - sent_at > 15) {
         kill(gp, SIGKILL); killed = 1;
-        fprintf(stderr, "[game-slot] pid %d 15 秒内没有退出，强制结束\n", gp);
+        fprintf(stderr, "[game-slot] pid %d did not exit within 15 s, killing it\n", gp);
     }
 }
 
@@ -288,7 +288,7 @@ void runtime_game_slot_acquire(const char *mode) {
         unsetenv("TOTK_GAME_SLOT_FD");
         holder_write();
         history("start", "slot=inherited");
-        fprintf(stderr, "[game-slot] 游戏位置由启动脚本持有（%s，%s）\n", owner, purpose);
+        fprintf(stderr, "[game-slot] the game slot is held by the launch script (%s, %s)\n", owner, purpose);
         dry_run();
         return;
     }
@@ -313,15 +313,15 @@ void runtime_game_slot_acquire(const char *mode) {
         char head[80]; queue_scan(head, sizeof head, NULL, 0);
         pid_t upid = user ? 0 : user_request_pid();
         const char *mine = strrchr(my_queue, '/') + 1;
-        if (upid) { snprintf(reason, sizeof reason, "用户的游戏（pid %d）正在等，让它先", upid); snprintf(key, sizeof key, "user %d", upid); }
+        if (upid) { snprintf(reason, sizeof reason, "the user's game (pid %d) is waiting, letting it go first", upid); snprintf(key, sizeof key, "user %d", upid); }
         else if (!user && strcmp(head, mine)) {
-            snprintf(reason, sizeof reason, "排队中，前面还有别的测试（queue/%s）", head); snprintf(key, sizeof key, "queue %s", head);
+            snprintf(reason, sizeof reason, "queued behind another test (queue/%s)", head); snprintf(key, sizeof key, "queue %s", head);
         }
         else if (!flock(lock_fd, LOCK_EX | LOCK_NB)) {
             pid_t old = ignore_legacy ? 0 : legacy_game();
             if (!old) break;
             flock(lock_fd, LOCK_UN);
-            snprintf(reason, sizeof reason, "pid %d 的游戏没有接入游戏锁（旧版程序？），等它退出", old);
+            snprintf(reason, sizeof reason, "the game with pid %d does not use the game lock (old build?), waiting for it to exit", old);
             snprintf(key, sizeof key, "legacy %d", old);
         } else {
             if (errno != EWOULDBLOCK) slot_fail("flock", lock_path);
@@ -332,11 +332,11 @@ void runtime_game_slot_acquire(const char *mode) {
         }
         time_t now = time(NULL);
         if (max_wait >= 0 && now - start >= max_wait) {
-            fprintf(stderr, "[game-slot] 等了 %lld 秒还没轮到（%s）；TOTK_GAME_SLOT_WAIT=%s，退出 75\n", (long long)(now - start), reason, mw);
+            fprintf(stderr, "[game-slot] waited %lld s without getting the slot (%s); TOTK_GAME_SLOT_WAIT=%s, exiting 75\n", (long long)(now - start), reason, mw);
             exit(75);
         }
         if (strcmp(key, last_key) || now - last_log >= 30) {
-            fprintf(stderr, "[game-slot] 等待游戏位置：%s\n", reason);
+            fprintf(stderr, "[game-slot] waiting for the game slot: %s\n", reason);
             snprintf(last_key, sizeof last_key, "%s", key); last_log = now;
         }
         usleep(user ? 200000 : 1000000);
@@ -349,7 +349,7 @@ void runtime_game_slot_acquire(const char *mode) {
     holder_write();
     char extra[64]; snprintf(extra, sizeof extra, "waited_s=%lld", (long long)(acquired_at - start));
     history("acquire", extra);
-    fprintf(stderr, "[game-slot] 取得游戏位置（%s，%s）%s\n", owner, purpose, acquired_at > start ? "，等待结束" : "");
+    fprintf(stderr, "[game-slot] got the game slot (%s, %s)%s\n", owner, purpose, acquired_at > start ? ", wait over" : "");
     dry_run();
 }
 #endif   /* !TARGET_OS_IPHONE */

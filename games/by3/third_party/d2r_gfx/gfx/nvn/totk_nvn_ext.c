@@ -210,10 +210,10 @@ NVN(nvnVertexStreamStateGetDivisor, int, const NVNvertexStreamState *s) { return
 // ---------- Rasterisation state without a Metal equivalent: lines are 1 pixel wide and point size comes from
 // the vertex shader on Metal. Non-default values are reported once (the drawing proceeds without them). ----------
 NVN(nvnCommandBufferSetLineWidth, void, NVNcommandBuffer *c, float w) {
-    (void)c; if (w != 1.0f) { static int once; if (!once++) LOG("【红】SetLineWidth %g: Metal draws 1-pixel lines", w); }
+    (void)c; if (w != 1.0f) { static int once; if (!once++) LOG("[red] SetLineWidth %g: Metal draws 1-pixel lines", w); }
 }
 NVN(nvnCommandBufferSetPointSize, void, NVNcommandBuffer *c, float sz) {
-    (void)c; if (sz != 1.0f) { static int once; if (!once++) LOG("【红】SetPointSize %g: Metal takes point size from the vertex shader", sz); }
+    (void)c; if (sz != 1.0f) { static int once; if (!once++) LOG("[red] SetPointSize %g: Metal takes point size from the vertex shader", sz); }
 }
 
 // ---------- Entry points outside main's name table (NVN 55 inline fast-path fallbacks and newer queries) ----------
@@ -224,8 +224,8 @@ NVN(nvnCommandBufferSetPointSize, void, NVNcommandBuffer *c, float sz) {
 void *nvn_slot_fn(const char *name);
 void nvn_bind_handles_deferred(NVNcommandBuffer *c, int op, int st, int first, int n, const uint64_t *h, size_t hw_bytes);
 NVN_EXTRA(nvnCommandBufferBindTexturesDeferred, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNtextureHandle *h) { nvn_bind_handles_deferred(c, OP_BIND_TEX, st, first, n, (const uint64_t *)h, 0); }
-NVN_EXTRA(nvnCommandBufferBindUniformBuffersDeferred, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *r) { static int once; if (!once++) LOG("[nvn] BindUniformBuffersDeferred 首次调用（缓冲范围仍按录制时绑定）"); CALL_SLOT(nvnCommandBufferBindUniformBuffers)(c, st, first, n, r); }
-NVN_EXTRA(nvnCommandBufferBindStorageBuffersDeferred, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *r) { static int once; if (!once++) LOG("[nvn] BindStorageBuffersDeferred 首次调用（缓冲范围仍按录制时绑定）"); CALL_SLOT(nvnCommandBufferBindStorageBuffers)(c, st, first, n, r); }
+NVN_EXTRA(nvnCommandBufferBindUniformBuffersDeferred, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *r) { static int once; if (!once++) LOG("[nvn] BindUniformBuffersDeferred first call (buffer ranges still bound at record time)"); CALL_SLOT(nvnCommandBufferBindUniformBuffers)(c, st, first, n, r); }
+NVN_EXTRA(nvnCommandBufferBindStorageBuffersDeferred, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *r) { static int once; if (!once++) LOG("[nvn] BindStorageBuffersDeferred first call (buffer ranges still bound at record time)"); CALL_SLOT(nvnCommandBufferBindStorageBuffers)(c, st, first, n, r); }
 NVN_EXTRA(nvnCommandBufferBindImagesDeferred, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNimageHandle *h) { nvn_bind_handles_deferred(c, OP_BIND_IMG, st, first, n, (const uint64_t *)h, 16 + 8 * (size_t)n); }
 NVN_EXTRA(nvnCommandBufferBindSeparateTexturesDeferred, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNseparateTextureHandle *h) { nvn_bind_handles_deferred(c, OP_BIND_TEX, st, first, n, (const uint64_t *)h, 16 + 8 * (size_t)n); }
 NVN_EXTRA(nvnCommandBufferBindSeparateSamplersDeferred, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNseparateSamplerHandle *h) { nvn_bind_handles_deferred(c, OP_BIND_SAMP, st, first, n, (const uint64_t *)h, 16 + 8 * (size_t)n); }
@@ -238,7 +238,7 @@ NVN_EXTRA(nvnCommandBufferSetZCullZF32CompressionEnable, void, NVNcommandBuffer 
 NVN_EXTRA(nvnDeviceSetAutomaticCheckpointsMask, void, NVNdevice *d, uint32_t m) { (void)d; (void)m; }
 /* NVN default provoking vertex is the last vertex (GL convention); Metal uses the first. Only the default is accepted. */
 NVN_EXTRA(nvnCommandBufferSetProvokingVertexMode, void, NVNcommandBuffer *c, int mode) {
-    (void)c; if (mode != 0) { static int once; if (!once++) LOG("【红】SetProvokingVertexMode %d: provoking-vertex conversion not implemented", mode); }
+    (void)c; if (mode != 0) { static int once; if (!once++) LOG("[red] SetProvokingVertexMode %d: provoking-vertex conversion not implemented", mode); }
 }
 NVN_EXTRA(nvnTextureBuilderGetViewOffset, ptrdiff_t, const NVNtextureBuilder *b, const NVNtextureView *v) {
     const tex_builder_t *o = CTB(b); const view_t *w = CVW(v);
@@ -263,18 +263,18 @@ NVN(nvnCommandBufferSetSubpixelPrecisionBias, void, NVNcommandBuffer *c, int x, 
 NVN(nvnCommandBufferDiscardColor, void, NVNcommandBuffer *c, int i) { (void)c; (void)i; }          /* contents become undefined: keeping them is valid */
 NVN(nvnCommandBufferDiscardDepthStencil, void, NVNcommandBuffer *c) { (void)c; }
 NVN(nvnCommandBufferSetConservativeRasterEnable, void, NVNcommandBuffer *c, uint32_t e) {
-    (void)c; if (e & 0xff) { static int once; if (!once++) LOG("【红】conservative rasterisation requested: not available on Metal (drawn normally)"); }
+    (void)c; if (e & 0xff) { static int once; if (!once++) LOG("[red] conservative rasterisation requested: not available on Metal (drawn normally)"); }
 }
 NVN(nvnCommandBufferSetConservativeRasterDilate, void, NVNcommandBuffer *c, float d) { (void)c; (void)d; }
 NVN(nvnCommandBufferSetSampleMask, void, NVNcommandBuffer *c, int m) {
-    (void)c; if ((m & 0xffff) != 0xffff) { static int once; if (!once++) LOG("【红】SetSampleMask %#x: fixed-function sample mask not applied", m); }
+    (void)c; if ((m & 0xffff) != 0xffff) { static int once; if (!once++) LOG("[red] SetSampleMask %#x: fixed-function sample mask not applied", m); }
 }
 NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) { (void)c; (void)r; }   /* only used with the alpha test, reported in the replay */
 /* Metal always restarts strips at the all-ones index; other restart indices are reported. */
 NVN(nvnCommandBufferSetPrimitiveRestart, void, NVNcommandBuffer *c, uint32_t e, int index) {
-    (void)c; if ((e & 0xff) && index != -1 && index != 0xffff) { static int once; if (!once++) LOG("【红】SetPrimitiveRestart index %#x: Metal restarts only at the all-ones index", index); }
+    (void)c; if ((e & 0xff) && index != -1 && index != 0xffff) { static int once; if (!once++) LOG("[red] SetPrimitiveRestart index %#x: Metal restarts only at the all-ones index", index); }
 }
 /* Metal has no depth-bounds test. Disabling is exact; an enabled range is drawn without the test and reported. */
 NVN(nvnCommandBufferSetDepthBounds, void, NVNcommandBuffer *c, uint32_t e, float lo, float hi) {
-    (void)c; if ((e & 0xff) && (lo > 0.0f || hi < 1.0f)) { static int once; if (!once++) LOG("【红】SetDepthBounds [%g, %g]: depth-bounds test not available on Metal (fragments outside the range are kept)", lo, hi); }
+    (void)c; if ((e & 0xff) && (lo > 0.0f || hi < 1.0f)) { static int once; if (!once++) LOG("[red] SetDepthBounds [%g, %g]: depth-bounds test not available on Metal (fragments outside the range are kept)", lo, hi); }
 }

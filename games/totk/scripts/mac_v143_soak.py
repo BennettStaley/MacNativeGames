@@ -104,7 +104,7 @@ def main():
                     line = raw.decode('utf-8', errors='replace')
                     if '[input] user input' in line:
                         raise RuntimeError('real user input; game left open, scripted control stopped')
-                    match = re.search(r'\[nvn\] 帧 (\d+)：\d+ 个函数', line)
+                    match = re.search(r'\[nvn\] frame (\d+): \d+ functions', line)
                     if match and int(match[1]) > latest_frame:
                         latest_frame = int(match[1])
                         frame_changed = time.monotonic()
@@ -113,7 +113,7 @@ def main():
                         audio = dict(rms=float(match[1]), peak=float(match[2]),
                                      underruns=int(match[3]), overruns=int(match[4]))
                         report['audio_reports'] += 1
-                    if re.search(r'GPU fault|command buffer.*(?:failed|error)|integrity mismatch|\[fatal\]|runtime_fail|EXC_BAD_ACCESS|【红】', line, re.I):
+                    if re.search(r'GPU fault|command buffer.*(?:failed|error)|integrity mismatch|\[fatal\]|runtime_fail|EXC_BAD_ACCESS|\[red\]|\u3010\u7ea2\u3011', line, re.I):
                         field = 'preexisting_diagnostic_lines' if initial_scan else 'suspicious_log_lines'
                         if len(report[field]) < 200:
                             report[field].append(line)

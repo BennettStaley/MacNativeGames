@@ -7,7 +7,7 @@ changes within a frame or two, except the few settings marked *after restart*. S
 
 | | |
 |---|---|
-| Mac | **⌘,**, **F1**, the app menu's **Settings…**, a controller's **Home** button (the Xbox button), or **Options and Menu** (View and Menu on Xbox) held together for a moment |
+| Mac | **⌘,**, **F1**, the app menu's **Settings…**, **L3 + R3** (both stick clicks) or **Options and Menu** (View and Menu on Xbox) held together for a moment, or a controller's **Home** button (on macOS 26 the Xbox button opens the system's Games overlay instead) |
 | iPad / iPhone | the **gear** at the top of the screen, a **three-finger tap**, a controller's **Home** button, **− and +** held together, or **Esc** / **⌘,** on a keyboard |
 
 On the Mac the menu is a sidebar inside the game window, so it works in full screen and the picture stays in view beside
@@ -18,7 +18,7 @@ The menu has four tabs, each a bar of sections:
 | Tab | Sections |
 |---|---|
 | **Game** | Display · Frame rate (with frame interpolation) · Controls · Audio · Interface |
-| **Graphics** | Image (preset, anti-aliasing, sharpening, anisotropic filtering, texture detail) · Effects (bloom, depth of field, lens flare, cave fog) · World detail (field of view, render distance, shadow resolution) |
+| **Graphics** | Image (preset, anti-aliasing, sharpening, anisotropic filtering, texture detail) · Effects (bloom, depth of field, lens flare, cave fog) · World detail (field of view, render distance, shadow resolution, dynamic resolution) |
 | **Content** | Mods · Saves (Send saves) · Downloads (shader list, cheat list) |
 | **Tools** | Cheats · Spawn · World (time of day) · Camera (hide the HUD) |
 
@@ -58,6 +58,13 @@ softer world, crisp HUD. The line at the top of the menu shows both sizes as the
 (`Display 3840×2160 · Render 2560×1432 (1440p, the most it can be)`). The 3D world stops at 1440p (see below), so at a
 4K display resolution anything from 67 % up draws it at 1440p.
 
+**Maximum render resolution** (Display, after a restart): 1440p, 1800p or 4K, the biggest the 3D world can be drawn
+at; it needs the 4K maximum output. Above 1440p the game's texture heap passes 1 GiB, so memory pools may reach 2 GiB
+and the GPU memory budget becomes 40 % of the Mac's memory. Measured on an 18 GB M3 Pro (2026-10-21): 1800p at a 4K
+display resolution held 60 fps and used 5.4–6.1 GB of GPU memory against a 7.2 GB budget; 4K needs about 1.5 GB more.
+The menu's second line shows **GPU memory** against that budget, orange above 80 % and red above 90 %: past it the game
+stops on purpose instead of risking a system crash.
+
 Limits and why:
 
 - The 3D scene stops at 2560×1440. The game keeps its render targets in one fixed texture heap sized at start; a 4K
@@ -83,6 +90,7 @@ Limits and why:
 | **Bloom** | 0–100 % of the game's glow around bright light. The tone map adds the bloom texture to the scene; below 100 % that texture is scaled first, so 0 % is no bloom at all. Version 1.4.3. |
 | **Lens flare** | On (the game's) or off. With the sun in view the game draws about a dozen rings, ghosts and a glint over the scene before its tone map; off leaves those draws out (the sun, its glow and bloom stay). Live. Version 1.4.3. |
 | **Render distance** | 50–300 % of the camera's far clip distance (the game's own is 100 %). The game's own is 25 km, more than the map is across, so below 100 % land in the far distance is cut off sooner and above 100 % mostly changes nothing you can see: it does not load more of the world or raise the detail of distant land, which the game decides separately. |
+| **Dynamic resolution** | *On* (the game's own) or *Off*. The game measures its frame times and, when frames run long, draws the 3D world at 90 % or 80 % of the render resolution; *Off* holds every step at 100 % (`TOTK_FIXED_RES=1`: one instruction of the game's resolution controller at `main+0x5848a8`), sharper in busy places at the cost of frame rate there. The render resolution you chose stays. Applies after a restart. Mac only (iPhone and iPad run code fixed at build). Version 1.4.3. |
 
 ## Frame rate, interface, controls, audio
 
@@ -130,6 +138,12 @@ Limits and why:
 Several settings follow features first offered on Switch and emulators by MaxLastBreath's UltraCam
 (https://gamebanana.com/mods/480138) and NX Optimizer (https://github.com/MaxLastBreath/nx-optimizer). This port
 reimplements them independently for 1.4.3 and contains none of their code.
+
+Not here yet: NX Optimizer's switches for ambient occlusion, volumetric fog, screen-space reflections, global
+illumination, the grass layers, far lights, forced level of detail, *Improve LOD* and *Remove QuaReduction*. In NX
+Optimizer they are settings of UltraCam (its `Shaders` and `Graphics` sections) or older code patches it downloads,
+so its files hold no game addresses or shader identities; each needs its 1.4.3 code site or render pass found first,
+the way depth of field and lens flare were (by their shaders in the draw log).
 ## World
 
 | Setting | What it does |
@@ -138,9 +152,9 @@ reimplements them independently for 1.4.3 and contains none of their code.
 
 ## Spawn
 
-Tools › Spawn creates actors a few metres in front of you, by calling the game's own
-`ActorMgr::requestCreateActorAsync` on its frame-end thread (no game code is patched). **Version 1.4.3 only**; elsewhere the
-tab says "Spawning needs 1.4.3 for now". Mac, iPad and iPhone.
+Tools › Spawn creates actors next to you, by calling the game's own `ActorMgr::requestCreateActorAsync` on its
+frame-end thread (no game code is patched). **Versions 1.0.0 and 1.4.3**; elsewhere the tab says "Spawning needs game
+version 1.0.0 or 1.4.3 for now" (1.2.1 needs its main checked first). Mac, iPad and iPhone.
 
 - **Categories**: Favorites, Recents, Creatures, NPCs, Items, Weapons, Armor, Zonai, Objects, from the actor list the build
   makes from your own game files (`build/actor_list.tsv`, `scripts/prepare_actor_list.py`). System actors are left out;
@@ -149,8 +163,12 @@ tab says "Spawning needs 1.4.3 for now". Mac, iPad and iPhone.
 - **Search** (/ or ⌘F) looks through every category while a query is typed.
 - **Amount** 1–20 (← →, − +). A, Return or a click spawns; Y or F marks a favorite. Every spawn goes to Recents.
   Favorites and recents are kept in `spawn-picks.txt` beside the profile (next to `cheats-enabled.txt`).
+- **Place**, the popup next to Amount: **In front** (3 m ahead, the default), **Above** (8 m up, so things drop in),
+  **Far** (15 m ahead) or **At Link's feet**. P, or ← on the category column with a controller, picks the next one; on
+  iPhone and iPad it is a menu in the bar. It is kept in `spawn-picks.txt` (`place above`).
+- There is no Undo yet: the game's delete call has not been matched to 1.4.3.
 - A toast in the window's corner says "Spawned Apple ×5" or why it failed. A spawn asked for during loading waits for the
-  world. Test runs: the input file's `spawn <name> [count]` works only with `TOTK_SURVEY=1` on a test profile.
+  world. Test runs: the input file's `spawn <name> [count [front|above|far|feet]]` works only with `TOTK_SURVEY=1` on a test profile.
 
 ## Cheats
 
@@ -255,7 +273,13 @@ in two files are separate cheats. **Reset this tab** and **Reset everything…**
 ## Known issues
 
 - With *Aspect ratio* filling a screen that is not 16:9, the game's pause menu, inventory and map (drawn at 16:9, outside
-  the extended view) sometimes flash for a frame while opening or closing. Seen on a Mac (2026-10-21); not yet looked into.
+  the extended view) sometimes flash for a frame while opening or closing. Seen on a Mac (2026-10-21), frame
+  interpolation off. Ruled out from that session's log: the canvas the UI is squeezed in changes only when the output
+  resolution changes, not with menus, and the aspect ratio and its field-of-view factor are set once, not per frame.
+  Suspects, not yet confirmed in game: (1) a UI quad drawn before the frame's first main UI shader is left unsqueezed
+  (`nvn_mtl.m` `uw_ui_squeeze`; the log now says `UI quad ... before the UI began`, and `TOTK_UI_SQUEEZE_EARLY=1`
+  squeezes those too); (2) a full-screen fade or dimming quad of the menu is squeezed into the middle 16:9 like the
+  rest of the UI, so the bands outside it miss the fade for those frames.
 
 ## The file
 

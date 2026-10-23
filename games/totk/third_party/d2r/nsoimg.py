@@ -1,4 +1,3 @@
-# NSO → 内存映像（与 patch_nso.py 同一解法）；验证工具共用。
 # NSO → memory image (same decoding as patch_nso.py); shared by the verification tools.
 import struct
 import lz4.block
@@ -50,7 +49,7 @@ def header(out_dir, mod):
     h = {}
     for line in open(f'{out_dir}/{mod}.fixups.tsv'):
         if not line.startswith('#'): break
-        k, v = line[1:].split(); h[k] = int(v, 0)      # 0x 开头为偏移，十进制为槽号 | A 0x prefix means an offset, decimal means a slot number
+        k, v = line[1:].split(); h[k] = int(v, 0)      # A 0x prefix means an offset, decimal means a slot number
     return h
 
 def mod0(img):
@@ -59,7 +58,7 @@ def mod0(img):
     return m0
 
 def func_starts(img, text_end):
-    """eh_frame_hdr 里的函数起点（与 patch_nso.py 同法）。 | Function start addresses from eh_frame_hdr (same method as patch_nso.py)."""
+    """Function start addresses from eh_frame_hdr (same method as patch_nso.py)."""
     m0 = mod0(img)
     ehs = m0 + struct.unpack_from('<i', img, m0 + 16)[0]
     def rd(o, enc):
@@ -81,7 +80,7 @@ def func_starts(img, text_end):
     return sorted(x for x in starts if x < text_end)
 
 def relocs(img):
-    """[(偏移, 类型, 符号名或 None, 符号值或 None, addend)]：RELA + JMPREL 全部条目。符号值 None = 未定义（导入）。 | [(offset, type, symbol name or None, symbol value or None, addend)]: all RELA + JMPREL entries. Symbol value None = undefined (import)."""
+    """[(offset, type, symbol name or None, symbol value or None, addend)]: all RELA + JMPREL entries. Symbol value None = undefined (import)."""
     m0 = mod0(img)
     dyn = m0 + struct.unpack_from('<i', img, m0 + 4)[0]
     d = {}

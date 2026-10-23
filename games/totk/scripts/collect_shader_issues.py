@@ -126,8 +126,7 @@ def main():
     print(f'written: {shader_list}')
     for number, rows, new in merged if args.close else []:
         gh('issue', 'comment', str(number), '--repo', args.repo, '--body',
-           f'Thank you! {rows} rows, {new} of them new to the shared shader list; they come with the next build. '
-           f'谢谢！共 {rows} 条，其中 {new} 条是公共清单里新增的，下次打包就会带上。')
+           f'Thank you! {rows} rows, {new} of them new to the shared shader list; they come with the next build.')
         gh('issue', 'close', str(number), '--repo', args.repo)
 
 

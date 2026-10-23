@@ -261,7 +261,10 @@ static void refresh_gamepads(void) {   // on the main queue (controller value ha
         if (!pad) continue;
         next.connected = 1;
         if (controller.physicalInputProfile.buttons[GCInputButtonHome].isPressed) menu = 1;
-        if (pad.buttonOptions.isPressed && pad.buttonMenu.isPressed) chord = 1;
+        /* Options + Menu (View + Menu on Xbox), or both stick clicks (L3 + R3): Home is often the system's (macOS 26 opens
+           its Games overlay on the Xbox button), so the stick clicks are the dependable chord. */
+        if (pad.buttonOptions.isPressed && pad.buttonMenu.isPressed) chord |= 1;
+        if (pad.leftThumbstickButton.isPressed && pad.rightThumbstickButton.isPressed) chord |= 2;
         physical |= gamepad_buttons(pad, face_by_position(controller));
         next.lx = stronger_axis(next.lx, stick_axis(pad.leftThumbstick.xAxis.value));
         next.ly = stronger_axis(next.ly, stick_axis(pad.leftThumbstick.yAxis.value));
@@ -281,13 +284,18 @@ static void refresh_gamepads(void) {   // on the main queue (controller value ha
     uint64_t now = runtime_now_ns(), edges = physical & ~physicalPrev, synthetic = 0, suppressed = 0;
     int moving = next.lx || next.ly;
     physicalPrev = physical;
-    /* The settings menu (the frontend; on iPhone / iPad the app's own): Home at once, or Options and Menu (View and Menu on
-       an Xbox pad) both held for MENU_CHORD_NS. A hold, not a same-instant press: the two never have to land together, and
+    /* The settings menu (the frontend; on iPhone / iPad the app's own): Home at once, or a chord (Options and Menu, or L3 and
+       R3) held for MENU_CHORD_MS. A hold, not a same-instant press: the two never have to land together, and
        a brush of both in play does not open it. Fires once per hold. */
     enum { MENU_CHORD_MS = 350 };
     static int menuPrev, chordFired; static uint64_t chordSince;
     if (menu && !menuPrev) runtime_front_settings_toggle();
     menuPrev = menu;
+    static int chordWas;
+    if (chord != chordWas) {   /* which chord the controller reports, so a combo that does not open the menu can be told apart */
+        if (chord) fprintf(stderr, "[totk-input] menu chord held: %s%s%s\n", chord & 1 ? "View/Options + Menu" : "", chord == 3 ? " and " : "", chord & 2 ? "L3 + R3" : "");
+        chordWas = chord;
+    }
     if (!chord) chordSince = 0, chordFired = 0;
     else if (!chordSince) {
         chordSince = now;   /* no further event comes while both stay held: look again when the hold is long enough */

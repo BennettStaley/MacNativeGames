@@ -1,194 +1,194 @@
-# 首次启动准备与预热八千个着色器
+# First-launch preparation and warm-up of eight thousand shaders
 
-用户目标：从零构建 App，第一次启动就像已有游玩缓存一样，可以发现并预热约八千个着色器；不要求先进入游戏收集一遍。仅测试 Mac。
+User goal: a freshly built App should, on its very first launch, discover and warm up about eight thousand shaders as if a play cache already existed, without having to play through the game once to collect them. Mac only for testing.
 
-旧打包器只复制 PSO 标识清单，没有复制标识对应的 MSL、反射和依赖索引。空缓存实测预热为 0 个着色器，清单中有 2,171 个着色器标识缺少实际翻译数据。已有存档机器上的预热效果不能代表首次安装。
+The old packager copied only the PSO key list, not the MSL, reflection and dependency index those keys refer to. With an empty cache, warm-up measured 0 shaders; 2,171 shader keys in the list had no translated data. Warm-up results on a machine that already has a play cache say nothing about a first install.
 
-## 构建与启动行为
+## Build and launch behaviour
 
-1. `build_app.py` 在签名打包前，用所选版本、已经通过完整校验的本地 RomFS 准备着色器，不读取现有用户缓存。`prepare_shader_seed.py` 解压字典压缩包，扫描整个 RomFS（`Shader/` 包、SDK/Bootup 包，以及特效 `Effect/*.esetb` 和界面布局里嵌的着色器，2026-10-19 起）和游戏程序模块（main 里嵌着 BNSH），解析 BNSH/NVN 程序，也解析 agl 引擎自己的着色器包 `.sharcb`（文件头 `BAHS`：记录头里是代码在代码池的偏移、控制段大小和到控制段的有符号偏移，几个记录可以共用一个控制段）。标题画面的合成、后期处理等用的就是 agl 的着色器（`Lib/agl`、`Shader/ApplicationPackage`、`Lib/Terrain`、`Lib/gsys`），只扫 BNSH 时全部漏掉，全新安装的 iPhone 因此整屏品红。控制段有 0x880 和 0x88c 两种大小，运行时的键只算前 0x880 字节；不为旧式短 control 结构编造补齐字节。
-2. 按运行时相同的 control + code SHA-256 去重，用原生翻译器和 SPIRV-Cross 为启动包里的着色器生成默认绑定状态的 MSL、反射及依赖索引；再按共享清单 `assets/shader_list.tsv`（[shader-list.md](shader-list.md)）为本游戏里找得到的着色器逐个生成清单记下的绑定状态，和已有变体依赖相同的只留一个。iPhone / iPad 不能边玩边翻译，靠的就是这些。成功准备少于 8,000 个时停止构建，不能只靠清单、重复条目或虚增计数交付。失败翻译留下的半成品不打包。每个 CPU 核心各起一个翻译服务进程，按着色器分配（同一着色器的默认与清单绑定状态在同一进程里按原顺序翻），结果按原顺序合并，输出与逐个翻译逐字节相同；Apple M4（10 核）上 1.4.3 的 24,032 个翻译任务由约 166 秒降到约 29 秒。
-3. 生成 `build/shader-seed`。其中 `shader-keys.json` 列出这个版本游戏里找到的全部着色器键（包括没翻译或翻译失败的），带翻译链、版本和 RomFS 哈希，并计入 `seed-manifest.json` 的文件哈希；没有它的旧种子会重新准备。版本、翻译链、工具身份和所有文件哈希在复用/打包时检查；这是用户游戏衍生数据，保留在工作目录和 App，不提交源码仓库。Metal 库在目标 Mac 上生成，不打包其他 GPU 的二进制缓存。
-4. 装有 Metal 工具链时，`step_shader_libs` 用与运行时相同的安全数学选项把种子里的每个 MSL 预先编译成 `build/shader-libs/<源码 SHA-256>.metallib` 并放进 App；重新构建只编译变化的着色器。运行时按本地 MSL 的 SHA-256 查找，只用完全一致的库，否则照旧现编。系统 Metal 缓存不跟着 App 走（App 挪到路径长度不同的目录就不命中，见下文“Metal 的缓存”），这些库随 App 移动。
-5. 首次启动验证并导入到外部用户缓存，先发布 shader 文件，再合并 `.variants`；保留用户已有变体及其他文件。相同种子不重复导入，删除文件后可补齐；错误翻译链、篡改源文件和越界文件名被拒绝。并发调用等待同一次导入完成。
-6. 第一帧前只预热标题画面、主菜单和存档列表用到的那一份（共享着色器清单 `assets/shader_list.tsv` 里带 `t` 标记的行，构建时导出成 `build/pso_title.tsv`；见下文“第一帧只等标题清单”和 [shader-list.md](shader-list.md)）；本版本游戏的其余 shader 和清单在标题画面后面继续预热（见下节“预热范围”），第一次进局时读取画面最多再等 15 秒。（2026-10-18 白天的版本是整批 shader 在第一帧前预热。）只把当前有数据的清单行算入进度，冻结本轮计划；缺源码的旧管线清单另行统计。新翻译的 MSL 只有在反射发布后才加入补充扫描，避免将仍在写入的配对文件误报失败。快捷键说明放在启动遮罩下面，预热过程中可以看见进度。
+1. Before signing and packaging, `build_app.py` prepares shaders from the selected version's fully verified local RomFS; it does not read any existing user cache. `prepare_shader_seed.py` decompresses the dictionary archives, scans the whole RomFS (`Shader/` packs, SDK/Bootup packs, and, since 2026-10-19, shaders embedded in effect `Effect/*.esetb` files and UI layouts) and the game's program modules (main embeds BNSH), parses BNSH/NVN programs, and also parses the agl engine's own shader archives `.sharcb` (file magic `BAHS`: each record header holds the code's offset in the code pool, the control section size and a signed offset to the control section; several records may share one control section). The title screen's compositing, post-processing and so on use agl shaders (`Lib/agl`, `Shader/ApplicationPackage`, `Lib/Terrain`, `Lib/gsys`); scanning only BNSH missed all of them, which is why a fresh iPhone install rendered a fully magenta screen. Control sections come in two sizes, 0x880 and 0x88c; the runtime key covers only the first 0x880 bytes. No padding bytes are invented for old short control structures.
+2. Shaders are deduplicated by the same control + code SHA-256 the runtime uses. The native translator and SPIRV-Cross generate MSL, reflection and dependency indexes for the default binding state of every shader in the startup pack; then, following the shared list `assets/shader_list.tsv` ([shader-list.md](shader-list.md)), each shader found in this game also gets the binding states the list records, keeping only one where the dependencies match an existing variant. iPhone / iPad cannot translate during play and rely entirely on this. The build stops if fewer than 8,000 are prepared successfully; it must not ship on the strength of the list alone, duplicate entries or inflated counts. Partial output from failed translations is not packaged. One translation service process is started per CPU core, work is distributed per shader (a shader's default and list binding states are translated in their original order in the same process), and results are merged in the original order, so the output is byte-for-byte identical to translating one at a time. On an Apple M4 (10 cores), the 24,032 translation jobs for 1.4.3 dropped from about 166 s to about 29 s.
+3. The result is `build/shader-seed`. Its `shader-keys.json` lists every shader key found in this game version (including ones that were not translated or failed), with the translation chain, version and RomFS hash, and is included in the file hashes of `seed-manifest.json`; older seeds without it are re-prepared. Version, translation chain, tool identity and all file hashes are checked on reuse/packaging. This is data derived from the user's game; it stays in the work directory and the App and is never committed to the source repository. Metal libraries are generated on the target Mac; binary caches for other GPUs are not packaged.
+4. When the Metal toolchain is installed, `step_shader_libs` precompiles every MSL in the seed into `build/shader-libs/<source SHA-256>.metallib` using the same safe-math options as the runtime, and puts them in the App; rebuilds compile only changed shaders. The runtime looks up by the SHA-256 of the local MSL and uses a library only on an exact match; otherwise it compiles as before. The system Metal cache does not travel with the App (it misses once the App moves to a directory with a different path length; see "The Metal cache" below), but these libraries do.
+5. On first launch the seed is verified and imported into the external user cache: shader files are published first, then `.variants` are merged; the user's existing variants and other files are kept. The same seed is not imported twice; deleted files are restored. Wrong translation chains, tampered source files and out-of-bounds file names are rejected. Concurrent callers wait for the same import to finish.
+6. Before the first frame, only what the title screen, main menu and save list use is warmed (rows marked `t` in the shared shader list `assets/shader_list.tsv`, exported at build time as `build/pso_title.tsv`; see "The first frame waits only for the title list" below and [shader-list.md](shader-list.md)). This version's remaining shaders and lists keep warming behind the title screen (see "Warm-up scope" next), and the first load into a game waits at most another 15 seconds on the loading screen. (The 2026-10-18 daytime version warmed the whole batch of shaders before the first frame.) Only list rows that currently have data count toward progress, and the plan for the run is frozen; old pipeline list entries missing their source are counted separately. Newly translated MSL joins the supplementary scan only after its reflection is published, so a pair still being written is not misreported as failed. The shortcut help sits below the startup overlay so warm-up progress stays visible.
 
-## 预热范围（PR #84 的 A 部分，2026-10-20 合并）
+## Warm-up scope (PR #84 part A, merged 2026-10-20)
 
-所有版本共用同一个翻译缓存目录，所以玩过别的版本的 Mac，缓存里混着其他版本的着色器，后台预热以前会把它们一起编。现在后台预热只预热种子 `shader-keys.json` 里的着色器，加上本机实际看到游戏用过、但不在清单里的着色器（记在缓存的 `observed/<RomFS SHA>.keys`，带翻译链、版本和 RomFS 身份，不对就不用）。其他版本的缓存条目只是这一轮不预热，不删除，真正绘制时照常使用。
+All versions share one translation cache directory, so on a Mac that has played other versions the cache mixes in other versions' shaders, and background warm-up used to compile all of them. Background warm-up now covers only the shaders in the seed's `shader-keys.json`, plus shaders this machine has actually seen the game use that are not in the list (recorded in the cache's `observed/<RomFS SHA>.keys`, with translation chain, version and RomFS identity; ignored if they don't match). Other versions' cache entries are simply not warmed this run; they are not deleted and are used as usual when actually drawn.
 
-- `shader-keys.json` 直接从种子目录读，按 `seed-manifest.json` 里的哈希和游戏身份核对，核对不过就回退到整个缓存预热；导入种子时它和其他文件一起校验，但不复制进缓存。
-- `TOTK_WARM_ALL=1` 回到整个缓存预热，用来对照。
-- iOS 上不启用（没有量过 iOS 的预热和内存），行为不变。
-- 实测（2026-10-20，M4，1.4.3，玩家缓存副本，混有 1.2.1 等版本的着色器）：同一缓存和种子，按范围预热 20,993 个着色器、后台 15.9 秒；`TOTK_WARM_ALL=1` 预热 31,770 个、28.4 秒。只玩过一个版本的缓存没有这个收益。
-- PR #84 的 B 部分（本机补编 Metal 库）暂缓：只有手动工具，还没接进打包和启动器。
+- `shader-keys.json` is read directly from the seed directory and checked against the hashes and game identity in `seed-manifest.json`; if the check fails, warm-up falls back to the whole cache. It is verified with the other files when the seed is imported, but not copied into the cache.
+- `TOTK_WARM_ALL=1` goes back to warming the whole cache, for comparison.
+- Not enabled on iOS (iOS warm-up and memory were not measured); behaviour unchanged there.
+- Measured (2026-10-20, M4, 1.4.3, copy of a player cache mixed with shaders from 1.2.1 and other versions): same cache and seed, scoped warm-up did 20,993 shaders in 15.9 s of background time; `TOTK_WARM_ALL=1` did 31,770 in 28.4 s. A cache that has only played one version gains nothing.
+- PR #84 part B (compiling Metal libraries locally) is on hold: there is only a manual tool, not yet wired into packaging or the launcher.
 
-## 管线存档（2026-10-21，默认开，`TOTK_PIPELINE_ARCHIVE=0` 关）
+## Pipeline archive (2026-10-21, on by default, `TOTK_PIPELINE_ARCHIVE=0` turns it off)
 
-建管线时，Metal 要把着色器的中间格式（metallib）编成这块 GPU 的机器码。原来 iOS 为了不卡，启动时把 App 带的全部管线预先建好并一直留着（iPhone 14 上进游戏后 3.84 GB，上限 4 GB）；系统自己的着色器缓存在重启、系统更新后会清空，靠不住。
+When a pipeline is built, Metal compiles the shaders' intermediate form (metallib) into machine code for this GPU. To avoid hitches, iOS used to build every pipeline the App ships with at startup and keep them all (3.84 GB on an iPhone 14 once in game, limit 4 GB); the system's own shader cache is cleared on reboot and OS updates, so it can't be relied on.
 
-现在机器码存进翻译缓存里的 Metal binary archive（`pipelines/` 目录，`totk_pipeline_archive.h`）：
-- 建管线时先只查存档（`MTLPipelineOptionFailOnBinaryArchiveMiss`），查不到再正常编，编完收进存档。
-- 第一次运行（iOS）不做全量预热，只建标题画面的管线，其余管线清单在后台逐条建好、收进存档、马上丢掉。
-- 有存档时只预建管线清单，不再单独加载约两万个着色器库，其余用到时从存档取。
-- 收进存档要再编一遍、和游戏抢编译服务，所以游戏线程上新编的管线排队，等游戏空闲（在世界里、预热完、3 秒没编新管线）时才在后台写文件。
-- **一条管线一个文件**（`pipelines/<管线键的哈希>.metalarchive`），建管线时只把它自己那个文件交给 Metal；没用到的管线的文件不打开。键只用来找文件，Metal 会核对函数和状态，拿错文件只是没命中，不会建错管线。为什么这样分，M4 上实测：
-  - 一个文件里放很多条时，Metal 打开文件要把所有管线描述复制进一个 flatbuffer，内存约随单文件条数的平方增长，并且释放存档也不归还（最简单的着色器：32 条 1 MB，1,024 条 777 MB）；
-  - Metal 会把交给管线的每个存档都查一遍，文件越多越慢（102 条新管线，挂着 142 个文件时 3.1 s）；
-  - 从文件打开的存档再加内容、再写盘，只写出新加的部分；
-  - 单条文件：打开 0.08 ms、约 35 KB，从它建管线 0.04 ms。磁盘上每个约 55 KB（含着色器中间格式），3,750 条约 206 MB。
-- 系统版本、GPU 或翻译链变了时，整个 `pipelines/` 目录删掉重建（`pipelines/identity.json`）。
-- 往一个新存档里加管线时，Metal 会在用户缓存目录里建一个工作目录（`com.apple.gpuarchiver/gpuarchiver-*`，约 380 KB），写完以后没有进程再打开它，但 Metal 一直不删，进程退出也不删。一条管线一个文件，所以每写一条就留下一个：一分钟的第一次运行留下 432 个，一夜涨到 65,536 个、25 GB，到上限后再也建不出新目录。现在每次写完只删这次新出现的那个（写存档逐条进行，不碰别的程序的目录）。目录的位置：有 bundle id 的程序（iPhone / iPad 的 App、打包好的 Mac App）在 `<缓存目录>/<bundle id>/com.apple.gpuarchiver`，只属于本 App，启动时在后台清掉以前留下的；没有 bundle id 的程序（如 `build/totk-native-v143`）在 `<缓存目录>/com.apple.gpuarchiver`，整个用户共用。iOS 上 `confstr(_CS_DARWIN_USER_CACHE_DIR)` 取不到路径，所以缓存目录取 `confstr` 的和系统 Caches 目录两处，各查带和不带 bundle id 两种位置；第一版只看了 `confstr` 的，在 iPhone 上什么都没删（2026-10-21：一次第一次运行留下 239 个，改后启动时删掉 239 个，剩 0 个）。Mac 第一次运行实测：写 3,000 条，删 3,000 个，目录不再增加。
-- `TOTK_SHADER_DEVICE_LIBS=1`（Mac，工具用）：像 iOS 一样加载种子里预编的 `.metallib`，例如 iOS 种子。这样在 Mac 上建出的管线描述的正是 iPhone 加载的库，可以用 `metal-tt` 离线生成 iPhone GPU 的存档。
+Machine code now goes into a Metal binary archive inside the translation cache (`pipelines/` directory, `totk_pipeline_archive.h`):
+- When building a pipeline, look only in the archive first (`MTLPipelineOptionFailOnBinaryArchiveMiss`); on a miss compile normally, then add the result to the archive.
+- First run (iOS) does no full warm-up: it builds only the title screen's pipelines; the rest of the pipeline lists are built one by one in the background, added to the archive, and dropped immediately.
+- With an archive present, only the pipeline lists are prebuilt; the ~20,000 shader libraries are no longer loaded separately, and the rest come from the archive when used.
+- Adding to the archive means compiling again and competing with the game for the compiler service, so pipelines newly compiled on the game thread are queued and written to file in the background only when the game is idle (in the world, warm-up done, no new pipeline compiled for 3 seconds).
+- **One file per pipeline** (`pipelines/<hash of pipeline key>.metalarchive`); when building a pipeline only its own file is handed to Metal, and files for unused pipelines are never opened. The key is used only to find the file; Metal checks functions and state, so the wrong file is just a miss, never a wrong pipeline. Why split this way, measured on M4:
+  - With many pipelines in one file, opening it makes Metal copy every pipeline descriptor into one flatbuffer; memory grows roughly with the square of entries per file and is not returned when the archive is released (simplest shader: 32 entries 1 MB, 1,024 entries 777 MB);
+  - Metal checks every archive handed to a pipeline, so more files means slower (102 new pipelines with 142 files attached: 3.1 s);
+  - Adding to an archive opened from a file and writing it again writes out only the newly added part;
+  - Single-entry file: opens in 0.08 ms, about 35 KB, building a pipeline from it 0.04 ms. About 55 KB each on disk (including the shader intermediate form); 3,750 entries about 206 MB.
+- When the OS version, GPU or translation chain changes, the whole `pipelines/` directory is deleted and rebuilt (`pipelines/identity.json`).
+- When adding pipelines to a new archive, Metal creates a working directory in the user cache directory (`com.apple.gpuarchiver/gpuarchiver-*`, about 380 KB). After the write no process opens it again, but Metal never deletes it, not even on process exit. With one file per pipeline, every write leaves one behind: a one-minute first run left 432, and overnight it grew to 65,536 (25 GB), at which point no new directory could be created. Now each write deletes only the one that just appeared (archive writes happen one at a time; other programs' directories are not touched). Where the directory lives: programs with a bundle id (the iPhone / iPad App, the packaged Mac App) use `<cache dir>/<bundle id>/com.apple.gpuarchiver`, which belongs to this App alone, and leftovers are cleared in the background at startup; programs without a bundle id (such as `build/totk-native-v143`) use `<cache dir>/com.apple.gpuarchiver`, shared by the whole user. On iOS `confstr(_CS_DARWIN_USER_CACHE_DIR)` returns no path, so both the `confstr` directory and the system Caches directory are used, each checked with and without the bundle id. The first version only looked at the `confstr` one and deleted nothing on iPhone (2026-10-21: one first run left 239; after the fix, startup deleted 239, leaving 0). Mac first run measured: 3,000 entries written, 3,000 deleted, directory count no longer grows.
+- `TOTK_SHADER_DEVICE_LIBS=1` (Mac, for tools): load the seed's precompiled `.metallib` files as iOS does, e.g. an iOS seed. Pipeline descriptors built on the Mac then reference exactly the libraries the iPhone loads, so `metal-tt` can generate an iPhone GPU archive offline.
 
-iPhone 14 实测（同一存档，进游戏后）：
+iPhone 14 measured (same archive, after entering the game):
 
-| | 原来（全量预热） | 管线存档 | 重启手机后 |
+| | Before (full warm-up) | Pipeline archive | After rebooting the phone |
 |---|---|---|---|
 | footprint | 3.84 GB | 3.65 GB | 3.64 GB |
-| 预热 | 95–122 s | 5.9 s | 16.2 s |
-| 长帧里建管线总时间 | 1,452 ms | 102 ms | 241 ms |
-| 存档命中 | — | 4,000 / 4,000 | 4,000 / 4,000 |
+| Warm-up | 95–122 s | 5.9 s | 16.2 s |
+| Total pipeline build time in long frames | 1,452 ms | 102 ms | 241 ms |
+| Archive hits | — | 4,000 / 4,000 | 4,000 / 4,000 |
 
-第一次运行（后台收存档）为 3.54 GB，138 s 收完 4,607 条。Mac（M4，同一存档，同一位置）：内存持平（一条一个文件 4,418 MB，不用存档 4,403 MB；`MALLOC_LARGE` 都是 74 MB）。第一次运行和原来一样（进世界那一下 412 ms，原来 417 ms），因为收进存档要再编一遍、和游戏抢编译服务，所以排队等游戏空闲时才收；第一次运行也不把存档挂到管线上，Metal 会把挂上的每个存档都查一遍，文件一边写一边多，越来越慢。第二次运行起：第一帧 59.6 s → 26.7 s，长帧里建管线的总时间 498 → 266 ms，最长一次 417 → 177 ms。
+First run (archiving in the background) was 3.54 GB and archived 4,607 entries in 138 s. Mac (M4, same archive, same location): memory flat (one file per entry 4,418 MB, no archive 4,403 MB; `MALLOC_LARGE` 74 MB in both). First run is the same as before (412 ms at world entry vs 417 ms before), because archiving means compiling again and competing with the game for the compiler service, so it waits for idle; the first run also does not attach archives to pipelines, since Metal checks every attached archive and the file count keeps growing during writes. From the second run on: first frame 59.6 s → 26.7 s, total pipeline build time in long frames 498 → 266 ms, longest single build 417 → 177 ms.
 
-## 数量与范围
+## Counts and scope
 
-| 所选版本 | 独立着色器 | 离线翻译失败 |
+| Selected version | Unique shaders | Offline translation failures |
 |---|---:|---:|
 | 1.0.0 | 9,360 | 0 |
 | 1.1.2 | 8,286 | 0 |
 | 1.4.3 | 8,290 | 0 |
 
-这些是真实提取、翻译后的独立 shader，不是八千条管线，也不等同于某个存档曾经遇到的全部绑定状态变体。纹理类型、顶点属性和输出格式发生变化时，依赖匹配仍会拒绝不合适的种子并生成新变体；必要的验证不会为了命中率而省略。进入新场景仍可能出现管线及新变体编译，不能承诺消除所有卡顿。
+These are genuinely extracted and translated unique shaders, not eight thousand pipelines, and not every binding-state variant a save has ever encountered. When texture types, vertex attributes or output formats change, dependency matching still rejects unsuitable seed entries and generates new variants; required validation is not skipped to improve hit rate. Entering new areas can still compile pipelines and new variants; eliminating all hitches is not promised.
 
-1.4.3 种子约 334 MiB，24,871 个运行时文件。实际生产导入器的纯 CPU 对照：空目录导入 24,871 个文件，第二次导入 0 个，均识别 8,290 个 shader。源用户缓存、正式存档和其备份未用于生成这批数据。其他版本目前验证的是提取/翻译，不冒充新 App 的完整游玩验证。
+The 1.4.3 seed is about 334 MiB, 24,871 runtime files. CPU-only check with the real production importer: importing into an empty directory brought in 24,871 files, the second import 0, both recognising 8,290 shaders. The source user cache, the real save and its backup were not used to generate this data. For the other versions, extraction/translation is what has been verified; it is not presented as full play verification of a new App.
 
-首次试验的 86 个 system shader 是扩大范围前的中间方案；用户明确要求八千个后已替换为以上全量集合。早期测试因真实键盘输入停止了自动操作并保留窗口，不将中断的三轮脚本算作全部通过。中间打包还曾主动停止，用于修正快捷键面板遮住预热进度的问题；不把它当成最终版本。
+The 86 system shaders in the first trial were an interim step before the scope widened; once the user explicitly asked for eight thousand, they were replaced by the full set above. Early tests stopped automation and kept the window when real keyboard input arrived; the three interrupted script rounds are not counted as passing. One interim package was also deliberately stopped to fix the shortcut panel covering warm-up progress; it is not treated as the final version.
 
-## 测试与本地证据
+## Tests and local evidence
 
-- 根目录 37 项测试包括容器/更新/重定位、工作目录隔离、打包/桌面迁移、BNSH 的实际 stage 偏移与运行时哈希、损坏范围拒绝、原生导入/复用及用户变体保留、错误翻译链/文件哈希/路径拒绝。另验证旧 App 仍运行时，打包器等待其正常关闭后才替换。
-- 全量准备、实际导入复用、最终 App 和真实启动证据已归档至项目外 `/Volumes/mac-APFS/MacNativeGames-artifacts/2026-10-18/analysis/v143-port/shader-first-launch-8k`。项目内只保留本说明和测试代码，不保留这些原始运行记录。
-- 第一轮只含 86 个的中间构建 `bd005120...` 已证明空缓存下导入 259 文件、约 4.8 秒后 86 个 shader 就绪，早于首帧；这不能算作八千个的最终验证。其原始中断记录在 `shader-first-launch-35/36`，保持不改。
+- The 37 root-level tests cover container/update/relocation, work directory isolation, packaging/desktop migration, actual BNSH stage offsets and runtime hashes, rejection of corrupt ranges, native import/reuse with user variants preserved, and rejection of wrong translation chains/file hashes/paths. It was also verified that while an old App is still running, the packager waits for it to close normally before replacing it.
+- Full preparation, real import reuse, the final App and real launch evidence are archived outside the project at `/Volumes/mac-APFS/MacNativeGames-artifacts/2026-10-18/analysis/v143-port/shader-first-launch-8k`. The project keeps only this document and the test code, not the raw run records.
+- The first-round interim build `bd005120...` with only 86 shaders showed that with an empty cache it imported 259 files and had the 86 shaders ready after about 4.8 seconds, before the first frame; this does not count as final verification of the eight thousand. Its original interrupted records are in `shader-first-launch-35/36`, left unchanged.
 
-## 最终 App 实测（2026-10-18 白天，整批种子在第一帧前预热的版本）
+## Final App measurements (2026-10-18 daytime, version that warmed the whole seed before the first frame)
 
-1.4.3 完整 CLI 打包通过，运行时 SHA-256 为 `0f3798678a46c453a0d96dfae1f0401fb68849aa6fc84627df0f0f60d27a9062`。通过 LaunchServices 打开实际 App，使用新建的空 profile 和空翻译缓存；无提前游玩、无用户缓存拷入、无按键注入。结果：
+Full 1.4.3 CLI packaging passed; runtime SHA-256 `0f3798678a46c453a0d96dfae1f0401fb68849aa6fc84627df0f0f60d27a9062`. The real App was opened through LaunchServices with a fresh empty profile and empty translation cache; no prior play, no user cache copied in, no injected keys. Results:
 
-- 初次发现 8,290 个，导入 24,871 个运行时文件。
-- 启动关键阶段等待 596,773 ms，8,290 个 shader 全部可用后才放行第一帧；首帧在启动后 641.563 秒。整轮观察约 642 秒。首次会等待约十分钟，这是本机此次测量，不是其他机器的耗时承诺。
-- 完整后台预热 597,024.3 ms，最终 8,291 个：8,290 个种子加启动时实际新增的 1 个；补充预热失败 0。空 profile 没有可用的已收集渲染/计算 PSO，本轮这两项均为 0，不能把 shader 预热说成八千条管线已准备。
-- 只读检查看见预热阶段文字与进度条，完成后正常进入开场地下场景，林克、塞尔达及火把可见。未把短暂显示的 FPS 当作长时间性能测试。
-- 真实用户输入记录为无，完成后通过窗口关闭按钮正常退出独立测试局。正式 profile 与升级前备份各 54 个文件，前后哈希完全一致。包签名再次通过 `codesign --verify --deep --strict`。
+- 8,290 discovered initially; 24,871 runtime files imported.
+- The startup-critical phase waited 596,773 ms; the first frame was released only once all 8,290 shaders were available, and arrived 641.563 s after launch. The whole run was observed for about 642 seconds. The roughly ten-minute first-launch wait is this machine's measurement, not a promise for other machines.
+- Full background warm-up took 597,024.3 ms, ending at 8,291: the 8,290 from the seed plus 1 actually added at startup; 0 supplementary warm-up failures. An empty profile has no collected render/compute PSOs, so both were 0 this run; shader warm-up must not be described as eight thousand pipelines being ready.
+- A read-only check saw the warm-up phase text and progress bar; afterwards the game entered the opening underground scene normally, with Link, Zelda and the torch visible. The briefly shown FPS was not treated as a long-run performance test.
+- Real user input recorded: none. Afterwards the standalone test session was closed normally via the window close button. The real profile and the pre-upgrade backup each had 54 files with identical hashes before and after. The bundle signature passed `codesign --verify --deep --strict` again.
 
-原始记录为证据目录下 `runtime/report.json`、`runtime/game.log`、`runtime/game-after-visual-review.log`、`runtime/close-result.json`、`visual-review.json`、`post-launch-signature.json` 和 `formal-profile-after.json`。本轮完整 App 验证的是首次空翻译缓存；重复导入 0 文件已由生产导入器的 CPU 对照验证，未宣称新的八千集合已完成三轮 App 正负对照或第二次 GPU 启动计时。
+Raw records are in the evidence directory: `runtime/report.json`, `runtime/game.log`, `runtime/game-after-visual-review.log`, `runtime/close-result.json`, `visual-review.json`, `post-launch-signature.json` and `formal-profile-after.json`. This full App run verified the first launch with an empty translation cache; a repeat import of 0 files was verified by the CPU check of the production importer. It is not claimed that the new eight-thousand set has completed three rounds of App positive/negative comparison or a second GPU launch timing.
 
-## 第一帧只等标题清单（2026-10-18 晚，Claude）
+## The first frame waits only for the title list (2026-10-18 evening, Claude)
 
-**为什么改。** 整批 8,290 个排在预热最前面时，第一帧要等它们全部编完。Metal 编过的库有系统缓存，但它不总在：磁盘紧张时 macOS 会清掉它，还出现过原因没查清的整份失效（见下文“Metal 的缓存”）。实测：
+**Why the change.** With all 8,290 at the front of warm-up, the first frame waited for every one to compile. Metal keeps a system cache of compiled libraries, but it is not always there: macOS purges it when disk space is tight, and it has also been invalidated wholesale for reasons not yet understood (see "The Metal cache" below). Measured:
 
-- 同一个游戏程序拷到另一个目录运行，第一帧等了 451 秒（就是因为换了目录，见下文“Metal 的缓存”）；
-- 系统盘写满、缓存被清理之后，桌面 App 第一帧等了 679 秒；
-- 缓存热的时候，每次启动也要多等 4–11 秒才出标题。
+- The same game binary copied to another directory waited 451 seconds for the first frame (precisely because the directory changed; see "The Metal cache" below);
+- After the system disk filled and the cache was purged, the desktop App waited 679 seconds for the first frame;
+- Even with a warm cache, every launch waited an extra 4–11 seconds before the title.
 
-**做法。**
+**What changed.**
 
-- 标题清单（原 `assets/pso_title.tsv`，2026-10-19 起并进共享清单 `assets/shader_list.tsv`，带 `t` 标记）：在 1.4.3、1.1.2、1.0.0 上各录一次标题画面、主菜单和存档列表新建的着色器和管线，合并去重共 1,445 行（1.4.3 录到 600 行，另两个版本各多出 389、456 行），不属于当前版本的行在预热时自动跳过。录制时关掉预热（`DM_PSO_MANIFEST=off`），并把已有清单所在的目录指向空目录（`DM_NVN_SHMAP`），否则已经在清单里的行不会被记下。
-- `nvn_mtl.m warm_start` 的清单顺序改为：标题清单（第一帧只等它）→ 游戏清单 → 存档的清单 → 本机收集的清单 → 种子。种子只有着色器库，排在最后；前面几份同时建管线。
+- Title list (formerly `assets/pso_title.tsv`, merged since 2026-10-19 into the shared list `assets/shader_list.tsv` with the `t` marker): the shaders and pipelines created by the title screen, main menu and save list were recorded once each on 1.4.3, 1.1.2 and 1.0.0, merged and deduplicated to 1,445 rows (1.4.3 recorded 600 rows; the other two versions added 389 and 456 more). Rows that don't belong to the current version are skipped automatically during warm-up. Recording was done with warm-up off (`DM_PSO_MANIFEST=off`) and the directory holding the existing lists pointed at an empty directory (`DM_NVN_SHMAP`); otherwise rows already in a list would not be recorded.
+- The list order in `nvn_mtl.m warm_start` is now: title list (the only thing the first frame waits for) → game list → save's list → locally collected list → seed. The seed has only shader libraries and goes last; the lists before it build pipelines as they go.
 
-**实测**（Mac mini M4，1.4.3，同一存档副本，自动读档进世界）。先跑一局把缓存攒热，再交替各跑两局：
+**Measured** (Mac mini M4, 1.4.3, same save copy, auto-load into the world). One run first to warm the cache, then two runs of each, alternating:
 
-| | 旧顺序（种子先） | 新顺序（标题清单先） |
+| | Old order (seed first) | New order (title list first) |
 |---|---|---|
-| 第一帧 | 5.8 / 5.4 秒 | 2.0 / 2.0 秒 |
-| 第一帧前等待 | 3.8 / 3.6 秒 | 0.1 / 0.1 秒 |
-| 全部预热做完 | 5.0 / 4.7 秒（大部分在第一帧前） | 8.8 / 10.1 秒（在标题画面后面） |
-| 进入世界 | 27 / 29 秒 | 22 / 19 秒 |
-| 第一次进局等预热 | 不用等 | 不用等 |
+| First frame | 5.8 / 5.4 s | 2.0 / 2.0 s |
+| Wait before first frame | 3.8 / 3.6 s | 0.1 / 0.1 s |
+| All warm-up done | 5.0 / 4.7 s (mostly before first frame) | 8.8 / 10.1 s (behind the title screen) |
+| Into the world | 27 / 29 s | 22 / 19 s |
+| First load waits for warm-up | No | No |
 
-**缓存冷的时候**（新 Mac，或 macOS 清理了缓存）：标题清单本身要现编，所以第一帧要几秒；随后整批种子在后台编。单线程时这一段约 7.5 分钟，期间进入世界，读取画面最多等 15 秒，剩下的边玩边编，新场景会卡。后来改成了多线程编，见“后台预热并行编译”。
+**With a cold cache** (new Mac, or macOS purged the cache): the title list itself must compile, so the first frame takes a few seconds; then the whole seed compiles in the background. Single-threaded this took about 7.5 minutes; entering the world during it, the loading screen waits at most 15 seconds and the rest compiles during play, with hitches in new areas. This later became multithreaded; see "Parallel compilation in background warm-up".
 
-**种子导入失败时照常启动。** 以前种子导入失败（App 里的种子文件损坏、磁盘写满等）会直接 `die` 退出，屏幕上什么都没有。现在会记一行红字，启动阶段显示“着色器缓存未就绪”，然后照常进入游戏，着色器边玩边翻译，和加入种子之前一样。导入本来就先写着色器文件、最后写引用它们的索引，中途失败时缓存仍然可用。
+**Launch proceeds when seed import fails.** Previously a failed seed import (corrupt seed file in the App, full disk, etc.) would `die` and exit with nothing on screen. Now it logs a line in red, the startup phase shows "Shader cache not ready", and the game starts as usual, translating shaders during play as before the seed existed. The import already writes shader files first and the index that references them last, so the cache stays usable if it fails midway.
 
-实测：在一份 App 资源的副本里，把一个种子文件末尾加一个换行，再用空缓存启动。
+Measured: in a copy of the App resources, append a newline to one seed file, then launch with an empty cache.
 
-- 旧程序：在第一帧之前以状态 2 退出，日志为 `startup shader preparation: Startup shader seed integrity check failed`。
-- 新程序：5 秒出标题，主菜单正常，缓存里是标题现场翻译的 240 个着色器。
+- Old binary: exits with status 2 before the first frame, log line `startup shader preparation: Startup shader seed integrity check failed`.
+- New binary: title in 5 seconds, main menu normal, the cache holds the 240 shaders the title translated on the spot.
 
-## Metal 的缓存（2026-10-18 夜第三次更正）
+## The Metal cache (third correction, 2026-10-18 night)
 
-Metal 编过的库存在这个用户的系统缓存里：每个 App 按 bundle ID 各一份（`$(getconf DARWIN_USER_CACHE_DIR)<bundle id>/com.apple.metal`），没有 bundle 的程序共用 `…/C/com.apple.metal`。游戏程序是启动器用 `execv` 换上来的、没有 bundle 的程序，用的是共用的那一份（这台 Mac 上没有 `org.macnativegames.totk` 自己的一份）。**共用的这份查的时候，除了源码和编译选项，还要程序所在目录的路径一样长**：只看长度，不看路径本身。2026-10-18 夜用 20 个新源码核对（在 A 处编，从 B 处查；测的都是英文路径）：
+Libraries Metal has compiled are stored in this user's system cache: one per App by bundle ID (`$(getconf DARWIN_USER_CACHE_DIR)<bundle id>/com.apple.metal`), and programs without a bundle share `…/C/com.apple.metal`. The game binary is swapped in by the launcher via `execv` and has no bundle, so it uses the shared one (this Mac has no separate one for `org.macnativegames.totk`). **Lookups in the shared one require, besides the same source and compile options, that the directory containing the program has a path of the same length**: only the length matters, not the path itself. Checked on the night of 2026-10-18 with 20 new sources (compiled at A, looked up from B; all English paths):
 
-- 命中（20 / 20）：同一路径下新建的目录（原位置重新打包就是这样）；目录改成同样长度的名字（`X`→`Y`、`pathtest`→`qathtest`）；同样长度、在另一个卷；同样长度、层数不同；同一目录里换文件名、换代码签名标识符；换当前工作目录；用相对路径启动（Metal 用的是绝对路径）。
-- 不命中（0–2 / 20）：目录名多一个字符（`X`→`XX`）、深一层、换到长度不同的别处（同一个卷、另一个卷都一样）。
+- Hit (20 / 20): a newly created directory at the same path (which is what repackaging in place does); directory renamed to a same-length name (`X`→`Y`, `pathtest`→`qathtest`); same length on another volume; same length, different depth; different file name or code signing identifier in the same directory; different current working directory; launched via a relative path (Metal uses the absolute path).
+- Miss (0–2 / 20): directory name one character longer (`X`→`XX`), one level deeper, moved anywhere with a different length (same volume or another volume alike).
 
-看起来像苹果算键时只用了路径的长度（像是 bug），以后的 macOS 可能会变。当天先后说过的“按目录分开”“所有程序共用”“按签名标识符分开”都只对了一半：那几次对比的程序，目录长度要么刚好一样，要么不一样。
+It looks as though Apple uses only the path length when computing the key (probably a bug); future macOS versions may change this. The explanations given earlier that day ("separate per directory", "shared by all programs", "separate per signing identifier") were each only half right: in those comparisons the directory lengths either happened to match or didn't.
 
-所以挪动 App（包括挪进 `/Applications`：游戏所在目录的路径从 102 个字符变成 68 个）之后，下一次启动是冷的；在原来的位置重新打包，缓存还在。
+So after moving the App (including into `/Applications`: the game's directory path goes from 102 characters to 68), the next launch is cold; repackaging in the original location keeps the cache.
 
-**同一时间只能有一个程序往里写。** 一个程序先连上这份缓存（编过一个库就一直连着，直到退出），这时另一个程序新编的库，在前一个程序开着时都查得到，前一个程序一退出就几乎全没了（20 个只剩 2 个）。谁连着，用 `lsof $(getconf DARWIN_USER_CACHE_DIR)com.apple.metal/*/libraries.*` 看。
+**Only one program at a time can write to it.** Once a program connects to this cache (compiling one library keeps it connected until exit), libraries newly compiled by another program are visible while the first one stays open, and almost all vanish as soon as the first one exits (2 of 20 left). To see who is connected: `lsof $(getconf DARWIN_USER_CACHE_DIR)com.apple.metal/*/libraries.*`.
 
-这份共用存储满了（数据文件固定约 1.08 GB）就淘汰，而且淘汰得很凶，不按“最久没用”：另一个程序新编 3,000 个，1 分钟前编的 500 个只剩 6%；同样的源码从路径长度不同的目录再编一遍，会顶掉原来那份（20 个顶掉 9–12 个）。所以任何没有 bundle 的程序一次编几千个新库，都可能把游戏的条目挤掉。系统盘写满时 macOS 也会整份清掉它。
+When this shared store fills up (data file fixed at about 1.08 GB) it evicts, aggressively and not least-recently-used: after another program compiled 3,000 new ones, only 6% of 500 compiled a minute earlier remained; compiling the same sources again from a directory with a different path length displaces the original copies (20 displaced 9–12). So any bundle-less program compiling thousands of new libraries at once can push the game's entries out. macOS also purges it entirely when the system disk fills.
 
-测冷启动时，给测试用的翻译缓存副本里每个源码末尾加一行带随机串的注释，Metal 就一个都没编过，和新 Mac 一样。这样编进去的几千个新库会挤掉别的条目（包括玩家 App 目录下的），测完要用预编工具在 App 的目录里把玩家的翻译缓存编回来。这种测法只让“编着色器库”冷，建管线那一步的系统缓存不一定冷；实测建管线一直不到 1 秒，时间几乎都花在编库上。程序要在原来的位置跑：拷到别处（路径长度不同）的程序不光查不到原目录的缓存，还找不到 `build/` 里的标题清单和种子清单。
+To test a cold start, append a comment with a random string to the end of every source in a test copy of the translation cache; Metal has then compiled none of them, just like a new Mac. The thousands of new libraries compiled this way push out other entries (including those from the player's App directory), so afterwards use the precompile tool in the App's directory to recompile the player's translation cache. This method makes only "compiling shader libraries" cold; the system cache for pipeline building is not necessarily cold. Pipeline building always measured under 1 second; nearly all the time goes into compiling libraries. The program must run from its original location: a copy elsewhere (different path length) not only misses the original directory's cache but also cannot find the title list and seed list in `build/`.
 
-## 后台预热并行编译（2026-10-18 晚，Claude）
+## Parallel compilation in background warm-up (2026-10-18 evening, Claude)
 
-**做法。** 预热线程把每份清单按 512 行分块：先把这一块用到的着色器库放到多个线程上编，再按原来的顺序逐行建管线。建管线照旧是一个接一个，全部加起来不到 1 秒；花时间的是编库。缓存补充预热也按 512 个一块并行。
+**What changed.** The warm-up thread splits each list into 512-row chunks: first the shader libraries used by the chunk are compiled across several threads, then pipelines are built row by row in the original order. Pipeline building is still sequential and totals under 1 second; library compilation is what takes time. Supplementary cache warm-up is also parallel in chunks of 512.
 
-- 线程数 `TOTK_WARM_THREADS`：Mac 默认是核数减 2，最多 8（M4 上是 8）；iOS 默认 1（手机读预编译的 metallib，不现编）。
-- 进世界以后最多 2 个线程，免得和游戏抢核。
-- `shader_load` 本来就会被预热线程和提交线程同时调用。改成多线程以后又改了三处：编译选项改成只初始化一次（原来两个线程同时第一次调用时，可能拿到还没设成精确数学的选项）；两个计数改成原子操作；日志每行加一次锁（多线程时行会交错）。
+- Thread count `TOTK_WARM_THREADS`: Mac default is cores minus 2, at most 8 (8 on M4); iOS default 1 (the phone loads precompiled metallibs and does not compile).
+- At most 2 threads once in the world, so as not to compete with the game for cores.
+- `shader_load` was already called concurrently by the warm-up and submit threads. Going multithreaded required three more changes: compile options are initialised only once (previously two threads calling for the first time at once could get options not yet set to precise math); two counters became atomic; logging takes a lock per line (lines interleaved with multiple threads).
 
-**实测**（Mac mini M4，1.4.3，停在标题、不读档；给每个源码加了随机注释，Metal 一个都没编过）：
+**Measured** (Mac mini M4, 1.4.3, sitting at the title, no save loaded; random comment added to every source so Metal had compiled none):
 
-| | 1 个线程 | 8 个线程 |
+| | 1 thread | 8 threads |
 |---|---|---|
-| 第一帧前等标题清单（283 个着色器） | 9.8 秒 | 2.4 / 2.3 秒 |
-| 后台预热做完（9,268 个着色器库、3,424 条渲染管线） | 856 秒（14.3 分钟） | 187.5 / 188.8 秒（3.1 分钟） |
-| 编库用时（各线程相加） | 849 秒，平均每个 92 ms | 1,453 / 1,470 秒，平均每个 157–159 ms |
-| 建管线用时 | 0.74 秒 | 0.71 / 0.66 秒 |
+| Wait for title list before first frame (283 shaders) | 9.8 s | 2.4 / 2.3 s |
+| Background warm-up done (9,268 shader libraries, 3,424 render pipelines) | 856 s (14.3 min) | 187.5 / 188.8 s (3.1 min) |
+| Library compile time (summed over threads) | 849 s, 92 ms each on average | 1,453 / 1,470 s, 157–159 ms each on average |
+| Pipeline build time | 0.74 s | 0.71 / 0.66 s |
 
-8 个线程比 1 个线程快 4.6 倍（两局 8 线程相差不到 1%）。每个库各自花的时间变长（92 → 157 ms），因为 8 个编译请求同时在跑，互相抢核（M4 只有 4 个性能核，游戏自己也在用）；但总时间短了。缓存热的时候（同样停在标题）：8 个线程 1.6 秒做完，第一帧前等 47 ms；1 个线程 12.2 秒，等 265 ms。重新编译后的第一局稍慢（8 个线程 4.0 秒、等 1.5 秒）。
+8 threads is 4.6× faster than 1 (the two 8-thread runs differ by under 1%). Each library takes longer (92 → 157 ms) because 8 compile requests run at once and compete for cores (M4 has only 4 performance cores, and the game uses them too), but total time is shorter. With a warm cache (also sitting at the title): 8 threads finish in 1.6 s with a 47 ms wait before the first frame; 1 thread 12.2 s with a 265 ms wait. The first run after recompiling is slightly slower (8 threads 4.0 s, 1.5 s wait).
 
-## 打包时预编（2026-10-18 夜，Claude）
+## Precompiling at package time (2026-10-18 night, Claude)
 
-**做法。** `build_app.py` 最后（macOS 检查完新 App 之后）把 `tools/warm_metal_cache.m` 编出的小工具拷进 App 里游戏程序的目录（`Contents/Resources/totk/build/`），在那里用游戏一样的编译选项（精确数学）、8 个线程把种子的 8,290 个源码编一遍，再在一个新进程里抽 64 个核对是否命中，最后把工具删掉（App 的签名覆盖这个目录，不能留东西）。工具放在游戏程序的目录里，路径和游戏一样长（上文“Metal 的缓存”）。编之前用 `lsof` 查有没有别的程序连着这份缓存（开着的游戏也算），有就跳过，并说出是哪个程序；这一步出任何问题都不会让打包失败，只是第一次打开时照旧由游戏在后台编。打包多约 2 分钟（M4 上 125 秒）。装有 Metal 工具链、种子的每个着色器都已经编成 App 里的库（上文第 4 条，`step_shader_libs`）时，这一步跳过：游戏直接加载那些库，用不到 Metal 的缓存。
+**What changed.** At the end of `build_app.py` (after macOS has checked the new App), a small tool built from `tools/warm_metal_cache.m` is copied into the directory of the game binary inside the App (`Contents/Resources/totk/build/`). There it compiles the seed's 8,290 sources with the same compile options as the game (precise math) on 8 threads, then in a new process samples 64 to check they hit, and finally deletes the tool (the App's signature covers this directory, so nothing may be left behind). The tool sits in the game binary's directory so its path has the same length as the game's (see "The Metal cache" above). Before compiling, `lsof` checks whether any other program is connected to this cache (a running game counts); if so the step is skipped and the program named. Any problem in this step never fails packaging; the game simply compiles in the background on first open as before. Packaging takes about 2 minutes longer (125 s on M4). When the Metal toolchain is installed and every seed shader has already been compiled into a library in the App (item 4 above, `step_shader_libs`), this step is skipped: the game loads those libraries directly and does not need the Metal cache.
 
-**实测**（Mac mini M4，1.4.3，新玩家的缓存：只有种子、每个源码加随机注释；游戏停在标题，不读档）：
+**Measured** (Mac mini M4, 1.4.3, a new player's cache: seed only, random comment added to every source; game sitting at the title, no save loaded):
 
-| 预编工具放在哪 | 工具编 8,290 个 | 游戏整轮预热 | 第一帧前等标题清单 |
+| Where the precompile tool runs | Tool compiles 8,290 | Game's full warm-up | Wait for title list before first frame |
 |---|---|---|---|
-| 不预编（同样的冷缓存） | — | 175–188 秒 | 325–351 ms |
-| 别的目录（路径长度不同） | 126 秒 | 181 秒（一个都没命中） | 325 ms |
-| 别的目录（路径长度不同），签成游戏的签名标识符 | 124 秒 | 175 秒（一个都没命中） | 330 ms |
-| **游戏程序的目录** | **125 秒** | **4.4 秒**（每个 0.8 ms） | **18 ms** |
+| No precompile (same cold cache) | — | 175–188 s | 325–351 ms |
+| Another directory (different path length) | 126 s | 181 s (no hits) | 325 ms |
+| Another directory (different path length), signed with the game's signing identifier | 124 s | 175 s (no hits) | 330 ms |
+| **The game binary's directory** | **125 s** | **4.4 s** (0.8 ms each) | **18 ms** |
 
-**一次失败，以及补救。** 2026-10-18 21:33 重新打包桌面 App 时，我自己的一个小探针程序正好和预编同时开始（它在排队等 macOS 扫描新 App，扫描一结束两个程序一起跑，它先连上了缓存），预编编完 8,290 个，新进程只查到 1 / 64，打包如实报了“Metal did not keep them”。之后在没有别的程序连着时，把工具拷进 App 里游戏程序的目录，把玩家的整份翻译缓存（9,268 个）编了一遍：144 秒，新进程 64 / 64 命中；用存档副本开局（直接运行 App 里的游戏程序），后台预热 3.1–4.1 秒做完，第一帧前等 79–108 ms，43–60 秒进世界。之后打包先用 `lsof` 查（`metal_cache_users`）。
+**One failure, and the fix.** When the desktop App was repackaged at 21:33 on 2026-10-18, a small probe program of mine happened to start at the same moment as the precompile (it was queued waiting for macOS to scan the new App; when the scan ended both ran together and it connected to the cache first). The precompile compiled all 8,290, but the new process found only 1 / 64, and packaging correctly reported "Metal did not keep them". Afterwards, with no other program connected, the tool was copied into the game binary's directory inside the App and the player's whole translation cache (9,268) was compiled: 144 s, 64 / 64 hits in a new process. Starting from a save copy (running the game binary inside the App directly), background warm-up finished in 3.1–4.1 s, the wait before the first frame was 79–108 ms, and the world was reached in 43–60 s. Packaging now checks with `lsof` first (`metal_cache_users`).
 
-**限制。**
-- 只对打包的这台 Mac 有用（编的是这台 Mac 的 GPU 的代码），App 拷到别的 Mac 上照旧冷；
-- 打包之后挪动 App，缓存就对不上了（想放在 `/Applications` 就用 `-o` 直接打包到那里）；
-- 打包时有别的程序连着这份缓存，就不预编（打包时会说是哪个程序）；
-- 系统清掉缓存、或别的没有 bundle 的程序一次编了大批新库，也会让它变冷；
-- 只预编种子；玩家玩出来的新变体（`pso_collected.tsv` 里的）照旧第一次遇到时现编，下次启动由后台预热编。
+**Limitations.**
+- Only helps the Mac that did the packaging (the code is for this Mac's GPU); copied to another Mac, the App is cold as before;
+- Moving the App after packaging breaks the match (to put it in `/Applications`, package straight there with `-o`);
+- If another program is connected to the cache at package time, precompiling is skipped (packaging names the program);
+- The system purging the cache, or another bundle-less program compiling a large batch of new libraries, also makes it cold;
+- Only the seed is precompiled; new variants the player produces (in `pso_collected.tsv`) still compile on first encounter, and background warm-up compiles them on the next launch.
 
-## 新装的 iPhone 只靠种子（2026-10-19 凌晨，Claude）
+## A fresh iPhone install relies on the seed alone (2026-10-19 early morning, Claude)
 
-**问题。** iPhone 14 全新安装后整屏品红：每 300 帧约 57,000 次绘制因缺着色器被跳过。iOS 不能边玩边翻译，只能用 App 带的种子；而缺的 167 个着色器全都不在 BNSH 文件里——它们在 agl 引擎自己的着色器包 `.sharcb` 里（`Lib/agl/agl_resource…sarc.zs` 102 个，`Shader/ApplicationPackage…sarc.zs` 39 个，`Lib/Terrain`、`Lib/gsys` 各 6 个），另有 14 个在游戏程序 main 嵌着的 BNSH 里。标题画面的合成和后期处理就用这些。iPad 当初是靠 `fill_shaders.py` 从设备运行时抓代码一轮轮补上的，所以没暴露。
+**Problem.** After a fresh install the iPhone 14 showed a fully magenta screen: about 57,000 draws per 300 frames were skipped for missing shaders. iOS cannot translate during play and can only use the seed shipped in the App; and none of the 167 missing shaders were in BNSH files. They were in the agl engine's own shader archives `.sharcb` (102 in `Lib/agl/agl_resource…sarc.zs`, 39 in `Shader/ApplicationPackage…sarc.zs`, 6 each in `Lib/Terrain` and `Lib/gsys`), plus 14 in the BNSH embedded in the game's main module. The title screen's compositing and post-processing use these. The iPad had been filled in round by round with `fill_shaders.py`, which captured code from the device at runtime, so it never showed the problem.
 
-**做法。** `prepare_shader_seed.py` 现在直接解析 `.sharcb`（见上文“构建与启动行为”第 1 条），也扫描游戏程序模块（`--modules rewritten/<版本>`），控制段 0x880 和 0x88c 都收。1.4.3 共解析出 28,769 个着色器，Mac 玩家缓存和 iPad 补译里出现过的全部能找到；agl 和模块的着色器也按默认绑定状态翻译。种子 15,266 个变体（12,472 个默认状态 + 2,794 个来自共享清单），84 个默认翻译失败（80 个 agl 顶点着色器翻译器数组越界，2 个参数越界，2 个计算着色器 SPIRV-Cross 空指针），这些着色器在所有缓存里都没出现过，游戏至今没用到。
+**What changed.** `prepare_shader_seed.py` now parses `.sharcb` directly (see item 1 of "Build and launch behaviour" above) and also scans the game's program modules (`--modules rewritten/<version>`), accepting both 0x880 and 0x88c control sections. For 1.4.3 it parses 28,769 shaders in total, covering everything seen in the Mac player cache and the iPad fill-ins; agl and module shaders are also translated in their default binding state. The seed has 15,266 variants (12,472 default state + 2,794 from the shared list); 84 failed default translation (80 agl vertex shaders hit an array out-of-bounds in the translator, 2 an out-of-range parameter, 2 compute shaders a SPIRV-Cross null pointer). None of these shaders has appeared in any cache; the game has not used them so far.
 
-**导入。** 首次启动把种子从 App 导入本机缓存：先逐个核对哈希，再复制。复制改为 APFS 克隆（`clonefile`，App 和缓存在同一个卷上），44,744 个文件从 59 秒降到 14 秒（M4）；核对仍约 18 秒。两步都显示进度条和数量（`runtime_boot_count`）。
+**Import.** On first launch the seed is imported from the App into the local cache: each file's hash is checked, then it is copied. Copying now uses APFS clones (`clonefile`; the App and the cache are on the same volume): 44,744 files went from 59 s to 14 s (M4); checking still takes about 18 s. Both steps show a progress bar and count (`runtime_boot_count`).
 
-**验证。** 设备锁屏时不能远程启动 App，所以在 Mac 上模拟：`TOTK_SHADER_NO_TRANSLATE=1` 让 Mac 运行时像手机一样只用种子、缺的跳过并记下请求，配合空的 `TOTK_SHADER_CACHE` 和 `TOTK_SHADER_SEED_DIR=build/shader-seed/v143`。空档案从新游戏开头的过场一直到洞穴，跑了 36,000 帧：没有一次绘制因缺着色器被跳过，没有写出补译请求，画面正常，左下角“新着色器 0 / 总计 15266”。真机复测待设备解锁。
+**Verification.** The App can't be launched remotely while the device is locked, so this was simulated on the Mac: `TOTK_SHADER_NO_TRANSLATE=1` makes the Mac runtime use only the seed like the phone, skipping and recording requests for missing shaders, together with an empty `TOTK_SHADER_CACHE` and `TOTK_SHADER_SEED_DIR=build/shader-seed/v143`. An empty profile ran 36,000 frames from the new-game opening cutscene to the cave: not one draw was skipped for a missing shader, no translation requests were written, the picture was correct, and the bottom-left box read "New shaders 0 / total 15266". Retest on the real device pending its unlock.
 
-## 复测
+## Retesting
 
-正常生成 App 使用 README 中原来的命令，无需新入口或手动 cache 参数。构建日志为 `<work>/logs/prepare-shader-seed.log`，首次启动日志应出现 `[shader-seed]`、实际数量、`启动关键管线已就绪` 和 `管线预热完成`。`启动关键管线已就绪` 只覆盖标题清单：缓存热时等待不到 1 秒，缓存冷时几秒。其余预热在后台完成，总用时见 `管线预热完成` 一行。比较启动时间时，先确认两边的 Metal 缓存状态一样（都热或都冷），见“Metal 的缓存”。
+Build the App normally with the existing command from the README; no new entry point or manual cache arguments are needed. The build log is `<work>/logs/prepare-shader-seed.log`. The first-launch log should show `[shader-seed]`, the actual count, the "startup-critical pipelines ready" line and the "pipeline warm-up complete" line. The "startup-critical pipelines ready" line covers only the title list: under 1 second of waiting with a warm cache, a few seconds with a cold one. The rest of warm-up finishes in the background; total time is on the "pipeline warm-up complete" line. When comparing launch times, first make sure both sides have the same Metal cache state (both warm or both cold); see "The Metal cache".
 
-完整诊断使用生产启动器、独立空 profile/翻译缓存和标准 game-slot，依次检查首次启动、相同缓存重开、关闭种子的空缓存负对照：
+Full diagnostics use the production launcher, a separate empty profile/translation cache and the standard game slot, checking in turn the first launch, a reopen with the same cache, and a negative control with the seed disabled and an empty cache:
 
 ```sh
 python3.14 games/totk/scripts/verify_first_launch_shaders.py \
@@ -196,16 +196,16 @@ python3.14 games/totk/scripts/verify_first_launch_shaders.py \
   --output "$HOME/Library/Application Support/MacNativeGames/TOTK/tests/first-shader-check-new"
 ```
 
-输出目录必须是新的；真实用户输入或用户新开游戏立即停止控制，保留测试局。已完成的启动阶段单独记载，后续截图/等待被中断不会改写成整轮通过。系统 Metal 驱动缓存不清除，因此该检查验证空翻译缓存的发现/预热行为，不能当成另一台全新 GPU 的冷编译耗时基准。
+The output directory must be new. Real user input, or the user starting a new game, stops control immediately and keeps the test session. Completed launch phases are recorded separately; a later interrupted screenshot/wait is never rewritten as a full pass. The system Metal driver cache is not cleared, so this check verifies discovery/warm-up behaviour with an empty translation cache; it cannot serve as a cold-compile timing benchmark for a brand-new GPU.
 
-纯 CPU 导入诊断（不启动游戏或 GPU）使用 `scripts/diag/import_shader_seed.m`，链接 Foundation，包含 `third_party/d2r_gfx/gfx/nvn`。参数为包内 seed 目录及新的私有 cache 目录；连续运行两次应分别导入全部文件和 0 个文件。
+CPU-only import diagnostics (no game or GPU launched) use `scripts/diag/import_shader_seed.m`, linked against Foundation and including `third_party/d2r_gfx/gfx/nvn`. Arguments are the seed directory in the bundle and a new private cache directory; two consecutive runs should import all files and then 0 files.
 
-## 工作目录体积与保留范围
+## Work directory size and what is kept
 
-此次全流程验证把独立构建工作区放在 `analysis/v143-port/full-build-work`，导致分析目录约 36 GiB；其中该工作区约 33 GiB，主要为本体与 1.4.3 两套解包数据。`analysis/v112-port` 约 70 MiB，几乎全部是 `runtime-layout.json`。1.4.3 其余占用还包括多轮场景测试的 profile 副本、日志和二进制诊断样本；这不是版本适配代码或着色器种子本身的体积。`du` 对 APFS 克隆统计的块可能共享，不能直接推算独占物理空间。
+This full end-to-end verification put a separate build workspace at `analysis/v143-port/full-build-work`, bringing the analysis directory to about 36 GiB; that workspace was about 33 GiB, mainly two sets of unpacked data (base game and 1.4.3). `analysis/v112-port` is about 70 MiB, almost all `runtime-layout.json`. The rest of the 1.4.3 usage also includes profile copies from several rounds of scene tests, logs and binary diagnostic samples; this is not the size of the version port code or the shader seed itself. `du` may count blocks shared by APFS clones, so it can't be used directly to infer exclusive physical space.
 
-完整构建工作区应放在游戏镜像旁的 `TOTK_build` 或源码树外通过 `--work` 指定的位置；项目内的文档仅保存重要结论、测试方法和外部证据位置，原始分析及运行记录放在项目外。最初只读调查明细保存在 `shader-first-launch-8k/disk-usage-comparison.json`。用户随后要求清理不属于项目的残留：已删除重复的 `full-build-work`、旧根目录 `TOTK_build`、多轮测试的 profile 副本、可重新生成的二进制诊断样本和工具临时构建缓存；按清理前 `du` 统计合计约 35 GiB，不能等同于 APFS 新释放的独占空间。`v143-port` 从约 36 GiB 降至约 753 MiB。保留复现步骤、报告、日志、截图、运行时布局、主开发目录的解包/构建产物、当前 App 及着色器缓存；正式 profile 与升级前备份前后哈希一致，未删除任何跟踪文件。Finder 可能即时重建 `.DS_Store`，不反复清理。精确删除清单及校验在 `analysis/v143-port/cleanup-2026-10-18.json`。所有这些生成目录均被 Git 忽略，提交只含源码、测试和文档。
+A full build workspace belongs in `TOTK_build` next to the game image, or outside the source tree via `--work`; documents in the project keep only important conclusions, test methods and where external evidence lives, while raw analysis and run records stay outside the project. The initial read-only investigation details are in `shader-first-launch-8k/disk-usage-comparison.json`. The user then asked for leftovers that don't belong to the project to be cleaned up: the duplicate `full-build-work`, the old root-level `TOTK_build`, profile copies from multiple test rounds, regenerable binary diagnostic samples and temporary tool build caches were deleted; by pre-cleanup `du` this totals about 35 GiB, which is not the same as newly freed exclusive APFS space. `v143-port` went from about 36 GiB to about 753 MiB. Reproduction steps, reports, logs, screenshots, runtime layouts, the main development directory's unpacked/build output, the current App and the shader cache were kept; the real profile and pre-upgrade backup had identical hashes before and after, and no tracked file was deleted. Finder may recreate `.DS_Store` immediately; it is not cleaned repeatedly. The exact deletion list and checks are in `analysis/v143-port/cleanup-2026-10-18.json`. All these generated directories are ignored by Git; commits contain only source, tests and docs.
 
-2026-10-18 后续整理：此前保留在项目内的整个 `games/totk/analysis`（约 823 MiB，含截图中的测试目录及 1.1.2/1.4.3 历史分析）已整体移至项目外 `/Volumes/mac-APFS/MacNativeGames-artifacts/2026-10-18/analysis`；原位置不留目录或符号链接。迁移前后文件哈希和链接目标一致，清单在归档旁 `analysis-relocation.json`。历史日志中的原始路径保持原样。上文证据文件的相对路径以该外部归档为准，重新生成诊断数据应使用外部工作区。
+Later cleanup on 2026-10-18: the whole `games/totk/analysis` previously kept in the project (about 823 MiB, including the test directories in the screenshots and the 1.1.2/1.4.3 historical analysis) was moved out of the project to `/Volumes/mac-APFS/MacNativeGames-artifacts/2026-10-18/analysis`; no directory or symlink is left in the original place. File hashes and link targets matched before and after the move; the manifest is `analysis-relocation.json` next to the archive. Original paths in historical logs are left as they are. Relative paths of the evidence files above refer to that external archive; regenerate diagnostic data in an external workspace.
 
-2026-10-18 最终源码目录整理：旧 `games/totk/build`、`extracted`、`rewritten` 和临时环境/工具链接已移至 `/Volumes/mac-APFS/MacNativeGames-artifacts/development/totk`；生成 App 移至 `/Volumes/mac-APFS/MacNativeGames-artifacts/apps/Tears of the Kingdom.app`。原桌面唯一入口已直接指向该外部 App。源码内不留对应大目录或链接；所有跟踪文件在迁移前后哈希一致，App 运行时哈希不变。项目总占用约 31 MiB（含约 14 MiB 的 `.git`），游戏数据仍保存在项目外，不声称这次迁移释放了磁盘空间。迁移明细为外部 `2026-10-18/source-tree-cleanup.json`。使用生产打包器的外部工作目录进行后续构建和测试，不在源码树直接生成诊断数据。
+Final source-tree cleanup on 2026-10-18: the old `games/totk/build`, `extracted`, `rewritten` and temporary environment/tool links were moved to `/Volumes/mac-APFS/MacNativeGames-artifacts/development/totk`; the generated App moved to `/Volumes/mac-APFS/MacNativeGames-artifacts/apps/Tears of the Kingdom.app`. The single desktop entry now points directly at that external App. No corresponding large directories or links remain in the source tree; all tracked files had identical hashes before and after the move, and the App's runtime hash is unchanged. The project totals about 31 MiB (including about 14 MiB of `.git`); game data still lives outside the project, and this move is not claimed to have freed disk space. Move details are in the external `2026-10-18/source-tree-cleanup.json`. Use the production packager's external work directory for later builds and tests; don't generate diagnostic data directly in the source tree.

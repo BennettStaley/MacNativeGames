@@ -6,13 +6,17 @@
 #include <stdint.h>
 
 /* 0 queued, or a negative SPAWN_ERR_* (runtime_spawn_error names it). Any thread. */
-int runtime_spawn_actor(const char *name, int count);
+int runtime_spawn_actor(const char *name, int count);   /* at runtime_spawn_placement() */
+int runtime_spawn_actor_at(const char *name, int count, int place);   /* place: SPAWN_PLACE_* (actor_spawn_queue.h) */
+/* The Spawn tab's Place choice (SPAWN_PLACE_*), used by runtime_spawn_actor; the tab keeps it in spawn-picks.txt. */
+void runtime_spawn_set_placement(int place);
+int runtime_spawn_placement(void);
 const char *runtime_spawn_error(int code);
-/* "spawn <name> [count]" from the test input file: 1 when the line was a spawn command (handled or refused). Only test
+/* "spawn <name> [count [front|above|far|feet]]" from the test input file: 1 when the line was a spawn command (handled or refused). Only test
    profiles with TOTK_SURVEY=1 (runtime_spawn_allow_commands) run it; in normal play the menu's Spawn tab is the way in. */
 int runtime_spawn_command(const char *line);
 void runtime_spawn_allow_commands(void);
-/* 1.4.3 at startup (world_survey.c runtime_survey_init, every session): checks the call's entry and turns the spawner on.
+/* 1.0.0 and 1.4.3 at startup (world_survey.c runtime_survey_init, every session): checks the call's entry and turns the spawner on.
    Returns 1 when it is on. */
 int runtime_spawn_init(Module *main_module);
 /* SPAWN_OK when the spawner is on, SPAWN_ERR_UNSUPPORTED on a game version without it, SPAWN_ERR_DISABLED when the

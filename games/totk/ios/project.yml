@@ -59,6 +59,9 @@ targets:
         UIViewControllerBasedStatusBarAppearance: false
         UIApplicationSupportsIndirectInputEvents: true
         GCSupportsControllerUserInteraction: true
+        # Game Mode (iOS 18+): the system lowers background work and Bluetooth latency while the game is in front;
+        # the Mac app sets LSSupportsGameMode (build_app.py).
+        GCSupportsGameMode: true
         GCSupportedGameControllers:
           - ProfileName: ExtendedGamepad
         CADisableMinimumFrameDurationOnPhone: true

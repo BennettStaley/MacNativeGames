@@ -12,7 +12,7 @@ int main(void) {
         {"rom", "rom://UI/layout.bin", "UI/layout.bin"},
         {"rom", "rom:/dir/a..b", "dir/a..b"},
         {"rom", "rom:/dir/.hidden", "dir/.hidden"},
-        {"rom", "rom:/dir/文件.bin", "dir/文件.bin"},
+        {"rom", "rom:/dir/\xe6\x96\x87\xe4\xbb\xb6.bin", "dir/\xe6\x96\x87\xe4\xbb\xb6.bin"},   /* a non-ASCII (UTF-8) file name */
         {NULL, "rom:/file", NULL},
         {"", "rom:/file", NULL},
         {"rom", NULL, NULL},

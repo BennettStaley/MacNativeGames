@@ -870,7 +870,7 @@ def step_update_data(tree, game, update, keys, logs, *, version='v112', mod=None
     if version == 'v143':   # the heaps for live scene sizes (runtime_render_reserve): 2K canvas on the Mac, 1080p canvas (iOS, TOTK_OUTPUT_RES=0)
         jobs += [('make_output_res_overlay.py', [canvas, '--scene', scene]) for canvas in ('2560x1440', '1920x1080')
                  for scene in ('1920x1080', '2560x1440')]
-        jobs += [('make_output_res_overlay.py', ['3840x2160', '--scene', '2560x1440'])]   # the settings' 4K headroom (Mac, 16 GB+)
+        jobs += [('make_output_res_overlay.py', ['3840x2160', '--scene', scene]) for scene in ('2560x1440', '3200x1800', '3840x2160')]   # the settings' 4K headroom (Mac, 16 GB+) and Maximum render resolution
         jobs += [('prepare_actor_list.py', [])]   # the spawner's actor list from this RomFS (build/v143/actor_list.tsv, never committed)
     for n, (script, arguments) in enumerate(jobs):
         if heapdef and script == 'make_output_res_overlay.py':   # every variant of the file keeps the mod's heap sizes

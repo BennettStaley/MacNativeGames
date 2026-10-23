@@ -18,3 +18,6 @@ int settings_render_size(int scale, unsigned *w, unsigned *h);   /* the render r
 const char *settings_display_status(void);      /* "Output 2560 x 1440, 3D scene 1280 x 720": what the game was last asked for */
 void settings_aspect_follow(float ratio);   /* key 4 changed the shape (-1 fit, 0 16:9, a ratio): display.aspect follows, not applied again */
 void settings_note_controller(const char *kind); /* "xbox" / "playstation" / "nintendo" / "other": the last controller connected */
+/* 1 while the iOS app holds the frame rate at 30 (hot device or Low Power Mode, ios/Sources/power.m): a new frame rate
+   limit is stored as usual and applies when the hold ends. */
+extern volatile int settings_fps_held;

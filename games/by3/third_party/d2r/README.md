@@ -1,33 +1,37 @@
-# D2R 改写器来源
+# D2R rewriter source
 
-上游：https://github.com/jhaizhou-ops/d2r-mobile
+Upstream: https://github.com/jhaizhou-ops/d2r-mobile
 
-固定提交：`9f0c25768ac4b231c6f4cb0a9f182ded68d0e7cf`
+Pinned commit: `9f0c25768ac4b231c6f4cb0a9f182ded68d0e7cf`
 
-复制文件：`dm/tools/patch_nso.py`、`dm/verify/structck.py`、
-`dm/verify/equiv.py`、`dm/verify/nsoimg.py`。MIT 许可证见同目录 LICENSE。
-`call_window.py` 为本工程新增的调用窗口编码器。
+Copied files: `dm/tools/patch_nso.py`, `dm/verify/structck.py`,
+`dm/verify/equiv.py`, `dm/verify/nsoimg.py`. MIT license: see LICENSE in this directory.
+`call_window.py` is a call-window encoder added by this project.
 
-本地改动：
+Local changes:
 
-1. 识别 `br x18` 跳转表时，向前查看的指令数量从 8 增加到 32。
-《王国之泪》v0 的 `main+0x590574` 在地址计算与跳转之间插入了浮点指令，
-原来的八条窗口无法读到 `main+0x590550` 的 `adr x18`。
-2. 为 `main+0x9c9858: blr x18` 增加两字 C 窗口：重放前一条栈存储，
-   保存/恢复借用寄存器，通过 K18 线程槽准备 x30，然后回到原调用位置执行
-   `blr x30`。因此原 SP、参数和产生 LR 的 PC 保持一致。检查已知直接分支、
-   函数入口、动态定义与相对重定位，拒绝绕过准备字进入第二字的情况。
-3. 独占窗口出口表的第一个条目改为默认落空出口 hi，修复两个外部分支窗口
-   条件未成立时落入条件成立出口的问题。
-4. 结构检查器理解 C 窗口并逐指令核对其模板和出口；无游戏专用宿主门时不要求
-   D2R 的 hle.h，涉及宿主门的 CUTS 仍需显式提供已登记接口。
-5. 等价检查器在 C 窗口内继续执行原调用位置的 BLR，再比较被调用函数入口状态。
-   其余判据保持原有方式；独占访问仍使用原有 deexcl 测试模型。
+1. When recognizing `br x18` jump tables, the look-back window grows from 8 to 32 instructions.
+   In Tears of the Kingdom v0, `main+0x590574` has floating-point instructions between the address
+   computation and the jump, so the old eight-instruction window could not reach the `adr x18` at `main+0x590550`.
+2. A two-word C window for `main+0x9c9858: blr x18`: it replays the preceding stack store,
+   saves/restores the borrowed registers, prepares x30 through the K18 thread slot, then returns to the
+   original call site to execute `blr x30`. The original SP, arguments and the PC that produces LR therefore
+   stay the same. Known direct branches, function entries, dynamic definitions and relative relocations are
+   checked, and entering the second word while bypassing the preparation word is rejected.
+3. The first entry of the exclusive-window exit table becomes the default fall-through exit hi, fixing two
+   external-branch windows that fell into the taken exit when their condition did not hold.
+4. The structure checker understands C windows and checks their template and exits instruction by instruction;
+   without game-specific host gates it does not require D2R's hle.h, while CUTS that involve host gates still
+   need the registered interfaces given explicitly.
+5. The equivalence checker continues executing the original call site's BLR inside a C window, then compares
+   the callee's entry state. The other criteria are unchanged; exclusive accesses still use the existing
+   deexcl test model.
 
-main/sdk/subsdk0 均已使用本地版本重新生成并完成全量结构和逐站点等价检查。
-新增调用方式另有递归、异常目标、负对照与 M4 原生多线程测试；修复的独占窗口
-另有未简化的 LDXR/STXR 成功路径与注入失败状态测试。
-复现入口：`make verify`，完整范围说明见项目 README 与 claude.md。
+main/sdk/subsdk0 have all been regenerated with the local version and passed full structure checks and
+per-site equivalence checks. The new call form also has recursion, exception-target, negative-control and
+M4 native multithreaded tests; the fixed exclusive window also has tests of the unsimplified LDXR/STXR
+success path and an injected failure status.
+To reproduce: `make verify`; the project README and claude.md describe the full scope.
 
 `../../runtime/gate.S` adapts the register-preserving `dm_gate` section of
 `dm/host/entry.S` from the same pinned upstream commit, under the included MIT

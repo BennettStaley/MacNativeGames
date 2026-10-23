@@ -10,9 +10,9 @@
 			<key>Type</key>
 			<string>PSGroupSpecifier</string>
 			<key>Title</key>
-			<string>遊戲語言 · Game language</string>
+			<string>Game language</string>
 			<key>FooterText</key>
-			<string>重新啟動遊戲後生效 · takes effect after relaunching the game</string>
+			<string>Takes effect after relaunching the game</string>
 		</dict>
 		<dict>
 			<key>Type</key>
@@ -20,7 +20,7 @@
 			<key>Key</key>
 			<string>TOTK_LANG</string>
 			<key>Title</key>
-			<string>語言 · Language</string>
+			<string>Language</string>
 			<key>DefaultValue</key>
 			<string></string>
 			<key>Values</key>
@@ -40,18 +40,18 @@
 			</array>
 			<key>Titles</key>
 			<array>
-				<string>自動 · 跟隨系統語言 · Follow system language</string>
-				<string>繁體中文</string>
-				<string>简体中文</string>
+				<string>Automatic (follow the system language)</string>
+				<string>Chinese (Traditional)</string>
+				<string>Chinese (Simplified)</string>
 				<string>English</string>
-				<string>日本語</string>
-				<string>Deutsch</string>
-				<string>Español</string>
-				<string>Français</string>
-				<string>Italiano</string>
-				<string>Nederlands</string>
-				<string>Русский</string>
-				<string>한국어</string>
+				<string>Japanese</string>
+				<string>German</string>
+				<string>Spanish</string>
+				<string>French</string>
+				<string>Italian</string>
+				<string>Dutch</string>
+				<string>Russian</string>
+				<string>Korean</string>
 			</array>
 		</dict>
 	</array>

@@ -28,8 +28,8 @@ static void tl_init(void) {
             g_ev = calloc(TL_CAP, sizeof *g_ev);
             if (g_ev && g_count) st = 1;
         }
-        if (!st) fprintf(stderr, "[timeline] TOTK_TIMELINE=%s 读不懂（要 <文件>:<首帧>:<帧数>），不记录\n", e);
-        else fprintf(stderr, "[timeline] 记录第 %llu 帧起 %llu 帧的时间线到 %s\n", (unsigned long long)g_first, (unsigned long long)g_count, g_path);
+        if (!st) fprintf(stderr, "[timeline] TOTK_TIMELINE=%s not understood (want <file>:<first frame>:<frame count>); not recording\n", e);
+        else fprintf(stderr, "[timeline] recording a timeline from frame %llu for %llu frames to %s\n", (unsigned long long)g_first, (unsigned long long)g_count, g_path);
     }
     int want = -1; atomic_compare_exchange_strong(&g_state, &want, st);
 }
@@ -53,7 +53,7 @@ uint64_t totk_tl_commit_id(void) { return atomic_fetch_add(&g_commit, 1) + 1; }
 
 static void tl_write(void) {
     FILE *f = fopen(g_path, "w");
-    if (!f) { fprintf(stderr, "[timeline] 写不了 %s\n", g_path); return; }
+    if (!f) { fprintf(stderr, "[timeline] cannot write %s\n", g_path); return; }
     uint64_t n = atomic_load(&g_n); if (n > TL_CAP) n = TL_CAP;
     fprintf(f, "# t_ns\tkind\ttid\tframe\ta\tb\n");
     static const char *names[] = {"?", "sub_in", "sub_out", "rep_begin", "rep_end", "commit", "gpu", "wait_in", "wait_out",
@@ -64,7 +64,7 @@ static void tl_write(void) {
                 e->tid, (unsigned long long)e->frame, (unsigned long long)e->a, (unsigned long long)e->b);
     }
     fclose(f);
-    fprintf(stderr, "[timeline] 写出 %llu 个事件到 %s\n", (unsigned long long)n, g_path);
+    fprintf(stderr, "[timeline] wrote %llu events to %s\n", (unsigned long long)n, g_path);
 }
 void totk_tl_frame(uint64_t presents) {
     totk_tl_on();

@@ -21,7 +21,9 @@ NSArray<NSString *> *totk_rt_known_variants(NSString *shader);
 // nil on iOS when the variant is not translated yet (request recorded). may_defer (Mac, async shaders): instead of
 // translating now, queue the translation in the background and return nil; once it is recorded, totk_rt_ready_gen()
 // moves. Without may_defer a running background job of the same shader is waited for.
+// may_defer 2: urgent, a draw further on cannot go without it: run now on the urgent services (a queued job of the shader too).
 NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local, int may_defer);
+void totk_rt_urgent_stats(uint64_t *n, uint64_t *ns);   // urgent jobs done and their time from queued to recorded
 // Called on the background worker after a translation, before the variant is recorded: compile its Metal library there.
 void totk_rt_set_ready_hook(void (*hook)(NSString *variant, int stage));
 NSString *totk_rt_root(void);   // the game folder (the executable lives in its build/)
@@ -36,6 +38,9 @@ NSString *totk_rt_prepare(NSString *shader, int stage, const uint8_t *control, c
    cache lacks, compiling each through compile (0 when it failed). */
 void totk_shader_list_boot(void);
 void totk_shader_list_warm_done(int (*compile)(NSString *variant_b, int stage));
+// The variant totk_rt_variant would return when the cache index already names one; nil otherwise (never translates).
+NSString *totk_rt_variant_cached(NSString *shader, NSDictionary *answers);
+void totk_rt_probe_index(NSString *shader, NSArray<NSDictionary *> *rows);   // probe-gfx only
 #endif
 #include <stdint.h>
 void totk_shader_list_set_enabled(int on);   // the setting Interface > Download new shaders (settings.c, live)

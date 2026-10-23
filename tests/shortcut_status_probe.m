@@ -81,8 +81,8 @@ int main(int argc, const char **argv) { @autoreleasepool {
     shortcut_test_output_size(3840, 2160); tick(); assert(picture(3840, 2160));
     shortcut_test_output_size(2560, 1440);
     mfx_set(MFX_HALF); mfx_latch();
-    setenv("TOTK_UI_LANG", "zh", 1); tick();
-    expect(panel, @"设置");
+    tick();
+    expect(panel, @"Settings");
 
     if (hud_compact()) {
         assert(panel.frame.size.width < host.bounds.size.width - 20);
@@ -98,12 +98,12 @@ int main(int argc, const char **argv) { @autoreleasepool {
     press(18); tick(); assert(fps_overlay_hints_enabled() && !fps_overlay_full_hud());
     if (hud_compact()) {
         assert(!panel.hidden); expect(panel, @"FPS 60  2560x1440");
-        assert(![panel.label.stringValue containsString:@"New shaders"] && ![panel.label.stringValue containsString:@"设置"]);
+        assert(![panel.label.stringValue containsString:@"New shaders"] && ![panel.label.stringValue containsString:@"Settings"]);
     } else assert(panel.hidden);   // corners: the FPS corner stays in the picture, the shortcut box goes
     press(18); tick(); assert(panel.hidden && !fps_overlay_hints_enabled());
     mfx_set(MFX_MAX); mfx_latch(); tick();
     press(18); tick(); assert(!panel.hidden && fps_overlay_full_hud());
-    expect(panel, @"设置");
+    expect(panel, @"Settings");
     hud_publish(0, "60 FPS (30 + 30)", 0); tick();
     if (hud_compact()) expect(panel, @"60 FPS (30 + 30)");
 
@@ -114,6 +114,6 @@ int main(int argc, const char **argv) { @autoreleasepool {
                 writeToFile:@(argv[1]) atomically:YES]);
     }
     [panel.timer invalidate];
-    puts("pass: current modes, keyboard cycling, frame latch, localization, both layouts and key 1 all/minimal/off");
+    puts("pass: current modes, keyboard cycling, frame latch, both layouts and key 1 all/minimal/off");
     return 0;
 }}

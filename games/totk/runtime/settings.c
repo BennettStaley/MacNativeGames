@@ -82,7 +82,7 @@ static int display_apply(const char *changed) {
     /* What the two settings make together: the picture (text and icons drawn at it) and the 3D world stretched to it. */
     display_cw = cw; display_ch = ch;
     snprintf(display_status, sizeof display_status, "Display %u×%u · Render %u×%u%s", cw, ch, sw, sh,
-             own ? " (the game's own)" : capped ? " (1440p, the most it can be)" : "");
+             own ? " (the game's own)" : capped ? " (the most it can be; see Maximum render resolution)" : "");
     pthread_mutex_unlock(&lock);
     fprintf(stderr, "[settings] display: %s%s\n", display_status, r ? " (a size waits for the next start)" : "");
     return r;
@@ -114,6 +114,7 @@ void settings_display_size(unsigned drawable_w, unsigned drawable_h, unsigned sc
 
 /* Live settings go to the code that owns them; the touch controls and the menu button are the iOS app's own views, which
    follow through settings_observe. Returns -1 when the game cannot take the value now (it applies at the next start). */
+volatile int settings_fps_held;
 static int apply_live(const SettingDef *d, int v) {
     extern void dm_gfx_set_flag(const char *name, int value);
     extern void nvn_fps_cap_set(int hz);
@@ -141,7 +142,7 @@ static int apply_live(const SettingDef *d, int v) {
     else if (!strcmp(d->key, "graphics.sharpen")) dm_gfx_set_flag("sharpen", v);
     else if (!strcmp(d->key, "graphics.aniso")) dm_gfx_set_flag("aniso", v);
     else if (!strcmp(d->key, "graphics.lod_bias")) dm_gfx_set_flag("lod_bias", v);
-    else if (!strcmp(d->key, "framerate.cap")) nvn_fps_cap_set(v);
+    else if (!strcmp(d->key, "framerate.cap")) { if (!settings_fps_held) nvn_fps_cap_set(v); }   /* held: power cap, ios/Sources/power.m */
     else if (!strcmp(d->key, "interface.readout")) fps_overlay_set_hints(v);
     else if (!strcmp(d->key, "interface.shader_counter")) { extern void shader_overlay_set(int on); shader_overlay_set(v); }
     else if (!strcmp(d->key, "interface.download_shaders")) { extern void totk_shader_list_set_enabled(int on); totk_shader_list_set_enabled(v); }

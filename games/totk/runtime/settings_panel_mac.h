@@ -56,7 +56,7 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     NSInteger section, focus;             /* SETTINGS_SECTIONS index; the focused row */
     NSInteger lastSection[SETTINGS_NTABS];   /* each tab opens on the section it showed last */
     BOOL onBar, confirmReset;             /* the focus is on the section bar (the top level); Reset everything… asks */
-    NSTimer *pollTimer;
+    NSTimer *pollTimer, *meterTimer;   /* meterTimer: the GPU memory line, once a second */
     uint64_t padPrev; double padRepeatAt; int padDir;
     BOOL cheatsUnavailableShown, cheatDbAsked;   /* the Cheats tab: the folded list is open; the list was checked this run */
 }
@@ -114,7 +114,7 @@ static NSColor *panel_color(double w, double a) { return [NSColor colorWithCalib
 
     NSTextField *title = [NSTextField labelWithString:@"Settings"];
     title.font = [NSFont systemFontOfSize:22 weight:NSFontWeightBold]; title.textColor = NSColor.whiteColor;
-    status = [NSTextField labelWithString:@""];
+    status = [NSTextField labelWithString:@""]; status.maximumNumberOfLines = 2; status.usesSingleLineMode = NO;
     status.font = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular]; status.textColor = NSColor.secondaryLabelColor;
     find = [NSSearchField new]; find.placeholderString = @"Search settings (/)"; find.delegate = self; find.controlSize = NSControlSizeSmall;
     find.sendsSearchStringImmediately = YES; find.target = self; find.action = @selector(searched:); findQuery = @"";
@@ -645,13 +645,25 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
 
 - (void)refreshStatus {
     const char *s = settings_display_status();
-    status.stringValue = s && *s ? @(s) : @"";
+    /* The memory meter: what the GPU holds against the budget the game stops at (bigger sizes, Maximum render resolution). */
+    extern void mtl_gpu_memory(uint64_t *used, uint64_t *budget); uint64_t used = 0, budget = 0; mtl_gpu_memory(&used, &budget);
+    NSMutableAttributedString *line = [[NSMutableAttributedString alloc] initWithString:s && *s ? @(s) : @"" attributes:@{
+        NSFontAttributeName:status.font, NSForegroundColorAttributeName:NSColor.secondaryLabelColor}];
+    if (budget) {
+        double f = (double)used / budget;
+        NSColor *c = f > 0.9 ? NSColor.systemRedColor : f > 0.8 ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+        [line appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"\nGPU memory %.1f of %.1f GB%@",
+            used / 1073741824.0, budget / 1073741824.0, f > 0.8 ? @": near the limit, the game stops past it" : @""]
+            attributes:@{NSFontAttributeName:status.font, NSForegroundColorAttributeName:c}]];
+    }
+    status.attributedStringValue = line;
     int pending = mods_changed_since_start();   /* Restart now: a setting marked (after restart), or mod changes */
     for (int i = 0; i < SETTINGS_COUNT && !pending; i++) pending = settings_pending_restart(SETTINGS[i].key);
     if (!pending) pending = cheats_pending() || runtime_cheats_files_changed();   /* code patches switched, cheat files changed */
     restartNow.hidden = !pending || !runtime_front_can_restart();
 }
 - (void)restartGame { [self hide]; runtime_front_restart(); }
+- (void)meterTick { if (self.superview) [self refreshStatus]; }   /* the memory meter, once a second while the menu shows */
 
 - (void)focusFind { [self.window makeFirstResponder:find]; }
 - (void)searched:(NSSearchField *)f {
@@ -924,12 +936,14 @@ static NSTextField *settings_help_label(NSView *v) {   /* a setting row's help t
     runtime_input_hold(1);
     padPrev = ~0ull;   /* the buttons that opened the menu do nothing until released */
     pollTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 60 target:self selector:@selector(poll) userInfo:nil repeats:YES];
+    [meterTimer invalidate]; meterTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(meterTick) userInfo:nil repeats:YES];
     fprintf(stderr, "[settings] menu open\n");
 }
 
 - (void)hide {
     if (!self.superview) return;
     onBar = YES; confirmReset = NO;   /* the next open starts at the top level */
+    [meterTimer invalidate]; meterTimer = nil;
     [pollTimer invalidate]; pollTimer = nil;
     NSWindow *w = self.window;
     [self removeFromSuperview];

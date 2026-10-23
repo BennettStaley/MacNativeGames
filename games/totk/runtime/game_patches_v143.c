@@ -531,10 +531,14 @@ void runtime_render_reserve(unsigned *w,unsigned *h){
         if(getenv("TOTK_EXPORT_IOS"))boot=0;   /* the export builds code only; the phone decides at its own launch */
         else if(e&&*e){
             if(!render_size_parse(e,&rw,&rh))runtime_fail("TOTK_RENDER_RESERVE must be <width>x<height>");
-            if(!render_overlay_exists(rw,rh)){char name[64];render_overlay_name(name,sizeof name,rw,rh);
-                fprintf(stderr,"[totk] TOTK_RENDER_RESERVE=%s needs the HeapDef overlay %s: scripts/make_output_res_overlay.py <canvas> --scene %ux%u --version v143\n",e,name,rw,rh);
-                runtime_fail("scene reserve HeapDef overlay missing");}
-        }else{
+            if(!render_overlay_exists(rw,rh)){   /* e.g. the Maximum render resolution setting without the 4K maximum output:
+                                                   the automatic choice below, never a failed start */
+                char name[64];render_overlay_name(name,sizeof name,rw,rh);
+                fprintf(stderr,"[totk] TOTK_RENDER_RESERVE=%s needs the HeapDef overlay %s (built for the 4K maximum output by build_app.py, or scripts/make_output_res_overlay.py <canvas> --scene %ux%u --version v143): the automatic reserve instead\n",e,name,rw,rh);
+                rw=1600;rh=900;e=NULL;
+            }
+        }
+        if(!getenv("TOTK_EXPORT_IOS")&&(!e||!*e)){
             /* By what the app may use at launch (iOS: its limit is far below the RAM) or the Mac's memory: the biggest
                candidate at or below that whose overlay was built (1600x900 and below need none). */
             static const unsigned cand[][2]={{2560,1440},{1920,1080},{1600,900},{1280,720}};
@@ -701,8 +705,8 @@ int runtime_output_mode_cycle(void){
     extern int mfxup_output_enabled(void);extern void dm_gfx_set_flag(const char *,int);
     int full=atomic_load((_Atomic uint64_t *)(void *)(output_page+32))==pack_size(output_w,output_h);
     int native=0,mfx=0;const char *name;
-    if(full)name="关闭 2K";
-    else if(mfxup_output_enabled()){native=1;name="原生 2K";}
+    if(full)name="2K off";
+    else if(mfxup_output_enabled()){native=1;name="native 2K";}
     else{mfx=1;name="MetalFX 2K";}
     if(full!=native)runtime_output_res_toggle();
     dm_gfx_set_flag("mfx_output",mfx);dm_gfx_set_flag("mfx_upscale",mfx);
