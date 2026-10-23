@@ -784,11 +784,15 @@ static void pool_tls_keep(const pidx_ent *p) {   // caller holds g_mu; p was jus
     pool_tls_t *t = &g_ptls;
     t->e[t->next++ % POOL_TLS_N] = (pool_tls_ent){p->lo, p->hi, p->base, p->buf, p->gpu, atomic_load_explicit(&g_pool_gen, memory_order_relaxed)};
 }
+/* TOTK frames in flight (TOTK_FRAMES_IN_FLIGHT=2, see fif_commit): while a submission is replayed, every memory pool it
+   looks up is noted, so at commit the pools the GPU reads straight from guest memory get the submission's fence. */
+static __thread int t_fif_rec;
+static void fif_note_pool(uintptr_t lo, uintptr_t hi);
 // The locked search; with keep, a pool it finds is remembered by this thread.
 static int pool_lookup_locked(uint64_t addr, uint64_t len, void **buf, uint64_t *base, uint64_t *gpu, int keep) {
     pthread_mutex_lock(&g_mu);
     pidx_ent *p = pool_query((uintptr_t)addr, len);
-    if (p) { pool_res(p); *buf = p->buf; *base = p->base; *gpu = p->gpu; if (keep) pool_tls_keep(p); }
+    if (p) { pool_res(p); *buf = p->buf; *base = p->base; *gpu = p->gpu; if (keep) pool_tls_keep(p); if (t_fif_rec) fif_note_pool(p->lo, p->hi); }
     pthread_mutex_unlock(&g_mu);
     return p != NULL;
 }
@@ -797,6 +801,7 @@ static int pool_lookup(uint64_t addr, uint64_t len, void **buf, uint64_t *base, 
     const pool_tls_ent *e = pool_tls_find((uintptr_t)addr, len);
     if (!e) { g_pool_tls_misses++; return pool_lookup_locked(addr, len, buf, base, gpu, 1); }
     g_pool_tls_hits++;
+    if (t_fif_rec) fif_note_pool(e->lo, e->hi);
     if (atomic_load_explicit(&g_pool_tls_check, memory_order_relaxed)) {
         void *b2; uint64_t base2, gpu2;
         if (!pool_lookup_locked(addr, len, &b2, &base2, &gpu2, 0) || b2 != e->buf || base2 != e->base || gpu2 != e->gpu)
@@ -821,7 +826,7 @@ int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_
 
 // ---------- Submission ----------
 static void defer_reset(void); static void defer_fallback(void);
-typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; void *vis; int qlog; float sph[4]; } post_op;   // vis: the visibility slot table for kind 3; qlog / sph: "querylog" diagnostic
+typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; void *vis; int qlog; float sph[4]; int has_prev; uint64_t prev[2]; } post_op;   // has_prev / prev: TOTK frames in flight, the destination's bytes at replay (post_stale)   // vis: the visibility slot table for kind 3; qlog / sph: "querylog" diagnostic
 static _Atomic int g_occl_vis; static _Atomic long g_ql_until = -1;   // TOTK occlusion diagnostics (see dm_gfx_querylog_next)
 void dm_gfx_querylog_next(long n); void dm_gfx_passdump_next(long n); void dm_gfx_texdump_next(const char *path);
 // ---------- Occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED) ----------
@@ -1071,6 +1076,7 @@ void mtl_sub_begin(void) {
     g_sub_pool = objc_autoreleasePoolPush();
     if (g_cg.ng) { static int once; if (!once++) MLOG("[red] [cube-merge] %d groups were still pending at the end of the last submit (should not happen)", g_cg.ng); g_cg.ng = 0; } g_cg_pending = 0; g_cg.take_seq = ~0ull;
     mtl_init(); g_sub_serial++;
+    { int fif_guard_on(void); void fif_begin(void); if (fif_guard_on()) fif_begin(); }
     { static int ka; if (!ka) { ka = 1; keepalive_start(); } atomic_store(&g_last_sub_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); }
     if (tbdr_on() == 0 && g_ruler_pending) { g_ruler_truth = 0; g_ruler_pending = 0; MLOG("DM_NVN_RULER: switched to the measured mode"); }
     tb_log();
@@ -1784,7 +1790,26 @@ static void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
     usnap_drop(dst, n);   // TOTK: the update reaches memory on the GPU timeline; later readers read it there
     enc_b_copy_buffer(blit_buffer(sb, so, (__bridge id<MTLBuffer>)db, dof, n), sb, so, (__bridge id<MTLBuffer>)db, dof, n);
 }
+/* TOTK frames in flight: completion-time writes (event signals, counter / timestamp reports) land up to a frame after
+   the game moved on; the game may have rewritten the destination meanwhile (e.g. counter = 1 to request the next frame's
+   conditional clear, which a TIMESTAMP report writing 0 would undo). The destination's bytes are kept at replay and the
+   completion writes only where memory still holds them (plain stores: a game write in the last instant can still race).
+   Samples-passed results (kind 3) are always written: the game may reset a query slot after reading it and still needs
+   the next result there. */
+static _Atomic uint64_t g_post_stale;
+static int post_stale(const post_op *o) {
+    if (!o->has_prev) return 0;
+    int st;
+    if (o->kind == 1) st = *o->val != (uint32_t)o->prev[0];
+    else { uint64_t now[2]; memcpy(now, (const void *)(uintptr_t)o->addr, sizeof now); st = now[0] != o->prev[0] || now[1] != o->prev[1]; }
+    if (st) atomic_fetch_add_explicit(&g_post_stale, 1, memory_order_relaxed);
+    return st;
+}
 static void post(post_op o) {
+    { int fif_guard_on(void); static int ck = -1; if (ck < 0) { const char *e = getenv("TOTK_FIF_POST_CHECK"); ck = !(e && !strcmp(e, "0")); }
+      if (ck && fif_guard_on()) {
+          if (o.kind == 1 && o.mode != 1 && o.val) { o.prev[0] = *o.val; o.has_prev = 1; }
+          else if (o.kind == 2 && o.addr) { memcpy(o.prev, (const void *)(uintptr_t)o.addr, sizeof o.prev); o.has_prev = 1; } } }
     if (g_npost == g_postcap) { g_postcap = g_postcap ? g_postcap * 2 : 64; g_post = realloc(g_post, g_postcap * sizeof *g_post); }
     g_post[g_npost++] = o;
 }
@@ -1983,6 +2008,10 @@ static void chunk_cfg(void) {
 }
 uint64_t mtl_chunk_commits(void) { return g_chunk_commits; }
 void mtl_blit_stats(uint64_t v[6]) { v[0] = g_blit_opens; v[1] = g_blit_splits; v[2] = g_upd_n; v[3] = g_upd_split; v[4] = g_copy_n; v[5] = g_copy_split; }
+/* Mid-submission commits are numbered (g_split_seq); g_split_done is the highest one the GPU completed, so a readback
+   can wait for the commit that ends right after its producer dispatch (fif_readback_wait; after DavidZande 6a87c04). */
+static uint64_t g_split_seq; static _Atomic uint64_t g_split_done;
+static pthread_mutex_t g_split_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_split_cv = PTHREAD_COND_INITIALIZER;
 static void mtl_sub_split(void) {
     uint64_t fc0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int fc_first = g_sub_chunks == 0;
     rs_sync();   // TOTK: the encode stage must have finished every pass of this command buffer
@@ -1992,9 +2021,10 @@ static void mtl_sub_split(void) {
     res_commit();
     uint64_t fc3 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t gpu_f = atomic_load(&g_cur_frame), fence_next = g_fence + 1; gpu_tag_begin(gpu_f);
-    TotkCommitOptions *o = [TotkCommitOptions new];
+    TotkCommitOptions *o = [TotkCommitOptions new]; uint64_t split_seq = ++g_split_seq;
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
         gpu_tag_done(gpu_f, f.GPUStartTime, f.GPUEndTime);
+        pthread_mutex_lock(&g_split_mu); if (split_seq > atomic_load(&g_split_done)) atomic_store(&g_split_done, split_seq); pthread_cond_broadcast(&g_split_cv); pthread_mutex_unlock(&g_split_mu);
         if (f.error) { atomic_store(&g_last_commit_error, 1); static int n; if (n++ < 8) MLOG("[red] segment command buffer error fence=%llu: %s", (unsigned long long)fence_next, f.error.description.UTF8String); }
     }];
     if (totk_tl_on()) { uint64_t tlid = totk_tl_commit_id(); totk_tl(TL_COMMIT, tlid, 0);
@@ -2025,6 +2055,8 @@ uint64_t mtl_sub_commit(void) {
     rs_sub_end();   // TOTK: encode stage drained before the command buffer is ended
     up_flush();
     uint64_t fence = ++g_fence;
+    { void fif_commit(uint64_t fence, int counters); int fif_guard_on(void);
+      if (fif_guard_on()) { int nc = 0; for (int i = 0; i < g_npost; i++) nc += g_post[i].kind == 2 || g_post[i].kind == 3; fif_commit(fence, nc); } }
     if (g_vis_ring_i >= 0) g_vis_ring[g_vis_ring_i].fence = fence;
     // CPU-visible effects after completion: copy the op table into the callback
     int n = g_npost; post_op *ops = n ? malloc(n * sizeof *ops) : NULL;
@@ -2045,10 +2077,12 @@ uint64_t mtl_sub_commit(void) {
     uint64_t gpu_f = atomic_load(&g_cur_frame); gpu_tag_begin(gpu_f);
     NSString *cctx = @(cctx_snap());
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
+        nvn_dirty_guard_nowait();   // TOTK frames in flight: this thread writes counters into pool memory for its own submission
         gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[red] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[red] context of the failing submit fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[red] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
         int nq = 0, nzero = 0;   // TOTK_OCCL_AUTODUMP: occlusion queries of this submission and how many reported 0
         for (int i = 0; i < n; i++) {
+            if (post_stale(&ops[i])) { if (ops[i].kind == 3) { vis_list *l = ops[i].vis; for (int k = 0; k < l->n; k++) CFRelease(l->s[k].buf); free(l); } continue; }
             if (ops[i].kind == 1) { if (ops[i].mode == 1) *ops[i].val += ops[i].v; else *ops[i].val = ops[i].v; }
             else if (ops[i].kind == 3) {   // Samples passed: the sum of all slots since the reset
                 vis_list *l = ops[i].vis; uint64_t sum = 0;
@@ -2130,6 +2164,114 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     int ok = g_done >= fence;
     pthread_mutex_unlock(&g_mu);
     return ok;
+}
+
+/* ---------- TOTK frames in flight (TOTK_FRAMES_IN_FLIGHT=2; hle_nvn.c fif_target) ----------
+   The game waits every frame on the fence of the frame it just submitted; with 2 that wait returns at the previous
+   frame's fence, so the game may run one frame ahead of the GPU. yuzu / Ryujinx can do this because their GPU never
+   reads guest memory directly; ours does (zero-copy pools), so the CPU side has to block instead:
+   - CPU -> GPU: the GPU reads memory pools zero-copy (vertex / index / storage / indirect buffers, buffer textures,
+     GPU texture decode). Every pool a submission looked up gets the submission's fence and its pages are made
+     read-only at commit (nvn_dirty_guard); a CPU write to such a page waits in the fault handler until that fence is
+     complete. Uniforms (usnap / upd_shadow) and CPU-mirrored textures are copies already and need nothing.
+   - GPU -> CPU: a pool invalidate (the game's "about to read") over memory a GPU command of a submission still in flight
+     writes waits for that command (fif_readback_wait; producers: storage writes, texture->buffer and buffer copies,
+     uniform updates, counters). Producer compute shaders the game reads back are learned and end a command buffer right
+     after their dispatch, so the wait is for that early commit only (port of DavidZande's TOTK_LAG_READBACK=2, 6a87c04
+     / bdb8946). Submissions with counter reports, or with a pool the guard could not cover, are flagged
+     (mtl_fence_flags) and the lagged wait falls back to the real fence for them (hle_nvn.c).
+   - TOTK_FIF_AUDIT=1: nothing waits; the guard and the readback check only count what would have waited, with sample
+     addresses (does TOTK multi-buffer its dynamic data?). Unsafe, for measurement. */
+static uint64_t mtl_done_fence(void) { return __atomic_load_n(&g_done, __ATOMIC_ACQUIRE); }
+static int fif_audit_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_FIF_AUDIT"); v = e && atoi(e) > 0; } return v; }
+int fif_guard_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_FRAMES_IN_FLIGHT"), *g = getenv("TOTK_FIF_GUARD"); v = e && atoi(e) > 1 && !(g && !strcmp(g, "0"));
+        if (v) { nvn_dirty_guard_init(mtl_done_fence, fif_audit_on());
+                 MLOG("[fif] frames in flight: pools the GPU reads are write-guarded per submission, readbacks wait for their producer%s (TOTK_FIF_GUARD=0: unguarded, unsafe)",
+                      fif_audit_on() ? "; TOTK_FIF_AUDIT=1: nothing waits, would-be waits are only counted (unsafe)" : ""); } }
+    return v;
+}
+#define FIF_SET 8192
+static uint64_t g_fif_lo[FIF_SET], g_fif_hi[FIF_SET]; static uint32_t g_fif_tag[FIF_SET], g_fif_gen, g_fif_list[FIF_SET / 2]; static int g_fif_n, g_fif_over;
+static _Atomic uint32_t g_fif_flags[4096]; static _Atomic uint64_t g_fif_flag_fence[4096];
+static _Atomic uint64_t g_fif_subs, g_fif_pools, g_fif_unguarded, g_fif_counter_subs;
+void fif_begin(void) { t_fif_rec = 1; if (!++g_fif_gen) { memset(g_fif_tag, 0, sizeof g_fif_tag); g_fif_gen = 1; } g_fif_n = 0; g_fif_over = 0; }
+static void fif_note_pool(uintptr_t lo, uintptr_t hi) {   // replay thread only (t_fif_rec)
+    uint32_t h = (uint32_t)((lo >> 12) * 0x9E3779B1u) & (FIF_SET - 1);
+    for (int k = 0; k < FIF_SET; k++, h = (h + 1) & (FIF_SET - 1)) {
+        if (g_fif_tag[h] != g_fif_gen) { if (g_fif_n >= FIF_SET / 2) { g_fif_over = 1; return; } g_fif_tag[h] = g_fif_gen; g_fif_lo[h] = lo; g_fif_hi[h] = hi; g_fif_list[g_fif_n++] = h; return; }
+        if (g_fif_lo[h] == lo) { if (hi > g_fif_hi[h]) g_fif_hi[h] = hi; return; }
+    }
+}
+void fif_commit(uint64_t fence, int counters) {   // flag 1: counter reports; flag 2: a pool read zero-copy is not guarded
+    t_fif_rec = 0;
+    uint32_t fl = (counters ? 1u : 0u) | (g_fif_over ? 2u : 0u);
+    for (int i = 0; i < g_fif_n; i++) { uint32_t h = g_fif_list[i]; if (!nvn_dirty_guard((const void *)(uintptr_t)g_fif_lo[h], g_fif_hi[h] - g_fif_lo[h], fence)) fl |= 2; }
+    atomic_store(&g_fif_flags[fence & 4095], fl); atomic_store_explicit(&g_fif_flag_fence[fence & 4095], fence, memory_order_release);
+    atomic_fetch_add(&g_fif_subs, 1); atomic_fetch_add(&g_fif_pools, (uint64_t)g_fif_n); if (fl & 2) atomic_fetch_add(&g_fif_unguarded, 1); if (fl & 1) atomic_fetch_add(&g_fif_counter_subs, 1);
+}
+uint32_t mtl_fence_flags(uint64_t after, uint64_t upto) {   // OR of the flags of the submissions (after, upto]; 2 for one not recorded
+    if (upto <= after) return 0;
+    if (upto - after > 4000) return 2;
+    uint32_t fl = 0;
+    for (uint64_t f = after + 1; f <= upto; f++) fl |= atomic_load_explicit(&g_fif_flag_fence[f & 4095], memory_order_acquire) == f ? atomic_load(&g_fif_flags[f & 4095]) : 2u;
+    return fl;
+}
+/* GPU -> CPU producers (after DavidZande 41de26e / 6a87c04 rb_prod): ranges a GPU command writes, with its submission's
+   fence and the early commit after it (seq, 0 none). */
+typedef struct { uint64_t lo, hi, fence, seq; char key[9]; } fif_prod;
+#define FIF_PROD_N 4096
+static fif_prod g_fprod[FIF_PROD_N]; static unsigned g_fprod_i; static pthread_mutex_t g_fprod_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_fearly[16][9]; static int g_nfearly;
+static uint64_t g_frb_waits, g_frb_ns, g_frb_full, g_frb_checked; static uint64_t g_frb_sample[4][2]; static unsigned g_frb_ns_i;
+static int fif_early(const char *key) { for (int i = 0; i < g_nfearly; i++) if (!strncmp(g_fearly[i], key, 8)) return 1; return 0; }
+static void fif_prod_note(uint64_t lo, uint64_t n, const char *key, uint64_t seq) {
+    if (!n || !fif_guard_on()) return;
+    pthread_mutex_lock(&g_fprod_mu);
+    fif_prod *e = &g_fprod[g_fprod_i++ % FIF_PROD_N]; e->lo = lo; e->hi = lo + n; e->fence = g_fence + 1; e->seq = seq; snprintf(e->key, sizeof e->key, "%s", key ? key : "?");
+    pthread_mutex_unlock(&g_fprod_mu);
+}
+static int fif_readback_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_FIF_READBACK"); v = fif_guard_on() && !(e && !strcmp(e, "0")); } return v; }
+/* The game's thread, before it reads [lo, lo+n) (pool invalidate): wait for the newest GPU write of the range that is
+   not complete -- its early commit when it has one, else its whole submission (and learn the shader). */
+static void fif_readback_wait(uint64_t lo, uint64_t n) {
+    if (!fif_readback_on() || !n) return;
+    uint64_t done = mtl_done_fence(); fif_prod best = {0}; int have = 0;
+    pthread_mutex_lock(&g_fprod_mu);
+    g_frb_checked++;
+    for (unsigned k = 0; k < FIF_PROD_N; k++) { const fif_prod *e = &g_fprod[k];
+        if (e->fence <= done || !(e->hi > lo && e->lo < lo + n)) continue;
+        if (!have || e->fence > best.fence || (e->fence == best.fence && e->seq > best.seq)) { best = *e; have = 1; } }
+    if (have) { g_frb_sample[g_frb_ns_i % 4][0] = lo; g_frb_sample[g_frb_ns_i % 4][1] = n; g_frb_ns_i++; }
+    pthread_mutex_unlock(&g_fprod_mu);
+    if (!have) return;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int full = 0;
+    if (fif_audit_on()) {}
+    else if (best.seq) {
+        pthread_mutex_lock(&g_split_mu);
+        while (atomic_load(&g_split_done) < best.seq && !mtl_wait(best.fence, 0)) { struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 2000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+            pthread_cond_timedwait(&g_split_cv, &g_split_mu, &dl); }
+        pthread_mutex_unlock(&g_split_mu);
+    } else if (!mtl_wait(best.fence, 0)) {
+        full = 1;
+        if (strlen(best.key) == 8 && !fif_early(best.key)) {   // a compute shader: its dispatches end a command buffer from now on
+            pthread_mutex_lock(&g_fprod_mu);
+            if (!fif_early(best.key) && g_nfearly < 16) { snprintf(g_fearly[g_nfearly], 9, "%s", best.key); g_nfearly++; MLOG("[fif] compute shader %s writes what the game reads back; its dispatches end a command buffer from now on", best.key); }
+            pthread_mutex_unlock(&g_fprod_mu);
+        }
+        mtl_wait(best.fence, UINT64_MAX);
+    }
+    uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    pthread_mutex_lock(&g_fprod_mu); g_frb_waits++; g_frb_ns += dt; g_frb_full += full; pthread_mutex_unlock(&g_fprod_mu);
+}
+/* For the periodic log line (hle_nvn.c): v = {submissions, pools guarded, submissions unguarded, with counters,
+   readback checks, readbacks of in-flight GPU writes (waits; audit: would-be waits), their wait ns, of them for a whole
+   submission, early-commit shaders, completion writes skipped as stale}; sample: the last readback ranges that hit. */
+void mtl_fif_stats(uint64_t v[10], uint64_t sample[4][2]) {
+    v[0] = atomic_load(&g_fif_subs); v[1] = atomic_load(&g_fif_pools); v[2] = atomic_load(&g_fif_unguarded); v[3] = atomic_load(&g_fif_counter_subs);
+    pthread_mutex_lock(&g_fprod_mu); v[4] = g_frb_checked; v[5] = g_frb_waits; v[6] = g_frb_ns; v[7] = g_frb_full; v[8] = (uint64_t)g_nfearly; memcpy(sample, g_frb_sample, sizeof g_frb_sample); pthread_mutex_unlock(&g_fprod_mu);
+    v[9] = atomic_load(&g_post_stale);
 }
 
 static void mtl_finish_gpu(void) {
@@ -2633,6 +2775,7 @@ void mtl_wb_eager(void) {
     wb_write_list(list, nl, 1);
 }
 void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
+    if (p && p->mem) fif_readback_wait((uint64_t)(uintptr_t)(p->mem + off), n);   // TOTK frames in flight: GPU writes the game is about to read
     if (!p || !p->mem || !atomic_load(&g_wb_on)) return;
     pthread_mutex_lock(&g_smu);
     if (!g_wb.n) { pthread_mutex_unlock(&g_smu); return; }
@@ -8359,7 +8502,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             }
             void *mb; uint64_t mo, gpu;
             if (va && g_nupd && upd_overlap_seq(va, va + 65536)) { g_ren_late++; RED_ONCE(60, "storage buffer pointer %#llx in a uniform slot found overlapping a pending uniform update only after the encoder opened", (unsigned long long)va); }
-            if (va && b->rw) usnap_drop(va, 65536);   // TOTK: the shader may write there (extent unknown: 64 KiB as for the update check)
+            if (va && b->rw) { usnap_drop(va, 65536); fif_prod_note(va, 65536, sh->key, 0); }   // TOTK: the shader may write there (extent unknown: 64 KiB as for the update check)
             if (va && mtl_gpu_addr(va, 1, &mb, &mo, &gpu)) { use_rec("buf", va, 1, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
             else { RED_ONCE(40, "stage %d uniform slot %d offset %u: storage buffer pointer %#llx is not in a memory pool (uniform %s)", nvn_stage, reg, b->off, (unsigned long long)va, u && u->addr ? "bound" : "unbound"); slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead);
                 /* TOTK diagnostic (first 12): which bound uniform block of this stage holds a pool pointer at this offset, and the head of every bound block */
@@ -8380,7 +8523,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                 if (b->kind == NVN_RB_UBOP) ren = upd_shadow(u->addr, u->size);
                 else if (upd_overlap_seq(u->addr, u->addr + (u->size ? u->size : 1))) { g_ren_late++; RED_ONCE(59, "storage buffer %#llx found overlapping a pending uniform update only after the encoder opened", (unsigned long long)u->addr); }
             }
-            if (b->kind == NVN_RB_SBUFP && b->rw && u && u->addr) usnap_drop(u->addr, u->size ? u->size : 1);   // TOTK: the shader may write it: no stale uniform copy from here on
+            if (b->kind == NVN_RB_SBUFP && b->rw && u && u->addr) { usnap_drop(u->addr, u->size ? u->size : 1); fif_prod_note(u->addr, u->size ? u->size : 1, sh->key, 0); }   // TOTK: the shader may write it: no stale uniform copy from here on
             const usnap_t *usc = !ren && b->kind == NVN_RB_UBOP && u && u->addr ? usnap_find(u->addr, u->size ? u->size : 1) : NULL;   // TOTK: compute uniforms as of the submit call
             if (ren) { slots[aid] = ren; USE(dummy_buf(), MTLResourceUsageRead); }
             else if (usc) { slots[aid] = usc->gpu + (u->addr - usc->lo); USE(dummy_buf(), MTLResourceUsageRead); }
@@ -11633,6 +11776,14 @@ static void dispatch(const p_dispatch *dp) {
     if (atomic_load(&g_draw_log) > 0) MLOG("[uw] F%llu pass %llu dispatch cs %.8s grid %dx%dx%d", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, cs->key, dp->x, dp->y, dp->z);
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
     if (!reuse) enc_c_end(ce);
+    /* TOTK frames in flight: a learned readback producer ends the command buffer right after its dispatch, and its storage
+       writes are noted with that early commit, so a readback waits for it only (after DavidZande 6a87c04). */
+    if (reuse && fif_readback_on() && fif_early(cs->key) && g_cb && !g_enc && !g_frz_on && !tbdr_on() && !pt_active()) {
+        uint64_t seq = g_split_seq + 1;
+        for (int i = 0; i < 16; i++) if (S.ssbo[5][i].addr && S.ssbo[5][i].size) fif_prod_note(S.ssbo[5][i].addr, S.ssbo[5][i].size, cs->key, seq);
+        if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+        mtl_sub_split();
+    }
     bright_lut(cs);   // 3D picture brightening: rewrite after the game finishes computing the color lookup table
     /* TOTK_EXPO_LOG=<file> (diagnostic): after each dispatch of the exposure kernel (ae725063), copy floats 96..127 of its
        storage buffer 0 (statistics; exposure at 108..111) into a shared ring and write them with the frame number once
@@ -11665,6 +11816,7 @@ static void copy_t2b(const p_copy_b2t *c) {
     upd_guard(c->src, c->src + img * nz);   // TOTK: renamed uniform updates before a GPU write to the range
     if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(31, "Texture->buffer copy destination is not in a memory pool"); return; }
     usnap_drop(c->src, img * nz);   // TOTK: a GPU write: no uniform copy of these bytes from here on
+    fif_prod_note(c->src, img * nz, "tex2buf", 0);
     id<MTL4ComputeCommandEncoder> b = blit(); BOTW_T2B_NOTE(c, t, mb, mo, img * nz) BOTW_GPU_COPY_SUPERSEDES(mb, mo, img * nz)
     if (is3d)
         enc_b_copy_texture_buffer(b, t, 0, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, c->r.zoffset), MTLSizeMake(c->r.width, c->r.height, nz), (__bridge id<MTLBuffer>)mb, mo, row, img);
@@ -12247,7 +12399,7 @@ void mtl_exec(const uint8_t *p) {
                 PD("Y signal_event cmd=%p dst=%p mode=%u value=%u", p, val, m, v); mtl_sub_event(val, m, v); break; }
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
-                cpend_push(ad, g_fence + 1, 0, t != NVN_COUNTER_TYPE_SAMPLES_PASSED);   // TOTK: value the completion handler will write (counter word)
+                cpend_push(ad, g_fence + 1, 0, t != NVN_COUNTER_TYPE_SAMPLES_PASSED); fif_prod_note(ad, 16, "counter", 0);   // TOTK: value the completion handler will write (counter word)
                 if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
                     post_op q = {3, NULL, 0, 0, ad, (uint32_t)t, vis_snapshot()};
                     if ((long)atomic_load(&g_cur_frame) <= atomic_load(&g_ql_until)) {   // "querylog": the proxy draw's sphere (vertex uniform block 1)
@@ -12265,9 +12417,9 @@ void mtl_exec(const uint8_t *p) {
                     g_vis_on = 1; g_vis_counting = 1; vis_clear(); }
                 break; }
             case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
-                PD("Y copy_b2b cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)s_, (unsigned long long)d, (unsigned long long)n); mtl_sub_copy(s_, d, n); break; }
+                PD("Y copy_b2b cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)s_, (unsigned long long)d, (unsigned long long)n); mtl_sub_copy(s_, d, n); fif_prod_note(d, n, "copy", 0); break; }
             case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
-                PD("Y update_ub cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)((const uint8_t *)a + 16), (unsigned long long)d, (unsigned long long)n); mtl_sub_update((const uint8_t *)a + 16, d, n); break; }
+                PD("Y update_ub cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)((const uint8_t *)a + 16), (unsigned long long)d, (unsigned long long)n); mtl_sub_update((const uint8_t *)a + 16, d, n); fif_prod_note(d, n, "update", 0); break; }
             case OP_SET_RT: {
                 const p_set_rt *r = a;
                 g_cg.rt_seq++; if (g_cg_pending && !cg_rt_match(r)) { g_cg.reason[0]++; cg_flush(); }   // TOTK: a target that is not a cube face set lands the pending groups

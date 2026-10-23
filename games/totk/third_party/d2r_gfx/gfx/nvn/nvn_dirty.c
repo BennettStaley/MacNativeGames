@@ -25,7 +25,8 @@ enum { BUSY_WAIT_MS = 2000 };
 /* TOTK: cgen[c] = highest page generation among pages [c << CHUNK_SHIFT, (c + 1) << CHUNK_SHIFT) (1 MB of 16 KB pages), raised
    after the page's own generation is stored, so a chunk at or below a stamp holds no page above it (nvn_dirty_check). */
 enum { CHUNK_SHIFT = 6 };
-typedef struct { uintptr_t base, end; _Atomic uint8_t *state; _Atomic uint64_t *gen; _Atomic uint64_t *cgen; size_t cap; _Atomic int live; _Atomic uint64_t latest; } range_t;   // latest (TOTK): highest page generation in the range
+typedef struct { uintptr_t base, end; _Atomic uint8_t *state; _Atomic uint64_t *gen; _Atomic uint64_t *cgen; size_t cap; _Atomic int live; _Atomic uint64_t latest;
+    _Atomic uint64_t fence, gstamp; } range_t;   // fence / gstamp (TOTK frames in flight): newest submission fence that reads this range, "now" when its pages were last all made read-only   // latest (TOTK): highest page generation in the range
 static range_t g_r[MAX_RANGE];
 static _Atomic int g_nr;
 static uintptr_t g_pg, g_shift;
@@ -96,10 +97,69 @@ static void unprotect_page(range_t *r, uintptr_t p) {   // The caller has alread
     atomic_fetch_add(&g_now, 1);
     atomic_store(&r->state[p], PG_NONE);
 }
+/* TOTK frames in flight (TOTK_FRAMES_IN_FLIGHT=2): the game may run one frame ahead of the GPU, so it can write memory
+   a submission still in flight reads straight from the pool (zero-copy). nvn_dirty_guard (called at commit for every
+   pool the submission read) records that submission's fence on the range and makes the range's pages read-only; a CPU
+   write that faults on such a page (or a host write through prep_write) first waits until that fence is complete, then
+   takes the usual dirty-tracking path. The wait only polls an atomic "completed fence" and sleeps (usable in the fault
+   handler, no locks). Threads marked with nvn_dirty_guard_nowait (the GPU completion callbacks, which write counters
+   into pool memory) never wait: they would wait for their own submission. Cheap when nothing is in flight: one atomic
+   compare of the newest guarded fence against the completed one. */
+static uint64_t (*g_done_fn)(void);
+static _Atomic uint64_t g_guard_max, g_gw_n, g_gw_ticks, g_gw_timeouts, g_guard_calls, g_guard_skipped, g_guard_untracked;
+static __thread int t_nowait;
+enum { GUARD_WAIT_MS = 2000 };
+static int g_guard_audit; static _Atomic uint64_t g_audit_n, g_audit_sample[8];   // TOTK_FIF_AUDIT: writes that would have waited, and the last pages
+void nvn_dirty_guard_init(uint64_t (*done)(void), int audit) { g_done_fn = done; g_guard_audit = audit; if (!g_tb.denom) mach_timebase_info(&g_tb); }
+void nvn_dirty_guard_nowait(void) { t_nowait = 1; }
+static void guard_wait(range_t *r, uintptr_t addr) {
+    uint64_t f = atomic_load_explicit(&r->fence, memory_order_acquire);
+    if (!f || !g_done_fn || t_nowait || g_done_fn() >= f) return;
+    if (g_guard_audit) { uint64_t i = atomic_fetch_add(&g_audit_n, 1); atomic_store(&g_audit_sample[i & 7], addr & ~(g_pg - 1)); return; }
+    uint64_t t0 = mach_absolute_time();
+    for (unsigned n = 0; g_done_fn() < f; n++) {
+        if (n < 64) { sched_yield(); continue; }
+        struct timespec ts = {0, 50000}; nanosleep(&ts, NULL);
+        if ((mach_absolute_time() - t0) * g_tb.numer / g_tb.denom > (uint64_t)GUARD_WAIT_MS * 1000000ull) {
+            if (!atomic_fetch_add(&g_gw_timeouts, 1)) LOG("[red] frames in flight: a CPU write to %p waited over %d ms for fence %llu; writing anyway", (void *)r->base, GUARD_WAIT_MS, (unsigned long long)f);
+            break; }
+    }
+    atomic_fetch_add(&g_gw_n, 1); atomic_fetch_add(&g_gw_ticks, mach_absolute_time() - t0);
+}
+static inline void guard_check(range_t *r, uintptr_t addr) {
+    if (__builtin_expect(atomic_load_explicit(&g_guard_max, memory_order_relaxed) != 0, 0) && g_done_fn && g_done_fn() < atomic_load(&g_guard_max)) guard_wait(r, addr);
+}
+void nvn_dirty_protect(const void *addr, size_t len);
+int nvn_dirty_guard(const void *addr, size_t len, uint64_t fence) {
+    range_t *r = len ? find((uintptr_t)addr) : NULL;
+    atomic_fetch_add(&g_guard_calls, 1);
+    if (!r || (uintptr_t)addr + len > r->end) { atomic_fetch_add(&g_guard_untracked, 1); return 0; }
+    { uint64_t f = atomic_load(&r->fence); while (f < fence && !atomic_compare_exchange_weak(&r->fence, &f, fence)) {} }
+    { uint64_t m = atomic_load(&g_guard_max); while (m < fence && !atomic_compare_exchange_weak(&g_guard_max, &m, fence)) {} }
+    uint64_t gs = atomic_load(&r->gstamp);
+    if (gs && atomic_load(&r->latest) <= gs) { atomic_fetch_add(&g_guard_skipped, 1); return 1; }   // no page of the range was unprotected since it was all read-only
+    uint64_t s = atomic_load(&g_now);   // before the pass: a page unprotected after this gets a generation above it and is seen next time
+    size_t np = (r->end - r->base) >> g_shift, nc = (np + (1u << CHUNK_SHIFT) - 1) >> CHUNK_SHIFT;
+    for (size_t c = 0; c < nc; c++) {
+        if (gs && atomic_load(&r->cgen[c]) <= gs) continue;   // nothing in this 1 MB chunk was unprotected since the last pass
+        uintptr_t a = r->base + ((uintptr_t)c << (CHUNK_SHIFT + g_shift)), e = a + ((uintptr_t)1 << (CHUNK_SHIFT + g_shift));
+        if (e > r->end) e = r->end;
+        nvn_dirty_protect((const void *)a, e - a);
+    }
+    { uint64_t g = atomic_load(&r->gstamp); while (g < s && !atomic_compare_exchange_weak(&r->gstamp, &g, s)) {} }
+    return 1;
+}
+uint64_t nvn_dirty_range_fence(const void *mem) { range_t *r = find((uintptr_t)mem); return r ? atomic_load(&r->fence) : 0; }
+void nvn_dirty_guard_audit(uint64_t *n, uint64_t sample[8]) { *n = atomic_load(&g_audit_n); for (int i = 0; i < 8; i++) sample[i] = atomic_load(&g_audit_sample[i]); }
+void nvn_dirty_guard_stats(uint64_t v[6]) {
+    v[0] = atomic_load(&g_gw_n); v[1] = atomic_load(&g_gw_ticks) * (g_tb.denom ? g_tb.numer : 1) / (g_tb.denom ? g_tb.denom : 1);
+    v[2] = atomic_load(&g_gw_timeouts); v[3] = atomic_load(&g_guard_calls); v[4] = atomic_load(&g_guard_skipped); v[5] = atomic_load(&g_guard_untracked);
+}
 static int on_fault(void *addr, int is_write, void *uc) {
     (void)uc;
     range_t *r = is_write ? find((uintptr_t)addr) : NULL;
     if (!r) return 0;
+    guard_check(r, (uintptr_t)addr);
     uintptr_t p = ((uintptr_t)addr - r->base) >> g_shift;
     uint8_t st = PG_PROT;
     if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); atomic_fetch_add(&g_faults, 1);
@@ -114,6 +174,7 @@ static void prep_write(void *addr, size_t len) {
         range_t *r = find(a);
         if (!r) { a = (a + g_pg) & ~(g_pg - 1); continue; }
         uintptr_t stop = e < r->end ? e : r->end;
+        guard_check(r, a);
         for (uintptr_t p = (a - r->base) >> g_shift, q = (stop - 1 - r->base) >> g_shift; p <= q; p++) {
             for (;;) { uint8_t st = PG_PROT;   // After waiting out BUSY, look again: the other side may have been setting read-only, in which case the page is PROT after the wait and still has to be unprotected
                 if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); atomic_fetch_add(&g_preps, 1); drec_add(r->base + (p << g_shift), dm_host_write_pc, 0, 1); break; }
@@ -192,7 +253,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     } else {
         memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset((void *)cgen, 0, nc * sizeof *cgen);
     }
-    r->base = base; r->end = end; r->state = state; r->gen = gen; r->cgen = cgen; atomic_store(&r->latest, 0);
+    r->base = base; r->end = end; r->state = state; r->gen = gen; r->cgen = cgen; atomic_store(&r->latest, 0); atomic_store(&r->fence, 0); atomic_store(&r->gstamp, 0);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
     pthread_mutex_unlock(&g_slot_mu);
