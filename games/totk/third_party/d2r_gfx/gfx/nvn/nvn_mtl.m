@@ -404,6 +404,13 @@ void bf_want_note(const char *key) {
     pthread_mutex_unlock(&g_bf_want_mu);
 }
 
+/* TOTK_REPLAY_FAST (default 1; =0 restores the old paths): one switch for the replay thread's CPU fast paths, so they can
+   be A/B'd together (hle_nvn.c reads the same variable for its recording copies). */
+static int replay_fast(void) {
+    static _Atomic int v = -1; int r = atomic_load_explicit(&v, memory_order_relaxed);
+    if (r < 0) { const char *e = getenv("TOTK_REPLAY_FAST"); r = !(e && !atoi(e)); atomic_store_explicit(&v, r, memory_order_relaxed); }
+    return r;
+}
 // ---------- 内存池 ----------
 // ---------- Memory pools ----------
 static pidx g_pools;                            // TOTK: sorted by address (nvn_pool_index.h); buf is a non-owning (__bridge) id<MTLBuffer>
@@ -419,8 +426,9 @@ static uint64_t g_pool_query_checked;
    the locked search. 32 entries halved the misses (10% -> 5%) but the longer scan cost as much, no net gain (2026-10-23). */
 #define POOL_TLS_N 8
 typedef struct { uintptr_t lo, hi, base; void *buf; uint64_t gpu, gen; } pool_tls_ent;
-static _Thread_local pool_tls_ent g_ptls[POOL_TLS_N];
-static _Thread_local unsigned g_ptls_next, g_ptls_last;   // next slot to fill; slot of the last hit (looked at first)
+/* One thread-local block: each _Thread_local variable is its own _tlv_get_addr call on Darwin, and the lookup touched two. */
+typedef struct { pool_tls_ent e[POOL_TLS_N]; unsigned next, last; } pool_tls_t;   // next slot to fill; slot of the last hit (looked at first)
+static _Thread_local pool_tls_t g_ptls;
 static _Atomic uint64_t g_pool_gen = 1;
 static _Atomic int g_pool_tls_on = -1, g_pool_tls_check;
 static uint64_t g_pool_tls_hits, g_pool_tls_misses, g_pool_tls_verified;   // statistics (the replay thread does nearly all lookups)
@@ -772,11 +780,12 @@ static const pool_tls_ent *pool_tls_find(uintptr_t a, uint64_t len) {
     uintptr_t end = a + (uintptr_t)len;
     if (end < a) return NULL;
     uint64_t gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
-    const pool_tls_ent *e = &g_ptls[g_ptls_last];
+    pool_tls_t *t = &g_ptls;
+    const pool_tls_ent *e = &t->e[t->last];
     if (e->gen == gen && e->lo <= a && a < e->hi && end <= e->hi) return e;   // a < hi: an address at the end may also start the next pool
     for (unsigned i = 0; i < POOL_TLS_N; i++) {
-        e = &g_ptls[i];
-        if (e->gen == gen && e->lo <= a && a < e->hi && end <= e->hi) { g_ptls_last = i; return e; }
+        e = &t->e[i];
+        if (e->gen == gen && e->lo <= a && a < e->hi && end <= e->hi) { t->last = i; return e; }
     }
     return NULL;
 }
@@ -785,7 +794,8 @@ static void pool_tls_keep(const pidx_ent *p) {   // caller holds g_mu; p was jus
     if (i < 0 || i >= g_pools.n) return;
     if (i > 0 && g_pools.maxhi[i - 1] > p->lo) return;          // an earlier pool reaches into this one
     if (i + 1 < g_pools.n && g_pools.e[i + 1].lo < p->hi) return; // a later pool starts inside this one
-    g_ptls[g_ptls_next++ % POOL_TLS_N] = (pool_tls_ent){p->lo, p->hi, p->base, p->buf, p->gpu, atomic_load_explicit(&g_pool_gen, memory_order_relaxed)};
+    pool_tls_t *t = &g_ptls;
+    t->e[t->next++ % POOL_TLS_N] = (pool_tls_ent){p->lo, p->hi, p->base, p->buf, p->gpu, atomic_load_explicit(&g_pool_gen, memory_order_relaxed)};
 }
 // The locked search; with keep, a pool it finds is remembered by this thread.
 static int pool_lookup_locked(uint64_t addr, uint64_t len, void **buf, uint64_t *base, uint64_t *gpu, int keep) {
@@ -4683,6 +4693,9 @@ static void uw_ui_squeeze(const char *vs, const p_draw *dw, const p_draw_idx *di
        when the game may draw the menu's own quads (uw_ui_vs's extra shaders: tab labels, map icons) first. Logged (the
        first 40, frame and shader) to confirm; TOTK_UI_SQUEEZE_EARLY=1 squeezes them as well (unverified, off). */
     static int early = -1; if (early < 0) { const char *e = getenv("TOTK_UI_SQUEEZE_EARLY"); early = e && !strcmp(e, "1"); }
+    /* TOTK_REPLAY_FAST: both cases below need a 6-index draw with a vertex shader and the squeeze on; most draws fail that,
+       so they leave before the 13 shader-name compares (~115 samples / 15 s on the replay thread, 2026-10-22). */
+    if (replay_fast() && (off || !vs || (dw ? dw->count : di ? di->count : 0) != 6)) return;
     if (!off && !g_uw_ui && vs && uw_ui_vs(vs) && (dw ? dw->count : di ? di->count : 0) == 6 && uw_on_canvas() && tw && th && uw_ratio() > 0) {
         static int n; if (n < 40) { n++; MLOG("[uw] F%llu: UI quad (vs %.8s) before the UI began: %s", (unsigned long long)atomic_load(&g_cur_frame), vs, early ? "squeezed (TOTK_UI_SQUEEZE_EARLY=1)" : "not squeezed"); }
         if (early) { totk_ui_squeeze(uw_ratio(), ux, uy); return; }
@@ -5671,9 +5684,14 @@ static void shader_key_of(const uint8_t *control, const void *code, uint32_t len
     CC_SHA256_Update(&ctx,code,length);CC_SHA256_Final(md,&ctx);
     for(unsigned j=0;j<32;j++)snprintf(key+2*j,3,"%02x",md[j]);
 }
-static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提交线程调用 | Called only on the submit thread
+/* 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly */
+static const prog_t *g_pg_lp; static uint64_t g_pg_lser, g_pg_lgen; static NvProg *g_pg_lpr;
+#define lp g_pg_lp
+#define lser g_pg_lser
+#define lgen g_pg_lgen
+#define lpr g_pg_lpr
+static __unsafe_unretained NvProg *prog_get_arc(const prog_t *cp) {   // 只在提交线程调用 | Called only on the submit thread
     prog_t *p = (prog_t *)cp;
-    static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly
     uint64_t gen = g_ser_gen;
     if (p == lp && p->serial == lser && lpr && (gen == lgen || ser_unaffected(lgen, gen, lser))) { lgen = gen; return lpr; }
     __unsafe_unretained NvProg *have = p->serial ? (__bridge NvProg *)serial_ptr(p->serial) : nil;
@@ -5715,6 +5733,24 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
     if (p->serial) serial_put(p->serial, o);
     return o;
 }
+/* TOTK_REPLAY_FAST: a function returning an object makes ARC autorelease the result and the caller claim / release it
+   (objc_retainAutoreleaseReturnValue + objc_unsafeClaimAutoreleasedReturnValue, ~180 samples / 15 s at the top of
+   draw_inner, 2026-10-22). The two cache hits (the last program; one the serial table holds) return the pointer as
+   void * instead, with the same checks and the same cache updates as prog_get_arc; anything else goes there. */
+static void *prog_get_raw(const prog_t *cp) {
+    if (replay_fast()) {
+        const prog_t *p = cp; uint64_t gen = g_ser_gen;
+        if (p == lp && p->serial == lser && lpr && (gen == lgen || ser_unaffected(lgen, gen, lser))) { lgen = gen; return (__bridge void *)lpr; }
+        void *have = p->serial ? serial_ptr(p->serial) : NULL;
+        if (have) { lp = p; lser = p->serial; lgen = gen; lpr = (__bridge NvProg *)have; return have; }
+    }
+    return (__bridge void *)prog_get_arc(cp);
+}
+#undef lp
+#undef lser
+#undef lgen
+#undef lpr
+#define prog_get(cp) ((__bridge NvProg *)prog_get_raw(cp))
 void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
 
 // ---------- 描述符池：贴图号 / 采样器号 → 对象 ----------

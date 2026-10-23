@@ -897,8 +897,25 @@ typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uin
 #endif
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
+/* TOTK_REPLAY_FAST (default 1; =0 the old paths): one switch shared by the replay's CPU fast paths (nvn_mtl.m reads the
+   same variable). Here: the recording copy is sized by a first walk over the record headers and allocated once, instead
+   of growing from 4 KiB by realloc and trimming at the end (the growth copies and the trim's move were ~500 samples per
+   15 s on the game's recording threads, 2026-10-22 profile). Same bytes, same checks, same order. */
+static int replay_fast(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_REPLAY_FAST"); v = !(e && !atoi(e)); } return v; }
+static size_t flatten_size(const uint8_t *p) {   // bytes of the copy (prefix included); dies as the copy loop would
+    size_t n = sizeof(copy_prefix);
+    for (;;) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.size < 8 || (h.size & 7)) die("corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
+        if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
+        n += h.size;
+        if (h.op == OP_END) return n;
+        p += h.size;
+    }
+}
 static uint8_t *flatten_recording(const uint8_t *p) {
-    size_t n = sizeof(copy_prefix), cap = 4096; uint8_t *out = malloc(cap);
+    int exact = replay_fast();
+    size_t n = sizeof(copy_prefix), cap = exact ? flatten_size(p) : 4096; uint8_t *out = malloc(cap);
     int bulk_ok = 1; uint32_t last_size = 0;
     if (!out) die("command copy allocation");
     for (;;) {
@@ -912,7 +929,7 @@ static uint8_t *flatten_recording(const uint8_t *p) {
         if (n + h.size > cap) { while (n + h.size > cap) cap *= 2; out = realloc(out, cap); if (!out) die("command copy allocation"); }
         memcpy(out + n, p, h.size); n += h.size;
         if (h.op == OP_END) {
-            uint8_t *trimmed = realloc(out, n); if (trimmed) out = trimmed;
+            if (!exact || n != cap) { uint8_t *trimmed = realloc(out, n); if (trimmed) out = trimmed; }
             copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
 #ifdef GAME_BOTW
             c->used = 0;
