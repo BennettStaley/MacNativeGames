@@ -39,6 +39,7 @@ static uint64_t g_gen_shown;            // interpolated frames handed to the scr
 #include "fps_overlay.h"
 #include "nvn_cover.h"
 #include "totk_shader_scope.h"   // totk_shader_scope_contains: the warm-up scope (PR #84)
+#include "totk_msl_fast.h"   // TOTK_MSL_FAST: selective fast:: math as a text pass over translated MSL (totk_msl_library)
 #include "dmsh_chain.h"   // DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree
 #include "nvn_hmap.h"
 #include "totk_lifelog.h"
@@ -5186,6 +5187,7 @@ static void pso_user_record(const char *fmt, ...) {
     int kind = line[0] == 'S' ? 0 : line[0] == 'R' ? 1 : line[0] == 'C' ? 2 : -1;
     if (kind >= 0) { atomic_fetch_add(&g_collect_new[kind], 1); atomic_store(&g_collect_last_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); }
 }
+static id<MTLLibrary> totk_msl_library(NSString *src, NSError **err);
 // Build the library from a .metallib file without permanently occupying a file descriptor: newLibraryWithURL keeps that file open for as long as the library object lives (one per game shader - of the 258 descriptors the iOS app permanently holds in a run, 213 are these,
 // while the default soft limit of an iOS process is 256; new shaders created in other acts raise it further). Here the file is mapped into memory and closed immediately, and the library is built from the in-memory data; the mapping is released when the library's data object is freed
 static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
@@ -5200,7 +5202,7 @@ static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
     if (len < 4 || memcmp(m, "MTLB", 4)) { NSString *src = [[NSString alloc] initWithBytes:m length:len encoding:NSUTF8StringEncoding]; munmap(m, len);
         if (!src) { if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:EILSEQ userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"neither a compiled library nor source %@", path]}]; return nil; }
         static _Atomic int n; static _Atomic long long us; CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
-        id<MTLLibrary> l = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:err]; long long dt = (long long)((CFAbsoluteTimeGetCurrent() - t0) * 1e6);
+        id<MTLLibrary> l = totk_msl_library(src, err); long long dt = (long long)((CFAbsoluteTimeGetCurrent() - t0) * 1e6);
         int k = atomic_fetch_add(&n, 1) + 1; long long tot = atomic_fetch_add(&us, dt) + dt;
         if (k == 1 || k % 100 == 0 || dt >= 300000) MLOG("Shader compiled at runtime: #%d took %.0f ms, %.1f s total", k, dt / 1e3, tot / 1e6);
         return l; }
@@ -5237,6 +5239,24 @@ static int totk_math_mode(void) {
         MLOG("[experiment] TOTK_MATH_MODE=%s: translated shaders use %s math (precompiled shader libraries skipped, pipeline archive in its own folder)", m == 1 ? "relaxed" : "fast", m == 1 ? "relaxed" : "fast");
     return atomic_load(&v);
 }
+/* TOTK_MSL_FAST=1 (default 0; measurement): the text pass of totk_msl_fast.h over every translated shader before it is
+   compiled, with mathMode still safe. Parts: TOTK_MSL_FAST_DIV=0 / TOTK_MSL_FAST_FUNCS=0 turn off fast::divide / the
+   fast:: log2 exp2 sqrt rsqrt calls (both on by default). The NaN guards on sample coordinates are not touched (see
+   docs/performance-followups.md). Like another math mode, a mask other than 0 skips the precompiled safe-math shader
+   libraries (they are keyed by the unmodified source) and keeps its pipeline archive in a folder of its own (par_dir);
+   Metal's own cache is keyed by the source text, which the pass changes. Returns the mask (MSLF_DIV | MSLF_FUNCS). */
+static int totk_msl_fast_mask(void) {
+    static _Atomic int v = -1; int m = atomic_load(&v);
+    if (m >= 0) return m;
+    const char *e = getenv("TOTK_MSL_FAST"), *d = getenv("TOTK_MSL_FAST_DIV"), *f = getenv("TOTK_MSL_FAST_FUNCS");
+    m = 0;
+    if (e && atoi(e)) m = (d && !atoi(d) ? 0 : MSLF_DIV) | (f && !atoi(f) ? 0 : MSLF_FUNCS);
+    int expect = -1;
+    if (atomic_compare_exchange_strong(&v, &expect, m) && m)
+        MLOG("[experiment] TOTK_MSL_FAST=1: fragment shaders get fast::%s%s%s (math mode unchanged; precompiled shader libraries skipped, pipeline archive in its own folder)",
+             m & MSLF_DIV ? "divide" : "", m == (MSLF_DIV | MSLF_FUNCS) ? " and fast::" : "", m & MSLF_FUNCS ? "log2/exp2/sqrt/rsqrt" : "");
+    return atomic_load(&v);
+}
 static MTLCompileOptions *totk_precise_opts(void) {
     /* Made once and published only when complete: the warm-up compiles on several threads (2026-10-18), and a thread must
        never get the options before mathMode is set (that would compile with fast math). */
@@ -5256,6 +5276,26 @@ static MTLCompileOptions *totk_precise_opts(void) {
    failure is retried instead of being taken as a broken shader. */
 static id<MTLLibrary> totk_msl_library(NSString *src, NSError **err) {
     NSError *e = nil;
+    int fast = totk_msl_fast_mask();
+    if (fast && src) {   // TOTK_MSL_FAST: compile the rewritten text; should it not compile, the original is compiled below
+        static _Atomic int n, divs, kept, calls, failed;
+        const char *c = src.UTF8String; mslf_stats st = {0};
+        char *r = c ? totk_msl_fast_rewrite(c, strlen(c), fast, &st) : NULL;
+        if (r) {
+            NSString *fs = [[NSString alloc] initWithBytesNoCopy:r length:strlen(r) encoding:NSUTF8StringEncoding freeWhenDone:YES];
+            id<MTLLibrary> lib = nil;
+            for (int attempt = 1; fs; attempt++) {
+                lib = [g_dev newLibraryWithSource:fs options:totk_precise_opts() error:&e];
+                if (lib || ![e.localizedDescription containsString:@"XPC_ERROR_CONNECTION_INTERRUPTED"] || attempt == 4) break;
+                usleep((useconds_t)attempt * 100000);
+            }
+            int k = atomic_fetch_add(&n, 1) + 1, dv = atomic_fetch_add(&divs, st.divs) + st.divs, kp = atomic_fetch_add(&kept, st.divs_kept) + st.divs_kept, cl = atomic_fetch_add(&calls, st.calls) + st.calls;
+            if (k == 1 || k % 1000 == 0) MLOG("[experiment] TOTK_MSL_FAST: %d shaders rewritten: %d divides fast, %d kept precise (integer use), %d fast:: calls", k, dv, kp, cl);
+            if (lib) { if (err) *err = nil; return lib; }
+            if (atomic_fetch_add(&failed, 1) < 5) MLOG("[red] TOTK_MSL_FAST: rewritten shader does not compile (%s); compiling the original", e.localizedDescription.UTF8String);
+            e = nil;
+        }
+    }
     for (int attempt = 1;; attempt++) {
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:&e];
         BOOL interrupted = !lib && [e.localizedDescription containsString:@"XPC_ERROR_CONNECTION_INTERRUPTED"];
@@ -5428,7 +5468,7 @@ static _Atomic uint64_t g_rt_prebuilt, g_rt_compiled;   // TOTK: translated vari
    MSL, so only an exact match is used. Metal's own cache of libraries compiled here does not follow the app to a folder
    whose path has another length (measured: a full 4.5-minute warm-up again); these files move with the app. */
 static NSString *shader_lib_prebuilt_path(NSData *src) {
-    if (totk_math_mode()) return nil;   // built with safe math (totk_precise_opts)
+    if (totk_math_mode() || totk_msl_fast_mask()) return nil;   // built with safe math (totk_precise_opts) from the unmodified source
     static NSString *dir; static dispatch_once_t once; dispatch_once(&once, ^{   // TOTK_SHADER_LIBS: the app's game-data store (launcher.m)
         const char *libs = getenv("TOTK_SHADER_LIBS"); dir = libs && *libs ? @(libs) : exe_rel("shader-libs"); });
     unsigned char md[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(src.bytes, (CC_LONG)src.length, md);
@@ -5462,7 +5502,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
         // iOS: the variant precompiled on the Mac (ios/tools/build_metallibs.sh, same options) if it came in shaders.pack;
         // those are safe-math builds, so another TOTK_MATH_MODE compiles the source instead
         NSString *rt_lib = totk_rt_file([pc stringByAppendingString:@".metallib"]);
-        if (!totk_math_mode() && [NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("[red] Failed to load precompiled shader library %s: %s (compiling at runtime instead)", pc.UTF8String, e.localizedDescription.UTF8String); else atomic_fetch_add(&g_rt_prebuilt, 1); }
+        if (!totk_math_mode() && !totk_msl_fast_mask() && [NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("[red] Failed to load precompiled shader library %s: %s (compiling at runtime instead)", pc.UTF8String, e.localizedDescription.UTF8String); else atomic_fetch_add(&g_rt_prebuilt, 1); }
         }
         if (!lib) { NSData *raw = [NSData dataWithContentsOfFile:rt_src options:0 error:&e];
 #if !TARGET_OS_IPHONE

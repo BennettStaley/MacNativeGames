@@ -286,6 +286,13 @@ graphics-tools:
 	cmake -S tooling/spirv-cross -B build/spirv-cross -DCMAKE_BUILD_TYPE=Release -DSPIRV_CROSS_ENABLE_TESTS=OFF
 	cmake --build build/spirv-cross -j 4
 
+.PHONY: probe-msl-fast
+# The TOTK_MSL_FAST text pass (fast::divide / fast:: calls, integer-division idiom kept precise) on sample snippets.
+probe-msl-fast:
+	@mkdir -p build/tests
+	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn tests/msl_fast/probe.c -o build/tests/msl_fast_probe
+	build/tests/msl_fast_probe
+
 .PHONY: probe-metal-semantics
 # GPU: Metal behaviours the shader translation relies on (2026-10-15): min / max / clamp / saturate with a NaN operand
 # return the other one, safe math keeps NaN * 0 = NaN, a colour attachment the fragment function does not write is kept.

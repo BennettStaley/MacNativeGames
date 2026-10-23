@@ -51,11 +51,14 @@ static int par_fill_light(void) {
 #endif
 }
 static int totk_math_mode(void);   // nvn_mtl.m: 0 safe, 1 relaxed, 2 fast (TOTK_MATH_MODE)
+static int totk_msl_fast_mask(void);   // nvn_mtl.m: TOTK_MSL_FAST parts (totk_msl_fast.h MSLF_*), 0 when off
 /* Pipelines built from libraries compiled with another math mode live in a folder of their own: Metal would only miss on
    the safe-math files (it checks the functions), but every miss would then overwrite a safe-math file with the other mode's. */
 static NSString *par_dir(void) {
     static const char *names[] = {"pipelines", "pipelines-relaxed", "pipelines-fast"};
-    return [totk_rt_dir() stringByAppendingPathComponent:@(names[totk_math_mode()])];
+    NSString *name = @(names[totk_math_mode()]); int fast = totk_msl_fast_mask();
+    if (fast) name = [name stringByAppendingFormat:@"-mslfast%d", fast];   // TOTK_MSL_FAST: libraries from rewritten source
+    return [totk_rt_dir() stringByAppendingPathComponent:name];
 }
 static NSString *par_file(NSString *key) { return [par_dir() stringByAppendingFormat:@"/%@.metalarchive", key]; }
 static NSDictionary *par_identity(id<MTLDevice> dev) {
