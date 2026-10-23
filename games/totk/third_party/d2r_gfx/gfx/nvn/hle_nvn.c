@@ -624,6 +624,24 @@ NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f)
 // and calls whose fence was the newest committed one (a full drain of the queue).
 _Atomic uint64_t g_sw_calls[2], g_sw_blocked[2], g_sw_ns[2], g_sw_newest[2];
 static int synclog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_SYNC_LOG") != NULL; return on; }
+/* TOTK_FRAMES_IN_FLIGHT=2 (experimental, off by default): every frame the game's main thread waits for the fence the render
+   thread set on the frame it just submitted, so the GPU never has the next frame queued while it finishes this one and
+   idles ~2 ms a frame waiting for our replay (2026-10-22, M3 Pro, TOTK_TIMELINE). With 2, a wait on the newest fence of a
+   fence-sync object waits for the fence that object held one frame earlier instead: the GPU runs up to one frame behind
+   the game. Unsafe if the game rewrites memory the GPU still reads for that frame; for measurement and visual checks. */
+static int fif_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_FRAMES_IN_FLIGHT"); v = e ? atoi(e) : 1; if (v > 1) LOG("[nvn] TOTK_FRAMES_IN_FLIGHT=%d: fence waits on the newest submission wait for the previous frame's fence (experimental)", v); } return v; }
+static uint64_t fif_target(const NVNsync *s, uint64_t fence) {
+    static struct { const NVNsync *s; uint64_t prev; } t[8]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static _Atomic uint64_t n_lag;
+    uint64_t r = fence;
+    pthread_mutex_lock(&mu);
+    int i = 0; while (i < 8 && t[i].s && t[i].s != s) i++;
+    if (i == 8) i = (int)(((uintptr_t)s >> 4) & 7);
+    if (t[i].s == s && t[i].prev && t[i].prev < fence) r = t[i].prev;
+    if (t[i].s != s || t[i].prev < fence) { t[i].s = s; t[i].prev = fence; }
+    pthread_mutex_unlock(&mu);
+    if (r != fence && (atomic_fetch_add(&n_lag, 1) + 1) % 6000 == 1) LOG("[nvn] frames in flight: %llu fence waits moved one frame back", (unsigned long long)atomic_load(&n_lag));
+    return r;
+}
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     NVN_BLOCKING();
     const sync_t *o = (const sync_t *)s;
@@ -631,11 +649,12 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     int k = (o->fenced & 2) != 0, lg = synclog_env();
     if (lg) { atomic_fetch_add(&g_sw_calls[k], 1); if (o->fence == mtl_last_fence()) atomic_fetch_add(&g_sw_newest[k], 1); }
     int tok = (o->fenced & 4) != 0;
-    if (tok ? fence_wait(o->fence, 0) : mtl_wait(o->fence, 0)) { survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
+    uint64_t fence = !tok && !k && fif_env() > 1 && o->fence == mtl_last_fence() ? fif_target(s, o->fence) : o->fence;
+    if (tok ? fence_wait(fence, 0) : mtl_wait(fence, 0)) { survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
     uint64_t t0 = lg ? now_ns() : 0;
-    totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
-    if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)o->fence, o->fence == mtl_last_fence()); guest_chain(w); }
-    int ok = tok ? fence_wait(o->fence, timeout) : mtl_wait(o->fence, timeout);
+    totk_tl(TL_WAIT_IN, fence, fence == mtl_last_fence());
+    if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)fence, fence == mtl_last_fence()); guest_chain(w); }
+    int ok = tok ? fence_wait(fence, timeout) : mtl_wait(fence, timeout);
     totk_tl(TL_WAIT_OUT, o->fence, ok);
     if (lg) { atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], now_ns() - t0); }
     if (ok) survey_after_wait(s);
