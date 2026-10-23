@@ -80,6 +80,15 @@
 - **RomFS 小读取走 256 KiB 块缓存（tvc97 9be79b5）。** 进世界时游戏读几千个相邻的小文件，每个都是一次冷 pread；现在 256 KiB 以下的读取从镜像的 256 KiB 对齐块里拷（Mac 64 MB / iOS 16 MB，最久未用的先出），相邻文件共用一次磁盘读。只缓存游戏镜像本身（按镜像偏移）：被 mod 或本工具补丁替换 / 新增的文件走各自覆盖文件的 fd，不经过缓存，mod 的文件照旧优先；mod 只在启动时加载，镜像只读，所以缓存不会给出过期数据。`TOTK_ROMFS_CACHE=0` 关闭；`TOTK_ROMFS_MMAP=1` 时走 mmap，也不经过缓存。日志：`RomFS block cache: N block reads for M small reads`；`TOTK_FS_TIMING=1` 打印每秒的 `[totk-fs] read window … wall_ms=…`。`probe-fs` 在 1.4.3 上用 2000 次随机小读（含跨块）与直接读比对，带一个测试 mod 也通过。
 - **刷新率取游戏窗口所在的显示器。** 以前 `mtl_display_hz` 读的是主显示器（`CGMainDisplayID`）：窗口在 120 Hz 副屏、主屏 60 Hz 时整局按 60 节拍，Auto 限帧也只在 60 的档位里选。现在 frontend.m 记下窗口所在显示器，窗口挪到另一块屏或显示器模式变化（系统设置改刷新率、插拔显示器）时计数加一；`mtl_display_hz` 按计数缓存，出图节拍（`g_paced_hz`、不限帧时钟上限）、Auto 限帧（看到新 Hz 从头选档）、显示节拍对象的帧率范围、上屏节奏统计都跟着换。没有开关（只有多显示器时行为不同）；`DM_PRESENT_HZ=<hz>` 仍可强制节拍。是否「不限帧率」仍只在启动时按当时的显示器决定。日志：`[totk] window display N (名字, H Hz): …`、`[nvn] the window's display changed: A Hz -> B Hz`、`[auto-cap] B Hz display: starts at …`。
 - **游戏设着色器时后台预编缓存里已有的变体（上游 #186，646ce29，手工移植）。** `TOTK_SHADER_PREFETCH=1` 时（默认关，同上游），`nvnProgramSetShaders` 把翻译缓存里该程序着色器已有的变体交给后台（最多 4 个同时编）编成 Metal 库，经 `warm_enqueue` / `warm_claim` 交给提交线程，首次绘制直接拿到库。不翻译、不跳绘制，管线仍在绘制时建。上游 1.1.2 / M5 Max：等库的帧 102 帧 / 278 个库（44 分钟，最长 4.3 s）→ 2 帧 / 3 个库（13 分钟，最长 0.5 s）；代价是后台多编了约 6000 个库，所以保持默认关。与本分支异步着色器（bfdd085）的冲突只在 totk_shader_rt.h 的声明，`totk_rt_variant` 保留 `may_defer`。日志：`[prefetch] 累计：程序 … 编好 … 后台共 … ms`。
+- **遮挡计数里的绘制也可以先跳过（上游 311f7ec）。** 着色器在后台准备时，遮挡查询里的绘制照样跳过，计数因此为 0 时报 1，物体不会被误剔。`TOTK_OCCL_SKIP=0` 回到当场翻译。日志：`[occl] … raised to 1 so far`。
+- **后面躲不掉的绘制的着色器立刻并行准备（上游 bc461fc）。** 第一次缺着色器时往后扫本次提交，不能跳过的绘制交给紧急翻译线程（`TOTK_RT_URGENT_WORKERS`，默认 4），后台翻译线程默认 2 → 4（`TOTK_RT_BG_WORKERS`）。`TOTK_SHADER_PREDICT=0` 关。与本分支 prefetch 的后台计数手工合并。日志：`[shader-predict] scan …`。
+- **提交线程不再写别处翻译的变体的着色器文件（上游 7305d4e）。** 无开关。
+- **预测扫描只在上次有收获时继续，管线扫描每帧限 4 ms（上游 f134a7b）。** `TOTK_PSO_PREDICT_FRAME_US`（默认 4000）、`TOTK_SHADER_PREDICT_FRAME_US`（默认 0 = 不限）。看 `并行预编 至提交 …` 统计行的扫描耗时。
+- **计算着色器也走紧急翻译，派发等它而不是跳过（上游 ebe621d）。** 无开关；`[shader-miss] 计算着色器还没翻译：跳过这个派发` 应不再出现。
+- **管线键忽略不混合目标的混合因子和不存在的颜色目标（上游 f3e2f66）。** 已录的预热清单读入时同样归一，重复的管线只建一次。管线存档键随之变化：受影响的管线第一次会再编一次。
+- **管线预测用已加载的着色器解析还没画过的程序和绑定变体（上游 6915f64）。** `TOTK_PSO_PREDICT_UNSEEN=0` 关。日志：`并行预编 至提交 …：扫描到程序或绑定变体还没解析的绘制 …`。
+- **预测到的变体的着色器库后台编，绘制等它（上游 65b4a1f）。** `TOTK_PSO_PREDICT_LIBS=0` 关。日志：同一统计行的「后台为预测开编着色器库 … 个，绘制领用 … 个」。
+- **边框色管线准备好之前先用普通管线画，预热按录下的配方建（上游 b06c88d）。** 只在异步着色器开时生效，`TOTK_BORDER_PLAIN=0` 回到当场编。清单新增 `B` 行。README 测试数行保留本分支的。
 
 ## 朝 120 Hz 的 GPU 时间（2026-10-21，均未在本机做游戏内 A/B）
 
