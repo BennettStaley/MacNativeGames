@@ -82,7 +82,8 @@ static const SettingChoice SET_HEADROOM[] = {{"Auto (4K on 16 GB)", "auto", NULL
 static const SettingChoice SET_RENDER_MAX[] = {{"1440p (2560 x 1440)", "1440", NULL, 1440}, {"1800p (3200 x 1800)", "1800", "3200x1800", 1800},
                                                {"4K (3840 x 2160)", "2160", "3840x2160", 2160}};
 static const SettingChoice SET_AA[] = {{"The game's own", "game", "0", 0}, {"Off", "off", "1", 1}, {"FXAA", "fxaa", "2", 2}, {"SMAA", "smaa", "3", 3}};
-static const SettingChoice SET_SHADOW[] = {{"The game's own", "game", NULL, 0}, {"2x", "2", "2", 2}, {"4x", "4", "4", 4}};
+static const SettingChoice SET_SHADOW[] = {{"0.25x", "0.25", "0.25", -4}, {"0.5x", "0.5", "0.5", -2}, {"The game's own", "game", NULL, 0},
+                                           {"2x", "2", "2", 2}, {"4x", "4", "4", 4}};
 /* Dynamic resolution (TOTK_FIXED_RES, runtime/game_patches_v143.c patch_fixed_res): the game's own drops the 3D world to 90 or
    80 % under load; Off holds every step at 100 %. A code patch at start, so after a restart, and only on the Mac. */
 static const SettingChoice SET_DYNRES[] = {{"On (the game's own)", "on", NULL, 0}, {"Off (always 100 %)", "off", "1", 1}};
@@ -130,7 +131,7 @@ static const SettingDef SETTINGS[] = {
      "TOTK_FOV", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 70, 140, 5, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.fog", "Effects", "Cave fog", "The fog in caves and other enclosed places, against the game's own: 50% reaches it at twice the distance, 0% has none. The outdoor haze is separate and not changed yet (version 1.4.3).",
      "TOTK_FOG", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 0, 100, 10, "%", NULL, 0, NULL, NULL, 0},
-    {"graphics.shadow_res", "World detail", "Shadow resolution", "The sun's shadow map: 2x and 4x give sharper shadow edges and use more memory (version 1.4.3).",
+    {"graphics.shadow_res", "World detail", "Shadow resolution", "The sun's shadow map: 0.5x and 0.25x are below the game's own quality (smaller maps, blockier shadow edges, a little faster); 2x and 4x give sharper shadow edges and use more memory (version 1.4.3).",
      "TOTK_SHADOW_RES", SET_CHOICE, SET_LIVE, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_SHADOW, SET_N(SET_SHADOW), "Not on iPhone and iPad yet.", NULL, 0},
     {"graphics.aa", "Image", "Anti-aliasing", "Smooths the 3D scene's edges before the game draws its text and icons on top (version 1.4.3).",
      "TOTK_AA", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_AA, SET_N(SET_AA), NULL, NULL, 0},
@@ -144,8 +145,8 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 0, 100, 10, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.lens_flare", "Effects", "Lens flare", "The game's rings and glints across the picture when the sun is in view (version 1.4.3).",
      NULL, SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
-    {"graphics.render_distance", "World detail", "Render distance", "How far the camera draws before distant land is cut off, against the game's own 25 km (version 1.4.3). It does not change the detail of distant land.",
-     "TOTK_RENDER_DISTANCE", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 50, 300, 25, "%", NULL, 0, NULL, NULL, 0},
+    {"graphics.render_distance", "World detail", "Render distance", "How far the camera draws before distant land is cut off, against the game's own 25 km (version 1.4.3); below 50% is below the game's own quality: far land is cut off visibly, in exchange for fewer things drawn. It does not change the detail of distant land.",
+     "TOTK_RENDER_DISTANCE", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 10, 300, 10, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.dynamic_res", "World detail", "Dynamic resolution", "The game lowers the 3D world to 90 or 80 % of the render resolution when frames run long; Off keeps it at 100 %, sharper but slower in busy places (version 1.4.3).",
      "TOTK_FIXED_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_DYNRES, SET_N(SET_DYNRES), "Not on iPhone and iPad: their game code is fixed when the app is built.", NULL, 0},
     {"graphics.lod_bias", "Image", "Texture detail bias", "Below 0 picks sharper texture levels, in hundredths of a level; too low shimmers.",

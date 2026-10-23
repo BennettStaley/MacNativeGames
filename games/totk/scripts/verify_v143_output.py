@@ -25,7 +25,7 @@ RENDER_KICK = {0x580920}   # the per-frame update's display-state load, ORed wit
 # Text padding after main's text (offsets from the stub base; the layout at the top of runtime/game_patches_v143.c):
 # frame step +0, output +16, aspect +48, cloth/hair clock +176, bounce +256, field of view +288, render veneer +384,
 # world +416, fog +512, shadow +560..+592.
-FOV_STUB, RENDER_VENEER, WORLD_STUB, STUBS_END = 288, 384, 416, 592
+FOV_STUB, RENDER_VENEER, WORLD_STUB, STUBS_END = 288, 384, 416, 600
 # runtime/world_patch.h: the time of day's step (s9) and the two far-plane loads, each a 32-byte stub from +416.
 WORLD_SITES = {0x68c15c: (0xbd403e69, 416, 72), 0x628c30: (0xbd413a60, 448, 76), 0xb43420: (0xbd4062c0, 480, 76)}
 
@@ -185,8 +185,8 @@ def world_checks(out, raw, data, layout):
     assert code == 0 and struct.unpack('<fI', start[data + 72:data + 80]) == (8.0, 0)
     code, _ = image({'TOTK_TIME_SPEED': '300'})
     assert code != 0, 'a time speed outside the choices was accepted'
-    code, _ = image({'TOTK_RENDER_DISTANCE': '20'})
-    assert code != 0, 'a render distance below 50 was accepted'
+    code, _ = image({'TOTK_RENDER_DISTANCE': '5'})
+    assert code != 0, 'a render distance below 10 was accepted'
     code, export = image({'TOTK_EXPORT_IOS': str(out / 'unused-export')})
     assert code == 0 and export[:data] == img[:data], 'the iOS export does not embed the same world stubs'
     return dict(sites={hex(p): hex(w) for p, (w, _, _) in WORLD_SITES.items()}, stubs=[hex(base + WORLD_STUB), hex(base + WORLD_STUB + 96)],
@@ -195,7 +195,7 @@ def world_checks(out, raw, data, layout):
 
 FOG_SITES = {0xd3050}                 # the Env writer's fog ramp scale, fcsel s9, s18, s1, ne (aspect_patch.h fog_install)
 SHADOW_SITES = {0x683604}             # the shadow map side's rounding, add w11, w11, #7 (aspect_patch.h shadow_install)
-FOG_STUB, SHADOW_STUB = 512, 560      # text padding offsets from the stub base: one 48-byte stub, one 32-byte stub (to +592)
+FOG_STUB, SHADOW_STUB = 512, 560      # text padding offsets from the stub base: one 48-byte stub, one 40-byte stub (to +600)
 FOG_SLOT, SHADOW_SLOT = 80, 84        # data page: the fog multiplier (float), the shadow shift (int)
 
 
@@ -242,7 +242,7 @@ def fog_shadow_checks(out, raw, data, layout):
         mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
         mu.mem_map(0, (len(img) + 0x3fff) & ~0x3fff); mu.mem_write(0, img)
         mu.reg_write(UC_ARM64_REG_S18, struct.unpack('<I', struct.pack('<f', side))[0]); mu.reg_write(UC_ARM64_REG_X17, 0x5555)
-        mu.emu_start(0x683600, 0x68360c, count=12)
+        mu.emu_start(0x683600, 0x68360c, count=14)
         assert mu.reg_read(UC_ARM64_REG_PC) == 0x68360c and mu.reg_read(UC_ARM64_REG_X17) == 0x5555
         return mu.reg_read(UC_ARM64_REG_X19) & 0xffffffff
 
@@ -277,13 +277,17 @@ def fog_shadow_checks(out, raw, data, layout):
     assert shadow_run(unset, 1440.0) == 1440, 'unset, the game\'s biggest side is capped'
     code, x2 = image({'TOTK_SHADOW_RES': '2'})
     assert code == 0 and shift(x2) == 1 and shadow_run(x2, 400.0) == 800
+    code, half_res = image({'TOTK_SHADOW_RES': '0.5'})
+    assert code == 0 and shift(half_res) == 0x100 and shadow_run(half_res, 800.0) == 400, 'TOTK_SHADOW_RES=0.5'
+    code, quarter = image({'TOTK_SHADOW_RES': '0.25'})
+    assert code == 0 and shift(quarter) == 0x200 and shadow_run(quarter, 800.0) == 200 and shadow_run(quarter, 421.3) == 112, 'TOTK_SHADOW_RES=0.25'
     code, _ = image({'TOTK_SHADOW_RES': '3'})
     assert code != 0, 'TOTK_SHADOW_RES=3 was accepted'
     code, export = image({'TOTK_EXPORT_IOS': str(out / 'unused-export'), 'TOTK_SHADOW_RES': '4'})
     assert code == 0 and {p for p in sites if raw[p:p+4] != export[p:p+4]} == sites, 'the iOS export did not embed the stubs'
     assert shift(export) == 0, 'the iOS export carried a shadow factor'
     return dict(sites=[hex(p) for p in sorted(sites)], stubs=[hex(base + FOG_STUB), hex(base + SHADOW_STUB)],
-                fog_scale_half=True, fog_zero=True, fog_live_back_to_game=True, shadow_4x=1600, shadow_2x=800,
+                fog_scale_half=True, fog_zero=True, fog_live_back_to_game=True, shadow_4x=1600, shadow_2x=800, shadow_quarter=200,
                 ios_export_embeds=len(sites), malformed_rejected=True)
 
 
@@ -330,7 +334,7 @@ def main():
     aspect = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0, 0x628c3c, 0xb4342c} \
         | {p for p in changes if frame_step + 48 <= p < frame_step + 176 or frame_step + FOV_STUB <= p < frame_step + FOV_STUB + 96}
     # Fog density and shadow resolution (aspect_patch.h): two sites, their stubs at +512..+592 (fog_shadow_checks).
-    aspect |= FOG_SITES | SHADOW_SITES | {p for p in changes if frame_step + FOG_STUB <= p < frame_step + SHADOW_STUB + 32}
+    aspect |= FOG_SITES | SHADOW_SITES | {p for p in changes if frame_step + FOG_STUB <= p < frame_step + SHADOW_STUB + 40}
     assert changes - aspect == want, [hex(p) for p in sorted((changes - aspect) ^ want)]
     assert not {p for p in changes if frame_step + 176 <= p < frame_step + 288}, 'cloth / bounce words changed with both turned off'
 

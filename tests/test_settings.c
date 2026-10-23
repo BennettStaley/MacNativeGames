@@ -86,6 +86,13 @@ int main(void) {
     expect(settings_parse_text("graphics.fog = 55\ngraphics.shadow_res = 4\n", v) == 2 && value(v, "graphics.fog") == 50 &&
            value(v, "graphics.shadow_res") == 4, "fog rounds to its step, shadows by their word");
     expect(settings_parse_text("graphics.shadow_res = 3\n", v) == 0 && value(v, "graphics.shadow_res") == 4, "no 3x shadows");
+    expect(settings_parse_text("graphics.shadow_res = 0.25\n", v) == 1 && value(v, "graphics.shadow_res") == -4, "0.25x shadows by their word");
+    unsetenv("TOTK_SHADOW_RES"); settings_export_env(v);
+    expect(getenv("TOTK_SHADOW_RES") && !strcmp(getenv("TOTK_SHADOW_RES"), "0.25"), "0.25x goes out as TOTK_SHADOW_RES=0.25");
+    setenv("TOTK_SHADOW_RES", "0.5", 1); settings_take_env(v);
+    expect(value(v, "graphics.shadow_res") == -2, "TOTK_SHADOW_RES=0.5 shows as 0.5x");
+    expect(SETTINGS[settings_index("graphics.shadow_res")].nchoices == 5, "shadows: 0.25x, 0.5x, the game's own, 2x, 4x");
+    unsetenv("TOTK_SHADOW_RES"); settings_parse_text("graphics.fog = 50\ngraphics.shadow_res = 4\n", v);
     expect(SETTINGS[settings_index("graphics.fog")].apply == SET_LIVE && SETTINGS[settings_index("graphics.shadow_res")].apply == SET_LIVE &&
            SETTINGS[settings_index("graphics.shadow_res")].platforms == SET_MAC, "fog is live everywhere, shadows live on the Mac");
     unsetenv("TOTK_FOG"); unsetenv("TOTK_SHADOW_RES"); settings_export_env(v);
@@ -173,11 +180,11 @@ int main(void) {
     const SettingDef *ts = &SETTINGS[settings_index("world.time_speed")], *rd = &SETTINGS[settings_index("graphics.render_distance")];
     expect(!strcmp(ts->page, "World") && ts->nchoices == 7 && ts->def_mac == 100 && ts->def_ios == 100 && ts->apply == SET_LIVE && ts->platforms == SET_ALL,
            "time of day speed: seven choices, normal by default, live everywhere");
-    expect(rd->min == 50 && rd->max == 300 && rd->step == 25 && rd->def_mac == 100 && rd->apply == SET_LIVE && rd->platforms == SET_ALL,
-           "render distance: 50..300 % in 25 % steps, live everywhere");
+    expect(rd->min == 10 && rd->max == 300 && rd->step == 10 && rd->def_mac == 100 && rd->apply == SET_LIVE && rd->platforms == SET_ALL,
+           "render distance: 10..300 % in 10 % steps, live everywhere");
     settings_defaults(v, 0);
-    expect(settings_parse_text("world.time_speed = paused\ngraphics.render_distance = 260\n", v) == 2, "the world settings parse");
-    expect(value(v, "world.time_speed") == 0 && value(v, "graphics.render_distance") == 250, "paused is 0 %, a distance rounds to its step");
+    expect(settings_parse_text("world.time_speed = paused\ngraphics.render_distance = 265\n", v) == 2, "the world settings parse");
+    expect(value(v, "world.time_speed") == 0 && value(v, "graphics.render_distance") == 260, "paused is 0 %, a distance rounds to its step");
     setenv("TOTK_TIME_SPEED", "800", 1); settings_take_env(v); unsetenv("TOTK_TIME_SPEED");
     expect(value(v, "world.time_speed") == 800, "TOTK_TIME_SPEED in percent");
 

@@ -420,8 +420,9 @@ static inline void fog_install(Module *m, const char *version, const uint64_t *s
    (runtime_shadow_res_set, the settings menu). Each view's side is picked in main+0x683480..: a quality table's two
    sizes blended by the camera's state, times a factor, converted (fcvtzs w11), rounded up to 8 (main+0x683604 add w11,
    w11, #7; and ~7) and stored as both width (+0x3d8) and height (+0x3f8) of the view (stride 0xbb0), which the map's
-   creation and the shadow passes read. A stub on that add first shifts w11 left by the int on the data page (+84: 1 =
-   2x, 2 = 4x, 0 = the game's own) and caps it at 2048: the game also makes maps for its other views (424, 800, 848, 720
+   creation and the shadow passes read. A stub on that add first shifts w11 left by the low byte of the int on the data
+   page (+84: 1 = 2x, 2 = 4x), then right by its second byte (1 = 0.5x, 2 = 0.25x; 0 = the game's own) and caps it at
+   2048. The smaller maps (TOTK_SHADOW_RES=0.5 / 0.25) cost less GPU time in the shadow passes and blur the edges; the game also makes maps for its other views (424, 800, 848, 720
    and 1440; measured 2026-10-20: 4x without the cap added 635 MB of GPU memory). Both paths to the rounding
    (main+0x6835a8 jumps to it) go through the stub. x16 and the flags are free there (x16 is written next at
    main+0x683618, the flags at main+0x683640). The iOS export embeds the stub; the phone checks it and leaves +84 at 0.
@@ -436,28 +437,34 @@ static inline void fog_install(Module *m, const char *version, const uint64_t *s
    800 -> 1600 -> 800 within a frame of each switch; GPU memory 3380 MB before, 3470 MB after the first 4x and flat
    through 20 more switches). */
 #define SHADOW_DATA_SLOT 84
-enum { SHADOW_STUB = 32, SHADOW_CAP = 2048 };   /* bytes; the largest side the stub makes */
+enum { SHADOW_STUB = 40, SHADOW_CAP = 2048 };   /* bytes; the largest side the stub makes */
 static inline void shadow_stub(uint32_t *s, uint32_t ins, uint64_t site, uint64_t stub, uint64_t data_off) {
     int64_t pages = (int64_t)(data_off >> 12) - (int64_t)(stub >> 12);   /* the module base is page aligned */
     if (pages < -(1 << 20) || pages >= (1 << 20)) runtime_fail("shadow stub: data page out of ADRP range");
     uint32_t imm = (uint32_t)pages & 0x1fffff, d = (ins >> 5) & 31;
     s[0] = 0x90000000u | ((imm & 3) << 29) | ((imm >> 2) << 5) | 16;          /* adrp x16, <data page> */
     s[1] = 0xb9400000u | ((SHADOW_DATA_SLOT / 4) << 10) | (16 << 5) | 16;    /* ldr w16, [x16, #84] */
-    s[2] = 0x1ac02000u | (16 << 16) | (d << 5) | d;                          /* lsl w11, w11, w16 */
-    s[3] = 0x52800000u | (SHADOW_CAP << 5) | 16;                             /* mov w16, #2048 */
-    s[4] = 0x6b00001fu | (16 << 16) | (d << 5);                              /* cmp w11, w16 */
-    s[5] = 0x1a80b000u | (16 << 16) | (d << 5) | d;                          /* csel w11, w11, w16, lt */
-    s[6] = ins;                                                              /* add w11, w11, #7 (the game's rounding) */
-    s[7] = aspect_branch(stub + 28, site + 4);                               /* b <after the add> */
+    s[2] = 0x1ac02000u | (16 << 16) | (d << 5) | d;                          /* lsl w11, w11, w16 (its low 5 bits) */
+    s[3] = 0x53087c00u | (16 << 5) | 16;                                     /* lsr w16, w16, #8 */
+    s[4] = 0x1ac02400u | (16 << 16) | (d << 5) | d;                          /* lsr w11, w11, w16 */
+    s[5] = 0x52800000u | (SHADOW_CAP << 5) | 16;                             /* mov w16, #2048 */
+    s[6] = 0x6b00001fu | (16 << 16) | (d << 5);                              /* cmp w11, w16 */
+    s[7] = 0x1a80b000u | (16 << 16) | (d << 5) | d;                          /* csel w11, w11, w16, lt */
+    s[8] = ins;                                                              /* add w11, w11, #7 (the game's rounding) */
+    s[9] = aspect_branch(stub + 36, site + 4);                               /* b <after the add> */
 }
-static int g_shadow_factor;   /* the factor in force (0 = the game's own) */
+/* The factor as the settings hold it: 0 = the game's own, 2 / 4 = 2x / 4x, -2 / -4 = 0.5x / 0.25x. */
+static int g_shadow_factor;   /* the factor in force */
 int runtime_shadow_res(void) { return g_shadow_factor; }
 static _Atomic(uint32_t) *g_shadow_slot;
+static int shadow_valid(int k) { return k == 0 || k == 2 || k == 4 || k == -2 || k == -4; }
+static uint32_t shadow_word(int k) { return k == 4 ? 2 : k == 2 ? 1 : k == -2 ? 1u << 8 : k == -4 ? 2u << 8 : 0; }
+static const char *shadow_name(int k) { return k == 4 ? "4x" : k == 2 ? "2x" : k == -2 ? "0.5x" : k == -4 ? "0.25x" : "the game's own"; }
 int runtime_shadow_res_set(int k) {
-    if (k != 0 && k != 2 && k != 4) return -1;
-    if (!g_shadow_slot) { fprintf(stderr, "[totk] shadow resolution %dx: not available in this build\n", k); return -1; }
-    atomic_store(g_shadow_slot, (uint32_t)(k == 4 ? 2 : k == 2 ? 1 : 0)); g_shadow_factor = k;
-    fprintf(stderr, "[totk] shadow resolution: %s (live)\n", k == 4 ? "4x" : k == 2 ? "2x" : "the game's own");
+    if (!shadow_valid(k)) return -1;
+    if (!g_shadow_slot) { fprintf(stderr, "[totk] shadow resolution %s: not available in this build\n", shadow_name(k)); return -1; }
+    atomic_store(g_shadow_slot, shadow_word(k)); g_shadow_factor = k;
+    fprintf(stderr, "[totk] shadow resolution: %s (live)\n", shadow_name(k));
     return 0;
 }
 static inline void shadow_install(Module *m, const char *version, uint64_t stub_off, uint64_t data_off) {
@@ -478,9 +485,13 @@ static inline void shadow_install(Module *m, const char *version, uint64_t stub_
     g_shadow_slot = (_Atomic(uint32_t) *)(void *)(m->base + data_off + SHADOW_DATA_SLOT);
 #endif
     const char *e = getenv("TOTK_SHADOW_RES"); int k = 0; char rest;
-    if (e && *e && (sscanf(e, "%d%c", &k, &rest) != 1 || (k != 0 && k != 1 && k != 2 && k != 4))) runtime_fail("TOTK_SHADOW_RES must be 0, 2 or 4");
+    if (e && *e) {
+        if (!strcmp(e, "0.5")) k = -2;
+        else if (!strcmp(e, "0.25")) k = -4;
+        else if (sscanf(e, "%d%c", &k, &rest) != 1 || (k != 1 && (k < 0 || !shadow_valid(k)))) runtime_fail("TOTK_SHADOW_RES must be 0.25, 0.5, 0, 2 or 4");
+    }
     if (k == 1 || getenv("TOTK_EXPORT_IOS")) k = 0;   /* the export builds code only; the phone decides at its own launch */
-    atomic_store((_Atomic(uint32_t) *)(void *)(m->base + data_off + SHADOW_DATA_SLOT), (uint32_t)(k == 4 ? 2 : k == 2 ? 1 : 0));
+    atomic_store((_Atomic(uint32_t) *)(void *)(m->base + data_off + SHADOW_DATA_SLOT), shadow_word(k));
     g_shadow_factor = k;
-    fprintf(stderr, "[totk] %s shadow resolution: %s (TOTK_SHADOW_RES); main+%#llx, stub +%#llx\n", version, k == 4 ? "4x" : k == 2 ? "2x" : "the game's own", (unsigned long long)site, (unsigned long long)stub_off);
+    fprintf(stderr, "[totk] %s shadow resolution: %s (TOTK_SHADOW_RES); main+%#llx, stub +%#llx\n", version, shadow_name(k), (unsigned long long)site, (unsigned long long)stub_off);
 }

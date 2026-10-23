@@ -106,7 +106,7 @@ static inline int world_install(Module *m, const char *what, const WorldSite *si
 static _Atomic(uint32_t) *g_time_slot, *g_distance_slot;
 static int g_time_percent = 100, g_distance_percent = 100;
 static inline int time_speed_valid(int p) { return p == 0 || p == 25 || p == 50 || p == 100 || p == 200 || p == 400 || p == 800; }
-static inline int distance_clamp(int p) { return p < 50 ? 50 : p > 300 ? 300 : p; }
+static inline int distance_clamp(int p) { return p < 10 ? 10 : p > 300 ? 300 : p; }
 static inline uint32_t world_bits(float v) { uint32_t bits; memcpy(&bits, &v, 4); return bits; }
 static void time_speed_write(void) {
     if (!g_time_slot) return;
@@ -123,7 +123,7 @@ void runtime_time_speed_set(int percent) {
     g_time_percent = percent; time_speed_write();
     fprintf(stderr, "[totk] time of day speed %d%%%s\n", percent, g_time_slot ? "" : " (not available in this build)");
 }
-/* Live: percent 50..300 (clamped) of the camera's far clip distance, 100 = the game's own. */
+/* Live: percent 10..300 (clamped) of the camera's far clip distance, 100 = the game's own. */
 void runtime_render_distance_set(int percent) {
     g_distance_percent = distance_clamp(percent); distance_write();
     fprintf(stderr, "[totk] render distance %d%%%s\n", g_distance_percent, g_distance_slot ? "" : " (not available in this build)");
@@ -135,14 +135,14 @@ static inline int world_env(const char *name, int def, int lo, int hi) {
     return p;
 }
 /* Mac and the iOS export: installs both (always; the factors switch them on). iOS: finds them embedded or leaves the game's
-   own. The start values are TOTK_TIME_SPEED (0, 25, 50, 100, 200, 400, 800) and TOTK_RENDER_DISTANCE (50..300). */
+   own. The start values are TOTK_TIME_SPEED (0, 25, 50, 100, 200, 400, 800) and TOTK_RENDER_DISTANCE (10..300). */
 static inline void world_patches_install(Module *m, const char *version, uint64_t stub_off, uint64_t data_off) {
     static const WorldSite time_sites[] = {{0x68c15c, 0xbd403e69 /* ldr s9, [x19, #0x3c] */, 8, 1}};
     static const WorldSite far_sites[] = {{0x628c30, 0xbd413a60 /* ldr s0, [x19, #0x138] */, 8, 2},
                                           {0xb43420, 0xbd4062c0 /* ldr s0, [x22, #0x60] */, 8, 2}};
     int t = world_env("TOTK_TIME_SPEED", g_time_percent, 0, 800);
     if (!time_speed_valid(t)) runtime_fail("TOTK_TIME_SPEED must be 0, 25, 50, 100, 200, 400 or 800");
-    int far = world_env("TOTK_RENDER_DISTANCE", g_distance_percent, 50, 300);
+    int far = world_env("TOTK_RENDER_DISTANCE", g_distance_percent, 10, 300);
     g_time_percent = t; g_distance_percent = far;
     if (world_install(m, "time speed", time_sites, 1, stub_off, data_off, TIME_SPEED_DATA_SLOT)) {
         g_time_slot = (_Atomic(uint32_t) *)(void *)(m->base + data_off + TIME_SPEED_DATA_SLOT); time_speed_write();
