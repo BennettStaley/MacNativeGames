@@ -50,7 +50,13 @@ static int par_fill_light(void) {
     const char *e = getenv("TOTK_PIPELINE_ARCHIVE_FILL"); return e && !strcmp(e, "1");
 #endif
 }
-static NSString *par_dir(void) { return [totk_rt_dir() stringByAppendingPathComponent:@"pipelines"]; }
+static int totk_math_mode(void);   // nvn_mtl.m: 0 safe, 1 relaxed, 2 fast (TOTK_MATH_MODE)
+/* Pipelines built from libraries compiled with another math mode live in a folder of their own: Metal would only miss on
+   the safe-math files (it checks the functions), but every miss would then overwrite a safe-math file with the other mode's. */
+static NSString *par_dir(void) {
+    static const char *names[] = {"pipelines", "pipelines-relaxed", "pipelines-fast"};
+    return [totk_rt_dir() stringByAppendingPathComponent:@(names[totk_math_mode()])];
+}
 static NSString *par_file(NSString *key) { return [par_dir() stringByAppendingFormat:@"/%@.metalarchive", key]; }
 static NSDictionary *par_identity(id<MTLDevice> dev) {
     return @{@"schema": @3, @"chain": @DMSH_CHAIN, @"gpu": dev.name ?: @"?",
