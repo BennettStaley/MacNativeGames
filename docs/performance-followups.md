@@ -26,6 +26,7 @@
 4. **长期内存。** 区分游戏堆、序号表、贴图池槽位、管线/驱动缓存、驻留集合与 GPU 完成后的实际对象。`mtl_dead_forget` 当前保守保留已销毁序号；缩表前须补齐槽位引用关系，不能重现旧的过早遗忘错误。1.4.3 的补帧配置复用只针对重复构建，其他增长仍须归因。
 5. **首次编译卡顿。** 同路线分别记录冷/热缓存，收集完整帧时间。相对尖峰日志会漏掉普通慢帧；截图 FPS、固定镜头平均值、补帧数都不能证明稳定 30/60。
 6. **场景、动作及真实显示器。** 复杂能力/战斗/过场、菜单传送与跨场景资源退役、长时间快速切档、物理 4K 和高刷新率分别检查。版本对比必须同机同负载，不比较不同游戏/设备的单张 FPS。
+7. **Split the DM_NVN_TBDR bundle.** DM_NVN_TBDR=1 made world frames slower on an M3 Pro (frame p50 18.5 → 25.5 ms, GPU p50 15.1 → 16.3 ms) and dropped depth-only passes ("pass without Metal targets: depth serial …"). Each piece now has its own switch, DM_NVN_TBDR_{STORE,UDC,XV,LOAD,DS,HOIST,DEFER,FUSE,ZSKIP,RANGE,GUARDS}=1 (default off); every piece also applies GUARDS (mid-submission commits, async shaders and layered passes off), so measure GUARDS alone first and read each piece against it. A `[tbdr]` log line every 600 frames gives per-piece hits, CPU ms per frame and dropped passes. Prime suspects: GUARDS for the CPU-side frame time (no mid-submission commits serialises encoding and GPU work), DS for the dropped passes.
 
 ## 每轮测试的最低记录
 
