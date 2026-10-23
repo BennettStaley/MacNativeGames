@@ -1,9 +1,3 @@
-// NVN 贴图的存储尺寸 / 对齐 / 各级偏移（Tegra X1 块线性布局）。
-// 基于 deko3d source/dk_image.cpp（zlib 许可，Copyright (C) 2018-2020 fincs），自动块高按 NVN SDK 的整除规则修正：
-//   一个 GOB = 64 字节 × 8 行 = 512 字节；块高（tileH，单位 GOB）按「高度×1.5」挑；各级按块对齐累加。
-// 游戏的预排布贴图（SetPackagedTextureLayout）带 8 字节布局参数：第 0 字节低半字节 = 块高 log2，高半字节 = 块深 log2（3D 用），
-// 有它时以它为准。立方体数组的 depth 已经是层面数（6 的倍数），不是立方体个数。这两条和线性贴图按像素行算尺寸，
-// 都是 digitalhivehub 用原驱动对拍得出的（nxnative PR #11，98fc8a0 / bacf2cb）。
 // Storage size / alignment / per-level offsets of NVN textures (Tegra X1 block-linear layout).
 // Based on deko3d source/dk_image.cpp (zlib license, Copyright (C) 2018-2020 fincs), with NVN SDK integer rounding for automatic tile height:
 //   one GOB = 64 bytes × 8 rows = 512 bytes; the block height (tileH, in GOBs) is picked by 'height×1.5'; levels are accumulated with block alignment.
@@ -15,12 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { uint8_t bpb, bw, bh; } fmt_t;   // 每块字节、块宽、块高（非压缩格式块宽高 = 1） | Bytes per block, block width, block height (for uncompressed formats block width and height = 1)
+typedef struct { uint8_t bpb, bw, bh; } fmt_t;   // Bytes per block, block width, block height (for uncompressed formats block width and height = 1)
 
 static fmt_t fmt_of(int f) {
     static const uint8_t astc[14][2] = {{4,4},{5,4},{5,5},{6,5},{6,6},{8,5},{8,6},{8,8},{10,5},{10,6},{10,8},{10,10},{12,10},{12,12}};
     if (f >= 0x79 && f <= 0x94) { int k = (f - 0x79) % 14; return (fmt_t){16, astc[k][0], astc[k][1]}; }
-    if (f >= 0x41 && f <= 0x50) {                         // DXT / RGTC / BPTC：4×4 块 | DXT / RGTC / BPTC: 4×4 blocks
+    if (f >= 0x41 && f <= 0x50) {                         // DXT / RGTC / BPTC: 4×4 blocks
         int b8 = (f <= 0x42) || (f == 0x45 || f == 0x46) || (f == 0x49 || f == 0x4A);
         return (fmt_t){b8 ? 8 : 16, 4, 4};
     }
@@ -49,17 +43,16 @@ static unsigned adj_tile(unsigned shift, uint32_t unit, uint32_t dim) {
     return shift;
 }
 
-// target：NVNtextureTarget；dims 维数、是否分层由 target 决定
 // target: NVNtextureTarget; the number of dims and whether it is layered are determined by target
 static void shape(const nvn_texdesc *d, unsigned *dpl, int *layered, uint32_t *w, uint32_t *h, uint32_t *z) {
     *w = d->width; *h = d->height; *z = d->depth; *layered = 0;
     switch (d->target) {
         case 0: *dpl = 1; *h = 1; *z = 1; break;                       // 1D
-        case 3: *dpl = 1; *z = d->height; *h = 1; *layered = 1; break; // 1D_ARRAY（层数在 height） | 1D_ARRAY (layer count is in height)
+        case 3: *dpl = 1; *z = d->height; *h = 1; *layered = 1; break; // 1D_ARRAY (layer count is in height)
         case 2: *dpl = 3; break;                                        // 3D
         case 4: case 6: *dpl = 2; *layered = 1; break;                  // 2D_ARRAY / MS_ARRAY
         case 8: *dpl = 2; *z = 6; *layered = 1; break;                  // CUBEMAP
-        case 9: *dpl = 2; *layered = 1; break;                          // CUBEMAP_ARRAY（depth 已是层面数 | depth already counts layer-faces）
+        case 9: *dpl = 2; *layered = 1; break;                          // CUBEMAP_ARRAY (depth already counts layer-faces)
         default: *dpl = 2; *z = 1; break;                               // 2D / MS / RECTANGLE
     }
     if (*z == 0) *z = 1;
@@ -124,14 +117,14 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
     if (nvn_tex_is_linear(d)) {                                            // Pitch storage: explicit stride, otherwise 32-byte (LINEAR) / 128-byte (LINEAR_RENDER_TARGET) alignment
         o->align = (d->flags & 0x40) ? 128 : 32;
         uint32_t stride = nvn_tex_linear_stride(d);
-        o->layer_size = o->size = (uint64_t)stride * h;              // 驱动按像素行算，压缩格式也一样 | the driver counts pixel rows, also for block-compressed formats
+        o->layer_size = o->size = (uint64_t)stride * h;              // the driver counts pixel rows, also for block-compressed formats
         return;
     }
     unsigned tileH = 0, tileD = 0;
     /* NVN truncates height*1.5 to whole GOB rows before choosing the power of
        two. Rounding up here changes e.g. 40 BC rows from H2 to H3 even when
        the total allocation size is unchanged, so padding becomes black texels. */
-    if (d->pkg_block_h) {                                             // 预排布第 0 字节：低半字节块高，高半字节块深 | packaged byte 0: low nibble block height, high nibble block depth
+    if (d->pkg_block_h) {                                             // packaged byte 0: low nibble block height, high nibble block depth
         unsigned pl = (unsigned)(d->pkg_block_h - 1) & 0xFF;
         if (dpl >= 2) tileH = pl & 0xF;
         if (dpl == 3) tileD = pl >> 4;

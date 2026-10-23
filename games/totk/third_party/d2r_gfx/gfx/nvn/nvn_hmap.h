@@ -1,6 +1,3 @@
-// 定长字节键 → 指针 的开放寻址哈希表（线性探测 + 删除时回移，无墓碑）。
-// 回放热路径用它替代 NSDictionary：键不装箱、不分配，查找只做一次哈希 + memcmp。
-// 不加锁：调用方按各自的锁保护。值的所有权归调用方（put / del 返回被替换 / 删除的旧值）。单测 tests/t_hmap.c。
 // Open-addressing hash table from fixed-length byte keys -> pointers (linear probing + backward shift on deletion, no tombstones).
 // The replay hot path uses it instead of NSDictionary: keys are not boxed, no allocation, a lookup does only one hash + memcmp.
 // No locking: callers protect it with their own locks. Ownership of values belongs to the caller (put / del return the replaced / deleted old value). Unit test tests/t_hmap.c.
@@ -9,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { uint8_t *keys; void **vals; uint32_t klen, cap, n; } nvn_hmap;   // vals[i] == NULL 即空位 | vals[i] == NULL means an empty slot
+typedef struct { uint8_t *keys; void **vals; uint32_t klen, cap, n; } nvn_hmap;   // vals[i] == NULL means an empty slot
 
 static inline uint64_t nvn_hm_hash(const void *k, uint32_t len) {
     const uint8_t *p = k; uint64_t h = 0x9e3779b97f4a7c15ull ^ len;
@@ -35,17 +32,15 @@ static inline void nvn_hm_grow(nvn_hmap *m) {
     for (uint32_t i = 0; i < o.cap; i++) if (o.vals[i]) nvn_hm_put(m, o.keys + (size_t)i * o.klen, o.vals[i]);
     free(o.keys); free(o.vals);
 }
-// v 不得为 NULL；返回同键的旧值（无则 NULL）
 // v must not be NULL; returns the old value for the same key (NULL if none)
 static inline void *nvn_hm_put(nvn_hmap *m, const void *k, void *v) {
-    if ((m->n + 1) * 4 > m->cap * 3) nvn_hm_grow(m);   // 装载率 ≤ 3/4 | Load factor <= 3/4
+    if ((m->n + 1) * 4 > m->cap * 3) nvn_hm_grow(m);   // Load factor <= 3/4
     for (uint32_t i = (uint32_t)nvn_hm_hash(k, m->klen) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
         uint8_t *ki = m->keys + (size_t)i * m->klen;
         if (!m->vals[i]) { memcpy(ki, k, m->klen); m->vals[i] = v; m->n++; return NULL; }
         if (!memcmp(ki, k, m->klen)) { void *old = m->vals[i]; m->vals[i] = v; return old; }
     }
 }
-// 删除后把同一探测链上后面的项回移补洞，保证查找遇空位即可停
 // After deletion, shift back later entries on the same probe chain to fill the hole, so that a lookup can stop at the first empty slot
 static inline void *nvn_hm_del(nvn_hmap *m, const void *k) {
     if (!m->n) return NULL;
@@ -61,14 +56,13 @@ static inline void *nvn_hm_del(nvn_hmap *m, const void *k) {
             j = (j + 1) & mask;
             if (!m->vals[j]) { m->n--; return old; }
             uint32_t h = (uint32_t)nvn_hm_hash(m->keys + (size_t)j * m->klen, m->klen) & mask;
-            if (i <= j ? (i < h && h <= j) : (i < h || h <= j)) continue;   // 理想位在 (i, j] 内：不能前移 | Ideal position is within (i, j]: cannot move forward
+            if (i <= j ? (i < h && h <= j) : (i < h || h <= j)) continue;   // Ideal position is within (i, j]: cannot move forward
             break;
         }
         memcpy(m->keys + (size_t)i * m->klen, m->keys + (size_t)j * m->klen, m->klen); m->vals[i] = m->vals[j];
         i = j;
     }
 }
-// 清空；rel 非空时对每个值调用一次（释放所有权）
 // Clear; when rel is non-null, call it once for each value (releasing ownership)
 static inline void nvn_hm_clear(nvn_hmap *m, void (*rel)(void *)) {
     for (uint32_t i = 0; i < m->cap; i++) if (m->vals[i]) { if (rel) rel(m->vals[i]); m->vals[i] = NULL; }
