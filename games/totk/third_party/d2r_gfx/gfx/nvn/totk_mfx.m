@@ -271,21 +271,23 @@ static void ensure_fi(NSUInteger iw, NSUInteger ih) {
     if (!g.mv_ps) {
         static const char *src =
             "#include <metal_stdlib>\nusing namespace metal;\n"
-            "struct P { float4x4 reproj; float2 size; float2 inv_size; float yflip; float obj; float pad1, pad2; };\n"
+            "struct P { float4x4 reproj; float2 size; float2 inv_size; float yflip; float obj; float maxpx, pad2; };\n"
             // camera motion of each depth pixel: where it was in the previous frame, in pixels of this texture. With
             // TOTK_OBJ_MOTION the motion the G-buffer draw wrote there wins (an NDC delta in Metal clip space: y up,
             // texture rows down); OBJMV_NONE (65000) or anything that large means none, the camera motion is used.
+            // The object's motion is also dropped when it differs from the camera motion by more than maxpx pixels:
+            // such a jump is almost always a draw matched with another object (culling changed while turning).
             "kernel void mfx_mv(depth2d<float, access::read> d [[texture(0)]], texture2d<float, access::write> mv [[texture(1)]],\n"
             "                   texture2d<float, access::read> om [[texture(2)]],\n"
             "                   constant P &p [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {\n"
             "  if (g.x >= uint(p.size.x) || g.y >= uint(p.size.y)) return;\n"
-            "  if (p.obj > 0.5) { float2 o = om.read(g).xy;\n"
-            "    if (all(abs(o) < 16.0)) { mv.write(float4(o * float2(0.5, -0.5) * p.size, 0.0, 0.0), g); return; } }\n"
             "  float2 uv = (float2(g) + 0.5) * p.inv_size;\n"
             "  float4 c = p.reproj * float4(uv.x * 2.0 - 1.0, p.yflip * (1.0 - uv.y * 2.0), d.read(g) * 2.0 - 1.0, 1.0);\n"
             "  float2 m = 0.0;\n"
             "  if (c.w > 1e-7) { float2 n = c.xy / c.w; m = (float2(n.x * 0.5 + 0.5, 0.5 - 0.5 * p.yflip * n.y) - uv) * p.size; }\n"
             "  if (any(isnan(m)) || any(isinf(m))) m = 0.0;\n"
+            "  if (p.obj > 0.5) { float2 o = om.read(g).xy;\n"
+            "    if (all(abs(o) < 16.0)) { float2 op = o * float2(0.5, -0.5) * p.size; if (length(op - m) <= p.maxpx) m = op; } }\n"
             "  mv.write(float4(m, 0.0, 0.0), g);\n"
             "}\n";
         MTLCompileOptions *o = [MTLCompileOptions new]; o.mathMode = MTLMathModeSafe;
@@ -391,6 +393,9 @@ int mfx_frame_prepare(double frame_s) {
     for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) par[c * 4 + r] = (float)m[r * 4 + c];   // float4x4 is column-major
     par[16] = (float)depth.width; par[17] = (float)depth.height; par[18] = 1.0f / depth.width; par[19] = 1.0f / depth.height; par[20] = (float)g.yflip;
     par[21] = obj ? 1.0f : 0.0f; g.enc_obj = obj; g.obj_frames += obj;
+    static double maxpct = -1;   // TOTK_OBJ_MOTION_MAXPCT: an object's own motion beyond this % of the width is a mismatch (default 3)
+    if (maxpct < 0) { const char *e = getenv("TOTK_OBJ_MOTION_MAXPCT"); maxpct = e ? atof(e) : 3.0; if (maxpct <= 0) maxpct = 1000; }
+    par[22] = (float)(maxpct * 0.01 * depth.width);
     cam_projection();
     g.enc_depth = depth;
     return s;

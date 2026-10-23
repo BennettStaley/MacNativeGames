@@ -18,6 +18,8 @@
    - Identity across frames: (vertex shader, vertex buffer of attribute 0, index buffer, first vertex / base vertex,
      count, instances, vertex range, primitive) and the ordinal among the pass's draws with those (om_key). The previous
      frame's table gives that draw's offset in the previous arena; a new or resized draw writes OBJMV_NONE (camera motion).
+     A mesh drawn more than once in this or the previous frame is not matched (ordinals shift when culling changes);
+     totk_mfx.m also drops any object motion further than TOTK_OBJ_MOTION_MAXPCT (3% of the width) from the camera's.
    - Arenas: three private buffers, one per game frame in turn: this frame writes one and reads the previous frame's,
      the third was last used two frames ago. They start at 16 MiB each (1M positions) and double at the end of a frame
      whose draws did not fit, up to TOTK_OBJ_MOTION_MB (default 64); a growth costs one frame of camera-only motion (the
@@ -44,7 +46,7 @@ static struct {
     id<MTLBuffer> arena[3]; uint64_t gpu[3]; uint32_t cap, used, prev_used, mb, mb_max, draw_max;
     uint64_t want;                               // positions this frame's draws asked for (fitting or not)
     om_ent tab[2][OM_TAB]; int t; uint32_t gen;   // tab[t]: this frame's draws, tab[t ^ 1] the previous frame's
-    uint64_t frames, draws, matched, fresh, overflow, unknown, big, grown;
+    uint64_t frames, draws, matched, fresh, dups, overflow, unknown, big, grown;
     om_ir ir[OM_IR]; uint64_t ir_scans;
 } g_om;
 static void om_arenas(uint32_t mb) {   // three arenas of mb MiB; the old ones are released after the GPU's use
@@ -99,8 +101,8 @@ static void om_frame_end(void) {   // at the game's present
         om_arenas(mb); g_om.grown++;
     }
     if (g_om.frames % 600 == 0)
-        MLOG("[mfx] TOTK_OBJ_MOTION: up to frame %llu: %llu motion draws, %llu matched the previous frame, %llu new, %llu without a vertex range, %llu over %u positions (camera motion), %llu over the arena (%u of %u positions last frame, arenas %u MiB each, %llu index ranges scanned)",
-             (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)g_om.draws, (unsigned long long)g_om.matched, (unsigned long long)g_om.fresh,
+        MLOG("[mfx] TOTK_OBJ_MOTION: up to frame %llu: %llu motion draws, %llu matched the previous frame, %llu new, %llu repeated meshes (camera motion), %llu without a vertex range, %llu over %u positions (camera motion), %llu over the arena (%u of %u positions last frame, arenas %u MiB each, %llu index ranges scanned)",
+             (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)g_om.draws, (unsigned long long)g_om.matched, (unsigned long long)g_om.fresh, (unsigned long long)g_om.dups,
              (unsigned long long)g_om.unknown, (unsigned long long)g_om.big, g_om.draw_max, (unsigned long long)g_om.overflow, g_om.prev_used, g_om.cap, g_om.mb,
              (unsigned long long)g_om.ir_scans);
 }
@@ -167,8 +169,8 @@ static void om_bind(id<MTL4RenderCommandEncoder> en, NvProg *pr, const p_draw *d
     else {
         uint64_t base = om_mix(om_mix(om_mix(om_mix((uint64_t)(uintptr_t)(__bridge void *)pr->sh[0], vb), ib), ((uint64_t)bv << 32) | count), ((uint64_t)inst << 32) | nv);
         base = om_mix(base, (uint64_t)prim);
-        om_ent *e = NULL; uint64_t key = 0;
-        for (uint64_t o = 0; o < 256 && !e; o++) {   // the ordinal among this frame's draws with the same identity
+        om_ent *e = NULL; uint64_t key = 0, o = 0;
+        for (; o < 256 && !e; o++) {   // the ordinal among this frame's draws with the same identity
             key = om_mix(base, o);
             om_ent *have = om_find(g_om.t, key, g_om.gen, 0);
             if (!have) e = om_find(g_om.t, key, g_om.gen, 1);
@@ -176,8 +178,15 @@ static void om_bind(id<MTL4RenderCommandEncoder> en, NvProg *pr, const p_draw *d
         if (e) {
             e->off = g_om.used; e->n = (uint32_t)need; g_om.used += (uint32_t)need;
             p.cur = g_om.gpu[g_om.ar] + 16ull * e->off; p.flags = 1; p.cap = (uint32_t)need;
-            om_ent *q = om_find(g_om.t ^ 1, key, g_om.gen - 1, 0);
+            /* The same mesh drawn more than once (this frame or the previous one) cannot be matched by ordinal: when
+               the camera turns, culling drops or adds copies and the ordinals shift onto other objects (the flicker
+               of TOTK_OBJ_MOTION while turning). Such draws keep the camera motion; TOTK_OBJ_MOTION_DUP=1 matches
+               them by ordinal as before. */
+            static int dup = -1; if (dup < 0) { const char *d = getenv("TOTK_OBJ_MOTION_DUP"); dup = d && atoi(d) > 0; }
+            int ambiguous = !dup && (o > 1 || om_find(g_om.t ^ 1, om_mix(base, 1), g_om.gen - 1, 0));
+            om_ent *q = ambiguous ? NULL : om_find(g_om.t ^ 1, key, g_om.gen - 1, 0);
             if (q && q->n == need) { p.prev = g_om.gpu[(g_om.ar + 2) % 3] + 16ull * q->off; p.flags |= 2; g_om.matched++; }
+            else if (ambiguous) g_om.dups++;
             else g_om.fresh++;
         } else g_om.overflow++;
     }
