@@ -5,9 +5,9 @@ int mtl_probe_sampler_border(void) {
     const char *which=getenv("TOTK_BORDER_PROBE_CASE");
     if(which && strcmp(which,"vertex-colour") && strcmp(which,"mixed-axis"))MDIE("unknown border probe case %s",which);
     NSMutableArray *program_lifetimes=[NSMutableArray array];
-    memset(&S,0,sizeof S); S.chmask.mask=15;
+    memset(&S,0,sizeof S); S.chmask.mask=15; g_pso_state_gen++;
     for(int kind=0;kind<3;kind++) {
-    S.chmask.mask=15;
+    S.chmask.mask=15; g_pso_state_gen++;
     const uint8_t base_pixel[4]={64,128,192,255}, layer_pixel[4]={192,64,128,255};
     const uint8_t *pixel=kind?layer_pixel:base_pixel;
     MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
@@ -78,7 +78,7 @@ int mtl_probe_sampler_border(void) {
             }
         }
     }
-    mtl_reg_tex(71,NULL,NULL);serial_del(t.serial);res_remove(input);res_remove(output);res_remove(readback);memset(&S,0,sizeof S);args_dirty_all();
+    mtl_reg_tex(71,NULL,NULL);serial_del(t.serial);res_remove(input);res_remove(output);res_remove(readback);memset(&S,0,sizeof S);args_dirty_all();g_pso_state_gen++;
     }
     return checked;
 }

@@ -3944,6 +3944,11 @@ static struct { uint64_t canvas, last_c0, swap[4]; uint32_t swap_w, swap_h; int 
 static id<MTLRenderPipelineState> g_enc_pso; static id<MTLDepthStencilState> g_enc_dss;   // Already set on this encoder (not set again if identical)
 static int g_enc_vis, g_enc_has_vis;   // This encoder's current visibility count mode (0 off / slot number + 1), and whether a visibility buffer is attached
 static int g_pso_dirty = 1, g_dss_dirty = 1;   // Pipeline / depth-stencil related state was changed during replay
+/* TOTK_PSO_MRU: bumped with every change to an input of pso_key_fill (the bound program, blend / colour / write mask /
+   multisample state, vertex layout) and every wholesale replacement of S, so a pipeline remembered on the program
+   (pso_mru_find) is valid only while the generation it was found under is current. */
+static uint64_t g_pso_state_gen = 1;
+#define PSO_DIRTY() (g_pso_state_gen++, g_pso_dirty = 1)
 static uint64_t g_stat_args_enc, g_stat_args_reuse;   // Argument buffer: new-encode / reuse counts
 uint64_t g_draw_skip[16];   // TOTK: draws dropped in the replay, by reason (logged with the per-frame draw count)
 static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw, g_udc_saved_bytes;   // Bandwidth ledger: attachment load / store bytes, number of full load-store passes
@@ -4982,7 +4987,9 @@ static int sh_has_src(NvShader *s) { return s && (s->src || s->src_path); }
     void *bar_sh[6]; uint8_t bar_vs, bar_wr;   // bar_*: bar_draw's view of sh[] (valid while sh[] is the same): vertex-side stages read textures / images / storage; a stage may write storage / images
     void *ar_sh[6]; uint8_t ar_n, ar_st[32], ar_reg[32], ar_img[32];   // ar_*: draw_att_reads' sampled texture / image slots of sh[] (valid while sh[] is the same; ar_n 255 = more than 32, scan the bindings)
     int missing, miss_has[2]; uint64_t miss_sig[2]; int exp_skip;
-    int keeps; uint64_t miss_gen; } @end   // TOTK (iOS, Mac async shaders): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip); keeps: a stage stores to memory or streams out (sph_keeps_memory), its draws are never skipped; miss_gen: totk_rt_ready_gen() when a stage was last found missing
+    int keeps; uint64_t miss_gen;
+    // TOTK_PSO_MRU (pso_mru_get): the last four final pipelines of this program with what they were found under
+    uint64_t mru_gen[4]; uint32_t mru_pass[4][13]; NvShader *mru_vs[4], *mru_fs[4]; NSString *mru_vb[4], *mru_fb[4]; id<MTLRenderPipelineState> mru_ps[4]; uint8_t mru_next; } @end   // TOTK (iOS, Mac async shaders): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip); keeps: a stage stores to memory or streams out (sph_keeps_memory), its draws are never skipped; miss_gen: totk_rt_ready_gen() when a stage was last found missing
 @implementation NvProg @end
 /* TOTK_EXP_SKIP_FS=<fragment key prefix>[,<prefix>...] (measurement only, 2026-10-16): drop every draw whose fragment shader key
    starts with one of the prefixes. A render pass whose draws are all dropped is never opened, so the GPU time saved is the
@@ -6184,7 +6191,7 @@ static void udc_note_draw(NvProg *pr) {
 }
 static void state_reset(void) {
     memset(&S, 0, sizeof S);
-    g_pso_dirty = g_dss_dirty = 1;
+    (PSO_DIRTY(), g_dss_dirty = 1);
     for (int i = 0; i < 8; i++) S.blend[i] = (blend_st){i, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD};
     S.color = (color_st){0, NVN_LOGIC_OP_COPY, NVN_ALPHA_FUNC_ALWAYS}; S.chmask.mask = 0xffffffffu;
     S.poly = (poly_st){NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0};
@@ -6341,7 +6348,7 @@ static void prog_resolve(NvProg *pr, int may_skip) {
         NSString *variant = totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), rt_local(pr->ctl[st], st), may_skip);
         if (!may_skip) async_why(pr, f0);
         if (!variant) continue;
-        prog_stage_set(pr, st, variant); pr->missing &= ~(1 << st); g_pso_dirty = 1;
+        prog_stage_set(pr, st, variant); pr->missing &= ~(1 << st); PSO_DIRTY();
     }
     pr->miss_gen = gen;
 }
@@ -7248,8 +7255,9 @@ static int apso_defer(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFuncti
     });
     return 1;
 }
+static int g_pso_final;   // pso_get returned the pipeline of its full key (no plain stand-in while a variant compiles): pso_mru_get may keep it
 static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRenderPassDescriptor *unused) {
-    (void)unused; g_pso_deferred = 0; apso_claim();
+    (void)unused; g_pso_deferred = 0; g_pso_final = 0; apso_claim();
     __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
     if (!vs) { RED_ONCE(13, "program has no vertex shader (or it is not mapped)"); return nil; }
     pso_key k; pso_key_fill(&k, vs, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, g_pso_lmap != NULL);
@@ -7278,10 +7286,11 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     int bordered = bfn || (k.a2c & PSO_VBORDER);
     if (g_vmissing) { bfn = nil; k.fsfn = NULL; k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; }
     __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
-    if (cached) { if (g_vmissing) atomic_fetch_add_explicit(&g_stat_variant_plain, 1, memory_order_relaxed); return cached; }
+    if (cached) { if (g_vmissing) atomic_fetch_add_explicit(&g_stat_variant_plain, 1, memory_order_relaxed); g_pso_final = !g_vmissing; return cached; }
+    int stand_in = g_vmissing;   // the plain pipeline stands in for a border one not compiled yet
     NSString *brec = !g_vmissing && bordered ? [NSString stringWithFormat:@"%@\t%@", (k.a2c & PSO_VBORDER) && vrec ? vrec : @"-", bfn && frec ? frec : @"-"] : nil;
     if (plain && !g_vmissing && bordered && apso_defer(&k, vs, fs, bfn, brec)) {   // the border pipeline is compiling: the plain one meanwhile
-        bfn = nil; k.fsfn = NULL; k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; brec = nil;
+        bfn = nil; k.fsfn = NULL; k.a2c &= ~PSO_VBORDER; k.vs = (__bridge void *)vs; brec = nil; stand_in = 1;
         atomic_fetch_add_explicit(&g_stat_variant_plain, 1, memory_order_relaxed);
         cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
         if (cached) return cached;
@@ -7310,6 +7319,39 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
     if (!ps) { static int said; if (said++ < 12) MLOG("[red] Render pipeline build failed: %s (vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d)", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("[red] Render pipeline build failed: further failures are not logged individually"); return nil; }
     pso_adopt(&k, vs, fs, bfn != nil, g_pso_lmap != NULL, ps, bt, 0, brec);
+    g_pso_final = !stand_in && !g_vmissing;
+    return ps;
+}
+/* TOTK_PSO_MRU (default on; =0 off): a program keeps its last four final pipelines (Ryujinx Program.TryGetGraphicsPipeline,
+   MoltenVK changePipeline). The draw path asked pso_get again at every pass change, every program change and, for a
+   shader that ever met an emulated border colour, at every draw: each time pso_key_fill, the border keys, fs_fn_border,
+   vs_fn_for and a hash lookup of the whole key. An entry holds every input of the key that is not the program itself:
+   g_pso_state_gen (bumped with every change to the pipeline state in S, PSO_DIRTY), the pass formats, sample count,
+   layered flag and MetalFX role, the vertex / fragment shader objects (prog_fit swaps variants), and the border keys
+   of both stages (the text holds every input of a border variant, border_parse). Only final pipelines are kept: a plain
+   stand-in while a border variant compiles, a deferred draw (nil) or a merged pass (g_pso_lmap) always go to pso_get. */
+static int pso_mru_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PSO_MRU"); v = e ? atoi(e) != 0 : 1; if (!v) MLOG("TOTK_PSO_MRU=0: pipeline MRU per program off"); } return v; }
+static uint64_t g_mru_hit, g_mru_miss;
+static int str_same(NSString *a, NSString *b) { return a == b || (a && b && [a isEqualToString:b]); }
+static __unsafe_unretained id<MTLRenderPipelineState> pso_mru_get(NvProg *pr) {
+    if (!pso_mru_on() || g_pso_lmap || !pr->sh[0]) return pso_get(pr, nil);
+    uint32_t sig[13]; memcpy(sig, g_pass.cfmt, sizeof g_pass.cfmt); sig[8] = g_pass.dfmt; sig[9] = g_pass.sfmt; sig[10] = g_pass.samples; sig[11] = (uint32_t)g_pass.layered; sig[12] = (uint32_t)g_mfx.role;
+    __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
+    NSString *vb = nil, *fb = nil;
+    if (atomic_load_explicit(&g_border_custom_any, memory_order_relaxed)) {   // the samplers bound now, as pso_get reads them
+        float bc[8][4]; int ba[8], bn; unsigned ax[8];
+        vb = border_key(vs, 0, bc, ba, ax, &bn);
+        if (!g_mfx.role && fs && sh_has_src(fs)) fb = border_key(fs, 1, bc, ba, ax, &bn);
+    }
+    for (int i = 0; i < 4; i++)
+        if (pr->mru_ps[i] && pr->mru_gen[i] == g_pso_state_gen && pr->mru_vs[i] == vs && pr->mru_fs[i] == fs && !memcmp(pr->mru_pass[i], sig, sizeof sig)
+            && str_same(pr->mru_vb[i], vb) && str_same(pr->mru_fb[i], fb)) { g_pso_deferred = 0; g_mru_hit++; return pr->mru_ps[i]; }
+    g_mru_miss++;
+    __unsafe_unretained id<MTLRenderPipelineState> ps = pso_get(pr, nil);
+    if (ps && g_pso_final) { int i = pr->mru_next++ & 3;
+        pr->mru_ps[i] = ps; pr->mru_gen[i] = g_pso_state_gen; pr->mru_vs[i] = vs; pr->mru_fs[i] = fs; memcpy(pr->mru_pass[i], sig, sizeof sig); pr->mru_vb[i] = vb; pr->mru_fb[i] = fb; }
+    { static uint64_t lf; uint64_t f = atomic_load(&g_cur_frame); if (f >= lf + 600) { lf = f;
+        MLOG("[totk] TOTK_PSO_MRU: %llu pipeline lookups answered by the program's MRU, %llu went to pso_get", (unsigned long long)g_mru_hit, (unsigned long long)g_mru_miss); } }
     return ps;
 }
 static NSString *warm_key(const char *s, size_t n) {
@@ -8729,7 +8771,7 @@ static int first_draw_covers(int i, id<MTLTexture> t, NSUInteger level) {
 static int state_op(uint32_t op, const void *a) {
     switch (op) {
         case OP_SCISSOR: R.sc = *(const p_scissor *)a; R.has_sc = 1; break;
-        case OP_BIND_PROGRAM: { const prog_t *np = ((const p_bind_program *)a)->prog; if (np != S.prog) { S.prog = np; g_pso_dirty = 1; args_program_changed(); } break; }
+        case OP_BIND_PROGRAM: { const prog_t *np = ((const p_bind_program *)a)->prog; if (np != S.prog) { S.prog = np; g_pso_dirty = 1; args_program_changed(); }   /* no generation bump: the program is the owner of its MRU (pso_mru_get) */ break; }
         case OP_BIND_STATE: {
             const p_bind_state *b = a; void *dst = NULL; size_t n = 0;
             blend_st bs;
@@ -8741,11 +8783,11 @@ static int state_op(uint32_t op, const void *a) {
                 case 4: dst = &S.poly; n = sizeof S.poly; break;
                 case 5: dst = &S.ds; n = sizeof S.ds; break;
             }
-            if (dst && memcmp(dst, b->bytes, n)) { memcpy(dst, b->bytes, n); if (b->kind == 5) g_dss_dirty = 1; else g_pso_dirty = 1; }
+            if (dst && memcmp(dst, b->bytes, n)) { memcpy(dst, b->bytes, n); if (b->kind == 5) g_dss_dirty = 1; else PSO_DIRTY(); }
             break;
         }
-        case OP_BIND_VATTR: { const p_bind_vattr *b = a; if (S.nattr != b->n || memcmp(S.attr, b->st, 4 * b->n)) { memcpy(S.attr, b->st, 4 * b->n); S.nattr = b->n; g_pso_dirty = 1; } break; }
-        case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; if (S.nstream != b->n || memcmp(S.stream, b->st, 8 * b->n)) { memcpy(S.stream, b->st, 8 * b->n); S.nstream = b->n; g_pso_dirty = 1; } break; }
+        case OP_BIND_VATTR: { const p_bind_vattr *b = a; if (S.nattr != b->n || memcmp(S.attr, b->st, 4 * b->n)) { memcpy(S.attr, b->st, 4 * b->n); S.nattr = b->n; PSO_DIRTY(); } break; }
+        case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; if (S.nstream != b->n || memcmp(S.stream, b->st, 8 * b->n)) { memcpy(S.stream, b->st, 8 * b->n); S.nstream = b->n; PSO_DIRTY(); } break; }
         case OP_BIND_VBUF: { const p_bind_vbuf *b = a; memcpy(&S.vbuf[b->first], b->r, sizeof *b->r * b->n); break; }
         case OP_BIND_UBO: { const p_bind_buf *b = a; if (b->stage < 6 && b->index < 16 && memcmp(&S.ubo[b->stage][b->index], b, sizeof *b)) { S.ubo[b->stage][b->index] = *b; args_dirty_stage(b->stage); } break; }
         case OP_BIND_SSBO: { const p_bind_buf *b = a; if (b->stage < 6 && b->index < 16 && memcmp(&S.ssbo[b->stage][b->index], b, sizeof *b)) { S.ssbo[b->stage][b->index] = *b; args_dirty_stage(b->stage); } break; }
@@ -8836,7 +8878,7 @@ static void shader_predict_rest(void) {
         if (hq.op == OP_CLEAR_COLOR || hq.op == OP_CLEAR_DS || hq.op == OP_RENDER_COND) continue;
         state_op(hq.op, aq);
     }
-    memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty; g_prog_for_draw = for_draw;
+    memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_pso_state_gen++; g_dss_dirty = dss_dirty; g_prog_for_draw = for_draw;
     g_sp_more = stop && (progs || urgent || queued);   // go on only after a scan that found something
     g_sp_budget.used_ns += bp_now() - started;
     g_sp_scans++; g_sp_ns += bp_now() - started; g_sp_progs += progs; g_sp_urgent += urgent; g_sp_queued += queued;
@@ -8940,7 +8982,7 @@ static void pso_predict_rest(void) {
     }
     (void)df; (void)sf;
     for (int i = 0; i < nb; i++) pso_pend_kick(&qb[i].k, (__bridge NvShader *)qb[i].vs, (__bridge NvShader *)qb[i].fs);
-    memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty;
+    memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_pso_state_gen++; g_dss_dirty = dss_dirty;
     static int logged; if (g_pp_kicked > (uint64_t)kicked0 && logged++ < 20) MLOG("Parallel precompile: %d draws left in this submit, %d pipelines handed to the background", draws, (int)g_pp_kicked - kicked0);
     g_pp_scans++; g_pp_scan_ns += bp_now() - started; if (stop) g_pp_stop[stop - 1]++;
     g_pp_more = stop != 0 && g_pp_kicked > (uint64_t)kicked0;   // go on only after a scan that kicked something
@@ -9016,7 +9058,7 @@ void dm_nvn_probe_prediction(void) {
             memcpy(uctl[s] + 0x704, &len, 4); memcpy(uctl[s] + 0x714, &s, 4); memset(ucode[s], 0x51 + (int)s, len);
             shader_key_of(uctl[s], ucode[s], len, k); ukey[s] = @(k); }
         static typeof(S) keep; memcpy(&keep, &S, sizeof S);
-        S.nattr = 1; S.attr[0].fmt = 0x0B;   // this draw's attribute 0 is an unsigned integer; the index lists a float variant first
+        S.nattr = 1; S.attr[0].fmt = 0x0B; g_pso_state_gen++;   // this draw's attribute 0 is an unsigned integer; the index lists a float variant first
         NSString *vf = [ukey[0] stringByAppendingString:@"-float"], *vu = [ukey[0] stringByAppendingString:@"-uint"], *pf = [ukey[1] stringByAppendingString:@"-any"];
         totk_rt_probe_index(ukey[0], @[@{@"variant": vf, @"deps": @{@"attr": @{@"0": @"float"}}}, @{@"variant": vu, @"deps": @{@"attr": @{@"0": @"uint"}}}]);
         totk_rt_probe_index(ukey[1], @[@{@"variant": pf, @"deps": @{}}]);
@@ -9060,7 +9102,7 @@ void dm_nvn_probe_prediction(void) {
         }
         serial_del(seen.serial); if (serial_ptr(unseen.serial)) serial_del(unseen.serial);
         [g_shcache removeObjectsForKeys:names]; totk_rt_probe_index(ukey[0], nil); totk_rt_probe_index(ukey[1], nil);
-        memcpy(&S, &keep, sizeof S);
+        memcpy(&S, &keep, sizeof S); g_pso_state_gen++;
     }
     // A depth-exporting fragment function gets the pass's depth buffer: guesses without it are never used.
     NvShader *depth_fs = [NvShader new], *color_fs = [NvShader new]; depth_fs->writes_depth = 1;
@@ -9115,7 +9157,7 @@ static void fz_probe_cov2(const p_set_rt *r2, const uint8_t *first, const int8_t
     }
     memcpy(&S, &Ssave, sizeof S); args_dirty_all(); R = Rsave;
     g_fd_dw = fdw; g_fd_di = fdi; g_fd_why = fdwhy;
-    g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty;
+    g_pso_dirty = pso_dirty; g_pso_state_gen++; g_dss_dirty = dss_dirty;
 }
 
 static int fz_load_covers(int i, id<MTLTexture> t, NSUInteger level) {
@@ -9580,10 +9622,10 @@ static void fz_check_run(const fuse_t *fz) {
     static typeof(S) Ssave; memcpy(&Ssave, &S, sizeof S); typeof(R) Rsave = R; const uint8_t *en0 = g_exec_next;
     g_fz_checking = 1; g_exec_next = NULL;   // Turn off all lookahead during the redraw (continuation / hoisting / merging / depth-stencil on demand): normal path
     R.rt = fz->rt2; memcpy(R.clear_c, fz->clr2, 8); memcpy(R.cc, fz->cc2, sizeof R.cc); R.clear_d = fz->cd2f; R.clear_s = fz->cs2f; R.cd = fz->cd2; R.cs = fz->cs2;
-    for (int i = 0; i < g_nfzs; i++) { fz_snap *z = &g_fzs[i]; memcpy(&S, z->S_, sizeof S); args_dirty_all(); R.sc = z->sc; R.has_sc = z->has_sc; g_pso_dirty = g_dss_dirty = 1;
+    for (int i = 0; i < g_nfzs; i++) { fz_snap *z = &g_fzs[i]; memcpy(&S, z->S_, sizeof S); args_dirty_all(); R.sc = z->sc; R.has_sc = z->has_sc; (PSO_DIRTY(), g_dss_dirty = 1);
         draw(z->idx ? NULL : &z->dw, z->idx ? &z->di : NULL); }
     rp_end();
-    memcpy(&S, &Ssave, sizeof S); args_dirty_all(); R = Rsave; g_exec_next = en0; g_fz_checking = 0; g_pso_dirty = g_dss_dirty = 1;
+    memcpy(&S, &Ssave, sizeof S); args_dirty_all(); R = Rsave; g_exec_next = en0; g_fz_checking = 0; (PSO_DIRTY(), g_dss_dirty = 1);
     for (int a = 0; a < na; a++) {
         id<MTLTexture> t = att[a], c = scr[a]; NSUInteger W = t.width, H = t.height, bpp = (NSUInteger)(att_bytes(t, 0) / (W * H));
         id<MTLBuffer> b1 = [g_dev newBufferWithLength:W * H * bpp options:MTLResourceStorageModeShared], b2 = [g_dev newBufferWithLength:W * H * bpp options:MTLResourceStorageModeShared];
@@ -9711,10 +9753,10 @@ static void defer_replay(void) {
         g_defer_cur = d; if (d->reset_between) g_vis_counting = 0;
         { static int once; if (!once++) MLOG("Deferred pass merge: first case pass %llu, group %d replays %d draws", g_stat_pass, gi, d->n); }   // With multiple groups, several groups may already have been created before the first replay, so it cannot be judged by g_defer_n == 1
         for (int i = 0; i < d->n; i++) { defer_snap *z = &d->snap[i]; static uint8_t lm[8]; for (int j = 0; j < 8; j++) lm[j] = d->lmap[j] == 0xff || d->lmap[j] >= 8 ? 0xff : z->pm[d->lmap[j]];
-            memcpy(&S, z->S_, sizeof S); args_dirty_all(); R.sc = z->sc; R.has_sc = z->has_sc; g_pso_dirty = g_dss_dirty = 1; g_pso_lmap = lm; draw(z->idx ? NULL : &z->dw, z->idx ? &z->di : NULL); }
+            memcpy(&S, z->S_, sizeof S); args_dirty_all(); R.sc = z->sc; R.has_sc = z->has_sc; (PSO_DIRTY(), g_dss_dirty = 1); g_pso_lmap = lm; draw(z->idx ? NULL : &z->dw, z->idx ? &z->di : NULL); }
         defer_release_one(d);
     }
-    g_vis_counting = vis; memcpy(&S, &save, sizeof S); args_dirty_all(); R.sc = sc; R.has_sc = has_sc; g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = g_dss_dirty = 1; g_exec_next = en0; g_defer_replaying = 0; g_defer_cur = &g_defer_slots[0];
+    g_vis_counting = vis; memcpy(&S, &save, sizeof S); args_dirty_all(); R.sc = sc; R.has_sc = has_sc; g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); (PSO_DIRTY(), g_dss_dirty = 1); g_exec_next = en0; g_defer_replaying = 0; g_defer_cur = &g_defer_slots[0];
 }
 static void defer_fallback(void) {
     if (g_defer_replaying || !defer_has_active()) return;
@@ -9723,10 +9765,10 @@ static void defer_fallback(void) {
     typeof(S) save; memcpy(&save, &S, sizeof S); p_set_rt rt = R.rt; g_defer_replaying = 1;
     for (int gi, after = 0; (gi = defer_next(0, after)) >= 0;) { defer_t *d = &g_defer_slots[gi]; after = d->born; g_defer_cur = d; R.rt = d->p_rt; R.has_rt = 1; memcpy(R.clear_c, d->clear_c, 8); memcpy(R.cc, d->cc, sizeof R.cc);
         R.clear_d = d->clear_d; R.clear_s = d->clear_s; R.cd = d->cd; R.cs = d->cs;
-        for (int i = 0; i < d->n; i++) { defer_snap *z = &d->snap[i]; memcpy(&S, z->S_, sizeof S); args_dirty_all(); R.sc = z->sc; R.has_sc = z->has_sc; g_pso_dirty = g_dss_dirty = 1; g_pso_lmap = z->pm; draw(z->idx ? NULL : &z->dw, z->idx ? &z->di : NULL); }
+        for (int i = 0; i < d->n; i++) { defer_snap *z = &d->snap[i]; memcpy(&S, z->S_, sizeof S); args_dirty_all(); R.sc = z->sc; R.has_sc = z->has_sc; (PSO_DIRTY(), g_dss_dirty = 1); g_pso_lmap = z->pm; draw(z->idx ? NULL : &z->dw, z->idx ? &z->di : NULL); }
         rp_end(); defer_release_one(d);
     }
-    memcpy(&S, &save, sizeof S); args_dirty_all(); R.rt = rt; g_defer_replaying = 0; g_defer_cur = &g_defer_slots[0];
+    memcpy(&S, &save, sizeof S); args_dirty_all(); g_pso_state_gen++; R.rt = rt; g_defer_replaying = 0; g_defer_cur = &g_defer_slots[0];
 }
 static const uint8_t *defer_cont(int *ci) {   // The next segment after a list ends (within the same submit): first the caller return stack, then the remaining handles of this submit; returns NULL when there are none left
     for (;;) { int k = (*ci)++;
@@ -10174,7 +10216,7 @@ static int bloomq_capture(void) {
     [g_bloomq_args setTexture:src.gpuResourceID atIndex:0]; [g_bloomq_args setSamplerState:g_bloomq_samp.gpuResourceID atIndex:0];
     float *p = g_bloomq_const[g_bloomq_i].contents; p[0] = g_bloomq.threshold; p[1] = g_bloomq.coeff_g; p[2] = g_bloomq.coeff_b; p[3] = src.width; p[4] = src.height; [g_bloomq_args setAddress:g_bloomq_const[g_bloomq_i].gpuAddress atIndex:0];
     [en setViewport:(MTLViewport){0,0,dst.width,dst.height,0,1}]; [en setRenderPipelineState:g_bloomq_pso]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; m4_end(en);
-    g_bloomq_i = (g_bloomq_i + 1) % 3; args_dirty_all(); g_pso_dirty = g_dss_dirty = 1; return 1;
+    g_bloomq_i = (g_bloomq_i + 1) % 3; args_dirty_all(); (PSO_DIRTY(), g_dss_dirty = 1); return 1;
 }
 // ---------- Drag-follow image for shop items: items on a vendor's shelf have no "picked up" state, so during a drag the replay layer takes "the draw that draws this item's icon", translates it to the finger at the end of the same pass and draws it once more ----------
 // In the UI pass each rectangle is one 4-vertex draw (20-byte vertices: position 3 floats + texture coordinates 2 floats; the position goes to clip coordinates through the matrix in vertex constant 0).
@@ -10244,11 +10286,11 @@ static void ghost_flush(void) {   // Before the render pass ends: translate the 
     float W = (float)g_pass.tw, H = (float)g_pass.th, ccx = (g_gh.r[0] + g_gh.r[2]) / 2, ccy = (g_gh.r[1] + g_gh.r[3]) / 2;
     { uint64_t v = 0; for (int i = 0; i < 4; i++) v |= (uint64_t)(uint16_t)(fminf(fmaxf(g_gh.r[i], 0), 1) * 65535 + .5f) << (16 * i); atomic_store(&g_ghost_found, v ? v : 1); }
     g_gh.busy = 1; typeof(S) save; memcpy(&save, &S, sizeof S); p_scissor sc = R.sc; int has_sc = R.has_sc;
-    memcpy(&S, c->S_, sizeof S); if (!S.has_vp) { S.vp[0][0] = S.vp[0][1] = 0; S.vp[0][2] = W; S.vp[0][3] = H; S.has_vp = 1; }
+    memcpy(&S, c->S_, sizeof S); g_pso_state_gen++; if (!S.has_vp) { S.vp[0][0] = S.vp[0][1] = 0; S.vp[0][2] = W; S.vp[0][3] = H; S.has_vp = 1; }
     S.vp[0][0] += (ax - ccx) * W; S.vp[0][1] += (ay - ccy) * H * (float)ui_hfrac(); R.has_sc = 0;
-    args_dirty_all(); g_pso_dirty = g_dss_dirty = 1; draw(&c->dw, NULL);
+    args_dirty_all(); (PSO_DIRTY(), g_dss_dirty = 1); draw(&c->dw, NULL);
     { static int once; if (!once++) MLOG("Carried-object follow image: first case pass %llu, %d candidates, taking the one whose texture is used %d times in this pass", g_stat_pass, g_gh.n, bn); }
-    memcpy(&S, &save, sizeof S); args_dirty_all(); R.sc = sc; R.has_sc = has_sc; g_pso_dirty = g_dss_dirty = 1; g_gh.busy = 0;
+    memcpy(&S, &save, sizeof S); args_dirty_all(); R.sc = sc; R.has_sc = has_sc; (PSO_DIRTY(), g_dss_dirty = 1); g_gh.busy = 0;
     for (int i = 0; i < g_gh.n; i++) free(g_gh.c[i].S_); g_gh.n = 0;
 }
 // TOTK: an 8-bit index buffer that GPU work earlier in this submit may have written is widened on the GPU timeline
@@ -10631,7 +10673,7 @@ static void skv_done(skv_item *l, int n, uint32_t frame) {   /* submission compl
     free(l);
 }
 static void draw(const p_draw *dw, const p_draw_idx *di) { g_draw_depth++; draw_inner(dw, di);
-    if (g_fx_masked) { S.chmask.mask = g_fx_saved_mask; g_fx_masked = 0; g_pso_dirty = 1; }   // hide the HUD: the UI draw's own colour mask again (totk_post.h fx_draw)
+    if (g_fx_masked) { S.chmask.mask = g_fx_saved_mask; g_fx_masked = 0; PSO_DIRTY(); }   // hide the HUD: the UI draw's own colour mask again (totk_post.h fx_draw)
     if (g_draw_depth == 1) nan_draw_probe(dw, di); g_draw_depth--; }
 // TOTK: an update makes the argument buffers of the stages whose bound uniform ranges overlap it stale.
 static void upd_dirty_stages(uint64_t lo, uint64_t hi) {
@@ -11037,7 +11079,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (pr && pr->missing && async_shaders()) { shader_predict_maybe(); prog_resolve(pr, draw_may_skip(pr)); }
     if (pr && pr->missing) { draw_skipped(); return; }   // TOTK (iOS): a stage is not translated yet; Mac (async shaders): still in the background
     if (g_nupd) upd_guard_draw(pr, di);   // TOTK: before any encoder or texture preparation of this draw
-    { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { draw_skipped(); return; } if (fit) g_pso_dirty = 1; }
+    { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { draw_skipped(); return; } if (fit) PSO_DIRTY(); }
     if (g_nlc) lc_take(pr);   // TOTK_LAZY_CLEAR: waiting clears become this pass's load actions or land now, before this draw prepares or reads any texture
     if (skv_on()) { g_skv_draws++; if (skv_check((__bridge const void *)pr, dw, di)) return; }   // measurement experiment: skip draws invisible in the last frames
     geometry_dump(pr, dw, di);
@@ -11228,16 +11270,16 @@ frz_plain:;
             if (r0 >= 0 && f >= r0 && f <= r1) MLOG("[mfx] role F%ld pass %llu draw role %d vs %s fs %s blend %#x count %u", f, g_stat_pass, r, pr && pr->sh[0] ? pr->sh[0]->key : "-", pr && pr->sh[1] ? pr->sh[1]->key : "-",
                                                      S.color.blend_en, dw ? dw->count : di ? di->count : 0);
         }
-        if (r != g_mfx.role) { g_mfx.role = r; g_pso_dirty = 1; }
+        if (r != g_mfx.role) { g_mfx.role = r; PSO_DIRTY(); }
     }
     if (g_mfx.want_cam) mfx_take_camera();
     if (defer_q_draw) defer_replay();
     if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
     static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass;
-    if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }   // Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
-    if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || (pr->sh[1] && pr->sh[1]->border_seen) || (pr->sh[0] && pr->sh[0]->border_seen)) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
-    if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // The next draw fetches again according to its own situation
+    if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; PSO_DIRTY(); }   // Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
+    if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || (pr->sh[1] && pr->sh[1]->border_seen) || (pr->sh[0] && pr->sh[0]->border_seen)) { cur_ps = pso_mru_get(pr); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
+    if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); PSO_DIRTY(); }   // The next draw fetches again according to its own situation
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
     if (!ps && g_pso_deferred) { draw_skipped(); return; }   // async shaders: the pipeline is compiling in the background
     if (!ps) { g_draw_skip[9]++; static int failed_n; if (failed_n++ < 3) MLOG("[pipeline-draw] rt-depth=%p serial=%llu fmt=%#x pass-depth=%u dt=%u dw=%u fs-depth=%d", R.rt.depth, (unsigned long long)(R.rt.depth ? R.rt.depth->serial : 0), R.rt.depth ? R.rt.depth->d.format : 0, g_pass.dfmt, S.ds.dt, S.ds.dw, pr->sh[1] ? pr->sh[1]->writes_depth : 0); return; }
@@ -15294,7 +15336,7 @@ int mtl_probe_vertex_streams(void) {
         g_arg_bind_cache_negative=cache_mode && getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE"))==15;
         atomic_store(&g_vertex_streams_on,mode);g_vertex_streams_negative=mode && getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE"))==9;
         mtl_sub_begin();mtl_exec((const uint8_t *)&end);
-        S.nattr=4;memset(S.attr,0,sizeof S.attr);memset(S.stream,0,sizeof S.stream);
+        S.nattr=4;g_pso_state_gen++;memset(S.attr,0,sizeof S.attr);memset(S.stream,0,sizeof S.stream);
         S.attr[0]=(va_st){.fmt=0x2e,.stream=2};S.attr[3]=(va_st){.fmt=scenario==2?0:0x2e,.stream=scenario==1?7:5};
         memset(S.vbuf,0,sizeof S.vbuf);
         for(unsigned i=0;i<15;i++){S.stream[i].stride=16;S.vbuf[i]=(NVNbufferRange){.address=(uint64_t)(uintptr_t)mem+512,.size=48};}
@@ -15458,7 +15500,7 @@ int mtl_probe_arg_epoch(void) {
     if (arg_epoch_safe(unsafe)) MDIE("argument epoch accepted writable storage"); checked++;
     MLOG("argument epoch probe: %llu extra reuses, %llu shadow comparisons",(unsigned long long)g_arg_epoch_extra,(unsigned long long)g_arg_epoch_verified);
     g_arg_epoch_negative=0; atomic_store(&g_arg_epoch_on,0);atomic_store(&g_arg_epoch_check,0);
-    memset(&S,0,sizeof S);args_dirty_all();mtl_pool_del(mem);res_remove(texture);res_remove(rb);free(mem);return checked;
+    memset(&S,0,sizeof S);args_dirty_all();g_pso_state_gen++;mtl_pool_del(mem);res_remove(texture);res_remove(rb);free(mem);return checked;
 }
 
 #include "nvn_tex_slots_probe.h"

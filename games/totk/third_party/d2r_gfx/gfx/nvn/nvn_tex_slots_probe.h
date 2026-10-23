@@ -112,6 +112,6 @@ int mtl_probe_tex_slots(void) {
     if(!g_tex_slots_hits||!g_tex_slots_verified) MDIE("texture slots probe missed cache/shadow paths");
     MLOG("texture slots probe: hits=%llu verified=%llu",(unsigned long long)g_tex_slots_hits,(unsigned long long)g_tex_slots_verified);
     atomic_store(&g_tex_slots_on,0);atomic_store(&g_tex_slots_check,0);g_tex_slots_negative=0;
-    memset(&S,0,sizeof S);args_dirty_all();mtl_pool_del(mem);free(mem);res_remove(typed);res_remove(rb);res_remove(output);
+    memset(&S,0,sizeof S);args_dirty_all();g_pso_state_gen++;mtl_pool_del(mem);free(mem);res_remove(typed);res_remove(rb);res_remove(output);
     return checked;
 }
