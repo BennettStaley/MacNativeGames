@@ -63,24 +63,8 @@ def due(rows, reminded):
     return rows >= reminded + STEP
 
 
-def chinese():
-    try:
-        langs = subprocess.run(['defaults', 'read', '-g', 'AppleLanguages'], capture_output=True, text=True).stdout
-    except OSError:
-        return False
-    first = next((l.strip(' ",()') for l in langs.splitlines() if l.strip(' ",()')), '')
-    return first.startswith('zh')
-
-
 def message(rows, device, auto=False):
     """(title, text, the middle button, "never", "send"); with auto (gh ready) the middle button submits at once."""
-    if chinese():
-        return ('期待你的贡献', f'你的 {device} 上有 {rows} 个着色器可以贡献：玩的时候遇到的、公共着色器清单里还没有的。'
-                f'它们只有着色器的标识，不含游戏内容、存档或个人信息。发到 GitHub 加进公共清单后，以后大家打包的 App 都会带上它们，'
-                f'玩到那里不再缺画面。\n\n'
-                + ('点“自动提交”会用这台 Mac 上登录的 GitHub 命令行（gh）直接提交，不用打开网页。' if auto else '')
-                + '点“发送”会打开 GitHub 的提交页面，并在访达里显示这个文件，把它拖进页面即可。',
-                '自动提交' if auto else '下次提醒', '不要提醒了', '发送')
     return ('We would love your contribution', f'Your {device} has {rows} shaders to contribute: ones the game met that the '
             f'shared shader list does not have yet. They are shader identifiers only: no game data, saves or personal '
             f'information. Sent to GitHub and added to the shared list, they come with everyone\'s next build, and nothing '
@@ -147,12 +131,10 @@ def ask(rows, device, path, platform='iPhone'):
     answer = subprocess.run(['osascript', '-e', script], capture_output=True, text=True).stdout
     if gh and f'button returned:{middle}' in answer:
         link = submit(gh, path, rows, platform)
-        zh = chinese()
         if link:
-            note((f'感谢你的 shader 贡献，让我们一起让游戏更流畅！\n{link}' if zh else
-                  f"Thank you for your shader contribution! Let's make the game smoother together!\n{link}"))
+            note(f"Thank you for your shader contribution! Let's make the game smoother together!\n{link}")
             return 'auto'
-        note('自动提交没有成功，改为打开提交页面。' if zh else 'Submitting automatically did not work; opening the form instead.')
+        note('Submitting automatically did not work; opening the form instead.')
         answer = f'button returned:{send}'
     if f'button returned:{send}' in answer:
         subprocess.run(['open', ISSUE_URL])

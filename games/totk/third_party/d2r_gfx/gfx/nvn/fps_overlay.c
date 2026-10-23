@@ -10,7 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "include/totk_ui_lang.h"
 
 enum { GLYPH_W = 5, GLYPH_H = 7, ADVANCE = 6, PAD = 2, BOX_ROWS = GLYPH_H + 2 * PAD, MAX_CHARS = 80 };
 static const uint8_t TEXT_BGRA[4] = {120, 255, 80, 255}, BOX_BGRA[4] = {12, 12, 12, 255}, HIGHLIGHT_BGRA[4] = {40, 230, 255, 255};   // green / dark / yellow
@@ -99,7 +98,7 @@ static void draw_text(uint8_t *out, int stride, const char *text, int n, int sca
     }
 }
 
-/* A line with characters the 5x7 font does not have (Chinese labels, user 2026-10-17: "MetalFX已开启", "新着色器 N / 总计 M")
+/* A line with characters the 5x7 font does not have (lower-case labels such as "MetalFX on" and "Shaders N compiling")
    in the system font (CoreText), with the same box height, padding and colours as the pixel font at this scale; the
    scale drops until the line fits the texture. */
 static void raster_line_ct(const char *text, int highlight, int scale, uint8_t *out, int tex_w, int tex_h, int *box_w, int *box_h) {
@@ -112,7 +111,7 @@ static void raster_line_ct(const char *text, int highlight, int scale, uint8_t *
     const CGFloat comps[4] = {c[2] / 255.0, c[1] / 255.0, c[0] / 255.0, 1.0};
     CGColorRef color = CGColorCreate(cs, comps);
     for (scale = scale < 1 ? 1 : scale > FPS_OVERLAY_MAX_SCALE ? FPS_OVERLAY_MAX_SCALE : scale; scale >= 1; scale--) {
-        CTFontRef font = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 8.0 * scale, CFSTR("zh-Hans"));
+        CTFontRef font = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 8.0 * scale, NULL);
         const void *keys[2] = {kCTFontAttributeName, kCTForegroundColorAttributeName}, *vals[2] = {font, color};
         CFDictionaryRef attrs = CFDictionaryCreate(NULL, keys, vals, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         CFAttributedStringRef as = CFAttributedStringCreate(NULL, str, attrs);
@@ -179,9 +178,9 @@ void fps_overlay_text(const fps_overlay_info *info, char *text, size_t n) {
         char avg[8], low[8];
         if (info->avg < 0) snprintf(avg, sizeof avg, "--"); else snprintf(avg, sizeof avg, "%d", info->avg > 999 ? 999 : info->avg);
         if (info->low < 0) snprintf(low, sizeof low, "--"); else snprintf(low, sizeof low, "%d", info->low > 999 ? 999 : info->low);
-        snprintf(detail, sizeof detail, TOTK_UI("  平均 %s  1%%低帧 %s", "  avg %s  1%% low %s"), avg, low);
+        snprintf(detail, sizeof detail, "  avg %s  1%% low %s", avg, low);
     }
-    snprintf(text, n, "FPS %s%s%s  %s%s%s", fps, gen, detail, ss, info->mfx ? TOTK_UI("  MetalFX已开启", "  MetalFX on") : "", info->big ? "  2K" : "");
+    snprintf(text, n, "FPS %s%s%s  %s%s%s", fps, gen, detail, ss, info->mfx ? "  MetalFX on" : "", info->big ? "  2K" : "");
 }
 
 void fps_overlay_raster(const fps_overlay_info *info, int scale, uint8_t *out, int *box_w, int *box_h) {
@@ -243,7 +242,7 @@ void shader_overlay_text(char *out, size_t n, uint64_t compiling, uint64_t fresh
     char t[16];
     (void)pipelines;   // user 2026-10-17: the pipeline count is not shown
     if (total < 0) snprintf(t, sizeof t, "--"); else snprintf(t, sizeof t, "%lld", (long long)(total > 999999 ? 999999 : total));
-    snprintf(out, n, TOTK_UI("着色器 编译中 %llu / 本次新增 %llu / 总计 %s", "Shaders %llu compiling / %llu new / %s total"),
+    snprintf(out, n, "Shaders %llu compiling / %llu new / %s total",
              (unsigned long long)(compiling > 99999 ? 99999 : compiling), (unsigned long long)(fresh > 99999 ? 99999 : fresh), t);
 }
 

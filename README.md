@@ -323,7 +323,7 @@ The menu bar shows the live frame rate as the game's own menu, on the left after
 
 Native 2K (key 3) changes the game's composition canvas and UI to 2560×1440. For any other size, up to your display's native pixels or 4K, and for the 3D scene's own resolution, use *Settings › Display* (Output resolution, 3D render scale). The manual MetalFX mode also works in smaller windows and scales to the actual output size, including 4K.
 
-Language: the game and the launcher's own text (startup screen, shader warm-up progress, overlays, keyboard prompt) follow the Mac's language. The launcher text is Chinese on a Chinese Mac and English otherwise. In a 1.4.3 build, Brazilian Portuguese selects the game's official pt-BR text. To give only this game another language, set its preferred language, for example `defaults write org.macnativegames.totk AppleLanguages -array pt-BR` (`defaults delete org.macnativegames.totk AppleLanguages` removes it). To override, launch with `TOTK_LANG` for the game (for example `open --env TOTK_LANG=en-US "Tears of the Kingdom.app"`) or `TOTK_UI_LANG=zh` / `en` for the launcher text.
+Language: the game's text follows the Mac's language; the launcher's own text (startup screen, shader warm-up progress, overlays, keyboard prompt) is English. In a 1.4.3 build, Brazilian Portuguese selects the game's official pt-BR text. To give only this game another language, set its preferred language, for example `defaults write org.macnativegames.totk AppleLanguages -array pt-BR` (`defaults delete org.macnativegames.totk AppleLanguages` removes it). To override, launch with `TOTK_LANG` (for example `open --env TOTK_LANG=en-US "Tears of the Kingdom.app"`).
 
 ## Settings menu
 
