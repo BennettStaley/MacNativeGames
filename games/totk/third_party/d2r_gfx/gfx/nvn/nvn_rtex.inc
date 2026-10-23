@@ -1,15 +1,3 @@
-// nvn_rtex.inc —— 运行时外推的着色器（由 nvn_mtl.m 在 rp_end / m4_end / res_add / args_dirty_all / blit 等定义之后 #include）
-//
-// int rt_ex_encode(dst_hdr, dst_ds, src_hdr, src_ds, vp_prev[16], vp_cur[16], unit_bits, ui_bits)
-//   在当前 MTL4 命令缓冲 g_cb 上编一个渲染通道（全屏一个三角形），把上一全画帧的不透明 HDR 与深度按本帧相机外推进 dst_hdr / dst_ds：
-//   反向映射：目标像素 q → 源像素 p，用源深度做 2 次不动点迭代；M = inv(vp_prev) · vp_cur 在 CPU 上双精度算（1e4 量级平移下单精度逆矩阵会差出 0.01 像素）。
-//   非洞：五抽头 Catmull-Rom，按 2×2 核心纹素的最小 / 最大值夹住防振铃，再按位移的小数相位补锐化（相位 0.5 最强、整数相位为 0，强度 k = 0.5）。
-//   洞（源 2×2 核心的模板含 unit_bits | ui_bits：旧单位位置 / 界面挖空）：沿 8 个方向每 4 像素往外找第一个非洞、非纯黑的像素（最远 24 步），
-//   按 1/距离² 加权平均；深度取其中最近那个。洞和屏边新露出（源越界）的像素由片元导出模板 0x80，之后的区域后处理据此重算。
-//   本帧界面挡住的像素（界面模板趟已写 0x2）按模板测试跳过。
-// 返回 1 = 编了；0 = 尺寸不齐 / 建不出管线（调用方 rt_copy_prev 先用 rx_setup 预检，建不出就整局退回原画法）。
-// 调用前后：本函数先 rp_end() 收掉当前渲染通道与拷贝编码器；编完置 args_dirty_all() / g_pso_dirty / g_dss_dirty，游戏下一个绘制按「读入」重开它的通道。
-// 资源：src_hdr / src_ds 由调用方建并 res_add；src_ds 要能开 X32_Stencil8 视图（建时带 MTLTextureUsagePixelFormatView）。
 // nvn_rtex.inc - shaders for runtime extrapolation (#included by nvn_mtl.m after the definitions of rp_end / m4_end / res_add / args_dirty_all / blit etc.)
 // int rt_ex_encode(dst_hdr, dst_ds, src_hdr, src_ds, vp_prev[16], vp_cur[16], unit_bits, ui_bits)
 //   Encodes one render pass (a single fullscreen triangle) on the current MTL4 command buffer g_cb, extrapolating the opaque HDR and depth of the previous fully drawn frame into dst_hdr / dst_ds by this frame's camera:
@@ -81,7 +69,7 @@ static int rx_setup(MTLPixelFormat fc, MTLPixelFormat fds) {
     g_rx_pso1 = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
     if (!g_rx_pso1) { MLOG("[red] runtime extrapolation: pipeline cannot be built %s", e.localizedDescription.UTF8String); g_rx_pso1 = nil; failed = 1; return 0; }
     MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new]; dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES;
-    if (fds == MTLPixelFormatDepth32Float_Stencil8) { MTLStencilDescriptor *sd = [MTLStencilDescriptor new]; sd.stencilCompareFunction = MTLCompareFunctionEqual; sd.readMask = 0x2; sd.writeMask = 0x80; sd.depthStencilPassOperation = MTLStencilOperationReplace;   // 洞 / 屏外新进来的像素由片元导出 0x80，后面 LDR 区域据此重算   // 本帧被界面挡住的像素（界面模板趟已写 0x2）不算 | Hole pixels / pixels newly entering from off-screen get 0x80 exported by the fragment, and the later LDR region is recomputed accordingly   // Pixels covered by this frame's UI (the UI stencil pass already wrote 0x2) do not count
+    if (fds == MTLPixelFormatDepth32Float_Stencil8) { MTLStencilDescriptor *sd = [MTLStencilDescriptor new]; sd.stencilCompareFunction = MTLCompareFunctionEqual; sd.readMask = 0x2; sd.writeMask = 0x80; sd.depthStencilPassOperation = MTLStencilOperationReplace;   // Hole pixels / pixels newly entering from off-screen get 0x80 exported by the fragment, and the later LDR region is recomputed accordingly   // Pixels covered by this frame's UI (the UI stencil pass already wrote 0x2) do not count
         dd.frontFaceStencil = sd; dd.backFaceStencil = sd; }
     g_rx_dss = [g_dev newDepthStencilStateWithDescriptor:dd];
     if (!g_rx_args) { MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 3; ad.maxBufferBindCount = 1;
@@ -91,7 +79,7 @@ static int rx_setup(MTLPixelFormat fc, MTLPixelFormat fds) {
     g_rx_fmt_c = fc; g_rx_fmt_ds = fds; MLOG("runtime extrapolation: shaders built (colour format %lu, depth format %lu)", (unsigned long)fc, (unsigned long)fds);
     return 1;
 }
-static void rx_inv4(const double *m, double *o) {   // 4×4 求逆（伴随矩阵法，双精度） | 4×4 inverse (adjugate method, double precision)
+static void rx_inv4(const double *m, double *o) {   // 4×4 inverse (adjugate method, double precision)
     double inv[16];
     inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
     inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
@@ -116,7 +104,7 @@ int rt_ex_encode(id<MTLTexture> dst_hdr, id<MTLTexture> dst_ds, id<MTLTexture> s
                  const float vp_prev[16], const float vp_cur[16], uint32_t unit_bits, uint32_t ui_bits) {
     if (!dst_hdr || !dst_ds || !src_hdr || !src_ds || !vp_prev || !vp_cur || !g_cb) return 0;
     if (src_hdr.width != dst_hdr.width || src_hdr.height != dst_hdr.height || src_ds.width != src_hdr.width || src_ds.height != src_hdr.height
-        || dst_ds.width != dst_hdr.width || dst_ds.height != dst_hdr.height) return 0;   // 换了分辨率（读取画面 / 动态比例）：这帧不外推 | Resolution changed (loading screen / dynamic scale): no extrapolation this frame
+        || dst_ds.width != dst_hdr.width || dst_ds.height != dst_hdr.height) return 0;   // Resolution changed (loading screen / dynamic scale): no extrapolation this frame
     if (!rx_setup(dst_hdr.pixelFormat, dst_ds.pixelFormat)) return 0;
     if (g_rx_stv_src != src_ds) {
         if (g_rx_stv) defer_obj_release(g_rx_stv);
@@ -124,24 +112,21 @@ int rt_ex_encode(id<MTLTexture> dst_hdr, id<MTLTexture> dst_ds, id<MTLTexture> s
         if (!g_rx_stv) { static int n; if (!n++) MLOG("[red] runtime extrapolation: cannot make a stencil view (src_ds needs PixelFormatView usage)"); return 0; }
         res_add(g_rx_stv); g_rx_stv_src = src_ds;
     }
-    // 常量：M = inv(vp_prev) · vp_cur（行向量：clip_cur = (ndc_prev, z, 1) · M）；Metal 的 float4x4 按列存，行向量矩阵的第 i 行正好当第 i 列 ⇒ 着色器里写 M * v
     // Constant: M = inv(vp_prev) · vp_cur (row vectors: clip_cur = (ndc_prev, z, 1) · M); Metal's float4x4 is stored by column, and row i of the row-vector matrix serves exactly as column i ⇒ write M * v in the shader
     double a[16], b[16], ia[16], m[16];
     for (int i = 0; i < 16; i++) { a[i] = vp_prev[i]; b[i] = vp_cur[i]; }
     rx_inv4(a, ia);
     for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) { double s = 0; for (int k = 0; k < 4; k++) s += ia[r * 4 + k] * b[k * 4 + c]; m[r * 4 + c] = s; }
-    // 小数相位：世界原点（任一点皆可，正交 + 平移全屏一致）在两帧屏幕上的像素位移 d = 目标 − 源；反向映射的源 = 目标 − d
     // Fractional phase: pixel displacement on screen between the two frames of the world origin (any point works; orthographic + translation is uniform across the screen), d = destination − source; the source of the backward mapping = destination − d
     double W = dst_hdr.width, H = dst_hdr.height;
-    double c0x = m[12] / m[15], c0y = m[13] / m[15];   // 源 NDC 原点 (0, 0, 0, 1) 投到本帧 | Source NDC origin (0, 0, 0, 1) projected into this frame
-    double dx = c0x / 2 * W, dy = -c0y / 2 * H, sx = -dx, sy = -dy;   // 源相对目标的偏移（像素） | Offset of the source relative to the destination (pixels)
+    double c0x = m[12] / m[15], c0y = m[13] / m[15];   // Source NDC origin (0, 0, 0, 1) projected into this frame
+    double dx = c0x / 2 * W, dy = -c0y / 2 * H, sx = -dx, sy = -dy;   // Offset of the source relative to the destination (pixels)
     double fx = sx - floor(sx), fy = sy - floor(sy), amount = 0.5 * 2 * (fx * (1 - fx) + fy * (1 - fy));
     float *k = g_rx_const[g_rx_ci].contents;
     for (int i = 0; i < 16; i++) k[i] = (float)m[i];
     ((uint32_t *)k)[16] = unit_bits | ui_bits; k[17] = (float)amount;
     id<MTLBuffer> cbuf = g_rx_const[g_rx_ci]; g_rx_ci = (g_rx_ci + 1) % 3;
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
-    // 单趟：外推 + 补洞 + 按小数相位补锐化 → dst_hdr；深度写进 dst_ds；本帧界面挡住的像素按模板跳过（模板不写）
     // Single pass: extrapolation + hole filling + sharpening compensation by fractional phase → dst_hdr; depth is written into dst_ds; pixels covered by this frame's UI are skipped by stencil (stencil not written)
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.colorAttachments[0].texture = dst_hdr; rp.colorAttachments[0].loadAction = MTLLoadActionLoad; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
@@ -158,7 +143,6 @@ int rt_ex_encode(id<MTLTexture> dst_hdr, id<MTLTexture> dst_ds, id<MTLTexture> s
     return 1;
 }
 
-// 正交相机下两帧之间整幅平移的像素量（取整）：目标 = 源 + (dx, dy)
 // Whole-image translation in pixels between two frames under an orthographic camera (rounded): destination = source + (dx, dy)
 static void rt_shift_px(const float vp_prev[16], const float vp_cur[16], double W, double H, int *dx, int *dy) {
     double a[16], b[16], ia[16], m[16];

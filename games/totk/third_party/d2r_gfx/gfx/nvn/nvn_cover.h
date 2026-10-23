@@ -1,7 +1,3 @@
-// 全覆盖首绘的几何证明（纯函数，单测 tests/t_cover.c）：这次绘制是否把附件该级整块的每个像素都画到。
-// 成立条件（全部满足）：剪裁覆盖整块；视口恰为 (0, 0, W, H)（NDC [-1,1]² 即整块）；某个未被剔除的三角形在 NDC 里包住四角（闭包含，
-// 像素中心都在正方形内部，四角在闭三角形内即整块在内）；各顶点 w = 1、z ∈ [0,1]（不被透视除法与深度裁剪改变）。
-// 朝向：NDC（y 向上）里逆时针为正；条带奇数个三角形顶点序反转。认不出的一律不成立。
 // Geometric proof of a full-coverage first draw (pure function, unit test tests/t_cover.c): whether this draw touches every pixel of the whole block of that attachment level.
 // Conditions (all must hold): the scissor covers the whole block; the viewport is exactly (0, 0, W, H) (NDC [-1,1]^2 is the whole block); some non-culled triangle encloses the four corners in NDC (closed containment:
 // pixel centers are all inside the square, so the four corners being in the closed triangle means the whole block is inside); every vertex has w = 1 and z in [0,1] (unchanged by perspective divide and depth clipping).
