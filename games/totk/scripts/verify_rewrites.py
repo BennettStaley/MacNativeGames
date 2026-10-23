@@ -68,8 +68,8 @@ def main():
                   '--jobs', str(args.jobs), '--min-eff', '2', '--max-extra', '16',
                   '--mutate', '300' if module == 'main' else '150',
                   '--tsv', str(analysis / f'{module}-equivalence-v3.tsv')], equivalence, environment)
-        structural = re.search(rf'^STRUCT {module} OK 改写点=(\d+)', structure.read_text(), re.M)
-        semantic = re.search(rf'^EQUIV {module} OK 站点=(\d+) 试验=(\d+) 有效试验=(\d+) 双异常=(\d+).*变异=(\d+).*抓到=(\d+) 漏抓=0', equivalence.read_text(), re.M)
+        structural = re.search(rf'^STRUCT {module} OK (?:sites|\u6539\u5199\u70b9)=(\d+)', structure.read_text(), re.M)
+        semantic = re.search(rf'^EQUIV {module} OK (?:sites|\u7ad9\u70b9)=(\d+) (?:trials|\u8bd5\u9a8c)=(\d+) (?:effective_trials|\u6709\u6548\u8bd5\u9a8c)=(\d+) (?:both_fault|\u53cc\u5f02\u5e38)=(\d+).*(?:mutations|\u53d8\u5f02)=(\d+).*(?:caught|\u6293\u5230)=(\d+) (?:missed|\u6f0f\u6293)=0', equivalence.read_text(), re.M)
         if not structural or not semantic:
             raise RuntimeError(f'Missing successful structure/equivalence gate for {module}')
         values = list(map(int, semantic.groups()))

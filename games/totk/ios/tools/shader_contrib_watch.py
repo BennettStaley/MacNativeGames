@@ -109,8 +109,8 @@ def gist_raw(gist_url):
 
 def issue_body(platform, link):
     """An issue laid out like the shader-list form, so scripts/collect_shader_issues.py reads it the same way."""
-    return (f'### Game version / 游戏版本\n\nSent automatically / 自动提交\n\n### Device / 设备\n\n{platform}\n\n'
-            f'### {UPLOAD_NAME}\n\n{link}\n\n### Where you played (optional) / 玩了哪些地方（可选）\n\n_No response_\n')
+    return (f'### Game version\n\nSent automatically\n\n### Device\n\n{platform}\n\n'
+            f'### {UPLOAD_NAME}\n\n{link}\n\n### Where you played (optional)\n\n_No response_\n')
 
 
 def submit(gh, path, rows, platform):

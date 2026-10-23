@@ -93,19 +93,19 @@ NSString *totk_rt_dir(void) {
             if (!seed) {   // 2026-10-18: a damaged bundle or a full disk used to end the game here with nothing on screen. The
                            // cache stays usable (totk_seed_import writes shader files before the indexes that name them),
                            // so play on and translate shaders as they first appear, as before the prepared shaders existed.
-                LOG("[shader-seed] 【红】导入 App 附带的着色器失败：%s；改为边玩边翻译",
+                LOG("[shader-seed] [red] importing the shaders bundled with the app failed: %s; translating during play instead",
                     error ? error.localizedDescription.UTF8String : "unknown error");
                 if (runtime_boot_status) runtime_boot_status(TOTK_UI("着色器缓存未就绪","Shader cache not ready"),TOTK_UI("App 附带的着色器导入失败，改为边玩边翻译","Could not import the shaders bundled with the app; shaders are translated during play"));
                 seed = @{@"available": @NO, @"failed": @YES};
             }
             if ([seed[@"available"] boolValue]) {
                 unsigned long long imported=[seed[@"imported_files"] unsignedLongLongValue];
-                LOG("[shader-seed] 发现随 App 准备的着色器 %llu 个，导入 %llu 个文件%s%s；首次启动即可预热",
+                LOG("[shader-seed] found %llu shaders prepared with the app, imported %llu files%s%s; warm-up can start on first launch",
                     [seed[@"shaders"] unsignedLongLongValue], imported,
-                    [seed[@"cloned_folder"] boolValue] ? "（整个文件夹一次克隆）" : "",
-                    g_seed_dir ? "（App 包已签名，原地读取，不校验也不复制）" : "");
-                if ([seed[@"folder_skipped"] length]) LOG("[shader-seed] 缓存里已有文件（例如 %s），逐个导入", [seed[@"folder_skipped"] UTF8String]);
-                if ([seed[@"clone_errno"] intValue]) LOG("[shader-seed] 【红】克隆失败（%s），改为复制文件", strerror([seed[@"clone_errno"] intValue]));
+                    [seed[@"cloned_folder"] boolValue] ? " (whole folder cloned at once)" : "",
+                    g_seed_dir ? " (app bundle is signed: read in place, not verified or copied)" : "");
+                if ([seed[@"folder_skipped"] length]) LOG("[shader-seed] cache already has files (e.g. %s); importing one by one", [seed[@"folder_skipped"] UTF8String]);
+                if ([seed[@"clone_errno"] intValue]) LOG("[shader-seed] [red] clone failed (%s); copying files instead", strerror([seed[@"clone_errno"] intValue]));
                 if (runtime_boot_status) runtime_boot_status(TOTK_UI("着色器缓存已就绪","Shader cache ready"),imported
                     ? [NSString stringWithFormat:@(TOTK_UI("已导入 %llu 个预置文件，开始预热","Imported %llu prepared files; starting warm-up")),imported].UTF8String
                     : g_seed_dir ? TOTK_UI("直接读取 App 附带的着色器，无需导入；开始预热","Reading the shaders bundled with the app in place, nothing to import; starting warm-up")
@@ -115,9 +115,9 @@ NSString *totk_rt_dir(void) {
 #if TARGET_OS_IPHONE
         // Variants that ios/tools/fill_shaders.py translated on the Mac for this device's earlier misses (shader-requests/).
         NSDictionary *fill = totk_fill_import(@"shader-fill", g_dir);
-        if ([fill[@"packs"] unsignedIntegerValue]) LOG("[shader-fill] 合并 Mac 补译的着色器包 %lu 个，导入 %lu 个文件",
+        if ([fill[@"packs"] unsignedIntegerValue]) LOG("[shader-fill] merged %lu shader packs translated on the Mac, imported %lu files",
             (unsigned long)[fill[@"packs"] unsignedIntegerValue], (unsigned long)[fill[@"imported_files"] unsignedIntegerValue]);
-        for (NSString *why in fill[@"rejected"]) LOG("【红】[shader-fill] 丢弃不完整的着色器包 %s（请在 Mac 上重新运行 fill_shaders.py）", why.UTF8String);
+        for (NSString *why in fill[@"rejected"]) LOG("[red] [shader-fill] discarded incomplete shader pack %s (rerun fill_shaders.py on the Mac)", why.UTF8String);
 #endif
     });
     return g_dir;
@@ -329,7 +329,7 @@ static void record_miss(NSString *shader, NSDictionary *rq, NSDictionary *answer
     [missed addObject:variant];
     [[json_string(rq) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:[NSString stringWithFormat:@"shader-requests/%@.json", variant] atomically:YES];
     totk_contrib_add(shader, answers);   // not in the prepared seed, so not in the shared shader list yet
-    LOG("[shader-miss] %s %s 不在手机的翻译缓存里：跳过用到它的绘制，请求已存 shader-requests/（第 %lu 个；在 Mac 上 ios/tools/fill_shaders.py 补上后下次启动预热）",
+    LOG("[shader-miss] %s %s is not in the phone's translation cache: skipping draws that use it; request saved in shader-requests/ (#%lu; fill it with ios/tools/fill_shaders.py on the Mac and it warms up on next launch)",
         [rq[@"stage"] UTF8String], variant.UTF8String, (unsigned long)missed.count);
 }
 /* One request through a translator service; the reflection of the new variant. */

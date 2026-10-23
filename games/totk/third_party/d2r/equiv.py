@@ -274,7 +274,7 @@ if __name__ == '__main__':
             f.write('site\ttrials\teff\tdiffs\n')
             for a, n, eff, d in res: f.write(f'{a:#x}\t{n}\t{eff}\t{len(d)}\n')
     ok = not bad and not zero and not miss   # 变异漏抓 = 判据分不出坏改写，判红（早先漏抓只打印不判） | A missed mutation = the criterion cannot tell a bad rewrite apart, so fail (earlier a miss was only printed, not judged)
-    print(f'EQUIV {MOD} {"OK" if ok else "FAIL"} 站点={len(res)} 试验={T} 有效试验={E} 双异常={T - E} '
-          f'有效≥1站点={len(res) - len(zero)} 有效≥{A.min_eff}站点={len(res) - len(low)} 零有效={len(zero)} 分歧站点={len(bad)} '
-          f'门站点(结构核对)={ngate} 已登记剪口(结构核对)={ncut} 观测门(结构核对)={nobs} 变异={len(mut_sites)}（{mut_by}） 抓到={caught} 漏抓={miss} seed={A.seed}', flush=True)
+    print(f'EQUIV {MOD} {"OK" if ok else "FAIL"} sites={len(res)} trials={T} effective_trials={E} both_fault={T - E} '
+          f'eff>=1_sites={len(res) - len(zero)} eff>={A.min_eff}_sites={len(res) - len(low)} zero_eff={len(zero)} diff_sites={len(bad)} '
+          f'gate_sites(struct_check)={ngate} registered_cuts(struct_check)={ncut} observe_gates(struct_check)={nobs} mutations={len(mut_sites)} ({mut_by}) caught={caught} missed={miss} seed={A.seed}', flush=True)
     sys.exit(0 if ok else 1)

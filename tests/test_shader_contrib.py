@@ -57,7 +57,7 @@ class IssueCollectionTests(unittest.TestCase):
         self.assertIsNone(watch.gist_raw('error: HTTP 401'))
         body = watch.issue_body('iPad', link)
         self.assertEqual(attachment_urls(body), [link])
-        self.assertIn('### Device / 设备\n\niPad\n', body)
+        self.assertIn('### Device\n\niPad\n', body)
         self.assertNotIn('udid', body.lower())
 
     def test_only_shader_rows_are_taken(self):

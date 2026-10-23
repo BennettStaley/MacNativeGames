@@ -82,7 +82,7 @@ static int pp_flag(const char *name, int v) {
 static int pp_env(const char *name, int lo, int hi, int def) {
     const char *e = getenv(name); if (!e || !*e) return def;
     char *end; long v = strtol(e, &end, 10);
-    if (*end || v < lo || v > hi) { MLOG("【红】%s=%s ignored (%d..%d)", name, e, lo, hi); return def; }
+    if (*end || v < lo || v > hi) { MLOG("[red] %s=%s ignored (%d..%d)", name, e, lo, hi); return def; }
     return (int)v;
 }
 /* The game's present (replay thread, between two frames): take the requested settings for the next frame. A changed
@@ -94,7 +94,7 @@ static void pp_latch(void) {
     if (!init) {
         init = 1;
         int aa = pp_env("TOTK_AA", 0, 3, 0), sh = pp_env("TOTK_SHARPEN", 0, 100, 0), an = pp_env("TOTK_ANISO", 0, 16, 0), lb = pp_env("TOTK_LOD_BIAS", -100, 0, 0);
-        if (an == 1 || (an & (an - 1))) { if (an > 1) MLOG("【红】TOTK_ANISO=%d ignored (0, 2, 4, 8 or 16)", an); an = 0; }
+        if (an == 1 || (an & (an - 1))) { if (an > 1) MLOG("[red] TOTK_ANISO=%d ignored (0, 2, 4, 8 or 16)", an); an = 0; }
         int unset = -1; atomic_compare_exchange_strong(&g_pp_req_aa, &unset, aa);
         unset = -1; atomic_compare_exchange_strong(&g_pp_req_sharpen, &unset, sh);
         unset = -1; atomic_compare_exchange_strong(&g_pp_req_aniso, &unset, an);
@@ -138,7 +138,7 @@ static id<MTLRenderPipelineState> pp_pso(int fn, MTLPixelFormat pf) {
     for (int i = 0; i < 4; i++) if (g_postfx.ps[fn][i] && g_postfx.pf[fn][i] == pf) return g_postfx.ps[fn][i];
     if (!g_postfx.lib && !g_postfx.lib_failed) {
         NSError *e = nil; g_postfx.lib = [g_dev newLibraryWithSource:@(k_post_msl) options:nil error:&e];
-        if (!g_postfx.lib) { g_postfx.lib_failed = 1; MLOG("【红】[pp] shaders do not compile: %s", e.localizedDescription.UTF8String); return nil; }
+        if (!g_postfx.lib) { g_postfx.lib_failed = 1; MLOG("[red] [pp] shaders do not compile: %s", e.localizedDescription.UTF8String); return nil; }
         MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 3; ad.maxBufferBindCount = 1;
         for (int f = 0; f < PP_NFN; f++) { g_postfx.args[f] = [g_dev newArgumentTableWithDescriptor:ad error:&e]; if (!g_postfx.args[f]) MDIE("[pp] argument table: %s", e.localizedDescription.UTF8String); }
     }
@@ -146,7 +146,7 @@ static id<MTLRenderPipelineState> pp_pso(int fn, MTLPixelFormat pf) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [g_postfx.lib newFunctionWithName:@"pp_vs"]; d.fragmentFunction = [g_postfx.lib newFunctionWithName:@(k_pp_fn[fn])]; d.colorAttachments[0].pixelFormat = pf;
     NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
-    if (!ps) { MLOG("【红】[pp] pipeline %s (format %lu): %s", k_pp_fn[fn], (unsigned long)pf, e.localizedDescription.UTF8String); return nil; }
+    if (!ps) { MLOG("[red] [pp] pipeline %s (format %lu): %s", k_pp_fn[fn], (unsigned long)pf, e.localizedDescription.UTF8String); return nil; }
     int i = 0; while (i < 3 && g_postfx.ps[fn][i]) i++;
     g_postfx.ps[fn][i] = ps; g_postfx.pf[fn][i] = pf; return ps;
 }
@@ -291,7 +291,7 @@ static id<MTLRenderPipelineState> fx_scale_pso(MTLPixelFormat pf) {
     a.sourceRGBBlendFactor = a.sourceAlphaBlendFactor = MTLBlendFactorZero;
     a.destinationRGBBlendFactor = a.destinationAlphaBlendFactor = MTLBlendFactorBlendColor;
     NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
-    if (!ps) { MLOG("【红】[pp] bloom pipeline (format %lu): %s", (unsigned long)pf, e.localizedDescription.UTF8String); return nil; }
+    if (!ps) { MLOG("[red] [pp] bloom pipeline (format %lu): %s", (unsigned long)pf, e.localizedDescription.UTF8String); return nil; }
     int i = 0; while (i < 3 && g_postfx.scale_ps[i]) i++;
     g_postfx.scale_ps[i] = ps; g_postfx.scale_pf[i] = pf; return ps;
 }

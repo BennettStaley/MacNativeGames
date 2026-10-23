@@ -189,7 +189,7 @@ static NSString *fetch(void) {
     }
     if (status != 200) { LOG("[shader-list] download answered HTTP %ld; keeping the previous list", (long)status); return same ? path : nil; }
     NSString *why = nil; NSDictionary<NSString *, NSArray<NSString *> *> *list = tsl_parse(body, &why);
-    if (!list) { LOG("[shader-list] 【红】rejected the downloaded list: %s; keeping the previous one", why.UTF8String); return same ? path : nil; }
+    if (!list) { LOG("[shader-list] [red] rejected the downloaded list: %s; keeping the previous one", why.UTF8String); return same ? path : nil; }
     if (![body writeToFile:path atomically:YES]) { LOG("[shader-list] cannot write %s", path.UTF8String); return nil; }
     NSUInteger variants = 0; for (NSString *k in list) variants += list[k].count;
     NSMutableDictionary *ns = [@{@"url": url.absoluteString, @"checked": @(now), @"sha256": sha256_hex(body.bytes, body.length),
@@ -358,7 +358,7 @@ static void prepare(void) {
     double t0 = now_s(); g_paused_s = 0;
     NSData *data = [NSData dataWithContentsOfFile:path];
     NSString *why = nil; NSDictionary<NSString *, NSArray<NSString *> *> *list = data ? tsl_parse(data, &why) : nil;
-    if (!list) { LOG("[shader-list] 【红】the saved list does not read (%s); it is fetched again next time", why ? why.UTF8String : "missing"); [NSFileManager.defaultManager removeItemAtPath:[dir stringByAppendingPathComponent:@"state.json"] error:nil]; return; }
+    if (!list) { LOG("[shader-list] [red] the saved list does not read (%s); it is fetched again next time", why ? why.UTF8String : "missing"); [NSFileManager.defaultManager removeItemAtPath:[dir stringByAppendingPathComponent:@"state.json"] error:nil]; return; }
     NSString *cache = totk_rt_dir();
     NSString *failedPath = [dir stringByAppendingPathComponent:@"failed.tsv"], *donePath = [cache stringByAppendingPathComponent:@"shader-list-done.tsv"];
     NSMutableSet *skip = rows_read(failedPath); [skip unionSet:rows_read(donePath)];
@@ -418,7 +418,7 @@ static void prepare(void) {
                 if ([err hasPrefix:@"translation failed"]) rows_add(failedPath, m[0], m[1]);
                 if ([err containsString:@"translator"] && ++broken >= 3) {   // the translator itself does not work: not item by item
                     free(owned); free(flat); free(raw); atomic_store(&g_pending, 0);
-                    LOG("[shader-list] 【红】stopped: the translator does not work (%s); the next start tries again", err.UTF8String);
+                    LOG("[shader-list] [red] stopped: the translator does not work (%s); the next start tries again", err.UTF8String);
                     return;
                 }
             } else {

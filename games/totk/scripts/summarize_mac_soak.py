@@ -70,8 +70,8 @@ def summarize(report, memory=(), log='', instrumentation=()):
     spikes = [dict(frame=int(m[1]), game_log_seconds=float(m[2]), host_ms=float(m[3]),
                    gpu_reported_ms=float(m[4]), pipelines=int(m[5]), libraries=int(m[6]),
                    creation_ms=float(m[7])) for m in re.finditer(
-                       r'\[长帧\] 帧 (\d+)（([\d.]+) s）整帧 ([\d.]+) ms.*?GPU ([\d.]+) ms；'
-                       r'新建管线 (\d+) 条 \+ 着色器库 (\d+) 个共 ([\d.]+) ms', log)]
+                       r'\[long frame\] frame (\d+) \(([\d.]+) s\) whole frame ([\d.]+) ms.*?GPU ([\d.]+) ms; '
+                       r'new pipelines (\d+) \+ shader libraries (\d+) in ([\d.]+) ms', log)]
     spikes = [s for s in spikes if frame_lo <= s['frame'] <= frame_hi]
     for spike in spikes:
         spike['possible_diagnostic_overlap'] = [w['tool'] for w in diagnostic_ranges
