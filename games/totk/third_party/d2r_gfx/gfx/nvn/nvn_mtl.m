@@ -134,7 +134,11 @@ static int g_present_latency = 1;
 static uint64_t g_pq_done;
 static uint64_t g_pq_read;
 static id<MTLResidencySet> g_res;
-static int g_res_dirty;
+/* Pending, uncommitted changes to g_res: RES_DIRTY_ADD (an allocation joined: it must be committed before a command
+   buffer that uses it is committed) and RES_DIRTY_REMOVE (one left: committing it only gives memory back, so it may wait,
+   see res_batch_on). Set under g_res_mu, cleared under g_res_mu by the commit, read without a lock by res_commit's fast path. */
+enum { RES_DIRTY_ADD = 1, RES_DIRTY_REMOVE = 2 };
+static _Atomic int g_res_dirty;
 static id<MTLSharedEvent> g_ev;
 /* TOTK containment (TOTK_GPU_NOCOMMIT=1): after full-game runs kernel-panicked macOS in the GPU driver, the replay can
    encode everything but submit nothing. Completion handlers run at once so fences, queries and pacing still advance;
@@ -218,7 +222,8 @@ static struct { uint64_t adds, removes, live_bytes; _Atomic uint64_t alive, aliv
 static char g_alloc_track_key;
 static NSMapTable *g_res_site_of;   // resource (weak key) -> NSNumber source line
 static uint64_t g_res_live_bytes;
-static uint64_t g_res_dedup_skips, g_res_commits, g_res_commit_calls;   // under g_res_mu
+static uint64_t g_res_dedup_skips, g_res_commits, g_res_commits_async;   // under g_res_mu
+static _Atomic uint64_t g_res_commit_calls, g_res_removal_waits;      // res_commit calls; calls that left removal-only changes for later
 static int res_dedup_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("TOTK_RES_DEDUP"); v = !(e && !strcmp(e, "0")); MLOG("TOTK_RES_DEDUP=%d: %s", v, v ? "re-adding a member or removing a non-member no longer marks the residency set for a commit" : "every add / remove marks the residency set for a commit (old)"); }
@@ -243,7 +248,7 @@ static void res_add_at(id<MTLResource> r, int site) {
             objc_setAssociatedObject(r, &g_alloc_track_key, tr, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
     }
-    g_res_dirty = 1;
+    atomic_fetch_or(&g_res_dirty, RES_DIRTY_ADD);
     pthread_mutex_unlock(&g_res_mu);
 }
 #define res_add(r) res_add_at((r), __LINE__)
@@ -258,7 +263,7 @@ static void res_remove_body(id<MTLResource> r) {
         g_res_live_bytes -= sz < g_res_live_bytes ? sz : g_res_live_bytes;
         [g_res_objects removeObject:r]; [g_res_site_of removeObjectForKey:r];
     }
-    g_res_dirty = 1;
+    atomic_fetch_or(&g_res_dirty, RES_DIRTY_REMOVE);
     pthread_mutex_unlock(&g_res_mu);
 }
 static int g_res_remove_no_pool; // GPU probe negative control only
@@ -324,14 +329,55 @@ static void res_check(id r, const char *what, int reg) {
         MLOG("[red] missing residency #%d: %s slot %d %s %p (parent chain %d deep) allocated %lu B storage %lu%s", nbad, what, reg, is_tex ? "texture" : "buffer", (__bridge void *)a, hops, (unsigned long)a.allocatedSize, (unsigned long)a.storageMode,
              t ? [NSString stringWithFormat:@" format %lu %lux%lu type %lu usage %#lx", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.textureType, (unsigned long)t.usage].UTF8String : ""); }
 }
+/* TOTK_RES_BATCH (default 1): res_commit, called before every command buffer commit (each mid-submission chunk split in
+   rp_begin_ex -> chunk_maybe_split -> mtl_sub_split, the end of a submission, uploads, readbacks), commits the residency set
+   only when an allocation was added since the last commit. Removals alone wait: the end of the submission hands them to a
+   background queue (res_commit_sub_end), so the replay thread no longer pays a kernel call (IOGPUMetalResidencySet commit)
+   at a chunk split just because a completion handler retired a texture (defer_drain -> res_remove) meanwhile.
+   Why it is equivalent for the GPU: residency sets attached to the queue apply what was committed when each command buffer
+   is committed. Additions keep their exact old ordering (committed on the committing thread before the command buffer).
+   A removal is only ever made after the submissions that used the allocation completed (defer_obj_release waits for their
+   fence), so keeping it resident a little longer is harmless; it only holds the memory wired until the next commit
+   (at most about one submission later). TOTK_RES_BATCH=0: every change, removals too, is committed at the next res_commit (old). */
+static int res_batch_on(void) {
+    static _Atomic int v = -1; int r = atomic_load_explicit(&v, memory_order_relaxed);
+    if (r < 0) { const char *e = getenv("TOTK_RES_BATCH"); r = !(e && !strcmp(e, "0")); int expect = -1;
+        if (atomic_compare_exchange_strong(&v, &expect, r)) MLOG("TOTK_RES_BATCH=%d: %s", r, r ? "the residency set is committed before a command buffer only when allocations joined it; removals are committed off the replay thread once per submission" : "every residency change is committed before the next command buffer (old)"); }
+    return r;
+}
 static void res_commit(void) {
-    gpu_budget_check("commit residency set");
+    atomic_fetch_add_explicit(&g_res_commit_calls, 1, memory_order_relaxed);
+    int need = res_batch_on() ? RES_DIRTY_ADD : RES_DIRTY_ADD | RES_DIRTY_REMOVE;
+    int d = atomic_load_explicit(&g_res_dirty, memory_order_acquire);
+    if (!(d & need)) { if (d) atomic_fetch_add_explicit(&g_res_removal_waits, 1, memory_order_relaxed); return; }   // clean (or removals only): no lock, no ObjC
+    gpu_budget_check("commit residency set");   // only when the set may have grown (q4_commit checks every command buffer too)
     pthread_mutex_lock(&g_res_mu);
-    g_res_commit_calls++;
-    if (g_res_dirty) { if (!nogpu()) [g_res commit]; g_res_dirty = 0; g_res_commits++; }
-    if (!(g_res_commit_calls & 16383)) MLOG("residency: %llu checks, %llu commits, %llu redundant adds/removes skipped",
-        (unsigned long long)g_res_commit_calls, (unsigned long long)g_res_commits, (unsigned long long)g_res_dedup_skips);
+    if (atomic_load_explicit(&g_res_dirty, memory_order_relaxed) & need) { if (!nogpu()) [g_res commit]; atomic_store(&g_res_dirty, 0); g_res_commits++; }
     pthread_mutex_unlock(&g_res_mu);
+}
+/* End of a submission (mtl_sub_commit, before its command buffer is committed): additions as in res_commit; removal-only
+   changes go to a background serial queue, at most one commit queued at a time. Every 600 frames: commits per frame. */
+static void res_commit_sub_end(uint64_t frame) {
+    res_commit();
+    static _Atomic int queued;
+    if (res_batch_on() && (atomic_load_explicit(&g_res_dirty, memory_order_acquire) & RES_DIRTY_REMOVE) && !atomic_exchange(&queued, 1)) {
+        static dispatch_queue_t q; static dispatch_once_t once;
+        dispatch_once(&once, ^{ q = dispatch_queue_create("totk.residency-commit", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0)); });
+        dispatch_async(q, ^{ @autoreleasepool {
+            atomic_store(&queued, 0);   // before the commit: a removal made while it runs queues another one
+            pthread_mutex_lock(&g_res_mu);
+            if (atomic_load_explicit(&g_res_dirty, memory_order_relaxed)) { if (!nogpu()) [g_res commit]; atomic_store(&g_res_dirty, 0); g_res_commits_async++; }
+            pthread_mutex_unlock(&g_res_mu);
+        } });
+    }
+    static uint64_t f0 = UINT64_MAX, c0, a0, w0, k0;
+    if (f0 == UINT64_MAX || frame < f0) { f0 = frame; pthread_mutex_lock(&g_res_mu); c0 = g_res_commits; a0 = g_res_commits_async; pthread_mutex_unlock(&g_res_mu); w0 = atomic_load(&g_res_removal_waits); k0 = atomic_load(&g_res_commit_calls); return; }
+    if (frame < f0 + 600) return;
+    pthread_mutex_lock(&g_res_mu); uint64_t c = g_res_commits, a = g_res_commits_async, dd = g_res_dedup_skips; unsigned long nobj = (unsigned long)g_res_objects.count; pthread_mutex_unlock(&g_res_mu);
+    uint64_t w = atomic_load(&g_res_removal_waits), k = atomic_load(&g_res_commit_calls); double nf = (double)(frame - f0);
+    MLOG("residency frames %llu-%llu (TOTK_RES_BATCH=%d): %.2f commits/frame before command buffers, %.2f removal-only commits/frame in the background, %.2f commit points/frame clean or deferring removals (of %.2f checks/frame); %llu redundant adds/removes skipped so far, %lu objects",
+         (unsigned long long)f0, (unsigned long long)frame, res_batch_on(), (double)(c - c0) / nf, (double)(a - a0) / nf, (double)(w - w0) / nf, (double)(k - k0) / nf, (unsigned long long)dd, nobj);
+    f0 = frame; c0 = c; a0 = a; w0 = w; k0 = k;
 }
 
 @interface NvDeferredRelease : NSObject { @public id object; uint64_t fence; int keep_resident; } @end
@@ -2098,7 +2144,7 @@ uint64_t mtl_sub_commit(void) {
     }];
     void arena_commit(uint64_t fence); arena_commit(fence);
     pt_finish(g_cb, o, gpu_f);
-    res_commit();
+    res_commit_sub_end(gpu_f);
     if (totk_tl_on()) { uint64_t tlid = totk_tl_commit_id(); totk_tl(TL_COMMIT, tlid, 1); totk_tl(TL_FENCE, tlid, fence);
         [o addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { totk_tl_at(TL_GPU, (uint64_t)(fb.GPUStartTime * 1e9), tlid, (uint64_t)(fb.GPUEndTime * 1e9)); }]; }
     [g_cb endCommandBuffer];
@@ -5171,16 +5217,35 @@ static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
 }
 /* TOTK: the translated Switch shaders rely on exactly rounded IEEE float arithmetic (integer-division idioms built from
    float bit patterns, invariant positions, depth compares); Metal's default fast math breaks them. */
+/* TOTK_MATH_MODE=safe|relaxed|fast picks the math mode every translated shader is compiled with (default safe).
+   relaxed lets the compiler reassociate and contract but keeps infinities and NaNs; fast also assumes there are none.
+   TOTK_FAST_MATH=1 is the older spelling of fast (TOTK_MATH_MODE wins when both are set). Anything but safe is for
+   measurement: fast is known to break the tile-light vertex shader's integer-division idiom, so pictures from such runs
+   are not evidence of correctness. Libraries and pipelines built ahead of time are safe-math builds, so another mode skips
+   the precompiled shader libraries and keeps its pipeline archive in a folder of its own (par_dir). 0 safe, 1 relaxed, 2 fast. */
+static int totk_math_mode(void) {
+    static _Atomic int v = -1; int m = atomic_load(&v);
+    if (m >= 0) return m;
+    const char *e = getenv("TOTK_MATH_MODE"), *f = getenv("TOTK_FAST_MATH");
+    m = 0;
+    if (e && *e) {
+        if (!strcmp(e, "safe")) m = 0; else if (!strcmp(e, "relaxed")) m = 1; else if (!strcmp(e, "fast")) m = 2;
+        else MDIE("TOTK_MATH_MODE=%s: expected safe, relaxed or fast", e);
+    } else if (f && atoi(f)) m = 2;
+    int expect = -1;
+    if (atomic_compare_exchange_strong(&v, &expect, m) && m)
+        MLOG("[experiment] TOTK_MATH_MODE=%s: translated shaders use %s math (precompiled shader libraries skipped, pipeline archive in its own folder)", m == 1 ? "relaxed" : "fast", m == 1 ? "relaxed" : "fast");
+    return atomic_load(&v);
+}
 static MTLCompileOptions *totk_precise_opts(void) {
     /* Made once and published only when complete: the warm-up compiles on several threads (2026-10-18), and a thread must
        never get the options before mathMode is set (that would compile with fast math). */
     static MTLCompileOptions *o; static dispatch_once_t once;
     dispatch_once(&once, ^{
         MTLCompileOptions *x = [MTLCompileOptions new];
-        if (@available(macOS 15.0, *)) x.mathMode = MTLMathModeSafe; else x.fastMathEnabled = NO;
-        /* TOTK_FAST_MATH=1 (measurement only): fast math for every translated shader. Known to break the tile-light vertex
-           shader's integer-division idiom, so pictures from such runs are not evidence of correctness. */
-        if (getenv("TOTK_FAST_MATH") && atoi(getenv("TOTK_FAST_MATH"))) { if (@available(macOS 15.0, *)) x.mathMode = MTLMathModeFast; else x.fastMathEnabled = YES; MLOG("[experiment] TOTK_FAST_MATH=1: shaders use fast math"); }
+        int m = totk_math_mode();
+        if (@available(macOS 15.0, *)) x.mathMode = m == 2 ? MTLMathModeFast : m == 1 ? MTLMathModeRelaxed : MTLMathModeSafe;
+        else x.fastMathEnabled = m == 2;   // no relaxed mode before macOS 15 / iOS 18: relaxed compiles as safe there
         o = x;
     });
     return o;
@@ -5363,7 +5428,7 @@ static _Atomic uint64_t g_rt_prebuilt, g_rt_compiled;   // TOTK: translated vari
    MSL, so only an exact match is used. Metal's own cache of libraries compiled here does not follow the app to a folder
    whose path has another length (measured: a full 4.5-minute warm-up again); these files move with the app. */
 static NSString *shader_lib_prebuilt_path(NSData *src) {
-    if (getenv("TOTK_FAST_MATH") && atoi(getenv("TOTK_FAST_MATH"))) return nil;   // built with safe math (totk_precise_opts)
+    if (totk_math_mode()) return nil;   // built with safe math (totk_precise_opts)
     static NSString *dir; static dispatch_once_t once; dispatch_once(&once, ^{   // TOTK_SHADER_LIBS: the app's game-data store (launcher.m)
         const char *libs = getenv("TOTK_SHADER_LIBS"); dir = libs && *libs ? @(libs) : exe_rel("shader-libs"); });
     unsigned char md[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(src.bytes, (CC_LONG)src.length, md);
@@ -5394,9 +5459,10 @@ static NvShader *shader_load(NSString *pc, int stage) {
         if (device_libs)
 #endif
         {
-        // iOS: the variant precompiled on the Mac (ios/tools/build_metallibs.sh, same options) if it came in shaders.pack
+        // iOS: the variant precompiled on the Mac (ios/tools/build_metallibs.sh, same options) if it came in shaders.pack;
+        // those are safe-math builds, so another TOTK_MATH_MODE compiles the source instead
         NSString *rt_lib = totk_rt_file([pc stringByAppendingString:@".metallib"]);
-        if ([NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("[red] Failed to load precompiled shader library %s: %s (compiling at runtime instead)", pc.UTF8String, e.localizedDescription.UTF8String); else atomic_fetch_add(&g_rt_prebuilt, 1); }
+        if (!totk_math_mode() && [NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("[red] Failed to load precompiled shader library %s: %s (compiling at runtime instead)", pc.UTF8String, e.localizedDescription.UTF8String); else atomic_fetch_add(&g_rt_prebuilt, 1); }
         }
         if (!lib) { NSData *raw = [NSData dataWithContentsOfFile:rt_src options:0 error:&e];
 #if !TARGET_OS_IPHONE
