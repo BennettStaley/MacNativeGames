@@ -174,9 +174,9 @@ def describe_holder(d):
     kv = kv_read(d / "holder")
     since, expect = num(kv, "since"), num(kv, "expect_s")
     held = int(time.time()) - since if since else 0
-    left = f"，预计还要约 {(expect - held + 59) // 60} 分钟" if expect > held else ""
-    return (f"{kv.get('owner', '?')}（{kv.get('purpose', '?')}）占用中，已 {held // 60} 分 {held % 60} 秒{left}，"
-            f"游戏 pid {kv.get('game_pid') or '-'}")
+    left = f", about {(expect - held + 59) // 60} min left" if expect > held else ""
+    return (f"{kv.get('owner', '?')} ({kv.get('purpose', '?')}) holds it, for {held // 60} min {held % 60} s{left}, "
+            f"game pid {kv.get('game_pid') or '-'}")
 
 
 def slot_held(d):
@@ -225,10 +225,10 @@ class GameSlot:
                 entries = queue_entries(d)
                 upid = user_request_pid(d)
                 if upid:
-                    reason, key = f"用户的游戏（pid {upid}）正在等，让它先", f"user {upid}"
+                    reason, key = f"the user's game (pid {upid}) is waiting, letting it go first", f"user {upid}"
                 elif entries and entries[0][0] != me.name:
                     head = entries[0][1]
-                    reason = f"排队中，前面是 {head.get('owner', '?')}（{head.get('purpose', '?')}）"
+                    reason = f"queued behind {head.get('owner', '?')} ({head.get('purpose', '?')})"
                     key = f"queue {entries[0][0]}"
                 else:
                     try:
@@ -240,10 +240,10 @@ class GameSlot:
                         if not old:
                             break
                         fcntl.flock(self.fd, fcntl.LOCK_UN)
-                        reason, key = f"pid {old[0]} 的游戏没有接入游戏锁（旧版程序？），等它退出", f"legacy {old[0]}"
+                        reason, key = f"the game with pid {old[0]} does not use the game lock (old build?), waiting for it to exit", f"legacy {old[0]}"
                 now = time.monotonic()
                 if key != last or now - last_t >= 30:
-                    self.log(f"[game-slot] 等待游戏位置：{reason}")
+                    self.log(f"[game-slot] waiting for the game slot: {reason}")
                     last, last_t = key, now
                 time.sleep(1 + random.random() * 0.2)
         except BaseException:
@@ -264,7 +264,7 @@ class GameSlot:
         waited = int(time.monotonic() - started)
         history(d, "acquire", self.owner, self.purpose, f"waited_s={waited}")
         if waited:
-            self.log(f"[game-slot] 取得游戏位置（{self.owner}，{self.purpose}），等了 {waited} 秒")
+            self.log(f"[game-slot] got the game slot ({self.owner}, {self.purpose}), waited {waited} s")
 
     def release(self):
         if self.fd is None:
@@ -351,9 +351,9 @@ def cmd_run(args):
                 code = process.wait()
         if slot.preempted:
             if args.no_retry:
-                print("[game-slot] 被用户的游戏打断（退出 75）", file=sys.stderr, flush=True)
+                print("[game-slot] interrupted by the user's game (exit 75)", file=sys.stderr, flush=True)
                 return EX_PREEMPTED
-            print("[game-slot] 被用户的游戏打断；等游戏位置空出来后重跑同一个测试", file=sys.stderr, flush=True)
+            print("[game-slot] interrupted by the user's game; rerunning the same test once the game slot is free", file=sys.stderr, flush=True)
             continue
         return code if code >= 0 else 128 - code
 

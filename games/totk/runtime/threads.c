@@ -106,7 +106,7 @@ static uint32_t h_new(int type, void *obj) {     // caller holds G
         g_h[i].type = type; g_h[i].obj = obj; g_hlin[i] = lin;
         return ((uint32_t)lin << 15) | (uint32_t)i;
     }
-    die("句柄表满");
+    die("handle table full");
 }
 static uint64_t g_stale_handles;
 static unsigned h_index(uint32_t h) {            // slot of a live handle, 0 when the value names none
@@ -122,7 +122,7 @@ static unsigned h_index(uint32_t h) {            // slot of a live handle, 0 whe
 #else
 static uint32_t h_new(int type, void *obj) {     // 调用方持 G | Caller holds G
     for (int i = 1; i < MAX_H; i++) if (!g_h[i].type) { g_h[i].type = type; g_h[i].obj = obj; return 0x1000 + i; }
-    die("句柄表满");
+    die("handle table full");
 }
 #endif
 static void *h_peek(uint32_t h, int type) {      // 只查不报 | Lookup only, no report
@@ -137,12 +137,12 @@ static void *h_peek(uint32_t h, int type) {      // 只查不报 | Lookup only, 
 }
 static void *h_get(uint32_t h, int type) {       // 查不到即报（句柄错是真错误） | Reports if not found (a wrong handle is a real error)
     void *o = h_peek(h, type);
-    if (!o) LOG("句柄无效 %#x（要类型 %d）", h, type);
+    if (!o) LOG("invalid handle %#x (wanted type %d)", h, type);
     return o;
 }
 static thr_t *cur(void) {
     thr_t *t = (g_keythr ? pthread_getspecific(g_keythr) : NULL);
-    if (!t) die("非客体线程调用了线程 SVC");
+    if (!t) die("thread SVC called from a non-guest thread");
     return t;
 }
 
@@ -485,7 +485,7 @@ static void *thread_main(void *p) {
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); core_take(t); pthread_mutex_unlock(&G);
     { volatile char marker = 0; runtime_hle_stack_set((uintptr_t)&marker - 1024); }   // host services of this thread run below this frame
     dm_thread_enter(t->entry, t->arg, t->stack_top,t->host_context);   // 不返回：客体须经 ExitThread 退出 | Does not return: the guest must exit through ExitThread
-    die("客体线程入口返回");
+    die("guest thread entry returned");
 }
 static void thr_free(thr_t *t) {   // 持 G；从全部线程链摘下并释放 | Holding G; unlink from the all-threads chain and free
     for (thr_t **p = &g_all; *p; p = &(*p)->all) if (*p == t) { *p = t->all; break; }
@@ -510,7 +510,7 @@ static _Noreturn void thread_exit(thr_t *t) {
  if(t->host_context[0])runtime_thread_leave(t->host_context,t,thread_exit_on_host);
  thread_exit_on_host(t);
 }
-void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon 要求 ExitThread）"); }
+void dm_thread_returned(void) { die("guest thread entry function returned (Horizon requires ExitThread)"); }
 
 // 主线程登记，返回其句柄（交给 nnosInitialize 作主线程句柄）
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
@@ -845,7 +845,7 @@ int svc_thread(int num, uint64_t *regs) {
                    : (h_peek(h, O_EVENT_W) ? h_peek(h, O_EVENT_W) : h_peek(h, O_EVENT_R));
         int64_t r = 0;
         if (!e) { r = (num == 0x17 && h_peek(h, O_THREAD)) ? R_BAD_STATE : R_BAD_HANDLE;
-                  if (r == R_BAD_HANDLE) LOG("事件 SVC %#x 句柄无效 %#x", num, h); }
+                  if (r == R_BAD_HANDLE) LOG("event SVC %#x: invalid handle %#x", num, h); }
         else if (num == 0x11) { e->signaled = 1; wake_sync_waiters(); }
         else if (num == 0x17 && !e->signaled) r = R_BAD_STATE;
         else e->signaled = 0;
@@ -919,15 +919,15 @@ int svc_thread(int num, uint64_t *regs) {
 void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线程上调（要执行 SDK 代码） | Must be called on a guest thread (it has to execute SDK code)
     pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
     if (wh) return;
-    if (!(g_keythr ? pthread_getspecific(g_keythr) : NULL)) die("hle_bind_system_event 须在客体线程上调用");
+    if (!(g_keythr ? pthread_getspecific(g_keythr) : NULL)) die("hle_bind_system_event must be called on a guest thread");
     static uint32_t (*create)(void *, int, int); static uint32_t (*getw)(const void *);
     if (!create) { create = guest_sym("_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb");
                    getw = guest_sym("_ZN2nn2os30GetWritableHandleOfSystemEventEPKNS0_15SystemEventTypeE"); }
     uint32_t r = create(ev, autoclear, 1);
-    if (r) die("CreateSystemEvent 失败 %#x", r);
+    if (r) die("CreateSystemEvent failed %#x", r);
     wh = getw(ev);
     pthread_mutex_lock(&g_se_lock);
-    if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent 绑定表满");
+    if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent binding table full");
     g_se[g_nse].ev = ev; g_se[g_nse++].wh = wh;
     pthread_mutex_unlock(&g_se_lock);
 }
@@ -943,17 +943,17 @@ void hle_signal_system_event(void *ev) {
         pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
         if (wh) {
             event_t *e = h_get(wh, O_EVENT_W);
-            if (!e) die("SystemEvent 写端句柄失效 %#x", wh);
+            if (!e) die("SystemEvent write-end handle invalid %#x", wh);
             e->signaled = 1; wake_sync_waiters();
             pthread_mutex_unlock(&G);
             return;
         }
         int guest = (g_keythr ? pthread_getspecific(g_keythr) : NULL) != NULL;
-        if (!guest && g_se_skipped++ < 8) LOG("SystemEvent %p 未绑定（游戏已销毁），宿主线程的触发跳过 | not bound (destroyed by the game): signal from a host thread skipped", ev);
+        if (!guest && g_se_skipped++ < 8) LOG("SystemEvent %p not bound (destroyed by the game): signal from a host thread skipped", ev);
         pthread_mutex_unlock(&G);
         if (!guest) return;
-        if (bound) die("SystemEvent %p 绑定后仍查不到 | still not bound after binding", ev);
-        hle_bind_system_event(ev, 0);   // 执行客体代码（其 SVC 要取 G）：不能持 G | runs guest code (its SVCs take G): not under G
+        if (bound) die("SystemEvent %p still not bound after binding", ev);
+        hle_bind_system_event(ev, 0);   // runs guest code (its SVCs take G): not under G
     }
 }
 

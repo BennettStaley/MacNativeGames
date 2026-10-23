@@ -32,7 +32,7 @@ static const char *k_rx_msl =
 "vertex VO rx_vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); VO o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
 "struct K { float4x4 M; uint hole; float amount; float2 pad; };\n"
 "static float4 cr_w(float t) { return float4(((-0.5 * t + 1.0) * t - 0.5) * t, (1.5 * t - 2.5) * t * t + 1.0, ((-1.5 * t + 2.0) * t + 0.5) * t, (0.5 * t - 0.5) * t * t); }\n"
-"static uint stv(texture2d<uint> s, int2 p) { uint4 v = s.read(uint2(p)); return v.r | v.g; }\n"   // X32_Stencil8 视图：模板值在哪个分量随实现，r | g 两处都取（另一处为 0） | X32_Stencil8 view: which component holds the stencil value is implementation-dependent, take both r | g (the other one is 0)
+"static uint stv(texture2d<uint> s, int2 p) { uint4 v = s.read(uint2(p)); return v.r | v.g; }\n"   // X32_Stencil8 view: which component holds the stencil value is implementation-dependent, take both r | g (the other one is 0)
 "static float zproj(float4x4 M, float2 p, float z, int W, int H) { float4 c = M * float4((p.x + 0.5) / W * 2 - 1, 1 - (p.y + 0.5) / H * 2, z, 1); return c.z / c.w; }\n"
 "struct O1 { float4 c [[color(0)]]; float d [[depth(any)]]; uint s [[stencil]]; };\n"
 "fragment O1 rx_fs1(VO in [[stage_in]], texture2d<float> hdr [[texture(0)]], depth2d<float> dep [[texture(1)]], texture2d<uint> stc [[texture(2)]], constant K& k [[buffer(0)]]) {\n"
@@ -52,13 +52,13 @@ static const char *k_rx_msl =
 "  if (!(s4 & k.hole)) {\n"
 "    float3 t00 = hdr.read(uint2(b0)).rgb, t10 = hdr.read(uint2(b0 + int2(1, 0))).rgb, t01 = hdr.read(uint2(b0 + int2(0, 1))).rgb, t11 = hdr.read(uint2(b0 + int2(1, 1))).rgb;\n"
 "    float3 lo = min(min(t00, t10), min(t01, t11)), hc = max(max(t00, t10), max(t01, t11)), avg = (t00 + t10 + t01 + t11) * 0.25;\n"
-"    float2 sp = p + 0.5; float2 tp1 = floor(sp - 0.5) + 0.5; float2 f = sp - tp1;\n"   // 五抽头 Catmull-Rom（双线性取样合并中间两抽头、丢四角） | Five-tap Catmull-Rom (bilinear sampling merges the two middle taps, the four corners are dropped)
+"    float2 sp = p + 0.5; float2 tp1 = floor(sp - 0.5) + 0.5; float2 f = sp - tp1;\n"   // Five-tap Catmull-Rom (bilinear sampling merges the two middle taps, the four corners are dropped)
 "    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f), w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);\n"
 "    float2 w12 = w1 + w2, t12 = tp1 + w2 / w12, t0 = tp1 - 1.0, t3 = tp1 + 2.0;\n"
 "    float3 acc = hdr.sample(ls, float2(t12.x, t0.y)).rgb * (w12.x * w0.y) + hdr.sample(ls, float2(t0.x, t12.y)).rgb * (w0.x * w12.y) + hdr.sample(ls, t12).rgb * (w12.x * w12.y)\n"
 "               + hdr.sample(ls, float2(t3.x, t12.y)).rgb * (w3.x * w12.y) + hdr.sample(ls, float2(t12.x, t3.y)).rgb * (w12.x * w3.y);\n"
 "    float wt = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y; float3 cr = clamp(acc / wt, lo, hc);\n"
-"    o.c = float4(max(cr + k.amount * (cr - avg), 0.0), 1); o.d = zproj(k.M, p, dep.read(uint2(cp)), W, H); return o; }\n"   // 按小数相位补锐化并进同一趟（邻域取 2×2 核心的均值） | Sharpening compensation by fractional phase is folded into the same pass (the neighborhood takes the mean of the 2×2 core)
+"    o.c = float4(max(cr + k.amount * (cr - avg), 0.0), 1); o.d = zproj(k.M, p, dep.read(uint2(cp)), W, H); return o; }\n"   // Sharpening compensation by fractional phase is folded into the same pass (the neighborhood takes the mean of the 2×2 core)
 "  const int2 dirs[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1) };\n"
 "  float3 sum = 0; float wsum = 0; int bestr = 1000; int2 bests = cp;\n"
 "  for (int d = 0; d < 8; d++) for (int r = 1; r <= 24; r++) { int2 s = cp + dirs[d] * (4 * r);\n"
@@ -70,16 +70,16 @@ static const char *k_rx_msl =
 "  o.c = float4(hdr.read(uint2(cp)).rgb, 1); o.d = zproj(k.M, p, dep.read(uint2(cp)), W, H); return o;\n"
 "}\n";
 static int rx_setup(MTLPixelFormat fc, MTLPixelFormat fds) {
-    if (getenv("DM_RT_TEST_NOPSO")) return 0;   // 测试：当作这台设备建不出外推管线（验整局退回原画法） | Test: pretend this device cannot build the extrapolation pipeline (verifies the whole run falls back to the original drawing method)
+    if (getenv("DM_RT_TEST_NOPSO")) return 0;   // Test: pretend this device cannot build the extrapolation pipeline (verifies the whole run falls back to the original drawing method)
     if (g_rx_pso1 && g_rx_fmt_c == fc && g_rx_fmt_ds == fds) return 1;
     static int failed; if (failed) return 0;
     NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(k_rx_msl) options:nil error:&e];
-    if (!lib) { MLOG("【红】运行时外推：着色器编译失败 %s", e.localizedDescription.UTF8String); failed = 1; return 0; }
+    if (!lib) { MLOG("[red] runtime extrapolation: shader compile failed %s", e.localizedDescription.UTF8String); failed = 1; return 0; }
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = [lib newFunctionWithName:@"rx_vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"rx_fs1"];
     pd.colorAttachments[0].pixelFormat = fc; pd.depthAttachmentPixelFormat = fds;
     if (fds == MTLPixelFormatDepth32Float_Stencil8) pd.stencilAttachmentPixelFormat = fds;
     g_rx_pso1 = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
-    if (!g_rx_pso1) { MLOG("【红】运行时外推：管线建不出 %s", e.localizedDescription.UTF8String); g_rx_pso1 = nil; failed = 1; return 0; }
+    if (!g_rx_pso1) { MLOG("[red] runtime extrapolation: pipeline cannot be built %s", e.localizedDescription.UTF8String); g_rx_pso1 = nil; failed = 1; return 0; }
     MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new]; dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES;
     if (fds == MTLPixelFormatDepth32Float_Stencil8) { MTLStencilDescriptor *sd = [MTLStencilDescriptor new]; sd.stencilCompareFunction = MTLCompareFunctionEqual; sd.readMask = 0x2; sd.writeMask = 0x80; sd.depthStencilPassOperation = MTLStencilOperationReplace;   // 洞 / 屏外新进来的像素由片元导出 0x80，后面 LDR 区域据此重算   // 本帧被界面挡住的像素（界面模板趟已写 0x2）不算 | Hole pixels / pixels newly entering from off-screen get 0x80 exported by the fragment, and the later LDR region is recomputed accordingly   // Pixels covered by this frame's UI (the UI stencil pass already wrote 0x2) do not count
         dd.frontFaceStencil = sd; dd.backFaceStencil = sd; }
@@ -87,8 +87,8 @@ static int rx_setup(MTLPixelFormat fc, MTLPixelFormat fds) {
     if (!g_rx_args) { MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 3; ad.maxBufferBindCount = 1;
         g_rx_args = [g_dev newArgumentTableWithDescriptor:ad error:&e];
         for (int i = 0; i < 3; i++) { g_rx_const[i] = [g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared]; res_add(g_rx_const[i]); } }
-    if (!g_rx_args || !g_rx_dss) { MLOG("【红】运行时外推：参数表 / 深度状态建不出"); g_rx_pso1 = nil; failed = 1; return 0; }
-    g_rx_fmt_c = fc; g_rx_fmt_ds = fds; MLOG("运行时外推：着色器建好（颜色格式 %lu，深度格式 %lu）", (unsigned long)fc, (unsigned long)fds);
+    if (!g_rx_args || !g_rx_dss) { MLOG("[red] runtime extrapolation: argument table / depth state cannot be built"); g_rx_pso1 = nil; failed = 1; return 0; }
+    g_rx_fmt_c = fc; g_rx_fmt_ds = fds; MLOG("runtime extrapolation: shaders built (colour format %lu, depth format %lu)", (unsigned long)fc, (unsigned long)fds);
     return 1;
 }
 static void rx_inv4(const double *m, double *o) {   // 4×4 求逆（伴随矩阵法，双精度） | 4×4 inverse (adjugate method, double precision)
@@ -121,7 +121,7 @@ int rt_ex_encode(id<MTLTexture> dst_hdr, id<MTLTexture> dst_ds, id<MTLTexture> s
     if (g_rx_stv_src != src_ds) {
         if (g_rx_stv) defer_obj_release(g_rx_stv);
         g_rx_stv = [src_ds newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
-        if (!g_rx_stv) { static int n; if (!n++) MLOG("【红】运行时外推：开不出模板视图（src_ds 要带 PixelFormatView 用途）"); return 0; }
+        if (!g_rx_stv) { static int n; if (!n++) MLOG("[red] runtime extrapolation: cannot make a stencil view (src_ds needs PixelFormatView usage)"); return 0; }
         res_add(g_rx_stv); g_rx_stv_src = src_ds;
     }
     // 常量：M = inv(vp_prev) · vp_cur（行向量：clip_cur = (ndc_prev, z, 1) · M）；Metal 的 float4x4 按列存，行向量矩阵的第 i 行正好当第 i 列 ⇒ 着色器里写 M * v

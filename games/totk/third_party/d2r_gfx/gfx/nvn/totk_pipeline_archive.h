@@ -104,7 +104,7 @@ static void par_ga_remove_new(NSSet<NSString *> *before) {
     for (NSString *path in made) {
         NSError *e = nil;
         if ([NSFileManager.defaultManager removeItemAtPath:path error:&e]) atomic_fetch_add(&g_par_ga_removed, 1);
-        else { static _Atomic int said; if (atomic_fetch_add(&said, 1) < 4) MLOG("【红】管线存档：删不掉 Metal 留下的工作目录 %s（%s）", path.UTF8String, e.localizedDescription.UTF8String); }
+        else { static _Atomic int said; if (atomic_fetch_add(&said, 1) < 4) MLOG("[red] pipeline archive: cannot delete the work directory Metal left at %s (%s)", path.UTF8String, e.localizedDescription.UTF8String); }
     }
 }
 // Once: the folder of this OS version, GPU and chain, and the keys it has files for.
@@ -121,8 +121,8 @@ static void par_open_dir(id<MTLDevice> dev) {
             for (NSString *path in par_ga_list(1)) if ([NSFileManager.defaultManager removeItemAtPath:path error:nil]) n++;
             pthread_mutex_unlock(&g_par_wmu);
             NSMutableArray *where = [NSMutableArray array];
-            for (NSDictionary *d in par_ga_dirs()) [where addObject:[NSString stringWithFormat:@"%@（%@）", d[@"path"], [d[@"own"] boolValue] ? @"本 App 的" : @"共用"]];
-            MLOG("管线存档：Metal 的工作目录查这些：%s；启动时删掉以前留下的 %lu 个", [where componentsJoinedByString:@"，"].UTF8String, (unsigned long)n);
+            for (NSDictionary *d in par_ga_dirs()) [where addObject:[NSString stringWithFormat:@"%@ (%@)", d[@"path"], [d[@"own"] boolValue] ? @"this app's" : @"shared"]];
+            MLOG("pipeline archive: Metal work directories checked: %s; deleted %lu left from earlier at start", [where componentsJoinedByString:@", "].UTF8String, (unsigned long)n);
         });
         NSString *stamp_path = [par_dir() stringByAppendingPathComponent:@"identity.json"];
         NSData *sd = [NSData dataWithContentsOfFile:stamp_path];
@@ -130,7 +130,7 @@ static void par_open_dir(id<MTLDevice> dev) {
         [fm removeItemAtPath:[totk_rt_dir() stringByAppendingPathComponent:@"pipelines.metalarchive"] error:nil];   // layouts of earlier tests
         [fm removeItemAtPath:[totk_rt_dir() stringByAppendingPathComponent:@"pipelines.json"] error:nil];
         if (![stamp isEqual:par_identity(dev)] && [fm fileExistsAtPath:par_dir()]) {
-            if (stamp) MLOG("管线存档：系统版本、GPU 或翻译链变了，删掉重建");
+            if (stamp) MLOG("pipeline archive: OS version, GPU or translation chain changed; deleting and rebuilding");
             [fm removeItemAtPath:par_dir() error:nil];
         }
         [fm createDirectoryAtPath:par_dir() withIntermediateDirectories:YES attributes:nil error:nil];
@@ -141,8 +141,8 @@ static void par_open_dir(id<MTLDevice> dev) {
             bytes += [[fm attributesOfItemAtPath:[par_dir() stringByAppendingPathComponent:name] error:nil] fileSize];
         }
         g_par_on = 1; g_par_valid = g_par_have.count > 0;
-        if (g_par_valid) MLOG("管线存档：%lu 条管线各有一个文件（共 %.1f MB），用到哪条才打开哪条", (unsigned long)g_par_have.count, bytes / 1048576.0);
-        else MLOG("管线存档：还没有，这次%s", par_fill_light() ? "在后台把管线清单收进存档（不常驻）" : "边玩边收（游戏空闲时在后台写）");
+        if (g_par_valid) MLOG("pipeline archive: %lu pipelines, one file each (%.1f MB total), each opened only when used", (unsigned long)g_par_have.count, bytes / 1048576.0);
+        else MLOG("pipeline archive: none yet; this run %s", par_fill_light() ? "collects the pipeline list into the archive in the background (not resident)" : "collects during play (written in the background while the game is idle)");
     });
 }
 // The archive with this pipeline's code, or nil (no file yet; off).
@@ -178,10 +178,10 @@ static void par_write(id<MTLDevice> dev, NSString *key, id desc) {
     par_ga_remove_new(before);
     pthread_mutex_unlock(&g_par_wmu);
     if (!ok) { unlink(temp.fileSystemRepresentation);
-               if (atomic_fetch_add(&g_par_write_failed, 1) < 4) MLOG("【红】管线存档：写不了（%s）", e ? e.localizedDescription.UTF8String : "改名失败"); return; }
+               if (atomic_fetch_add(&g_par_write_failed, 1) < 4) MLOG("[red] pipeline archive: cannot write (%s)", e ? e.localizedDescription.UTF8String : "rename failed"); return; }
     pthread_mutex_lock(&g_par_mu); [g_par_have addObject:key]; pthread_mutex_unlock(&g_par_mu);
     uint64_t n = atomic_fetch_add(&g_par_written, 1) + 1;
-    if (n % 500 == 0) MLOG("管线存档：这次已写 %llu 条（删掉 Metal 留下的工作目录 %llu 个）", (unsigned long long)n, (unsigned long long)atomic_load(&g_par_ga_removed));
+    if (n % 500 == 0) MLOG("pipeline archive: %llu written this run (deleted %llu work directories Metal left)", (unsigned long long)n, (unsigned long long)atomic_load(&g_par_ga_removed));
 }
 enum { PAR_IDLE_NS = 3000000000u };
 static _Atomic uint64_t g_par_last_compile_ns;   // set by pso_new / cs_new when they compiled

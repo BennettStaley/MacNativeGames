@@ -23,7 +23,7 @@ LOG = Path.home()/'Library/Logs/MacNativeGames/totk.log'
 
 
 def startup_facts(text, mode, expected):
-    discovery = re.findall(r'\[shader-seed\].*?着色器 (\d+) 个，导入 (\d+) 个文件', text)
+    discovery = re.findall(r'\[shader-seed\].*?found (\d+) shaders prepared with the app, imported (\d+) files', text)
     priority = re.findall(r'Startup-critical pipelines ready: waited (\d+) ms, (\d+) shaders / (\d+) render pipelines / (\d+) compute pipelines', text)
     first, ready, user = (text.find(s) for s in ('first presented frame', 'Startup-critical pipelines ready:', '[input] user input'))
     return dict(discovery=[list(map(int, x)) for x in discovery],
@@ -93,7 +93,7 @@ def trial(app, output, mode, cache, profile, expected, timeout=1800):
             check()
             if not (output/'title.png').exists():
                 raise RuntimeError('title screenshot did not complete')
-            discovered = re.findall(r'\[shader-seed\].*?着色器 (\d+) 个，导入 (\d+) 个文件', text)
+            discovered = re.findall(r'\[shader-seed\].*?found (\d+) shaders prepared with the app, imported (\d+) files', text)
             warm = re.findall(r'Pipeline warm-up done: (\d+) shaders / (\d+) render pipelines.*?/ (\d+) compute pipelines', text)
             priority = re.findall(r'Startup-critical pipelines ready: waited (\d+) ms, (\d+) shaders / (\d+) render pipelines / (\d+) compute pipelines', text)
             report.update(discovery=[list(map(int, x)) for x in discovered],
