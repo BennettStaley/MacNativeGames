@@ -22,6 +22,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include "totk_taa.h"
+#include <TargetConditionals.h>
+
+#if TARGET_OS_VISION
+/* visionOS has no MetalFX temporal scaler: anti-aliasing stays off there (it is off by default everywhere, key 5). */
+int taa_enabled(void) { return 0; }
+int taa_active(void) { return 0; }
+int taa_ready(void) { return 0; }
+void taa_toggle(void) {}
+int taa_pass(MTL4RenderPassDescriptor *pd) { (void)pd; return 0; }
+int taa_jittered(void) { return 0; }
+void taa_jitter(double *x, double *y) { *x = 0; *y = 0; }
+void taa_note_camera(const float *cam, int n) { (void)cam; (void)n; }
+id<MTLTexture> taa_encode(id<MTL4CommandBuffer> cb, id<MTLTexture> scene) { (void)cb; (void)scene; return nil; }
+id<MTLResidencySet> taa_residency(void) { return nil; }
+void taa_frame_end(void) {}
+void taa_stats(char *out, size_t n) { snprintf(out, n, "not available on visionOS"); }
+#else
 
 #define TLOG(...) do { fprintf(stderr, "[dm] [nvn-mtl] [taa] " __VA_ARGS__); fputc('\n', stderr); } while (0)
 /* Per-frame parameter buffers and argument tables: the replay can encode several frames before the GPU runs the first
@@ -42,7 +59,8 @@ static struct {
     unsigned jit_i; double jx, jy;
     __unsafe_unretained id<MTLTexture> last_src; uint64_t frame, encoded_frame;
     uint64_t done, resets, missing;
-    struct { id obj; uint64_t frame; } old[TAA_OLD * 3]; int nold;
+    /* Each size change retires the scaler and five textures. Keep every one alive for the in-flight frames. */
+    struct { id obj; uint64_t frame; } old[TAA_OLD * 6]; int nold;
 } g;
 static void keep_old(id obj) {   // released (and dropped from the residency set) TAA_OLD frames later, when the GPU is done with it
     if (!obj) return;
@@ -279,3 +297,5 @@ void taa_stats(char *out, size_t n) {
     snprintf(out, n, "frame %llu: anti-aliased %llu, history resets %llu, without depth or camera %llu",
              (unsigned long long)g.frame, (unsigned long long)g.done, (unsigned long long)g.resets, (unsigned long long)g.missing);
 }
+
+#endif   // TARGET_OS_VISION

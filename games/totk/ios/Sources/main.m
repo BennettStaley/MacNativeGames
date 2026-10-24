@@ -2,6 +2,7 @@
 #import <AVFAudio/AVFAudio.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <GameController/GameController.h>
+#include <TargetConditionals.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -19,6 +20,7 @@
 
 int totk_host_main(int argc, char **argv);
 void runtime_ios_attach_layer(CAMetalLayer *layer, UIView *host);
+void runtime_ios_sync_drawable(UIView *host);
 static char *host_argv[3];
 static NSString *g_no_game_data;   // set when there is no RomFS image to play from (didFinishLaunching)
 static NSString *g_seed_pack, *g_seed_unpack_to;   // a pushed shader pack to unpack before the game starts (seed_unpack)
@@ -77,6 +79,9 @@ void runtime_shortcut_help_toggle(void) {}
 @interface TOTKMetalView : UIView @end
 @implementation TOTKMetalView
 + (Class)layerClass { return CAMetalLayer.class; }
+#if TARGET_OS_VISION
+- (void)layoutSubviews { [super layoutSubviews]; runtime_ios_sync_drawable(self); }
+#endif
 @end
 
 /* Settings changes made outside the menu (none yet) reach the app's views the same way as the menu's own. */
@@ -121,6 +126,12 @@ static void settings_changed(const char *key, int value) {
     self.view.backgroundColor = UIColor.blackColor;
     self.gameView = [[TOTKMetalView alloc] initWithFrame:self.view.bounds];
     self.gameView.autoresizingMask = UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
+#if TARGET_OS_VISION
+    // Keep gamepad actions in GameController instead of visionOS converting them to pinch events.
+    GCEventInteraction *controllerInput = [GCEventInteraction new];
+    controllerInput.handledEventTypes = GCUIEventTypeGamepad;
+    [self.gameView addInteraction:controllerInput];
+#endif
     [self.view addSubview:self.gameView];
     runtime_ios_attach_layer((CAMetalLayer *)self.gameView.layer, self.gameView);
     TOTKTouchPad *pad=[[TOTKTouchPad alloc] initWithFrame:self.view.bounds];pad.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;[self.view addSubview:pad];
@@ -197,6 +208,13 @@ static void settings_changed(const char *key, int value) {
     if (![scene isKindOfClass:UIWindowScene.class]) return;
     self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
     self.window.rootViewController = [TOTKGameController new]; [self.window makeKeyAndVisible];
+#if TARGET_OS_VISION
+    UIWindowSceneGeometryPreferencesVision *prefs = [[UIWindowSceneGeometryPreferencesVision alloc] initWithSize:CGSizeMake(1280, 720)];
+    prefs.resizingRestrictions = UIWindowSceneResizingRestrictionsUniform;
+    [(UIWindowScene *)scene requestGeometryUpdateWithPreferences:prefs errorHandler:^(NSError *error) {
+        fprintf(stderr, "[totk] 16:9 window refused: %s\n", error.localizedDescription.UTF8String);
+    }];
+#endif
 }
 @end
 
@@ -297,7 +315,15 @@ static void audio_observe(void) {
         g_no_game_data = @"No shaders. Install the game again from the Mac with ios/tools/install_device.py (it copies them to the device).";
         fprintf(stderr, "[totk] no shader seed: %s\n", g_no_game_data.UTF8String);
     }
+#if TARGET_OS_VISION
+    setenv("TOTK_OPERATION_MODE","docked",1);
+    setenv("TOTK_IOS_DRAWABLE_H","1080",0);
+    setenv("TOTK_RENDER_RES","1600x900",0);   // avoid the iPhone's default 960x540 in 1.4.3
+    setenv("TOTK_MFX_UPSCALE","0",0);
+    setenv("TOTK_FPS_OVERLAY","0",0);
+#else
     setenv("TOTK_OPERATION_MODE","handheld",1);
+#endif
     // Game language: the Settings app (Settings.bundle › TOTK_LANG) stores the choice in our defaults; empty means the
     // system language, which is what the runtime already follows. iOS 27 does not honour Info.plist LSEnvironment, so
     // the value must be applied here. overwrite=0 keeps devicectl --environment-variables winning when testing from the Mac.
