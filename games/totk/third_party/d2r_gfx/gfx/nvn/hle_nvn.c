@@ -617,10 +617,33 @@ static int synclog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK
    - samples passed (occlusion queries): real fence (they drive object culling); TOTK_FIF_COUNTERS=1 lags them as well.
    - a pool with pages no tracking range covers, a virtual pool whose physical storage could not be guarded, a pool set
      overflow, or a submission whose flags were not recorded: real fence.
-   Synchronous replay only (the translation thread's tokens are not lagged). TOTK_FIF_GUARD=0: the old unguarded
+   With the translation thread (TOTK_ASYNC_REPLAY=1) the newest token fence is lagged too (fif_target_tok, TOTK_FENCE_LAG
+   below). TOTK_FIF_GUARD=0: the old unguarded
    measurement mode; TOTK_FIF_AUDIT=1: guarded pages and readbacks only count what would have waited (unsafe, answers
    whether TOTK multi-buffers its dynamic data). */
-static int fif_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_FRAMES_IN_FLIGHT"); v = e ? atoi(e) : 1; if (v > 1) LOG("[nvn] TOTK_FRAMES_IN_FLIGHT=%d: fence waits on the newest submission wait for the previous frame's fence (experimental)", v); } return v; }
+/* TOTK_FENCE_LAG (default 0 = off): the frame fence answered one frame late with the translation thread, after
+   DavidZande a92fa74 / 198669e (M1 Pro, busy area: 54.0 -> 59.7 FPS) but with the frames-in-flight guard of this file.
+   It is shorthand, applied before anything reads the environment: TOTK_FENCE_LAG=1 or 2 sets TOTK_ASYNC_REPLAY=1 and
+   TOTK_FRAMES_IN_FLIGHT=2 unless they are set already (an explicit TOTK_ASYNC_REPLAY=0 leaves the lag synchronous).
+   The value picks how far the lagged token wait goes (fif_target_tok):
+     1 (also the mode for TOTK_FRAMES_IN_FLIGHT=2 with TOTK_ASYNC_REPLAY=1 and no TOTK_FENCE_LAG): the wait still lets the
+       translation thread finish replaying the newest submission, so its pools are write-guarded and its classes known
+       before the game goes on; then it waits only for the previous submission's GPU work. Same guarantees as the
+       synchronous TOTK_FRAMES_IN_FLIGHT=2.
+     2 (DavidZande's semantics): the wait returns once the previous submission is replayed and done, while the newest is
+       still queued or being replayed. Its pools are guarded only from its commit on, so a CPU write before that can be
+       seen by its replay / GPU work one frame early (uniforms are captured at the submit call and are not affected);
+       its classes are predicted from the last replayed submission. Retired recording copies are kept until the queued
+       submissions ran (copy_free). */
+static int g_fence_lag = -1;
+__attribute__((constructor)) static void fence_lag_env(void) {
+    const char *e = getenv("TOTK_FENCE_LAG"); g_fence_lag = e ? atoi(e) : 0;
+    if (g_fence_lag < 0 || g_fence_lag > 2) g_fence_lag = 0;
+    if (g_fence_lag) { setenv("TOTK_ASYNC_REPLAY", "1", 0); setenv("TOTK_FRAMES_IN_FLIGHT", "2", 0); }
+}
+static int fence_lag_mode(void) { return g_fence_lag == 2 ? 2 : 1; }
+static int fif_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_FRAMES_IN_FLIGHT"); v = e ? atoi(e) : 1; if (v > 1) { const char *a = getenv("TOTK_ASYNC_REPLAY"); LOG("[nvn] TOTK_FRAMES_IN_FLIGHT=%d: fence waits on the newest submission wait for the previous frame's fence (experimental)%s", v,
+        !a || atoi(a) <= 0 ? "" : fence_lag_mode() == 2 ? "; translation thread: the newest replay overlaps the game's next frame (TOTK_FENCE_LAG=2)" : "; translation thread: the wait still covers the newest replay (TOTK_FENCE_LAG=1)"); } } return v; }
 int fif_guard_on(void);
 void mtl_counter_stats(uint64_t rep[32], uint64_t rst[32]); const char *cnt_type_name(uint64_t t);
 /* Wait outcomes: 0 lagged (no flag), 1 lagged over timestamp / statistics reports, then the fallbacks to the real fence:
@@ -628,6 +651,9 @@ void mtl_counter_stats(uint64_t rep[32], uint64_t rst[32]); const char *cnt_type
    backing, 6 pool set overflow, 7 flags not recorded. */
 enum { FW_LAG, FW_LAG_STAT, FW_FB_OCCL, FW_FB_STAT, FW_FB_UNG, FW_FB_VIRT, FW_FB_OVER, FW_FB_NOREC, FW_N };
 static _Atomic uint64_t g_fw[FW_N];
+/* Translation-thread lag (fif_target_tok): lagged token waits, of them waits for the newest replay (mode 1) and their
+   time, returns before the newest submission was replayed (mode 2), class decisions predicted from an earlier one. */
+static _Atomic uint64_t g_ftk_lag, g_ftk_rwait, g_ftk_rwait_ns, g_ftk_early, g_ftk_pred;
 static void fif_log(void) {
     static uint64_t last_w[FW_N], last_g[6], last_m[MTL_FIF_NSTAT], last_a, last_add[3], last_rep[32]; static uint64_t t_last; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     uint64_t now = now_ns();
@@ -653,6 +679,10 @@ static void fif_log(void) {
     LOG("[fif]   guard: %llu fault waits (%.3f a frame, %.3f ms a frame, %llu over 2 s); readbacks of in-flight GPU writes %llu of %llu checked (%.3f ms a frame, %llu for a whole submission), %llu early-commit shaders; completion writes skipped as stale %llu",
         (unsigned long long)(g[0] - last_g[0]), (g[0] - last_g[0]) / nf, (g[1] - last_g[1]) / 1e6 / nf, (unsigned long long)(g[2] - last_g[2]),
         (unsigned long long)(m[5] - last_m[5]), (unsigned long long)(m[4] - last_m[4]), (m[6] - last_m[6]) / 1e6 / nf, (unsigned long long)(m[7] - last_m[7]), (unsigned long long)m[8], (unsigned long long)(m[9] - last_m[9]));
+    { static uint64_t l[5]; uint64_t c[5] = {atomic_load(&g_ftk_lag), atomic_load(&g_ftk_rwait), atomic_load(&g_ftk_rwait_ns), atomic_load(&g_ftk_early), atomic_load(&g_ftk_pred)};
+      if (c[0] != l[0] || c[1] != l[1]) LOG("[fif]   translation thread (TOTK_FENCE_LAG mode %d): %llu token waits lagged; %llu waited for the newest replay (%.3f ms a wait); %llu returned before it was replayed, %llu decided on predicted classes",
+          fence_lag_mode(), (unsigned long long)(c[0] - l[0]), (unsigned long long)(c[1] - l[1]), c[1] > l[1] ? (c[2] - l[2]) / 1e6 / (double)(c[1] - l[1]) : 0.0, (unsigned long long)(c[3] - l[3]), (unsigned long long)(c[4] - l[4]));
+      memcpy(l, c, sizeof c); }
     if (getenv("TOTK_FIF_AUDIT")) LOG("[fif] audit: %llu CPU writes to pages a submission in flight reads (%.2f a frame), sample pages %#llx %#llx %#llx %#llx; readbacks of in-flight GPU writes sample %#llx+%llu %#llx+%llu",
         (unsigned long long)(an - last_a), (an - last_a) / nf, (unsigned long long)as[0], (unsigned long long)as[1], (unsigned long long)as[2], (unsigned long long)as[3],
         (unsigned long long)smp[0][0], (unsigned long long)smp[0][1], (unsigned long long)smp[1][0], (unsigned long long)smp[1][1]);
@@ -660,10 +690,10 @@ static void fif_log(void) {
     memcpy(last_g, g, sizeof g); memcpy(last_m, m, sizeof m); last_a = an; memcpy(last_add, add, sizeof add); memcpy(last_rep, rep, sizeof rep); t_last = now;
     pthread_mutex_unlock(&mu);
 }
-static uint64_t fif_target(const NVNsync *s, uint64_t fence) {
-    static struct { const NVNsync *s; uint64_t prev; } t[8]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static _Atomic uint64_t n_lag;
-    static int cnt_mode = -2;   // TOTK_FIF_COUNTERS: -1 unset (lag timestamp / statistics, not occlusion), 0 lag none, 1 lag all
-    if (cnt_mode == -2) { const char *e = getenv("TOTK_FIF_COUNTERS"); cnt_mode = e ? (atoi(e) > 0) : -1; }
+/* The fence sync object s held one frame earlier (per-object table; fence itself when there is none). Fences and
+   translation-thread tokens are both increasing, and a process uses only one of the two. */
+static uint64_t fif_prev(const NVNsync *s, uint64_t fence) {
+    static struct { const NVNsync *s; uint64_t prev; } t[8]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     uint64_t r = fence;
     pthread_mutex_lock(&mu);
     int i = 0; while (i < 8 && t[i].s && t[i].s != s) i++;
@@ -671,23 +701,34 @@ static uint64_t fif_target(const NVNsync *s, uint64_t fence) {
     if (t[i].s == s && t[i].prev && t[i].prev < fence) r = t[i].prev;
     if (t[i].s != s || t[i].prev < fence) { t[i].s = s; t[i].prev = fence; }
     pthread_mutex_unlock(&mu);
-    if (r != fence && fif_guard_on()) {
-        uint32_t fl = mtl_fence_flags(r, fence); int why = FW_LAG;
-        if (fl & FIF_FL_NOREC) why = FW_FB_NOREC;
-        else if (fl & FIF_FL_OVER) why = FW_FB_OVER;
-        else if (fl & FIF_FL_UNG) why = FW_FB_UNG;
-        else if (fl & FIF_FL_VIRT) why = FW_FB_VIRT;
-        else if ((fl & FIF_FL_OCCL) && cnt_mode != 1) why = FW_FB_OCCL;
-        else if ((fl & FIF_FL_STAT) && cnt_mode == 0) why = FW_FB_STAT;
-        else if (fl & (FIF_FL_STAT | FIF_FL_OCCL)) why = FW_LAG_STAT;
-        atomic_fetch_add(&g_fw[why], 1);
-        if (why >= FW_FB_OCCL) r = fence;
-    }
+    return r;
+}
+/* Whether a wait may stop at Metal fence `after` instead of `upto`: decided by the classes of the submissions in
+   (after, upto] (fif_commit flags), counted in g_fw. */
+static int fif_lag_ok(uint64_t after, uint64_t upto) {
+    static int cnt_mode = -2;   // TOTK_FIF_COUNTERS: -1 unset (lag timestamp / statistics, not occlusion), 0 lag none, 1 lag all
+    if (cnt_mode == -2) { const char *e = getenv("TOTK_FIF_COUNTERS"); cnt_mode = e ? (atoi(e) > 0) : -1; }
+    uint32_t fl = mtl_fence_flags(after, upto); int why = FW_LAG;
+    if (fl & FIF_FL_NOREC) why = FW_FB_NOREC;
+    else if (fl & FIF_FL_OVER) why = FW_FB_OVER;
+    else if (fl & FIF_FL_UNG) why = FW_FB_UNG;
+    else if (fl & FIF_FL_VIRT) why = FW_FB_VIRT;
+    else if ((fl & FIF_FL_OCCL) && cnt_mode != 1) why = FW_FB_OCCL;
+    else if ((fl & FIF_FL_STAT) && cnt_mode == 0) why = FW_FB_STAT;
+    else if (fl & (FIF_FL_STAT | FIF_FL_OCCL)) why = FW_LAG_STAT;
+    atomic_fetch_add(&g_fw[why], 1);
+    return why < FW_FB_OCCL;
+}
+static uint64_t fif_target(const NVNsync *s, uint64_t fence) {
+    static _Atomic uint64_t n_lag;
+    uint64_t r = fif_prev(s, fence);
+    if (r != fence && fif_guard_on() && !fif_lag_ok(r, fence)) r = fence;
     if (r != fence) atomic_fetch_add(&n_lag, 1);
     if (fif_guard_on()) fif_log();
     else if (r != fence && atomic_load(&n_lag) % 6000 == 1) LOG("[nvn] frames in flight (unguarded): %llu fence waits moved one frame back", (unsigned long long)atomic_load(&n_lag));
     return r;
 }
+static int async_replay(void); static uint64_t x_sub_queued(void); static uint64_t fif_target_tok(const NVNsync *s, uint64_t tok);
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     NVN_BLOCKING();
     const sync_t *o = (const sync_t *)s;
@@ -696,6 +737,7 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     if (lg) { atomic_fetch_add(&g_sw_calls[k], 1); if (o->fence == mtl_last_fence()) atomic_fetch_add(&g_sw_newest[k], 1); }
     int tok = (o->fenced & 4) != 0;
     uint64_t fence = !tok && !k && fif_env() > 1 && o->fence == mtl_last_fence() ? fif_target(s, o->fence) : o->fence;
+    if (tok && !k && fif_env() > 1 && async_replay() && o->fence == x_sub_queued()) fence = fif_target_tok(s, o->fence);   /* translation thread: see fif_target_tok */
     if (tok ? fence_wait(fence, 0) : mtl_wait(fence, 0)) { survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
     uint64_t t0 = lg ? now_ns() : 0;
     totk_tl(TL_WAIT_IN, fence, fence == mtl_last_fence());
@@ -1060,13 +1102,33 @@ static void copy_touch(NVNcommandHandle h, uint64_t now) {
 }
 
 static uint64_t g_copy_drop_readd, g_copy_drop_token, g_copy_mark_faults;   /* why copies were released: their control memory was added again / their mark there is gone (of those: unmapped) */
+/* TOTK_FENCE_LAG=2 (after DavidZande a92fa74): with the frame fence answered before the newest submission was replayed,
+   the game re-adds a command buffer's control memory, and so retires its copies, while the translation thread may still
+   replay from them. Such copies are retired (magic cleared: a later submit of the handle still stops) but their memory
+   is kept until the translation thread has run every submission queued at that moment. g_copy_mu held. */
+static uint64_t x_sub_queued(void), x_sub_ran(void);
+static int fence_lag_overlap(void);
+typedef struct { copy_prefix *pf; uint64_t after; } copy_grave;
+static copy_grave *g_grave; static size_t g_ngrave, g_capgrave;
+static void grave_reap(void) {
+    if (!g_ngrave) return;
+    uint64_t ran = x_sub_ran(); size_t k = 0;
+    for (size_t i = 0; i < g_ngrave; i++) { if (g_grave[i].after <= ran) free(g_grave[i].pf); else g_grave[k++] = g_grave[i]; }
+    g_ngrave = k;
+}
+static void copy_free(copy_prefix *pf) {
+    if (!fence_lag_overlap()) { free(pf); return; }
+    grave_reap();
+    if (g_ngrave == g_capgrave) { g_capgrave = g_capgrave ? g_capgrave * 2 : 1024; g_grave = realloc(g_grave, g_capgrave * sizeof *g_grave); if (!g_grave) die("retired command copies"); }
+    g_grave[g_ngrave++] = (copy_grave){pf, x_sub_queued()};
+}
 static void copy_drop(copy_bucket *b, uint32_t i, int by_token) {   /* g_copy_mu held: release copy i of bucket b */
     cmd_copy *c = &b->v[i];
     c->stale_at = g_submits + 1;
     copy_prefix *pf = (copy_prefix *)(c->copy - sizeof(copy_prefix));
     if (cmdlog_env()) LOG("[cmd] free copy=%p%s", (void *)c->copy, by_token ? " (its mark in the control memory is gone)" : "");
     g_freed[g_nfreed++ % FREED_RING] = (typeof(g_freed[0])){(uintptr_t)c->copy, g_submits, c->stale_at, pf->used_at, pf->made_at, c->ctl_lo};
-    pf->magic = 0; g_copy_bytes -= malloc_size(pf); free(pf); b->v[i] = b->v[--b->n]; g_ncopies--;
+    pf->magic = 0; g_copy_bytes -= malloc_size(pf); copy_free(pf); b->v[i] = b->v[--b->n]; g_ncopies--;
     if (by_token) g_copy_drop_token++; else g_copy_drop_readd++;
     if (!b->n && !b->empty) { b->empty = 1; g_cbk_empty++; }
 }
@@ -2253,6 +2315,9 @@ static void x_drain(void) {   // everything queued so far has run (no-op when sy
     atomic_fetch_add(&g_x_drains, 1); atomic_fetch_add(&g_x_drain_ns, now_ns() - t0);
 }
 void nvn_x_drain(void) { x_drain(); }   // for the graphics layer (pool invalidate write-back)
+static uint64_t x_sub_queued(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_xsub_in; pthread_mutex_unlock(&g_xq_mu); return v; }
+static uint64_t x_sub_ran(void) { pthread_mutex_lock(&g_xq_mu); uint64_t v = g_xsub_done; pthread_mutex_unlock(&g_xq_mu); return v; }
+static int fence_lag_overlap(void) { static int v = -1; if (v < 0) v = async_replay() && fif_env() > 1 && fence_lag_mode() == 2; return v; }
 // Fence token for FenceSync: submits enqueued so far (async) or the Metal fence (synchronous).
 static uint64_t fence_now(int *token) {
     if (!async_replay()) { *token = 0; return mtl_last_fence(); }
@@ -2276,6 +2341,36 @@ static int fence_wait(uint64_t k, uint64_t timeout_ns) {
     return mtl_wait(f, timeout_ns > used ? timeout_ns - used : 0);
 }
 
+/* TOTK_FRAMES_IN_FLIGHT=2 / TOTK_FENCE_LAG with the translation thread: a wait on the newest token `tok` (the game's
+   frame fence, placed right after the frame's submit) stops at the token the same sync object held one frame earlier,
+   so the game's next frame overlaps this frame's GPU work (mode 1) or its replay and GPU work (mode 2). The lag is
+   decided by the classes of the submissions in between, like fif_target, on their Metal fences (g_xsub_fence). */
+static uint64_t fif_target_tok(const NVNsync *s, uint64_t tok) {
+    uint64_t r = fif_prev(s, tok);
+    if (r == tok) return tok;
+    if (!fif_guard_on()) { atomic_fetch_add(&g_ftk_lag, 1); return r; }   /* TOTK_FIF_GUARD=0: unguarded measurement mode */
+    int mode = fence_lag_mode();
+    pthread_mutex_lock(&g_xq_mu);
+    if (mode == 1 && g_xsub_done < tok) {   /* the newest replay commits first: its pools are guarded, its classes recorded */
+        uint64_t t0 = now_ns();
+        while (g_xsub_done < tok) pthread_cond_wait(&g_xq_cv, &g_xq_mu);
+        atomic_fetch_add(&g_ftk_rwait, 1); atomic_fetch_add(&g_ftk_rwait_ns, now_ns() - t0);
+    }
+    uint64_t done = g_xsub_done, mr, mn; int pred = 0;
+    if (tok - r >= XF / 2) { pthread_mutex_unlock(&g_xq_mu); return tok; }
+    if (done >= tok) { mr = g_xsub_fence[r % XF]; mn = g_xsub_fence[tok % XF]; }   /* replayed: the real classes */
+    else {   /* mode 2, not replayed yet: the classes of the last replayed submission(s) stand in for it */
+        pred = 1; atomic_fetch_add(&g_ftk_early, 1);
+        uint64_t span = tok - r; if (span > done) span = done;
+        mn = done ? g_xsub_fence[done % XF] : 0; mr = done > span ? g_xsub_fence[(done - span) % XF] : 0;
+    }
+    pthread_mutex_unlock(&g_xq_mu);
+    if (pred) atomic_fetch_add(&g_ftk_pred, 1);
+    int ok = mn <= mr || fif_lag_ok(mr, mn);
+    if (ok) atomic_fetch_add(&g_ftk_lag, 1);
+    fif_log();
+    return ok ? r : tok;
+}
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     NVN_BLOCKING();
 #ifdef GAME_BOTW
@@ -2299,6 +2394,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         g_def_ns += now_ns() - r0;
         if (((queue_t *)q)->submits % 600 == 0) LOG("[nvn] deferred binds to submit %llu: %llu handle reads at submit, %llu of them differing from record time; avg %.3f ms of handle reads per submit", (unsigned long long)((queue_t *)q)->submits, (unsigned long long)g_def_n, (unsigned long long)g_def_changed, g_def_ns / 1e6 / (double)((queue_t *)q)->submits);
     }
+    if (fence_lag_overlap()) { pthread_mutex_lock(&g_copy_mu); grave_reap(); pthread_mutex_unlock(&g_copy_mu); }   /* retired copies the replay has passed */
     if (async_replay()) {
         xjob j = {.kind = XJ_SUBMIT, .n = n, .h = malloc(sizeof(uint64_t) * (n > 0 ? n : 1))};
         if (!j.h) die("submit job");
