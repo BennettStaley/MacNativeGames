@@ -1978,7 +1978,9 @@ static int survey_shader_log(void) { static int on = -1; if (on < 0) on = getenv
 static uint64_t g_bp_t0;   // Time of process start (when this module is loaded)
 __attribute__((constructor)) static void bp_t0(void) { g_bp_t0 = bp_now(); }
 static int bootprof(void) { static int v = -1; if (v < 0) v = getenv("DM_BOOTPROF") != NULL; return v; }
-static uint64_t g_bp_lib_n, g_bp_lib_ns, g_bp_pso_n, g_bp_pso_ns, g_bp_up_bytes, g_bp_first_present;
+static uint64_t g_bp_lib_n, g_bp_pso_n, g_bp_up_bytes, g_bp_first_present;
+/* The guest present thread reads these while asynchronous replay may still be updating them. */
+static _Atomic uint64_t g_bp_lib_ns, g_bp_pso_ns;
 static uint64_t g_up_total_ns;   // Cumulative upload time (same source as the per-frame @upload_ms)
 // ---------- Per-frame GPU time aggregation ----------
 #define GRING 1024
@@ -2161,7 +2163,7 @@ uint64_t mtl_sub_commit(void) {
     rp_flush();
     usnap_finish();   // TOTK: the helper threads must be done with the copies (they are, long before this)
     g_nusnap = 0; g_mat_gen++;   // TOTK: the replay is done; the uniform copies stay in this submission's arena until it completes
-    upd_flush(); BOTW_WB_STAGE()   // TOTK: renamed uniform updates reach memory here, after every draw that read them through private copies
+    upd_flush(); BOTW_WB_STAGE() BOTW_TINY_COMMIT()   // TOTK: renamed uniform updates reach memory here, after every draw that read them through private copies
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     rs_sub_end();   // TOTK: encode stage drained before the command buffer is ended
     up_flush();
@@ -2852,6 +2854,7 @@ static void wb_note(const tex_t *t) {
     TILELOG(t, "GPU render (owned %d)", gpu_owned(t->serial));
     if (!atomic_load(&g_wb_on) || !t->mem || !t->L.size) return;
     id o = serial_get(t->serial); if (!o) return;
+    BOTW_TINY_NOTE(t, o)
     /* CPU writes after this rendering show up in nvn_dirty_since. TOTK (#90): the stamp comes first; a write that faults while
        the pages are being protected then counts as after it (taken after, it covered that page, writable from then on). */
     uint64_t stamp = nvn_dirty_now(), k = t->serial;
@@ -3826,7 +3829,7 @@ static id<MTLTexture> pkg_upload(const tex_t *t, uint64_t *stamp, reup_key *key,
 uint64_t mtl_upload_ns_take(void) { return atomic_exchange(&g_upload_ns, 0); }
 uint64_t mtl_upload_gpu_ns_take(void) { return atomic_exchange(&g_upload_gpu_ns, 0); }
 void mtl_create_stats(uint64_t *lib, uint64_t *pso) { *lib = g_bp_lib_n; *pso = g_bp_pso_n; }
-void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = g_bp_lib_ns; *pso_ns = g_bp_pso_ns; }   // Cumulative time spent synchronously creating shader libraries / pipelines on the spot (the long-frame log takes the per-frame difference)
+void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = atomic_load_explicit(&g_bp_lib_ns, memory_order_relaxed); *pso_ns = atomic_load_explicit(&g_bp_pso_ns, memory_order_relaxed); }   // Cumulative time spent synchronously creating shader libraries / pipelines on the spot (the long-frame log takes the per-frame difference)
 uint64_t mtl_upload_bytes(void) { return g_bp_up_bytes; }   // Cumulative texture upload bytes
 /* TOTK: textures replaced by a re-upload are kept (still resident) once the submissions that read them completed, and the
    next upload with the same description writes into one instead of creating a texture: about 30 small textures the game
@@ -4237,6 +4240,15 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     int live = 0, peak = 0, cap = 0; nvn_dirty_stat(&live, &peak, &cap);
     MLOG("memory up to frame %llu: RSS %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, memory pools %d (peak %d / tracking table capacity %d), texture re-uploads %llu", frame, rss_mb, gpu, nd, nr, live, peak, cap, (unsigned long long)g_pkg_reuploads);
     MLOG("textures with dead serials so far %llu (the leak source before replacement)", (unsigned long long)g_dead_put_total);
+    /* Exact-writeback snapshots are host allocations, absent from Metal's allocatedSize. Include them in the existing
+       diagnostic so an iPhone run can attribute the cost of the larger terrain-normal snapshots (PR #188). */
+    size_t snap_bytes = 0; unsigned snap_count = 0;
+    pthread_mutex_lock(&g_smu);
+    for (uint32_t i = 0; g_wb.vals && i < g_wb.cap; i++) {
+        const wb_ent *e = g_wb.vals[i]; if (e && e->snap) { snap_bytes += e->snap_n; snap_count++; }
+    }
+    pthread_mutex_unlock(&g_smu);
+    MLOG("[writeback] live snapshots %u, %zu bytes (per-target limit %u bytes)", snap_count, snap_bytes, WB_SNAP_MAX);
     pthread_mutex_lock(&g_smu); uint64_t dead_n = g_dead_serial.n, owned_n = g_gpu_owned.n;
     uint64_t serial_bytes = g_dead_serial.bytes + g_gpu_owned.bytes, serial_pages = g_dead_serial.pages + g_gpu_owned.pages; pthread_mutex_unlock(&g_smu);
     registry_lock(); unsigned refs_n = g_treg_refs.n; registry_unlock();
@@ -5375,6 +5387,17 @@ static void shmap_load(void) {
     warm_start();
 }
 
+/* PR #483's sampler/registry identity and #286's ready-function reuse. Cache objects are lazy:
+   ordinary shaders retain only these pointers, on phones as well as on the Mac. */
+@interface NvBorderKeyCache : NSObject { @public
+    int stage, nsid, n; uint64_t gen; uint32_t sid[NVN_REFL_MAXB];
+    NSString *key; float c[8][4]; int a[8]; unsigned x[8]; samp_par p[8];
+} @end
+@implementation NvBorderKeyCache @end
+@interface NvFunctionCache : NSObject { @public
+    id peer[4]; NSString *key[4]; id<MTLFunction> fn[4]; int mode[4]; unsigned next;
+} @end
+@implementation NvFunctionCache @end
 typedef struct { int n; int aid[8]; unsigned axes[8]; float col[8][4]; samp_par par[8]; } border_sig;   // TOTK: the samplers one border_key call found (see border_key)
 @interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, writes_depth, lay_ok; uint8_t drv_scanned[3];   /* drv_scanned (TOTK): driver segment c0 / c2 reads found by drv_scan in the MSL but missing from the reflection json */ /* lay_ok (TOTK): vertex MSL can write the layer (1) or not (-1), 0 = not checked yet; writes_depth (TOTK): the fragment function has a [[depth(...)]] output, so its pipeline needs a depth attachment */ const char *builtin; uint64_t logged; char key[80]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint16_t texture_slots[NVN_REFL_MAXB]; uint8_t texture_count, texture_plan_ready;
@@ -5385,10 +5408,14 @@ typedef struct { int n; int aid[8]; unsigned axes[8]; float col[8][4]; samp_par 
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass;   // ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn; id<MTLFunction> no_depth_fn;
     NSString *src, *src_path; NSDictionary<NSNumber *, NSString *> *io; NSMutableDictionary<NSString *, id<MTLFunction>> *vpatch; id<MTLFunction> mfx_fn[8]; uint8_t mfx_tried[8]; NSMutableDictionary<NSString *, id<MTLFunction>> *bpatch; int border_seen;
-    // TOTK (upstream #286): the last results of border_key (per stage, under the registry lock), fs_fn_border (per nodepth, g_bpatch_lock) and vs_fn_for (4 entries, g_vpatch_lock), so a draw that binds what the previous one bound builds no key strings
-    border_sig bk_sig[2]; NSString *bk_str[2]; NSString *fb_key[2]; id<MTLFunction> fb_fn[2];
+    // TOTK: border_key's last sampler signature and key string per stage (border_key_compute, registry lock): the same
+    // samplers give the same key object back, so the function caches below (keyed by object identity) stay valid across
+    // registry generations (upstream #286 combined with #483's sampler-id / generation fast path, border_cache)
+    border_sig bk_sig[2]; NSString *bk_str[2];
     uint8_t fbr_outs, fbr_outs_ok;   // TOTK: colour outputs [[color(n)]] the fragment MSL declares (bit n), fs_color_outs
-    NvShader *vf_fs[4]; NSString *vf_bkey[4]; id<MTLFunction> vf_fn[4]; int vf_layered[4]; uint8_t vf_ok[4], vf_next; } @end   // TOTK: MSL source, user varyings (locn -> type), patched vertex functions   // bflib: readable-tile version <key>_bf (merge B step 2)
+    NvBorderKeyCache *border_cache;   // registry lock
+    NvFunctionCache *fragment_cache, *vertex_cache;   // g_bpatch_lock / g_vpatch_lock
+} @end   // TOTK: MSL source, user varyings (locn -> type), patched vertex functions   // bflib: readable-tile version <key>_bf (merge B step 2)
 @implementation NvShader @end
 /* TOTK: a shader's MSL source is needed only to build derived functions (varying patches, layered vertex, depth-less and
    MetalFX UI fragment variants). The Mac keeps it; iOS keeps only the path and reads it when needed (thousands of sources
@@ -6032,7 +6059,8 @@ static int plib_on(void) {
 }
 static NSMutableDictionary<NSString *, id> *g_plib;   // variant key -> NSNull while it compiles, its NvShader once compiled (a failed one is removed)
 static pthread_mutex_t g_plib_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_plib_cv = PTHREAD_COND_INITIALIZER;
-static uint64_t g_plib_kicked, g_plib_taken, g_plib_waits, g_plib_wait_ns;   // statistics line of pso_predict_rest
+static uint64_t g_plib_kicked, g_plib_taken, g_plib_waits;
+static _Atomic uint64_t g_plib_wait_ns;   // statistics line of pso_predict_rest
 static int g_plib_probe; static NSString *g_plib_probe_key; static int g_plib_probe_stage;   // probe-gfx: record the request instead of compiling
 static void plib_kick(NSString *pc, int stage) {   // submission thread
     if (!plib_on()) return;
@@ -6073,7 +6101,7 @@ static NvShader *plib_take(NSString *pc, int wait) {
     if (wait && j == NSNull.null && pred_negative() != 31) {
         uint64_t t0 = bp_now();
         while ((j = g_plib[pc]) == NSNull.null) pthread_cond_wait(&g_plib_cv, &g_plib_mu);
-        g_plib_waits++; g_plib_wait_ns += bp_now() - t0;
+        g_plib_waits++; atomic_fetch_add_explicit(&g_plib_wait_ns, bp_now() - t0, memory_order_relaxed);
     }
     NvShader *sh = [j isKindOfClass:NvShader.class] ? j : nil;
     if (sh && wait) { [g_plib removeObjectForKey:pc]; g_plib_taken++; }
@@ -6124,7 +6152,7 @@ static NvShader *shader_get(NSString *pc, int stage) {
     g_shcache[pc] = o;
     pso_record("S\t%s\t%d\n", pc.UTF8String, stage);
     pso_user_record("S\t%s\t%d\n", pc.UTF8String, stage);
-    g_bp_lib_n++; g_bp_lib_ns += bp_now() - bt;
+    g_bp_lib_n++; atomic_fetch_add_explicit(&g_bp_lib_ns, bp_now() - bt, memory_order_relaxed);
     if (survey_shader_log() && !taken) MLOG("[survey-shader] frame %llu Metal library stage %d %s in %.2f ms%s", (unsigned long long)atomic_load(&g_cur_frame), stage, pc.UTF8String, (bp_now() - bt) / 1e6, predicted ? " (compiled for prediction; waited)" : "");
     return o;
 }
@@ -7168,12 +7196,31 @@ static NSString *fs_src_without_depth(NvShader *fs);
 static int border_filtered(const samp_par *p) {   // MIN/MAX reduction is not affine in the colour: it keeps the plain test
     return !p->reduction && (p->magf || p->minf == 1 || p->minf == 3 || p->minf == 5 || p->aniso > 1);
 }
-static NSString *border_key(NvShader *sh, int stage, float colours[][4], int aids[], unsigned axes[], samp_par params[], int *n) {
+/* The sampler IDs, registry generation and stage describe the exact inputs to the existing key builder.
+   Both cache publication and registry reads use the registry lock. No Metal resource is owned by this cache.
+   TOTK_BORDER_KEY_CACHE=0 is the uncached control; CHECK recomputes all returned data on every hit.
+   Two layers (upstream #483 + our #286 port): border_key skips the sampler walk while the sampler ids and the registry
+   generation are unchanged (border_cache); after any registration bumps the generation, border_key_compute still hands back
+   the same key object when the sampler contents match (bk_sig / bk_str), so the identity-keyed function caches
+   (fragment_cache / vertex_cache) and the PSO recipe stay hot instead of re-keying on every texture registration. */
+static int border_key_cache_on(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (value < 0) { const char *e = getenv("TOTK_BORDER_KEY_CACHE"); value = !(e && !strcmp(e, "0")); atomic_store_explicit(&cached, value, memory_order_relaxed); }
+    return value;
+}
+static int border_key_check_on(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (value < 0) { const char *e = getenv("TOTK_BORDER_KEY_CHECK"); value = e && *e && strcmp(e, "0"); atomic_store_explicit(&cached, value, memory_order_relaxed); }
+    return value;
+}
+static uint64_t g_bk_hits, g_bk_misses;
+/* Called holding the registry lock, including from the reference/check path. */
+static NSString *border_key_compute(NvShader *sh, int stage, float colours[][4], int aids[], unsigned axes[], samp_par params[], int *n) {
     *n = 0;
-    if (!atomic_load_explicit(&g_border_custom_any, memory_order_relaxed)) return nil;
     NSString *key = nil;
     border_sig sig; memset(&sig, 0, sizeof sig);
-    registry_lock();
     for (int i = 0; i < sh->rf.nb && *n < 8; i++) {
         const nvn_rbind *b = &sh->rf.b[i];
         if ((b->kind != NVN_RB_SAMP && b->kind != NVN_RB_SAMPT) || b->reg >= 128) continue;
@@ -7203,8 +7250,49 @@ static NSString *border_key(NvShader *sh, int stage, float colours[][4], int aid
             if (si >= 0) { sh->bk_sig[si] = sig; sh->bk_str[si] = key; }
         }
     }
-    registry_unlock();
+    return key;
+}
+
+static NSString *border_key(NvShader *sh, int stage, float colours[][4], int aids[], unsigned axes[], samp_par params[], int *n) {
+    *n = 0;
+    if (!atomic_load_explicit(&g_border_custom_any, memory_order_relaxed)) return nil;
+    registry_lock();
+    int cache_on = border_key_cache_on();
+    uint32_t sids[NVN_REFL_MAXB]; int ns = 0;
+    if (cache_on) for (int i = 0; i < sh->rf.nb; i++) {
+        const nvn_rbind *b = &sh->rf.b[i];
+        if ((b->kind != NVN_RB_SAMP && b->kind != NVN_RB_SAMPT) || b->reg >= 128) continue;
+        sids[ns++] = (uint32_t)((b->kind == NVN_RB_SAMPT ? S.tex[stage][b->reg] : S.samp[stage][b->reg]) >> 20);
+    }
+    uint64_t gen = atomic_load_explicit(&g_reg_gen, memory_order_relaxed);
+    NvBorderKeyCache *cached = cache_on ? sh->border_cache : nil;
+    NSString *key;
+    if (cached && cached->stage == stage && cached->gen == gen && cached->nsid == ns && !memcmp(cached->sid, sids, sizeof *sids * ns)) {
+        g_bk_hits++; key = cached->key; *n = cached->n;
+        if (*n) { memcpy(colours, cached->c, sizeof cached->c[0] * *n); memcpy(aids, cached->a, sizeof cached->a[0] * *n);
+                  memcpy(axes, cached->x, sizeof cached->x[0] * *n); memcpy(params, cached->p, sizeof cached->p[0] * *n); }
+        if (border_key_check_on()) {
+            float c2[8][4]; int a2[8]; unsigned x2[8]; samp_par p2[8]; int n2 = 0;
+            NSString *k2 = border_key_compute(sh, stage, c2, a2, x2, p2, &n2);
+            if (n2 != *n || (k2 != key && ![k2 isEqualToString:key]) ||
+                memcmp(c2, colours, n2 * sizeof c2[0]) || memcmp(a2, aids, n2 * sizeof a2[0]) ||
+                memcmp(x2, axes, n2 * sizeof x2[0]) || memcmp(p2, params, n2 * sizeof p2[0]))
+                MDIE("border_key cache differs from uncached sampler inputs");
+        }
+    } else {
+        g_bk_misses++; key = border_key_compute(sh, stage, colours, aids, axes, params, n);
+        // A shader that has never needed emulation allocates nothing, even when other shaders use custom borders.
+        if (cache_on && (key || cached)) {
+            if (!cached) sh->border_cache = cached = [NvBorderKeyCache new];
+            cached->stage = stage; cached->gen = gen; cached->nsid = ns; memcpy(cached->sid, sids, sizeof *sids * ns);
+            cached->key = [key copy]; cached->n = *n;
+            if (*n) { memcpy(cached->c, colours, sizeof cached->c[0] * *n); memcpy(cached->a, aids, sizeof cached->a[0] * *n);
+                      memcpy(cached->x, axes, sizeof cached->x[0] * *n); memcpy(cached->p, params, sizeof cached->p[0] * *n); }
+            key = cached->key;
+        }
+    }
     if (key) sh->border_seen = 1;
+    registry_unlock();
     return key;
 }
 static NSString *border_src(NvShader *sh, NSString *src0, float colours[][4], const int aids[], const unsigned axes[], const samp_par params[], int n) {
@@ -7314,17 +7402,40 @@ static int border_parse(NSString *key, border_in *b) {
 }
 static id<MTLFunction> fs_fn_border_with(NvShader *fs, int nodepth, NSString *key, border_in b, NSString **cache_key);
 /* The fragment function for the draw's samplers (border_key), nil when none needs the emulation. recipe: its border_key. */
+/* The peer and key are retained: pointer identity cannot alias a destroyed object. Never cache nil (pending).
+   Four entries also cover plain varying/layer variants; the old dictionaries remain authoritative on misses. */
+static id<MTLFunction> function_cache_get(NvFunctionCache *cache, id peer, NSString *key, int mode) {
+    if (cache) for (int i = 0; i < 4; i++) if (cache->fn[i] && cache->peer[i] == peer && cache->key[i] == key && cache->mode[i] == mode) return cache->fn[i];
+    return nil;
+}
+static void function_cache_put(NvFunctionCache *__strong *cache, id peer, NSString *key, int mode, id<MTLFunction> fn) {
+    if (!fn) return;
+    if (!*cache) *cache = [NvFunctionCache new];
+    NvFunctionCache *c = *cache; unsigned i = c->next++ & 3;
+    c->peer[i] = peer; c->key[i] = key; c->mode[i] = mode; c->fn[i] = fn;
+}
+static int function_cache_on(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (value < 0) { const char *e = getenv("TOTK_SHADER_FUNCTION_CACHE"); value = !(e && !strcmp(e, "0")); atomic_store_explicit(&cached, value, memory_order_relaxed); }
+    return value;
+}
 static id<MTLFunction> fs_fn_border(NvShader *fs, int nodepth, NSString **recipe) {
     if (!fs || !sh_has_src(fs)) return nil;
     border_in b;
-    NSString *bkey = border_key(fs, 1, b.c, b.a, b.x, b.p, &b.n);
-    if (!bkey) return nil;
-    if (recipe) *recipe = bkey;
-    int nd = nodepth && fs->writes_depth;   // the same key object means the same samplers as last time (border_key)
-    os_unfair_lock_lock(&g_bpatch_lock); id<MTLFunction> last = fs->fb_key[nd] == bkey ? fs->fb_fn[nd] : nil; os_unfair_lock_unlock(&g_bpatch_lock);
-    if (last) return last;
-    id<MTLFunction> fn = fs_fn_border_with(fs, nodepth, bkey, b, NULL);
-    if (fn) { os_unfair_lock_lock(&g_bpatch_lock); fs->fb_key[nd] = bkey; fs->fb_fn[nd] = fn; os_unfair_lock_unlock(&g_bpatch_lock); }   // nil: not compiled yet (or none), asked again next time
+    NSString *key = border_key(fs, 1, b.c, b.a, b.x, b.p, &b.n);
+    if (!key) return nil;
+    if (recipe) *recipe = key;
+    if (!function_cache_on()) return fs_fn_border_with(fs, nodepth, key, b, NULL);
+    int nd = nodepth && fs->writes_depth;
+    os_unfair_lock_lock(&g_bpatch_lock);
+    id<MTLFunction> fn = function_cache_get(fs->fragment_cache, nil, key, nd);
+    os_unfair_lock_unlock(&g_bpatch_lock);
+    if (fn) return fn;
+    fn = fs_fn_border_with(fs, nodepth, key, b, NULL);
+    os_unfair_lock_lock(&g_bpatch_lock);
+    function_cache_put(&fs->fragment_cache, nil, key, nd, fn);
+    os_unfair_lock_unlock(&g_bpatch_lock);
     return fn;
 }
 /* The fragment function for a border key and its inputs (a draw's samplers, or a recipe); cache_key: its bpatch key. */
@@ -7401,22 +7512,16 @@ static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int bo
     border_in b; b.n = 0;
     NSString *bkey = border && sh_has_src(vs) ? border_key(vs, 0, b.c, b.a, b.x, b.p, &b.n) : nil;
     if (recipe) *recipe = bkey;
-    /* The variant for (fs, layered, border key) is a function of those alone: the last four found are kept on the vertex
-       shader, holding the objects they were found with (a key object is the same only while the samplers are). */
-    id<MTLFunction> f = nil;
+    if (!function_cache_on()) return vs_fn_variant(vs, fs, layered, bkey, b, NULL);
     os_unfair_lock_lock(&g_vpatch_lock);
-    for (int i = 0; i < 4 && !f; i++)
-        if (vs->vf_ok[i] && vs->vf_fs[i] == fs && vs->vf_bkey[i] == bkey && vs->vf_layered[i] == layered) f = vs->vf_fn[i];
+    id<MTLFunction> fn = function_cache_get(vs->vertex_cache, fs, bkey, layered);
     os_unfair_lock_unlock(&g_vpatch_lock);
-    if (f) return f;
-    f = vs_fn_variant(vs, fs, layered, bkey, b, NULL);
-    if (f) {   // nil: not compiled yet, asked again next time
-        os_unfair_lock_lock(&g_vpatch_lock);
-        int i = vs->vf_next++ & 3;
-        vs->vf_fs[i] = fs; vs->vf_bkey[i] = bkey; vs->vf_layered[i] = layered; vs->vf_fn[i] = f; vs->vf_ok[i] = 1;
-        os_unfair_lock_unlock(&g_vpatch_lock);
-    }
-    return f;
+    if (fn) return fn;
+    fn = vs_fn_variant(vs, fs, layered, bkey, b, NULL);
+    os_unfair_lock_lock(&g_vpatch_lock);
+    function_cache_put(&vs->vertex_cache, fs, bkey, layered, fn);
+    os_unfair_lock_unlock(&g_vpatch_lock);
+    return fn;
 }
 /* The same for a border key and its inputs (a draw's samplers, or a recipe); cache_key: its vpatch key (nil: vs->fn). */
 static id<MTLFunction> vs_fn_variant(NvShader *vs, NvShader *fs, int layered, NSString *bkey, border_in b, NSString **cache_key) {
@@ -7815,18 +7920,27 @@ static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // Whether this sub
    frame (TOTK_PSO_PREDICT_FRAME_US, 4000 us). The urgent shader scan has none by default (TOTK_SHADER_PREDICT_FRAME_US,
    0 = none): at 4 ms a frame it handed 170 jobs to the urgent translators instead of 258, and the submit thread translated
    494 variants itself instead of 360, more than the scans it saved. */
-typedef struct { uint64_t frame, used_ns; } scan_budget;
+#include "nvn_scan_budget.h"
+typedef nvn_scan_budget scan_budget;
 static int scan_budget_left(scan_budget *b, int limit_us) {
-    uint64_t f = atomic_load(&g_cur_frame);
-    if (b->frame != f) { b->frame = f; b->used_ns = 0; }
-    return b->used_ns < (uint64_t)limit_us * 1000ull;
+    return nvn_scan_budget_left(b, atomic_load(&g_cur_frame), (uint64_t)limit_us * 1000ull, 0);
 }
 static int env_us(const char *name, int dflt) { const char *e = getenv(name); int v = e ? atoi(e) : dflt; return v < 0 ? 0 : v; }
 static int pso_rescans(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PSO_RESCANS"); v = e ? atoi(e) : 32; if (v < 0) v = 0; } return v; }
 static int g_pp_more, g_pp_rescans; static uint64_t g_pp_sync; static scan_budget g_pp_budget;   // last scan stopped at a budget; scans after the first; pipelines compiled on the submission thread
 // Statistics line (pso_predict_rest, every 100 scans): guesses refused because the table was full, stale guesses freed,
 // time draws waited for a background compile, scans and which budget ended them.
-static uint64_t g_pp_full, g_pp_reclaimed, g_pp_waits, g_pp_wait_ns, g_pp_scans, g_pp_scan_ns, g_pp_stop[3];
+static uint64_t g_pp_full, g_pp_reclaimed, g_pp_waits, g_pp_scans, g_pp_stop[3];
+static _Atomic uint64_t g_pp_wait_ns, g_pp_scan_ns;
+/* The frame's scan budget (4 ms) was spent early in a burst, and every later miss of the frame was then built here one
+   after another: 37 pipelines in 865 ms in one frame (Tears of the Kingdom 1.1.2, a new area, 2026-10-23), while the
+   cores the background builds use sat idle. Adaptive budget: a frame may also scan as long as it has spent on
+   synchronous builds, so one 23 ms build pays for about ten scans that hand the rest of the submission to the
+   background. TOTK_PSO_SCAN_ADAPT=0 turns it off. */
+/* Snapshot counters read by the guest present thread, including with asynchronous replay enabled. */
+void mtl_wait_stats(uint64_t *plib_ns, uint64_t *pso_ns) { *plib_ns = atomic_load_explicit(&g_plib_wait_ns, memory_order_relaxed); *pso_ns = atomic_load_explicit(&g_pp_wait_ns, memory_order_relaxed); }
+static _Atomic uint64_t g_sp_ns;
+void mtl_scan_stats(uint64_t *shader_ns, uint64_t *pso_ns) { *shader_ns = atomic_load_explicit(&g_sp_ns, memory_order_relaxed); *pso_ns = atomic_load_explicit(&g_pp_scan_ns, memory_order_relaxed); }
 static void pso_predict_rest(void);
 /* The shader counter's "compiling": pipelines Metal is building in the background right now, plus the warm-up's items
    still to go while it runs (warm_task_done). */
@@ -7870,7 +7984,7 @@ static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // Called 
     int at = pso_pend_find(k); id<MTLRenderPipelineState> ps = nil;
     if (at >= 0) { uint64_t t0 = bp_now(); int waited = !g_pp[at].done;
         while (!g_pp[at].done) pthread_cond_wait(&g_pp_cv, &g_pp_mu);
-        if (waited) { g_pp_waits++; g_pp_wait_ns += bp_now() - t0; }
+        if (waited) { g_pp_waits++; atomic_fetch_add_explicit(&g_pp_wait_ns, bp_now() - t0, memory_order_relaxed); }
         ps = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].used = 0; }
     pthread_mutex_unlock(&g_pp_mu);
     return ps;
@@ -8040,14 +8154,19 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     ps = g_pso_lmap ? nil : pso_pend_take(&k);
     if (ps) g_pp_taken++;
     else {
-        static int frame_us = -1; if (frame_us < 0) frame_us = env_us("TOTK_PSO_PREDICT_FRAME_US", 4000);
-        if (!scan_budget_left(&g_pp_budget, frame_us)) { if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; g_pp_rescans = 0; g_pp_more = 0; } }   // this frame's scans are spent
+        static int frame_us = -1, adapt = -1;
+        if (frame_us < 0) { frame_us = env_us("TOTK_PSO_PREDICT_FRAME_US", 4000); const char *a = getenv("TOTK_PSO_SCAN_ADAPT"); adapt = !a || atoi(a); }
+        uint64_t cf = atomic_load(&g_cur_frame);
+        int left = nvn_scan_budget_left(&g_pp_budget, cf, (uint64_t)frame_us * 1000ull, adapt);   // the first call resets the budget at a new frame
+        if (!left) { if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; g_pp_rescans = 0; g_pp_more = adapt; } }   // this frame's scans are spent (adaptive: a later miss, once a build has paid for it, scans)
         else if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; g_pp_rescans = 0; g_pp_more = 0; pso_predict_rest(); }   // First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
         else if (g_pp_more && g_pp_rescans < pso_rescans()) { g_pp_rescans++; pso_predict_rest(); }   // TOTK: the last scan stopped early: go on from here
+        uint64_t b0 = adapt ? bp_now() : 0;   // the build alone pays for scans (not the scan just above, or scans would pay for themselves)
         MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, bfn ? bfn : g_pso_fsfn, g_pso_lmap != NULL);
         ps = pso_new(d, pso_archive_key(&k, vs, fs, g_pso_lmap != NULL), &e); g_pp_sync++;
+        if (adapt) nvn_scan_budget_build(&g_pp_budget, cf, bp_now() - b0);
     }
-    g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
+    g_bp_pso_n++; atomic_fetch_add_explicit(&g_bp_pso_ns, bp_now() - bt, memory_order_relaxed);
     if (!ps) { static int said; if (said++ < 12) MLOG("[red] Render pipeline build failed: %s (vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d)", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("[red] Render pipeline build failed: further failures are not logged individually"); return nil; }
     pso_adopt(&k, vs, fs, bfn != nil, g_pso_lmap != NULL, ps, bt, 0, brec);
     g_pso_final = !stand_in && !g_vmissing;
@@ -9639,7 +9758,7 @@ static void rt_sub(const p_set_rt *r, int k, uint64_t *ser, int *lv, int *sl);
    (g_prog_prefetch), and the other new variants are queued as usual. Those draws then wait in parallel. A scan that ends
    on its budget (TOTK_SHADER_PREDICT_SCAN commands, 8192; TOTK_SHADER_PREDICT_US, 2000) may run again from the next
    miss, up to 16 per submission. */
-static uint64_t g_sp_mark, g_sp_scans, g_sp_ns, g_sp_progs, g_sp_urgent, g_sp_queued; static int g_sp_n, g_sp_more;
+static uint64_t g_sp_mark, g_sp_scans, g_sp_progs, g_sp_urgent, g_sp_queued; static int g_sp_n, g_sp_more;
 static scan_budget g_sp_budget;
 static void shader_predict_rest(void) {
     static int enabled = -1, max_ops, max_us;
@@ -9691,7 +9810,7 @@ static void shader_predict_rest(void) {
     memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_pso_state_gen++; g_dss_dirty = dss_dirty; g_prog_for_draw = for_draw;
     g_sp_more = stop && (progs || urgent || queued);   // go on only after a scan that found something
     g_sp_budget.used_ns += bp_now() - started;
-    g_sp_scans++; g_sp_ns += bp_now() - started; g_sp_progs += progs; g_sp_urgent += urgent; g_sp_queued += queued;
+    g_sp_scans++; atomic_fetch_add_explicit(&g_sp_ns, bp_now() - started, memory_order_relaxed); g_sp_progs += progs; g_sp_urgent += urgent; g_sp_queued += queued;
     if ((progs || urgent || queued) && (g_sp_scans <= 20 || g_sp_scans % 100 == 0)) {
         uint64_t un, uns; totk_rt_urgent_stats(&un, &uns);
         MLOG("[shader-predict] scan %llu (%d commands%s): %llu new programs, %llu urgent, %llu queued in %.2f ms; in all %llu programs, %llu urgent, %llu queued, %.1f ms over %llu scans; urgent jobs done %llu, %.1f ms each from queued to recorded",
@@ -9794,7 +9913,7 @@ static void pso_predict_rest(void) {
     for (int i = 0; i < nb; i++) pso_pend_kick(&qb[i].k, (__bridge NvShader *)qb[i].vs, (__bridge NvShader *)qb[i].fs);
     memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_pso_state_gen++; g_dss_dirty = dss_dirty;
     static int logged; if (g_pp_kicked > (uint64_t)kicked0 && logged++ < 20) MLOG("Parallel precompile: %d draws left in this submit, %d pipelines handed to the background", draws, (int)g_pp_kicked - kicked0);
-    g_pp_scans++; g_pp_scan_ns += bp_now() - started; if (stop) g_pp_stop[stop - 1]++;
+    g_pp_scans++; atomic_fetch_add_explicit(&g_pp_scan_ns, bp_now() - started, memory_order_relaxed); if (stop) g_pp_stop[stop - 1]++;
     g_pp_more = stop != 0 && g_pp_kicked > (uint64_t)kicked0;   // go on only after a scan that kicked something
     g_pp_budget.used_ns += bp_now() - started;
     if (g_pp_scans % 100 == 0) {
@@ -12288,7 +12407,7 @@ frz_plain:;
        a sub-pixel, a small sphere covers a few more or fewer samples each frame (338 / 345 for an egg lamp), and the game
        scales the light by that count, so lamps and what they light pulsed while standing still. */
     double jx = 0, jy = 0; unsigned nv = di ? di->count : dw ? dw->count : 0;
-    if (taa_jittered() && nv > 6 && vo == 0 && vs == 1 && ux == 1 && uy == 1 && !g_vis_counting && !att_n && !(!att_store_on() && draw_att_reads(pr, att_rs)))
+    if (taa_jittered() && nv > 6 && vo == 0 && vs == 1 && ux == 1 && uy == 1 && !g_vis_counting && !fb_fn && !att_n && !(!att_store_on() && draw_att_reads(pr, att_rs)))
         taa_jitter(&jx, &jy);
     if (S.has_vp) enc_r_viewport(en, (MTLViewport){vx + jx, vy + jy, vw, vh, S.dr[0], S.dr[1]});
     else enc_r_viewport(en, (MTLViewport){vx + jx, vy + jy, vw, vh, 0, 1});
@@ -12575,7 +12694,7 @@ static void dispatch(const p_dispatch *dp) {
     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
     if (!ps) {
         NSError *e = nil; uint64_t bt = bp_now(); ps = cs_new(cs, &e);
-        g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
+        g_bp_pso_n++; atomic_fetch_add_explicit(&g_bp_pso_ns, bp_now() - bt, memory_order_relaxed);
         if (!ps) { MLOG("[red] Failed to build compute pipeline: %s", e.localizedDescription.UTF8String); return; }
         if (survey_shader_log()) MLOG("[survey-shader] frame %llu compute pipeline %s in %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), cs->key, (bp_now() - bt) / 1e6);
         pso_record("C\t%s\n", cs->key);
@@ -16741,6 +16860,59 @@ void botw_serial_note(uint64_t serial, const char *what) {
 }
 #endif
 #ifdef GAME_BOTW
+/* Water colours (BOTW_TINY_* in nvn_obj.h): some renders are read back by the CPU without an invalidate. Breath of the
+   Wild bakes one colour per water type by drawing into a 1x1 RGBA32F target in a CPU-cached pool, flushes the range and
+   reads the pixel two frames later (main+0x147d590 on 1.6.0); on hardware the GPU wrote that memory directly, here the
+   pixel stayed in the Metal texture and the game read 0 for every water type: every pond was fully transparent. Tiny
+   targets of this kind (TINY_WB linear bytes at most) are copied into their memory as soon as the submission that
+   rendered them completes, unless the CPU changed those bytes since the rendering. Larger ones still wait for an
+   invalidate (mtl_pool_invalidate). Submit thread only, as wb_note and mtl_sub_commit. */
+#define TINY_WB 256
+#define TINY_MAX 16
+typedef struct { tex_t t; uint8_t *snap; size_t lp, lr; } tiny_ent;
+static tiny_ent g_tiny[TINY_MAX]; static __strong id<MTLTexture> g_tiny_tex[TINY_MAX]; static int g_ntiny;
+void botw_tiny_note(const void *tp, const void *op) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_BOTW_TINY_WB"); on = !(e && !strcmp(e, "0")); }
+    if (!on) return;   // diagnostic negative control: the CPU keeps the old pool bytes
+    const tex_t *t = tp; id o = (__bridge id)op;
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    if (bpb <= 0 || bw != 1 || bh != 1 || t->d.levels != 1 || t->d.samples > 1 || t->d.target == 2 || t->L.layers > 1) return;
+    size_t lp = (size_t)t->d.width * bpb, lr = t->d.height;
+    if (lp * lr > TINY_WB || t->L.size > 4096) return;
+    id<MTLTexture> mt = [o isKindOfClass:[NvPkg class]] ? ((NvPkg *)o)->tex : o; if (!mt) return;
+    int i = 0; while (i < g_ntiny && g_tiny[i].t.serial != t->serial) i++;
+    if (i == g_ntiny) { if (g_ntiny == TINY_MAX) { static int said; if (!said++) MLOG("more than %d tiny GPU renders read by the CPU in one submission", TINY_MAX); return; } g_ntiny++; }
+    else free(g_tiny[i].snap);
+    g_tiny[i] = (tiny_ent){*t, malloc(t->L.size), lp, lr}; g_tiny_tex[i] = mt;
+    if (g_tiny[i].snap) memcpy(g_tiny[i].snap, t->mem, t->L.size);
+}
+static __strong id<MTLBuffer> g_tiny_buf[64];
+static uint64_t g_tiny_fence[64];   // a slot remains owned until its CPU write-back has completed
+void botw_tiny_commit(void) {   // in mtl_sub_commit, after the last render pass: copy the tiny targets out, then into memory on completion
+    if (!g_ntiny) return;
+    uint64_t fence = g_fence + 1;
+    if (g_tiny_fence[fence % 64]) mtl_wait(g_tiny_fence[fence % 64], UINT64_MAX);
+    g_tiny_fence[fence % 64] = fence;
+    id<MTLBuffer> buf = g_tiny_buf[fence % 64];
+    if (!buf) { buf = g_tiny_buf[fence % 64] = [g_dev newBufferWithLength:TINY_WB * TINY_MAX options:MTLResourceStorageModeShared]; if (!buf) MDIE("tiny write-back buffer"); res_add(buf); res_commit(); }
+    for (int i = 0; i < g_ntiny; i++) {
+        tiny_ent *e = &g_tiny[i];
+        enc_b_copy_texture_buffer(blit(), g_tiny_tex[i], 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(e->t.d.width, e->t.d.height, 1), buf, (NSUInteger)i * TINY_WB, e->lp, e->lp * e->lr);
+        g_tiny_tex[i] = nil;
+    }
+    int n = g_ntiny; tiny_ent *l = malloc(n * sizeof *l); if (!l) MDIE("tiny write-back list"); memcpy(l, g_tiny, n * sizeof *l); g_ntiny = 0;
+    [g_commit_blocks addObject:^{
+        for (int i = 0; i < n; i++) { tiny_ent *e = &l[i]; const tex_t *t = &e->t;
+            if (e->snap && !memcmp(e->snap, t->mem, t->L.size)) {   // the CPU has not written these bytes since the rendering
+                void *tok = nvn_dirty_tracked(t->mem, t->L.size) ? nvn_dirty_gpu_write_begin(t->mem, t->L.size) : NULL;
+                if (!tok) dm_guest_write_prepare(t->mem, t->L.size);
+                if (nvn_swizzle(&t->d, 0, 0, (const uint8_t *)buf.contents + (size_t)i * TINY_WB, e->lp, t->mem)) RED_ONCE(122, "tiny write-back: unsupported layout");
+                nvn_dirty_gpu_write_end(tok);
+                TILELOG(t, "tiny write-back on completion");
+            } else TILELOG(t, "tiny write-back skipped: the CPU wrote since the render");
+            free(e->snap); }
+        free(l); }];
+}
 /* Write-back staging (BOTW_WB_* in nvn_obj.h; docs/botw-v1.9.0-port.md). Serials rendered in this submission are noted on the submit
    thread; at the submission's end each small one (WB_STAGE_MAX) is copied into its stage buffer in the same command
    buffer, so the invalidate waits for that fence only and swizzles from the stage without a read-back blit. */
@@ -16852,3 +17024,4 @@ void mtl_mem_report(const char *tag) {
     for (int j = 0; j < ng; j++) if (big[j].b >= (8u << 20)) MLOG("[memreport]   old-size targets %ux%u: %d, %llu MB", big[j].w, big[j].h, big[j].n, (unsigned long long)(big[j].b >> 20));
     MLOG("[memreport]   interpolation: %s", mfx);
 }
+#include "nvn_writeback_probe.h"

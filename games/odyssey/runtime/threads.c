@@ -26,6 +26,8 @@
 #include <errno.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
+#include <sys/ucontext.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <mach/mach.h>
@@ -59,8 +61,10 @@ typedef struct thr {
     uint64_t nsvc;             // SVC 次数（现场导出用） | SVC count (for the state dump)
     mach_port_t mport;         // 宿主线程端口（取 CPU 时间） | Host thread port (to get CPU time)
     uint32_t qos;
-    int cur_core;              // virtual core held while running guest code, -1 while blocked / not started
-    int preempt;               // a higher-priority thread waits for this thread's core
+    _Atomic int cur_core;              // virtual core held while running guest code, -1 while blocked / not started
+    _Atomic int preempt;               // a higher-priority thread waits for this thread's core
+    _Atomic int kicked;
+    uint64_t preempt_ns, cwait_ns;
     uint64_t cseq, core_since; struct thr *cnext;
     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
@@ -129,28 +133,77 @@ static thr_t *g_core_wait;
 static int g_cores_on = -1;
 static int cores_enabled(void) { if (g_cores_on < 0) g_cores_on = getenv("TOTK_FREE_CORES") ? 0 : 1; return g_cores_on; }
 static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1); }
+/* Adapted from the MIT LM3 port (#218, 714e4f3): bounded starvation and guest-only signal preemption.
+   Anti-starvation (Odyssey): a thread that has waited CORE_STARVE_NS for a core gets the next free one before
+   higher-priority waiters, and core_watch preempts an owner for it. Horizon has no such rule, but the guest's busier-than-
+   hardware threads kept a priority-45 job worker off its only core while the main thread waited for its job. */
+#define CORE_STARVE_NS 30000000
 static void core_grant(int c) {   // holding G: give free core c to the best waiter
-    thr_t *b = NULL, **bp = NULL;
+    thr_t *b = NULL, **bp = NULL; uint64_t now = now_ns();
     for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext)
+        if (core_allowed(*p, c) && now - (*p)->cwait_ns > CORE_STARVE_NS && (!b || (*p)->cwait_ns < b->cwait_ns)) { b = *p; bp = p; }
+    if (!b) for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext)
         if (core_allowed(*p, c) && (!b || (*p)->prio < b->prio || ((*p)->prio == b->prio && (*p)->cseq < b->cseq))) { b = *p; bp = p; }
     if (!b) return;
     *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); g_core_owner[c] = b; pthread_cond_signal(&b->cv);
 }
 static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
-    int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
+    int c = t->cur_core; t->cur_core = -1; t->preempt = 0; t->kicked = 0; g_core_owner[c] = NULL; core_grant(c);
 }
+static void core_watch_start(void);
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
     if (!cores_enabled() || t->cur_core >= 0) return;
     if (!(t->mask & ((1u << NCORE) - 1))) die("thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
     int c = t->core >= 0 && t->core < NCORE && core_allowed(t, t->core) && !g_core_owner[t->core] ? t->core : -1;
     for (int i = 0; c < 0 && i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) c = i;
     if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
-    t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
-    for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
+    core_watch_start();
+    t->cseq = ++g_wseq; t->cwait_ns = now_ns(); t->cnext = g_core_wait; g_core_wait = t;
+    /* Higher priority preempts; at equal priority a thread running away from its ideal core gives that core back to a
+       waiter whose ideal core it is (Horizon migrates a thread only onto an idle core). Both at the owner's next SVC. */
+    for (int i = 0; i < NCORE; i++) { thr_t *o = g_core_owner[i];
+        if (core_allowed(t, i) && o && !o->preempt && (o->prio > t->prio || (o->prio == t->prio && o->core != i && t->core == i))) { o->preempt = 1; o->preempt_ns = now_ns(); } }
     while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
 }
 static thr_t *me_or_null(void) { return g_keythr ? pthread_getspecific(g_keythr) : NULL; }
+/* Odyssey's audio thread can spin on IsMemoryPoolAttached without an SVC while the renderer update that completes
+   the detach waits for its virtual core. Horizon's scheduler preempts at once; here a watcher interrupts a
+   core owner that a higher-priority waiter has been waiting on for 2 ms. The signal handler gives the core up only when
+   the thread was interrupted in guest code (inside a loaded module), where it holds no host lock; elsewhere it gives it
+   up at its next SVC as before. Guest threads run their handlers on their own signal stack (loader.c). */
+#define CORE_PREEMPT_NS 2000000
+#define CORE_PREEMPT_SIGNAL SIGUSR2
+int runtime_module_offset(uint64_t pc, const char **name, uint64_t *off);
+static void core_preempt_handler(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; int saved = errno;
+    thr_t *t = me_or_null(); const char *name; uint64_t off;
+    uint64_t pc = arm_thread_state64_get_pc(((ucontext_t *)ctx)->uc_mcontext->__ss);
+    if (t && t->cur_core >= 0 && runtime_module_offset(pc, &name, &off)) {
+        pthread_mutex_lock(&G); if (t->preempt && t->cur_core >= 0) { t->preempt = 0; core_put(t); core_take(t); } else t->kicked = 0; pthread_mutex_unlock(&G);
+    } else if (t) t->kicked = 0;   /* host code: the next SVC checkpoint gives the core up */
+    errno = saved;
+}
+static void *core_watch(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct timespec d = {0, 1000000}; nanosleep(&d, NULL);
+        pthread_mutex_lock(&G); uint64_t now = now_ns();
+        for (thr_t *w = g_core_wait; w; w = w->cnext) if (now - w->cwait_ns > CORE_STARVE_NS)   /* a starving waiter: preempt an owner of one of its cores */
+            for (int i = 0; i < NCORE; i++) { thr_t *o = g_core_owner[i]; if (o && core_allowed(w, i) && !o->preempt) { o->preempt = 1; o->preempt_ns = now - CORE_PREEMPT_NS - 1; break; } }
+        for (int i = 0; i < NCORE; i++) { thr_t *o = g_core_owner[i];
+            if (o && o->preempt && !o->kicked && now - o->preempt_ns > CORE_PREEMPT_NS) { o->kicked = 1; (void)pthread_kill(o->pt, CORE_PREEMPT_SIGNAL); } }
+        pthread_mutex_unlock(&G);
+    }
+    return NULL;
+}
+static void core_watch_init(void) {
+    struct sigaction a = {0}; a.sa_sigaction = core_preempt_handler; a.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART; sigemptyset(&a.sa_mask);
+    if (sigaction(CORE_PREEMPT_SIGNAL, &a, NULL)) runtime_fail("core preemption signal");
+    pthread_t w; if (pthread_create(&w, NULL, core_watch, NULL)) runtime_fail("core preemption watcher");
+    pthread_detach(w);
+}
+static void core_watch_start(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, core_watch_init); }
 void runtime_thread_note_hle(unsigned i) { thr_t *t = me_or_null(); if (t) t->last_hle = (int)i + 1; }   // hle_stack.c, while tracing
 uint32_t runtime_thread_current_handle(void) { thr_t *t = me_or_null(); return t ? t->handle : 0; }
 // Host services that wait for other threads or the GPU give the core up around the wait (no host locks held).

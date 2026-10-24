@@ -977,6 +977,9 @@ float runtime_aspect_now(void) { return g_uw_main && atomic_load(&g_uw_on) && at
 int runtime_aspect_toggle(void) {
     if (!g_uw_main) return 0;
     int on = !atomic_load(&g_uw_on); atomic_store(&g_uw_on, on); botw_aspect_word(on);
+#if !TARGET_OS_IPHONE
+    runtime_front_resize_aspect(on ? g_uw_wide : ASPECT_GAME);
+#endif
     fprintf(stderr, "[botw] key 4: aspect ratio %s\n", on ? "wide" : "16:9 (the game's own)");
     return 1;
 }

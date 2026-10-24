@@ -1,6 +1,9 @@
 GFX_SRC := $(wildcard third_party/d2r_gfx/gfx/nvn/*.c third_party/d2r_gfx/gfx/nvn/*.m third_party/d2r_gfx/gfx/nvn/*.S third_party/d2r_gfx/gfx/tex/*.c third_party/d2r_gfx/gfx/tex/*.m)
 GFX_OBJECTS := $(addprefix build/gfx/,$(addsuffix .o,$(GFX_SRC)))
-NATIVE_OPT ?= -O2
+# -O3 with full LTO across the graphics objects and the runtime (as in upstream PR #472): the graphics objects become LLVM
+# bitcode and are optimised together with the runtime at the link (about 35 s instead of 15 s for the runtime step on an
+# M-series Mac; NATIVE_OPT=-O2 restores the old build). The link writes the dSYM from the LTO object as before.
+NATIVE_OPT ?= -O3 -flto=full
 GFX_FLAGS := -std=gnu11 -Wno-error -Wno-unused-function -Wno-unused-parameter -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn/include
 
 PY := .venv/bin/python
@@ -415,6 +418,10 @@ probe-depth16-clear: $(RENDER_PROBE_DIR)/depth16-clear-probe
 	$(GAME_SLOT_RUN) "$(RENDER_PROBE_DIR)/depth16-clear-probe"
 
 .PHONY: probe-fbread
+.PHONY: probe-gpu-writeback
+probe-gpu-writeback: runtime-botw160
+	MTL_DEBUG_LAYER=1 build/totk-native-botw160 rewritten/botw160 probe-gpu-writeback
+
 # Decals reading the attachment they write (nvn_fbread.h): overlapping draws see each other only through the tile read.
 $(RENDER_PROBE_DIR)/fbread-probe: tests/fbread/probe.m third_party/d2r_gfx/gfx/nvn/nvn_fbread.h
 	@mkdir -p "$(RENDER_PROBE_DIR)"

@@ -4,6 +4,8 @@
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
+#include <stdlib.h>
 
 // 哑贴图类型：与原 dummy_tex 同一套前缀判定（未绑贴图槽按 D3D 语义读出 0）
 // Dummy texture type: same prefix rules as the original dummy_tex (an unbound texture slot reads 0 per D3D semantics)
@@ -55,6 +57,22 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             else if ([k isEqualToString:@"c1"]) r->kind = NVN_RB_C1;
             else if ([k isEqualToString:@"drvcb"]) r->kind = [b[@"bank"] intValue] == 2 ? NVN_RB_DRV2 : NVN_RB_DRV0;
             else FAIL("B 绑定种类 %s 未实现（%s）", k.UTF8String, [b[@"msl_name"] UTF8String]);
+            /* A combined handle in a user constant buffer has no fixed NVN texture register. Maxwell c3..c16
+               are NVN user uniform slots 0..13; the name's hexadecimal offset is in 32-bit words. */
+            if (reg < 0 && (r->kind == NVN_RB_TEX || r->kind == NVN_RB_SAMPT)) {
+                const char *name = [b[@"msl_name"] UTF8String], *at = name ? strstr(name, "_t_cb") : NULL;
+                if (at) {
+                    char *end; errno = 0;
+                    unsigned long bank = strtoul(at + 5, &end, 10);
+                    if (errno || end == at + 5 || *end != '_') FAIL("invalid uniform texture binding %s", name);
+                    const char *word_start = end + 1; unsigned long word = strtoul(word_start, &end, 16);
+                    const char *suffix = r->kind == NVN_RB_SAMPT ? "Smplr" : "";
+                    if (errno || end == word_start || strcmp(end, suffix) || bank < 3 || bank > 16 || word > 0x3fff)
+                        FAIL("uniform texture binding out of range or unsupported: %s", name);
+                    reg = (int)bank - 3; r->reg = (uint16_t)reg; r->off = (uint16_t)(word * 4);
+                    r->kind = r->kind == NVN_RB_TEX ? NVN_RB_TEXU : NVN_RB_SAMPU;
+                }
+            }
             if ((r->kind == NVN_RB_CBUF || r->kind == NVN_RB_SAMP || r->kind == NVN_RB_SAMPT || r->kind == NVN_RB_TEX || r->kind == NVN_RB_IMG || r->kind == NVN_RB_TBUF || r->kind == NVN_RB_SBUFP || r->kind == NVN_RB_UBOP || r->kind == NVN_RB_SBUFU) && reg < 0)
                 FAIL("B 绑定 %s 没解出槽号", [b[@"msl_name"] UTF8String]);
             o->nb++;

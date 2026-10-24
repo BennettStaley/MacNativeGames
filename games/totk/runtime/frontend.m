@@ -303,6 +303,29 @@ static void note_screen(const char *why){
  CGDisplayModeRef m=d?CGDisplayCopyDisplayMode(d):NULL;double hz=m?CGDisplayModeGetRefreshRate(m):0;if(m)CGDisplayModeRelease(m);
  fprintf(stderr,"[totk] window display %u (%s, %.0f Hz): %s\n",d,s?s.localizedName.UTF8String:"?",hz,why);
 }
+/* BotW key 4: the window takes the selected camera ratio. Keep the chosen height across toggles, even when a wide
+   window has to shrink to fit the display; a manual resize establishes a new height. AppKit stays on the main queue. */
+void runtime_front_resize_aspect(double ratio){
+ if(!isfinite(ratio)||ratio<0.5||ratio>8)return;
+ dispatch_async(dispatch_get_main_queue(), ^{
+  if(!window||(window.styleMask&NSWindowStyleMaskFullScreen))return;
+  NSScreen *screen=window.screen?:NSScreen.mainScreen;if(!screen)return;
+  static NSSize lastSize;static CGFloat preferredHeight;
+  NSRect oldFrame=window.frame;NSSize current=window.contentView.bounds.size;
+  if(preferredHeight<=0||fabs(current.width-lastSize.width)>1||fabs(current.height-lastSize.height)>1)preferredHeight=current.height;
+  NSRect visible=screen.visibleFrame;
+  NSRect content=[window contentRectForFrameRect:visible];
+  CGFloat h=fmin(preferredHeight,fmin(content.size.height,content.size.width/ratio));
+  if(h<=0)return;
+  NSRect frame=[window frameRectForContentRect:NSMakeRect(0,0,round(h*ratio),round(h))];
+  frame.origin=NSMakePoint(NSMidX(oldFrame)-frame.size.width/2,NSMidY(oldFrame)-frame.size.height/2);
+  frame.origin.x=fmax(NSMinX(visible),fmin(frame.origin.x,NSMaxX(visible)-frame.size.width));
+  frame.origin.y=fmax(NSMinY(visible),fmin(frame.origin.y,NSMaxY(visible)-frame.size.height));
+  [window setFrame:frame display:YES];
+  lastSize=window.contentView.bounds.size;
+  front_sync_drawable();
+ });
+}
 @interface TOTKWindowDelegate:NSObject<NSWindowDelegate>
 @end
 @implementation TOTKWindowDelegate

@@ -236,7 +236,13 @@ NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
         nvn_dirty_remove_range(o->mem, o->size); mtl_pool_del(o->mem); }
     totk_vpool_fini(o); o->magic = 0;
 }
-NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
+/* A mirrored render target has private Metal storage. Reconcile GPU writes at mapped-range cache maintenance too:
+   BotW flushes its grass masks before reading their pool bytes. The write-back helper keeps later CPU writes and
+   does nothing when the range has no pending rendering; ordinary shared-buffer CPU uploads remain coherent. */
+void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n);
+NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
+    if (off >= 0 && n) mtl_pool_invalidate((const pool_t *)p, (uint64_t)off, n);
+}
 NVN(nvnMemoryPoolGetFlags, NVNmemoryPoolFlags, const NVNmemoryPool *p){return (NVNmemoryPoolFlags)((const pool_t *)p)->flags;}
 NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p){const pool_t *v=(const void *)p;
 #ifdef GAME_BOTW
@@ -2616,6 +2622,9 @@ typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned
 static lf_rec g_lf[LFN];
 __attribute__((weak)) void dm_longframe_note(const char *what) { LOG("[long frame] %s", what); }   // Default (graphics unit tests); the strong definition in the host's diag.c adds scene context and writes perf.txt
 extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns); extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
+extern void mtl_wait_stats(uint64_t *plib_ns, uint64_t *pso_ns); extern void mtl_scan_stats(uint64_t *shader_ns, uint64_t *pso_ns);
+extern void totk_rt_submit_stats(uint64_t *wait_n, uint64_t *wait_ns, uint64_t *sync_n, uint64_t *sync_ns);
+__attribute__((weak)) void dm_core_wait_stats(uint64_t *self_ns, uint64_t *all_ns, uint64_t *all_n) { *self_ns = *all_ns = *all_n = 0; }   // runtime/threads.c; 0 in the graphics unit tests
 extern uint64_t mtl_view_stats(void); extern void mtl_variant_stats(uint64_t *n, uint64_t *ns, uint64_t *pre, uint64_t *bg, uint64_t *plain);
 /* TOTK_LONGFRAME_DETAIL=1: a long-frame line also names the frame's draws, render passes and new texture views, to tell a
    frame that drew far more than usual from one that met many textures for the first time, and the patched shader
@@ -3168,6 +3177,21 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         // Accounting: number of synchronous creations on the submit thread this frame + a timestamp on the same clock as UIMSG (offline, frames are split into front end / loading / in-run by the loading screen intervals)
         static uint64_t plib, ppso; uint64_t lib_, pso_; mtl_create_stats(&lib_, &pso_);
         trow(f, "@lib_new", (double)(lib_ - plib)); trow(f, "@pso_new", (double)(pso_ - ppso));
+        {   // where the submit thread waited this frame (ms): translating on the spot, waiting for a translation running elsewhere,
+            // waiting for a predicted library / pipeline, synchronous library / pipeline creation, the prediction scans;
+            // the guest threads waiting for a virtual core (runtime/threads.c)
+            static uint64_t pxw, pxs, ppl, ppp, plns2, ppns2, psp, ppp2, pcw_self, pcw_all, pcw_n;
+            uint64_t xwn, xw, xsn, xs, pl_, pp_, ln_, pn_, sp_, pp2_, cw_s, cw_a, cw_n;
+            totk_rt_submit_stats(&xwn, &xw, &xsn, &xs); mtl_wait_stats(&pl_, &pp_); mtl_create_ns(&ln_, &pn_); mtl_scan_stats(&sp_, &pp2_);
+            dm_core_wait_stats(&cw_s, &cw_a, &cw_n);
+            trow(f, "@xl_sync_ms", (xs - pxs) / 1e6); trow(f, "@xl_wait_ms", (xw - pxw) / 1e6);
+            trow(f, "@plib_wait_ms", (pl_ - ppl) / 1e6); trow(f, "@pso_wait_ms", (pp_ - ppp) / 1e6);
+            trow(f, "@lib_ms", (ln_ - plns2) / 1e6); trow(f, "@pso_ms", (pn_ - ppns2) / 1e6);
+            trow(f, "@sp_scan_ms", (sp_ - psp) / 1e6); trow(f, "@pp_scan_ms", (pp2_ - ppp2) / 1e6);
+            trow(f, "@core_wait_ms", (cw_s - pcw_self) / 1e6); trow(f, "@core_wait_all_ms", (cw_a - pcw_all) / 1e6); trow(f, "@core_waits", (double)(cw_n - pcw_n));
+            pxw = xw; pxs = xs; ppl = pl_; ppp = pp_; plns2 = ln_; ppns2 = pn_; psp = sp_; ppp2 = pp2_; pcw_self = cw_s; pcw_all = cw_a; pcw_n = cw_n;
+            (void)xwn; (void)xsn;
+        }
         {   // long-frame log: this frame's items are first recorded into the ring; whether to print is decided 8 frames later, once the GPU time has arrived (see below)
             static uint64_t plns, ppns, pup, prup, pub; uint64_t lns, pns, up, rup, ub; mtl_create_ns(&lns, &pns); mtl_pkg_stats(&up, &rup); ub = mtl_upload_bytes();
             lf_rec *r = &g_lf[f % LFN]; r->f = f; r->fr = fr; r->nv = nv; r->ls = g_nvn_loadscreen_up ? g_nvn_loadscreen_up() : 0; r->t_s = (now_ns() - g_t0_ns) / 1e9; r->pso = (unsigned)(pso_ - ppso); r->lib = (unsigned)(lib_ - plib);

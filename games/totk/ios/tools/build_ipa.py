@@ -46,15 +46,39 @@ def copy_tree(src,dst):
     for p in src.rglob('*'):
         if p.is_file(): clone(p,dst/p.relative_to(src))
 
+def project_for_platform(project, platform):
+    if platform == 'ios': return project
+    if platform != 'visionos': raise ValueError(f'unknown platform {platform}')
+    for old,new in [('    iOS: "26.0"','    visionOS: "26.0"'),('    platform: iOS','    platform: visionOS'),
+                    ('IPHONEOS_DEPLOYMENT_TARGET','XROS_DEPLOYMENT_TARGET'),
+                    ('TARGETED_DEVICE_FAMILY: "1,2"','TARGETED_DEVICE_FAMILY: "7"'),
+                    ('        UIRequiresFullScreen: true\n','')]:
+        if old not in project: raise RuntimeError(f'project.yml no longer has {old!r}')
+        project=project.replace(old,new)
+    return project
+
+def seed_reusable(seed, source_hash, source_files, sdk):
+    manifest=seed/'seed-manifest.json'
+    if not manifest.is_file(): return False
+    cached=json.loads(manifest.read_text())
+    shaders=[name for name in source_files if name.endswith('_b.metal')]
+    return (cached.get('ios_source_manifest_sha256')==source_hash and
+            cached.get('ios_metallibs')==len(shaders) and cached.get('ios_sdk','iphoneos')==sdk and
+            cached.get('ios_metal_flags')==' '.join(METAL_FLAGS) and
+            all((seed/(name.removesuffix('.metal')+'.metallib')).is_file() for name in shaders))
+
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--tree',type=Path,required=True);p.add_argument('--out',type=Path,required=True)
     p.add_argument('--version',choices=['v0','v112','v121','v143','botw160','botw190'],required=True);p.add_argument('--logs',type=Path,required=True)
+    p.add_argument('--platform',choices=['ios','visionos'],default='ios')
     p.add_argument('--image-outside',action='store_true',help='leave romfs.bin out: the device keeps it in Documents/GameData');p.add_argument('--app-name',default='Tears of the Kingdom');p.add_argument('--bundle-id',default='org.macnativegames.totk')
     a=p.parse_args(); tree=a.tree.resolve(); ios=tree/'ios';gen=ios/'Gen';logs=a.logs.resolve(); out=a.out.resolve()
     if out.suffix.lower() not in ('.ipa','.app'): raise RuntimeError('iOS output path must end in .ipa (or .app: the unsigned folder)')
     env=dict(os.environ,DEVELOPER_DIR=developer_dir())
-    sdk=subprocess.check_output(['xcrun','--sdk','iphoneos','--show-sdk-path'],env=env,text=True).strip()
+    vision=a.platform=='visionos'; sdk_name='xros' if vision else 'iphoneos'
+    if vision and a.version.startswith('botw'): raise RuntimeError('native visionOS builds currently support Tears of the Kingdom only')
+    sdk=subprocess.check_output(['xcrun','--sdk',sdk_name,'--show-sdk-path'],env=env,text=True).strip()
     subprocess.run(['xcodebuild','-version'],env=env,check=True,stdout=subprocess.DEVNULL)
     if not shutil.which('xcodegen'): raise RuntimeError('install xcodegen: brew install xcodegen')
     gen.mkdir(parents=True,exist_ok=True)
@@ -70,7 +94,7 @@ def main():
     run([host,rewritten,'export-ios'],tree,logs/'export-ios.log',e)
     flags=subprocess.check_output([sys.executable,ios/'tools/gen_embed.py',rewritten,gen/'embed.S','--text-dir',modules,'main','subsdk0','sdk'],text=True,env=env).strip()
     # The app's sources use version-specific patch and generated runtime tables.
-    project=(ios/'project.yml').read_text()
+    project=project_for_platform((ios/'project.yml').read_text(),a.platform)
     if botw:   # game_patches_botw.c instead of both Tears of the Kingdom files; GAME_BOTW for the runtime and the graphics layer
         project=project.replace('          - game_patches_botw.c','          - game_patches.c\n          - game_patches_v143.c')
         project=project.replace('-I../build\n','-I../build -DGAME_BOTW=1 -DGAME_'+a.version.upper()+'=1\n')
@@ -84,7 +108,7 @@ def main():
     # Mac app's icon) as one 1024 px opaque PNG in an asset catalog; Xcode makes every iPhone / iPad size from it.
     icon=tree/'build/AppIcon.icns'; icon_set=gen/'Assets.xcassets/AppIcon.appiconset'
     shutil.rmtree(gen/'Assets.xcassets',ignore_errors=True)
-    if icon.is_file():
+    if icon.is_file() and not vision:   # visionOS: no iOS app icon set
         icon_set.mkdir(parents=True)
         flat=gen/'icon-1024.jpg'   # through JPEG: iOS app icons must have no alpha channel
         run(['sips','-s','format','jpeg','-s','formatOptions','best','-z','1024','1024',icon,'--out',flat],tree,logs/'ios-icon.log',env)
@@ -93,11 +117,11 @@ def main():
         (icon_set/'Contents.json').write_text(json.dumps({'images':[{'filename':'icon-1024.png','idiom':'universal','platform':'ios','size':'1024x1024'}],
                                                           'info':{'author':'xcode','version':1}},indent=1)+'\n')
         project=project.replace('      - path: Gen/embed.S','      - path: Gen/embed.S\n      - path: Gen/Assets.xcassets',1)
-    else: print(f'no {icon}: the iOS app gets the default icon',file=sys.stderr)
+    elif not vision: print(f'no {icon}: the iOS app gets the default icon',file=sys.stderr)
     (ios/'project.generated.yml').write_text(project)
     # Build device dependencies separately: Homebrew's Mac archives cannot be linked into an iOS application.
-    deps=tree/'build/ios-deps'
-    run([sys.executable,ios/'tools/build_deps.py',deps],tree,logs/'ios-dependencies.log',env)
+    deps=tree/('build/xros-deps' if vision else 'build/ios-deps')
+    run([sys.executable,ios/'tools/build_deps.py',deps,sdk_name],tree,logs/f'{sdk_name}-dependencies.log',env)
     shutil.copytree(deps/'include',gen/'deps/include',dirs_exist_ok=True)
     (gen/'deps/lib').mkdir(parents=True,exist_ok=True)
     for lib in ('libopus.a','libvpx.a'): clone(deps/'lib'/lib,gen/'deps/lib'/lib)
@@ -105,22 +129,13 @@ def main():
     if not (seed_src/'seed-manifest.json').is_file(): raise RuntimeError(f'missing verified shader seed: {seed_src}')
     import hashlib
     source_manifest_hash=hashlib.sha256((seed_src/'seed-manifest.json').read_bytes()).hexdigest()
-    expected_metallibs=sum(name.endswith('_b.metal') for name in json.loads((seed_src/'seed-manifest.json').read_text())['files'])
-    cached_manifest=seed/'seed-manifest.json'
-    reuse_seed=False
-    if cached_manifest.is_file():
-        cached=json.loads(cached_manifest.read_text())
-        reuse_seed=(cached.get('ios_source_manifest_sha256')==source_manifest_hash and
-                    cached.get('ios_metallibs')==expected_metallibs and
-                    cached.get('ios_metal_flags')==' '.join(METAL_FLAGS) and   # e.g. not the old fast-math libraries
-                    all((seed/(name.removesuffix('.metal')+'.metallib')).is_file()
-                        for name in json.loads((seed_src/'seed-manifest.json').read_text())['files'] if name.endswith('_b.metal')))
+    reuse_seed=seed_reusable(seed,source_manifest_hash,json.loads((seed_src/'seed-manifest.json').read_text())['files'],sdk_name)
     if not reuse_seed:
         if seed.exists(): shutil.rmtree(seed)
         copy_tree(seed_src,seed)
-        run([sys.executable,ios/'tools/compile_seed.py',seed,'iphoneos'],tree,logs/'ios-shaders.log',env)
+        run([sys.executable,ios/'tools/compile_seed.py',seed,sdk_name],tree,logs/f'{sdk_name}-shaders.log',env)
     seed_manifest=json.loads((seed/'seed-manifest.json').read_text())
-    seed_manifest['ios_source_manifest_sha256']=source_manifest_hash
+    seed_manifest['ios_source_manifest_sha256']=source_manifest_hash; seed_manifest['ios_sdk']=sdk_name
     (seed/'seed-manifest.json').write_text(json.dumps(seed_manifest,indent=2)+'\n')
     (seed/'shader_map.tsv').write_text('# TOTK control-code-sha256-v1\n')
     # The file list: every shader file with its SHA-256. Hashes the manifest already has are kept (the seed's own files,
@@ -138,10 +153,10 @@ def main():
     xcconfig.write_text(f'OTHER_LDFLAGS = $(inherited) {frameworks} -lz Gen/deps/lib/libopus.a Gen/deps/lib/libvpx.a {flags}\n'
                         +('ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon\n' if (gen/'Assets.xcassets').is_dir() else ''))
     run(['xcodegen','generate','--spec','project.generated.yml'],ios,logs/'xcodegen.log',env)
-    derived=tree/'build/ios-derived';run(['xcodebuild','-project','TOTKIOS.xcodeproj','-scheme','TOTKIOS','-configuration','Release',
-        '-destination','generic/platform=iOS','-derivedDataPath',derived,'CODE_SIGNING_ALLOWED=NO','CODE_SIGNING_REQUIRED=NO','CODE_SIGN_IDENTITY='],
-        ios,logs/'xcodebuild-ios.log',env)
-    app=derived/'Build/Products/Release-iphoneos/TOTK.app'
+    derived=tree/('build/xros-derived' if vision else 'build/ios-derived');run(['xcodebuild','-project','TOTKIOS.xcodeproj','-scheme','TOTKIOS','-configuration','Release',
+        '-destination','generic/platform='+('visionOS' if vision else 'iOS'),'-derivedDataPath',derived,'CODE_SIGNING_ALLOWED=NO','CODE_SIGNING_REQUIRED=NO','CODE_SIGN_IDENTITY='],
+        ios,logs/f'xcodebuild-{a.platform}.log',env)
+    app=derived/f'Build/Products/Release-{sdk_name}/TOTK.app'
     if not app.is_dir(): raise RuntimeError(f'Xcode did not produce {app}')
     # Carry the increased-memory-limit entitlement in the executable's ad-hoc signature so re-signing tools keep it;
     # the game's 3.2 GiB pool exceeds the default iOS footprint limit.

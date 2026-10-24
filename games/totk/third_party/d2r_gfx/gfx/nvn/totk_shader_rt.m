@@ -5,6 +5,7 @@
 // build/shader-service/totk_xlate --service when it is there (tools/totk_xlate/Service.cs, NativeAOT: no Python, no .NET
 // runtime; 2026-10-17), else scripts/shader_service.py with the .NET translator. Same requests, replies and cache files.
 #import <Foundation/Foundation.h>
+#include "dm_wait_stats.h"
 #include <TargetConditionals.h>
 #include "totk_shader_rt.h"
 #include "dmsh_chain.h"
@@ -554,6 +555,13 @@ static void urgent_translate(NSString *shader, NSMutableArray *job) {
 }
 void totk_rt_urgent_stats(uint64_t *n, uint64_t *ns) { *n = atomic_load(&g_rt_urgent_n); *ns = atomic_load(&g_rt_urgent_ns); }
 
+/* What the submit thread spends on translation itself (may_defer 0): waiting for a job already running
+   elsewhere, and translating on the spot. Per-frame differences go to the frame TSV (hle_nvn.c @xl_wait_ms / @xl_sync_ms). */
+static _Atomic uint64_t g_rt_wait_n, g_rt_wait_ns, g_rt_sync_n, g_rt_sync_ns;
+void totk_rt_submit_stats(uint64_t *wait_n, uint64_t *wait_ns, uint64_t *sync_n, uint64_t *sync_ns) {
+    *wait_n = atomic_load(&g_rt_wait_n); *wait_ns = atomic_load(&g_rt_wait_ns); *sync_n = atomic_load(&g_rt_sync_n); *sync_ns = atomic_load(&g_rt_sync_ns);
+}
+
 NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local, int may_defer) {
     uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     pthread_mutex_lock(&g_rt_lock);
@@ -563,7 +571,9 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     NSString *found = variant_lookup(shader, answers);
     for (NSMutableArray *job; !found && !may_defer && (job = g_rt_pending[shader]); found = variant_lookup(shader, answers)) {
         if ([job[0] intValue] == RT_JOB_QUEUED) { job[0] = @(RT_JOB_TAKEN); [g_rt_pending removeObjectForKey:shader]; break; }
+        uint64_t w0 = dm_wait_stats_enabled() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
         pthread_cond_wait(&g_rt_done, &g_rt_lock);
+        if (w0) { atomic_fetch_add(&g_rt_wait_n, 1); atomic_fetch_add(&g_rt_wait_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0); }
     }
     if (!found && may_defer == 2 && g_rt_pending[shader]) {   // urgent: a job of this shader still in line runs now
         NSMutableArray *job = g_rt_pending[shader];
@@ -577,7 +587,9 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     BOOL existed = [NSFileManager.defaultManager fileExistsAtPath:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.metal", rq[@"variant"]]];   // a re-translation of a broken variant is not a new one
     if (may_defer == 2) { urgent_translate(shader, rt_job_new(shader, stage, rq, existed, code_bytes)); pthread_mutex_unlock(&g_rt_lock); return nil; }
     if (may_defer) { bg_translate(shader, stage, rq, existed, code_bytes); pthread_mutex_unlock(&g_rt_lock); return nil; }
+    uint64_t s0 = dm_wait_stats_enabled() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     variant_record(shader, rq, translate(&g_svc, rq, started), existed, started, 0);
+    if (s0) { atomic_fetch_add(&g_rt_sync_n, 1); atomic_fetch_add(&g_rt_sync_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - s0); }
     pthread_mutex_unlock(&g_rt_lock);
     return rq[@"variant"];
 }
