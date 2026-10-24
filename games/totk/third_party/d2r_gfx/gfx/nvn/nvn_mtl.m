@@ -192,7 +192,9 @@ static void bg_gate(void) {
     pthread_mutex_lock(&g_bg_mu); while (atomic_load(&g_app_inactive)) pthread_cond_wait(&g_bg_cv, &g_bg_mu); pthread_mutex_unlock(&g_bg_mu);
     MLOG("App not in the foreground: GPU submission was paused for %.1f s, resuming now", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9);
 }
+static void ubc_wait_all(void);
 static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) {
+    ubc_wait_all();   // TOTK_UB_COPY_THREAD: uniform copies queued before this commit are in memory before the GPU can read them
     bg_gate();
     gpu_budget_check("commit command buffer");
     atomic_fetch_add(&g_q4_inflight, 1);
@@ -477,11 +479,18 @@ static uint64_t g_pool_query_checked;
    is unchanged. Only a pool no other pool overlaps is kept, so a hit is the pool the locked search returns; it is already
    resident (pool_res ran), and only its removal takes it out of the residency set, which bumps the generation.
    TOTK_POOL_TLS=0 or flag pool_tls 0 turns it off; TOTK_POOL_TLS_CHECK=1 or flag pool_tls_check 1 compares every hit with
-   the locked search. 32 entries halved the misses (10% -> 5%) but the longer scan cost as much, no net gain (2026-10-23). */
+   the locked search. 32 entries halved the misses (10% -> 5%) but the longer scan cost as much, no net gain (2026-10-23).
+   TOTK (port of nxnative 8a4b1dc, 2026-10-23): a first level direct-mapped by 4 KB page (POOL_TLS_PG entries) is looked at
+   before the last-hit entry and the 8 recent ones; a hit in the recent list or in the locked search fills it. Uniform rings
+   move to a new page every few draws but stay in one pool, so the page table plus the recent list answers more lookups
+   without the lock than the 8 entries alone. Same validity rule (generation, non-overlapped pool). TOTK_POOL_PAGE=0 off. */
 #define POOL_TLS_N 8
+#define POOL_TLS_PG_BITS 10
 typedef struct { uintptr_t lo, hi, base; void *buf; uint64_t gpu, gen; } pool_tls_ent;
 /* One thread-local block: each _Thread_local variable is its own _tlv_get_addr call on Darwin, and the lookup touched two. */
-typedef struct { pool_tls_ent e[POOL_TLS_N]; unsigned next, last; } pool_tls_t;   // next slot to fill; slot of the last hit (looked at first)
+typedef struct { pool_tls_ent e[POOL_TLS_N]; unsigned next, last; pool_tls_ent pg[1u << POOL_TLS_PG_BITS]; } pool_tls_t;   // next slot to fill; slot of the last hit (looked at first); pg: by 4 KB page
+static inline unsigned pool_tls_pg_slot(uintptr_t a) { return (unsigned)(((uint64_t)(a >> 12) * UINT64_C(0x9E3779B97F4A7C15)) >> (64 - POOL_TLS_PG_BITS)); }
+static int pool_page_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_POOL_PAGE"); v = !(e && !atoi(e)); } return v; }
 static _Thread_local pool_tls_t g_ptls;
 static _Atomic uint64_t g_pool_gen = 1;
 static _Atomic int g_pool_tls_on = -1, g_pool_tls_check;
@@ -835,21 +844,26 @@ static const pool_tls_ent *pool_tls_find(uintptr_t a, uint64_t len) {
     if (end < a) return NULL;
     uint64_t gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
     pool_tls_t *t = &g_ptls;
+    int pg = pool_page_on();
+    pool_tls_ent *ps = pg ? &t->pg[pool_tls_pg_slot(a)] : NULL;
+    if (ps && ps->gen == gen && ps->lo <= a && a < ps->hi && end <= ps->hi) return ps;
     const pool_tls_ent *e = &t->e[t->last];
-    if (e->gen == gen && e->lo <= a && a < e->hi && end <= e->hi) return e;   // a < hi: an address at the end may also start the next pool
+    if (e->gen == gen && e->lo <= a && a < e->hi && end <= e->hi) { if (ps) *ps = *e; return e; }   // a < hi: an address at the end may also start the next pool
     for (unsigned i = 0; i < POOL_TLS_N; i++) {
         e = &t->e[i];
-        if (e->gen == gen && e->lo <= a && a < e->hi && end <= e->hi) { t->last = i; return e; }
+        if (e->gen == gen && e->lo <= a && a < e->hi && end <= e->hi) { t->last = i; if (ps) *ps = *e; return e; }
     }
     return NULL;
 }
-static void pool_tls_keep(const pidx_ent *p) {   // caller holds g_mu; p was just made resident
+static void pool_tls_keep(const pidx_ent *p, uintptr_t addr) {   // caller holds g_mu; p was just made resident and holds addr
     int i = (int)(p - g_pools.e);
     if (i < 0 || i >= g_pools.n) return;
     if (i > 0 && g_pools.maxhi[i - 1] > p->lo) return;          // an earlier pool reaches into this one
     if (i + 1 < g_pools.n && g_pools.e[i + 1].lo < p->hi) return; // a later pool starts inside this one
     pool_tls_t *t = &g_ptls;
-    t->e[t->next++ % POOL_TLS_N] = (pool_tls_ent){p->lo, p->hi, p->base, p->buf, p->gpu, atomic_load_explicit(&g_pool_gen, memory_order_relaxed)};
+    pool_tls_ent c = {p->lo, p->hi, p->base, p->buf, p->gpu, atomic_load_explicit(&g_pool_gen, memory_order_relaxed)};
+    t->e[t->next++ % POOL_TLS_N] = c;
+    if (pool_page_on() && addr >= p->lo && addr < p->hi) t->pg[pool_tls_pg_slot(addr)] = c;
 }
 /* TOTK frames in flight (TOTK_FRAMES_IN_FLIGHT=2, see fif_commit): while a submission is replayed, every memory pool it
    looks up is noted, so at commit the pools the GPU reads straight from guest memory get the submission's fence. */
@@ -859,7 +873,7 @@ static void fif_note_pool(uintptr_t lo, uintptr_t hi);
 static int pool_lookup_locked(uint64_t addr, uint64_t len, void **buf, uint64_t *base, uint64_t *gpu, int keep) {
     pthread_mutex_lock(&g_mu);
     pidx_ent *p = pool_query((uintptr_t)addr, len);
-    if (p) { pool_res(p); *buf = p->buf; *base = p->base; *gpu = p->gpu; if (keep) pool_tls_keep(p); if (t_fif_rec) fif_note_pool(p->lo, p->hi); }
+    if (p) { pool_res(p); *buf = p->buf; *base = p->base; *gpu = p->gpu; if (keep) pool_tls_keep(p, (uintptr_t)addr); if (t_fif_rec) fif_note_pool(p->lo, p->hi); }
     pthread_mutex_unlock(&g_mu);
     return p != NULL;
 }
@@ -1711,13 +1725,27 @@ static size_t arena_alloc(size_t n, __strong id<MTLBuffer> *buf);
    TOTK_UB_RENAME=0 keeps the per-update GPU copies. */
 static inline void args_dirty_all(void);
 static void upd_dirty_stages(uint64_t lo, uint64_t hi);
-typedef struct { uint64_t lo, hi, seq; } upd_ent;
+typedef struct { uint64_t lo, hi, seq; const uint8_t *src; } upd_ent;   // src: the update's bytes in the submission arena (TOTK_UB_SAME)
 static upd_ent *g_upd; static int g_nupd, g_updcap; static uint64_t g_upd_lo = UINT64_MAX, g_upd_hi, g_upd_seq;
 /* g_upd is kept sorted by lo (insertion with memmove; a few hundred entries per submission) with g_upd_maxhi[i] = largest hi
    in g_upd[0..i], so an overlap query is a binary search plus a backwards walk over actual overlaps: every uniform binding
    of the frame (over ten thousand) is checked, and most overlap nothing. */
 static uint64_t *g_upd_maxhi;
-static void upd_insert(uint64_t lo, uint64_t hi) {
+/* TOTK (from nxnative 8a4b1dc): a logged update that the new one covers whole is dropped from the log. Contents come
+   from the pending writes (pend_materialize), not from the log; the log answers "newest update overlapping a range"
+   (any range overlapping the dropped entry overlaps the newer one) and which ranges upd_flush writes back (the newer one
+   covers them). Games rewrite one block before every draw group, so the log stays short and every binding lookup scans
+   less. TOTK_UB_COVER=0 keeps every entry. */
+static uint64_t g_ren_covered;
+static int ub_cover_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_UB_COVER"); v = !(e && !strcmp(e, "0")); } return v; }
+static void upd_insert(uint64_t lo, uint64_t hi, const uint8_t *src) {
+    int from = g_nupd;   // first index whose g_upd_maxhi must be recomputed
+    if (g_nupd && ub_cover_on()) {
+        int f = 0, b = g_nupd; while (f < b) { int m = (f + b) >> 1; if (g_upd[m].lo < lo) f = m + 1; else b = m; }   // entries [f, ..) start at or after lo
+        int w = f, i = f;
+        for (; i < g_nupd && g_upd[i].lo < hi; i++) if (g_upd[i].hi > hi) g_upd[w++] = g_upd[i];
+        if (w < i) { memmove(g_upd + w, g_upd + i, (size_t)(g_nupd - i) * sizeof *g_upd); g_ren_covered += (uint64_t)(i - w); g_nupd -= i - w; from = f; }
+    }
     if (g_nupd == g_updcap) {
         g_updcap = g_updcap ? g_updcap * 2 : 256;
         g_upd = realloc(g_upd, (size_t)g_updcap * sizeof *g_upd); g_upd_maxhi = realloc(g_upd_maxhi, (size_t)g_updcap * sizeof *g_upd_maxhi);
@@ -1725,19 +1753,21 @@ static void upd_insert(uint64_t lo, uint64_t hi) {
     }
     int a = 0, b = g_nupd; while (a < b) { int m = (a + b) >> 1; if (g_upd[m].lo <= lo) a = m + 1; else b = m; }
     memmove(g_upd + a + 1, g_upd + a, (size_t)(g_nupd - a) * sizeof *g_upd);
-    g_upd[a] = (upd_ent){lo, hi, ++g_upd_seq}; g_nupd++;
-    for (int i = a; i < g_nupd; i++) { uint64_t prev = i ? g_upd_maxhi[i - 1] : 0; g_upd_maxhi[i] = g_upd[i].hi > prev ? g_upd[i].hi : prev; }
+    g_upd[a] = (upd_ent){lo, hi, ++g_upd_seq, src}; g_nupd++;
+    for (int i = a < from ? a : from; i < g_nupd; i++) { uint64_t prev = i ? g_upd_maxhi[i - 1] : 0; g_upd_maxhi[i] = g_upd[i].hi > prev ? g_upd[i].hi : prev; }
     if (lo < g_upd_lo) g_upd_lo = lo; if (hi > g_upd_hi) g_upd_hi = hi;
 }
-// Newest seq among logged updates overlapping [lo, hi), 0 when none.
-static uint64_t upd_overlap_seq(uint64_t lo, uint64_t hi) {
-    if (!g_nupd || hi <= g_upd_lo || lo >= g_upd_hi) return 0;
+// Newest logged update overlapping [lo, hi), NULL when none.
+static const upd_ent *upd_overlap_newest(uint64_t lo, uint64_t hi) {
+    if (!g_nupd || hi <= g_upd_lo || lo >= g_upd_hi) return NULL;
     int a = 0, b = g_nupd; while (a < b) { int m = (a + b) >> 1; if (g_upd[m].lo < hi) a = m + 1; else b = m; }   // entries [0, a) start below hi
-    uint64_t last = 0;
-    for (int i = a - 1; i >= 0 && g_upd_maxhi[i] > lo; i--) if (g_upd[i].hi > lo && g_upd[i].seq > last) last = g_upd[i].seq;
+    const upd_ent *last = NULL;
+    for (int i = a - 1; i >= 0 && g_upd_maxhi[i] > lo; i--) if (g_upd[i].hi > lo && (!last || g_upd[i].seq > last->seq)) last = &g_upd[i];
     return last;
 }
-typedef struct { uint64_t lo, size, seq, gpu; uint8_t *cpu; uint64_t gen, done; int npend; } ubo_shadow;   // cpu/gen/done/npend: upd_shadow's incremental copy (TOTK_SHADOW_INCR)
+// Newest seq among logged updates overlapping [lo, hi), 0 when none.
+static inline uint64_t upd_overlap_seq(uint64_t lo, uint64_t hi) { const upd_ent *e = upd_overlap_newest(lo, hi); return e ? e->seq : 0; }
+typedef struct { uint64_t lo, size, seq, gpu; uint8_t *cpu; uint64_t gen, done; int npend; uint64_t ready; } ubo_shadow;   // cpu/gen/done/npend: upd_shadow's incremental copy (TOTK_SHADOW_INCR); ready: copy-thread jobs that fill cpu (TOTK_UB_COPY_THREAD)
 static uint64_t g_ren_incr;
 #define UBO_SHADOW_MAX 512
 static ubo_shadow g_shadow[UBO_SHADOW_MAX]; static int g_nshadow;
@@ -1758,13 +1788,30 @@ static unsigned shadow_index_slot(uint64_t lo, uint64_t size) {
     uint64_t h=(lo >> 4) ^ (lo >> 19) ^ (size * UINT64_C(0x9e3779b97f4a7c15));
     return (unsigned)(h ^ (h >> 32)) & (SHADOW_INDEX_N-1);
 }
-static uint64_t g_ren_updates, g_ren_shadows, g_ren_bytes, g_ren_flushes, g_ren_late, g_ren_fallback;
+static uint64_t g_ren_updates, g_ren_shadows, g_ren_bytes, g_ren_flushes, g_ren_late, g_ren_fallback, g_ren_same;
 static int ub_rename_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("TOTK_UB_RENAME"); v = !(e && !strcmp(e, "0")); MLOG("TOTK: inline uniform updates %s", v ? "renamed per binding (render passes stay open)" : "copied on the GPU timeline (TOTK_UB_RENAME=0)"); }
     return v;
 }
-void mtl_ren_stats(uint64_t v[7]) { v[6] = g_ren_incr; v[0] = g_ren_updates; v[1] = g_ren_shadows; v[2] = g_ren_bytes; v[3] = g_ren_flushes; v[4] = g_ren_late; v[5] = g_ren_fallback; }
+/* TOTK (port of svich da73689): an inline update whose bytes equal those of the newest logged update covering its whole
+   range changes nothing the GPU will read; it is dropped (no log entry, no pending write, no new private copy of the
+   bound range in upd_shadow, argument buffers stay valid). Never across a newer overlapping update (only the newest
+   overlapping one is compared) or a flush (the log is empty after it). About 46% of TOTK's ~350 updates a frame.
+   TOTK_UB_SAME=0 logs every update. */
+static int ub_same_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_UB_SAME"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_UB_SAME=0: every inline uniform update is logged, also when its bytes equal the newest one"); }
+    return v;
+}
+static int g_upd_same_any;   // probe-gpu-ub-rename negative control only: compare with any covering update, not the newest overlapping one
+static int upd_same(const void *data, uint64_t dst, uint64_t n) {
+    if (!g_nupd || !ub_same_on()) return 0;
+    const upd_ent *e = upd_overlap_newest(dst, dst + n);
+    if (g_upd_same_any) for (int i = 0; i < g_nupd; i++) if (g_upd[i].lo <= dst && g_upd[i].hi >= dst + n) { e = &g_upd[i]; break; }
+    return e && e->src && e->lo <= dst && e->hi >= dst + n && !memcmp(e->src + (dst - e->lo), data, (size_t)n);
+}
+void mtl_ren_stats(uint64_t v[9]) { v[8] = g_ren_covered; v[7] = g_ren_same; v[6] = g_ren_incr; v[0] = g_ren_updates; v[1] = g_ren_shadows; v[2] = g_ren_bytes; v[3] = g_ren_flushes; v[4] = g_ren_late; v[5] = g_ren_fallback; }
 /* Bytes [a, a+n) as the GPU will see them at this point of the submission: memory, then every pending write that the GPU
    has not completed yet, oldest first (inline updates carry their bytes; GPU copies read their source the same way). */
 static void pend_materialize_x(uint64_t a, uint8_t *out, size_t n, int depth, int wait) {
@@ -1815,6 +1862,54 @@ static inline int upd_guard(uint64_t lo, uint64_t hi) {
 }
 // GPU address of a private copy of the uniform range [lo, lo+size) holding the logged updates, or 0 when none overlaps it.
 static int shadow_incr_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_SHADOW_INCR"); on = !(e && !strcmp(e, "0")); if (!on) MLOG("TOTK_SHADOW_INCR=0: every uniform copy rebuilt from the snapshot and all pending writes"); } return on; }   // =0: every copy the full way (A/B)
+/* TOTK (from nxnative 8a4b1dc, adapted to upd_shadow): the incremental copies of 512 bytes or more (the previous copy of
+   the range plus the writes noted since) are made by a worker thread instead of the replay thread. Jobs are plain
+   memcpys run in queue order, so a copy that starts from an earlier queued copy sees it filled. The sources are
+   immutable for the submission (arena copies of inline updates and earlier shadows). Every command buffer commit
+   (q4_commit) waits for the jobs queued before it; a CPU read of a shadow waits for the jobs that fill it (its ready
+   count). The full path (snapshot plus every pending write) stays on the replay thread. TOTK_UB_COPY_THREAD=0 off. */
+#define UBC_RING 8192
+typedef struct { uint8_t *dst; const uint8_t *src; size_t n; } ubc_job;
+static ubc_job g_ubc[UBC_RING];
+static _Atomic uint64_t g_ubc_head, g_ubc_done;   // jobs queued (the replay thread only) / finished (the worker only)
+static dispatch_semaphore_t g_ubc_sem;
+static uint64_t g_ubc_jobs, g_ubc_bytes, g_ubc_waits;
+static void *ubc_main(void *arg) {
+    (void)arg; pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    for (;;) {
+        dispatch_semaphore_wait(g_ubc_sem, DISPATCH_TIME_FOREVER);
+        uint64_t d = atomic_load_explicit(&g_ubc_done, memory_order_relaxed);
+        (void)atomic_load_explicit(&g_ubc_head, memory_order_acquire);   // pairs with the release store in ubc_push: the job is written
+        const ubc_job *j = &g_ubc[d % UBC_RING];
+        memcpy(j->dst, j->src, j->n);
+        atomic_store_explicit(&g_ubc_done, d + 1, memory_order_release);
+    }
+    return NULL;
+}
+static int ubc_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_UB_COPY_THREAD"); v = !(e && !strcmp(e, "0"));
+        if (v) { g_ubc_sem = dispatch_semaphore_create(0); pthread_t th; if (pthread_create(&th, NULL, ubc_main, NULL)) MDIE("uniform copy thread"); pthread_detach(th); }
+        MLOG("TOTK_UB_COPY_THREAD=%d: uniform copies of 512 bytes or more built on an earlier copy are made %s", v, v ? "by a worker thread (commits wait for them)" : "on the replay thread");
+    }
+    return v;
+}
+static void ubc_wait(uint64_t upto) {
+    if (atomic_load_explicit(&g_ubc_done, memory_order_acquire) >= upto) return;
+    g_ubc_waits++;
+    while (atomic_load_explicit(&g_ubc_done, memory_order_acquire) < upto) sched_yield();
+}
+static void ubc_wait_all(void) { ubc_wait(atomic_load_explicit(&g_ubc_head, memory_order_acquire)); }
+static uint64_t ubc_push(uint8_t *dst, const uint8_t *src, size_t n) {   // returns the count to wait for until dst holds the bytes
+    uint64_t h = atomic_load_explicit(&g_ubc_head, memory_order_relaxed);
+    if (h - atomic_load_explicit(&g_ubc_done, memory_order_acquire) >= UBC_RING) ubc_wait(h - UBC_RING + 1);
+    g_ubc[h % UBC_RING] = (ubc_job){dst, src, n};
+    atomic_store_explicit(&g_ubc_head, h + 1, memory_order_release);
+    dispatch_semaphore_signal(g_ubc_sem);
+    g_ubc_jobs++; g_ubc_bytes += n;
+    return h + 1;
+}
 static uint64_t upd_shadow(uint64_t lo, uint64_t size) {
     uint64_t last = size ? upd_overlap_seq(lo, lo + size) : 0;
     if (!last) return 0;
@@ -1845,19 +1940,23 @@ static uint64_t upd_shadow(uint64_t lo, uint64_t size) {
        meanwhile (g_done); else the full way. */
     uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE); int prev = -1;
     if (shadow_incr_on()) for (int i = g_nshadow - 1; i >= 0; i--) if (g_shadow[i].lo == lo && g_shadow[i].size == size) { prev = i; break; }
+    uint64_t ready = 0;
     if (prev >= 0 && g_shadow[prev].gen == g_mat_gen && g_shadow[prev].done == done && g_shadow[prev].npend <= g_npend) {
-        memcpy(cpu, g_shadow[prev].cpu, (size_t)size);
+        int defer = size >= 512 && ubc_on();   // TOTK_UB_COPY_THREAD
+        if (defer) ready = ubc_push(cpu, g_shadow[prev].cpu, (size_t)size);
+        else { ubc_wait(g_shadow[prev].ready); memcpy(cpu, g_shadow[prev].cpu, (size_t)size); }
         for (int i = g_shadow[prev].npend; i < g_npend; i++) {
             uint64_t plo = g_pend_lo[i], phi = g_pend_hi[i];
             if (phi <= lo || plo >= lo + size || g_pend_fence[i] <= done) continue;
             uint64_t s0 = plo > lo ? plo : lo, e0 = phi < lo + size ? phi : lo + size;
-            memcpy(cpu + (s0 - lo), (const uint8_t *)g_pend_src[i] + (s0 - plo), e0 - s0);   // kind 0 only: a kind 1 write bumps g_mat_gen
+            const uint8_t *src = (const uint8_t *)g_pend_src[i] + (s0 - plo);   // kind 0 only: a kind 1 write bumps g_mat_gen
+            if (defer) ready = ubc_push(cpu + (s0 - lo), src, e0 - s0); else memcpy(cpu + (s0 - lo), src, e0 - s0);
         }
         g_ren_incr++;
     } else pend_materialize(lo, cpu, (size_t)size, 0);
     uint64_t gpu = sb.gpuAddress + so;
     if (g_nshadow == UBO_SHADOW_MAX) g_nshadow = 0;
-    g_shadow[g_nshadow++] = (ubo_shadow){lo, size, last, gpu, cpu, g_mat_gen, done, g_npend};
+    g_shadow[g_nshadow++] = (ubo_shadow){lo, size, last, gpu, cpu, g_mat_gen, done, g_npend, ready};
     if(indexed)g_shadow_index[slot]=(uint16_t)g_nshadow;
     g_ren_shadows++; g_ren_bytes += size;
     return gpu;
@@ -1867,13 +1966,17 @@ static void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
     g_upd_n++;
     pd_update_bytes(data, dst, n, g_upd_n);
     if (!mtl_addr(dst, n, &db, &dof)) MDIE("uniform update target not in any memory pool dst=%#llx n=%#llx", (unsigned long long)dst, (unsigned long long)n);
+    if (upd_same(data, dst, n)) {   // TOTK_UB_SAME: nothing changes; no log entry, no new private copies, argument buffers stay valid
+        g_ren_same++; pd_xfer("update", 0, dst, n); anom_note_xfer('U', 0, dst, n, data);
+        return;
+    }
     id<MTLBuffer> sb; size_t so = arena_alloc((size_t)n, &sb);
     memcpy((uint8_t *)sb.contents + so, data, (size_t)n);
     pend_note(dst, n, (const uint8_t *)sb.contents + so, 0);   // the arena copy outlives this submission's replay
     pd_xfer("update", 0, dst, n);
     anom_note_xfer('U', 0, dst, n, data);   // TOTK_ANOMALY
     if (ub_rename_on() && g_npend < PEND_MAX && __atomic_load_n(&g_done, __ATOMIC_ACQUIRE) >= g_pend_over_fence) {
-        upd_insert(dst, dst + n);
+        upd_insert(dst, dst + n, (const uint8_t *)sb.contents + so);
         g_ren_updates++;
         upd_dirty_stages(dst, dst + n);   // argument buffers reused inside the pass would still point at the previous version
         return;
@@ -4271,7 +4374,9 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
       MLOG("[pool-query-cache] enabled=%d hits=%llu misses=%llu checked=%llu",pool_query_on(),(unsigned long long)hits,(unsigned long long)misses,(unsigned long long)checked); }
     MLOG("[pkg-hot] enabled=%d in=%llu out=%llu checks=%llu hash_ms=%.1f", pkg_hot_on(), (unsigned long long)g_pkg_hot_in, (unsigned long long)g_pkg_hot_out, (unsigned long long)g_pkg_hot_checks, g_pkg_hot_hash_ns / 1e6);
     MLOG("[vbuf-cache] enabled=%d reused=%llu resolved=%llu", vbuf_cache_on(), (unsigned long long)g_vbuf_reuse, (unsigned long long)g_vbuf_resolve);
-    MLOG("[pool-tls] enabled=%d hits=%llu misses=%llu verified=%llu",pool_tls_on(),(unsigned long long)g_pool_tls_hits,(unsigned long long)g_pool_tls_misses,(unsigned long long)g_pool_tls_verified);
+    { void vc_report(void); vc_report(); }
+    MLOG("[ub-copy-thread] enabled=%d jobs=%llu KB=%llu waits=%llu",ubc_on(),(unsigned long long)g_ubc_jobs,(unsigned long long)(g_ubc_bytes>>10),(unsigned long long)g_ubc_waits);
+    MLOG("[pool-tls] enabled=%d page=%d hits=%llu misses=%llu verified=%llu",pool_tls_on(),pool_page_on(),(unsigned long long)g_pool_tls_hits,(unsigned long long)g_pool_tls_misses,(unsigned long long)g_pool_tls_verified);
     MLOG("[shadow-index] enabled=%d hit=%llu miss=%llu verified=%llu",shadow_index_on(),(unsigned long long)g_shadow_index_hits,(unsigned long long)g_shadow_index_misses,(unsigned long long)g_shadow_index_verified);
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
     MLOG("texture type cache reclaimed %llu retired views", (unsigned long long)g_type_retired_views);
@@ -6337,6 +6442,51 @@ void mtl_reg_samp(int sid, const samp_par *sp) {
     if (samp_border_custom(sp)) atomic_store(&g_border_custom_any, 1);
     registry_unlock();
 }
+/* TOTK (from nxnative 9b7cb76): texture views kept by texture serial and view parameters beside the per-ID view, so a
+   texture registered into another ID (or again into an ID that dropped its view) with the same view gets the view made
+   before instead of a new newTextureViewWithPixelFormat. A hit is checked against the current base texture (re-uploads and
+   format-view upgrades replace it). Only textures the CPU does not mirror (treg_kind 0: GPU-written or shared storage);
+   mirrored copies can be evicted, purged or re-uploaded, and a cached view would keep the old copy alive. Entries go when
+   the serial is finalized (treg_drop_serial), and all of them past VC_MAX serials. Under g_rmu. TOTK_VIEW_CACHE=0 off. */
+typedef struct { uint32_t pf, l0, nl, s0, ns; uint8_t tt, swz, sw[4], pad[2]; } vc_key;
+enum { VC_WAYS = 4, VC_MAX = 4096 };
+typedef struct { unsigned next; vc_key k[VC_WAYS]; void *view[VC_WAYS]; } vc_set;   // view: retained
+static nvn_hmap g_vc = {.klen = 8};   // texture serial -> vc_set
+static uint64_t g_vc_hit, g_vc_new, g_vc_stale;
+static int vc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_VIEW_CACHE"); v = !(e && !strcmp(e, "0")); } return v; }
+static void vc_set_free(vc_set *vs) {
+    for (int i = 0; i < VC_WAYS; i++) if (vs->view[i]) { defer_obj_unref((__bridge id)vs->view[i]); CFRelease(vs->view[i]); }
+    free(vs);
+}
+static void vc_clear_locked(void) {
+    for (uint32_t i = 0; i < g_vc.cap; i++) if (g_vc.vals[i]) vc_set_free(g_vc.vals[i]);
+    free(g_vc.keys); free(g_vc.vals); g_vc.keys = NULL; g_vc.vals = NULL; g_vc.cap = g_vc.n = 0;
+}
+static void vc_drop_locked(uint64_t serial) { vc_set *vs = g_vc.n ? nvn_hm_del(&g_vc, &serial) : NULL; if (vs) vc_set_free(vs); }
+static id<MTLTexture> vc_get(uint64_t serial, const vc_key *k, id<MTLTexture> base) {
+    vc_set *vs = nvn_hm_get(&g_vc, &serial); if (!vs) return nil;
+    for (int i = 0; i < VC_WAYS; i++) if (vs->view[i] && !memcmp(&vs->k[i], k, sizeof *k)) {
+        id<MTLTexture> v = (__bridge id<MTLTexture>)vs->view[i];
+        if (v.parentTexture == base) { g_vc_hit++; return v; }
+        defer_obj_unref(v); CFRelease(vs->view[i]); vs->view[i] = NULL; g_vc_stale++; return nil;   // made from a base texture since replaced
+    }
+    return nil;
+}
+static void vc_put(uint64_t serial, const vc_key *k, id<MTLTexture> v) {
+    vc_set *vs = nvn_hm_get(&g_vc, &serial);
+    if (!vs) {
+        if (g_vc.n >= VC_MAX) vc_clear_locked();
+        if (!(vs = calloc(1, sizeof *vs))) return;
+        nvn_hm_put(&g_vc, &serial, vs);
+    }
+    unsigned i = vs->next++ % VC_WAYS;
+    if (vs->view[i]) { defer_obj_unref((__bridge id)vs->view[i]); CFRelease(vs->view[i]); }
+    vs->k[i] = *k; vs->view[i] = (void *)CFBridgingRetain(v); g_vc_new++;
+}
+void vc_report(void) {
+    registry_lock(); unsigned vn = g_vc.n; registry_unlock();
+    MLOG("[view-cache] enabled=%d serials=%u reused=%llu made=%llu stale=%llu", vc_on(), vn, (unsigned long long)g_vc_hit, (unsigned long long)g_vc_new, (unsigned long long)g_vc_stale);
+}
 /* Texture-pool slots whose cached view still holds a texture of a finalized serial (diagnostic for the readout line). */
 static void treg_stale_report(void) {
     unsigned long stale = 0, views = 0; unsigned long long stale_mb = 0;
@@ -6351,6 +6501,7 @@ static void treg_drop_serial(uint64_t serial) {
     registry_lock();
     for (int head; (head = (int)(uintptr_t)nvn_hm_get(&g_view_heads, &serial)); )
         treg_clear_view_locked(head - 1);
+    vc_drop_locked(serial);   // TOTK_VIEW_CACHE
     registry_unlock();
 }
 /* A slot that is no longer sampled never takes tex_by_id's invalidation path. After a CPU upload
@@ -6639,10 +6790,18 @@ static id<MTLTexture> tex_by_id(int tid) {   // Caller holds g_rmu
                        r.v.set_target ? "" : "(unset)", r.v.target, (unsigned long)base.pixelFormat, (unsigned long)base.mipmapLevelCount, (unsigned long)slices);
               return nil;
           } }
-        v = need_swz ? [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns) swizzle:vsw]
-                     : [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns)];
-        atomic_fetch_add_explicit(&g_stat_views, 1, memory_order_relaxed);
-        if (!v) { RED_ONCE(11, "could not create texture view for id %d", tid); v = base; }
+        vc_key vk; memset(&vk, 0, sizeof vk);   // TOTK_VIEW_CACHE
+        vk.pf = pf; vk.tt = (uint8_t)tt; vk.l0 = (uint32_t)l0; vk.nl = (uint32_t)nl; vk.s0 = (uint32_t)s0; vk.ns = (uint32_t)ns; vk.swz = (uint8_t)need_swz;
+        if (need_swz) { vk.sw[0] = (uint8_t)vsw.red; vk.sw[1] = (uint8_t)vsw.green; vk.sw[2] = (uint8_t)vsw.blue; vk.sw[3] = (uint8_t)vsw.alpha; }
+        int vcache = vc_on() && rp->t.serial && !treg_kind(&rp->t);
+        v = vcache ? vc_get(rp->t.serial, &vk, base) : nil;
+        if (!v) {
+            v = need_swz ? [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns) swizzle:vsw]
+                         : [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns)];
+            atomic_fetch_add_explicit(&g_stat_views, 1, memory_order_relaxed);
+            if (!v) { RED_ONCE(11, "could not create texture view for id %d", tid); v = base; }
+            else if (vcache) vc_put(rp->t.serial, &vk, v);
+        }
     }
     rp->view = (void *)CFBridgingRetain(v); rp->view_rid = v.gpuResourceID._impl; rp->view_ser = sg; rp->view_pkg = treg_kind(&rp->t); rp->view_dirty = rp->view_pkg == 2 || (rp->view_pkg == 1 && tex_check_once()) ? g_sub_serial : dg;
     treg_link_locked(tid);
@@ -9102,6 +9261,7 @@ static uint64_t driver_bank_gpu(int bank, int stage, __strong id<MTLBuffer> *out
    guest address which another game thread may already have recycled. The per-GPU-address
    suffix also keeps distinct inline updates of the same guest address within one pass. */
 static const uint8_t *bound_uniform_bytes(uint64_t gpu, size_t size, id<MTLBuffer> original) {
+    ubc_wait_all();   // TOTK_UB_COPY_THREAD: the shadow may still be filled by the worker
     uint64_t begin = original.gpuAddress, length = original.length;
     if (gpu >= begin && gpu - begin <= length && size <= length - (gpu - begin))
         return (const uint8_t *)original.contents + (gpu - begin);
@@ -15919,6 +16079,31 @@ int mtl_probe_ub_rename(void) {
         if(((uint8_t *)out.contents)[step*128+i]!=expected)MDIE("shadow index: GPU bytes differ step%d offset%d",step,i);checked++;
     }
     g_shadow_index_stale_probe=0;atomic_store(&g_shadow_index_on,saved_index);
+    /* TOTK_UB_SAME: updates equal to the newest logged update covering them are dropped (the same range and a part of it
+       keep the private copy). An equal update under a newer different one, and one after a flush, are logged.
+       TOTK_PROBE_NEGATIVE=9 compares with any covering update instead of the newest overlapping one: the read fails. */
+    if (ub_same_on()) {
+        g_upd_same_any=neg==9;
+        uint8_t u3[16]; memset(u3,0x22,sizeof u3); uint64_t same_before=g_ren_same; memset(mem+4096,0,96);
+        mtl_sub_begin();mtl_exec((const uint8_t *)&end);
+        mtl_sub_update(u1,base+16,64);
+        uint64_t s1=upd_shadow(base,size);
+        mtl_sub_update(u1,base+16,64);mtl_sub_update(u3,base+32,16);
+        if(g_nupd!=1 || g_ren_same!=same_before+2 || upd_shadow(base,size)!=s1)MDIE("ub same probe: equal updates logged (%d entries, %llu dropped)",g_nupd,(unsigned long long)(g_ren_same-same_before));checked++;
+        mtl_sub_update(u2,base+32,16);mtl_sub_update(u3,base+32,16);   // 0x33, then 0x22 again: not equal to the newest
+        uint64_t s3=upd_shadow(base,size);
+        se=enc_c_begin(NULL);enc_c_pso(se,ps);enc_c_args(se,s1,0);enc_c_args(se,out.gpuAddress+256,1);
+        [se dispatchThreads:MTLSizeMake(size,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];enc_c_end(se);
+        se=enc_c_begin(NULL);enc_c_pso(se,ps);enc_c_args(se,s3,0);enc_c_args(se,out.gpuAddress+384,1);
+        [se dispatchThreads:MTLSizeMake(size,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];enc_c_end(se);
+        mtl_sub_copy(base,copy_dst,size);mtl_sub_update(u3,base+32,16);   // the copy flushed the log
+        if(g_nupd!=1)MDIE("ub same probe: update after a flush dropped");checked++;
+        mtl_sub_commit();mtl_finish();g_upd_same_any=0;
+        for(int step=0;step<2;step++)for(int i=0;i<96;i++) {
+            if(((uint8_t *)out.contents)[256+step*128+i]!=want[1][i])MDIE("ub same probe: read %d byte %d = %#x, expected %#x",step,i,((uint8_t *)out.contents)[256+step*128+i],want[1][i]);checked++;
+        }
+        for(int i=0;i<96;i++){ if(mem[256+i]!=want[1][i] || mem[4096+i]!=want[1][i])MDIE("ub same probe: memory byte %d",i);checked++; }
+    }
     mtl_pool_del(mem); return checked;
 }
 
