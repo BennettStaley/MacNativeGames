@@ -3109,7 +3109,13 @@ static uint64_t present_period(const win_t *o) {
                                     m == MFX_MAX ? (g_uncapped ? "interpolation max: uncapped, one generated frame per frame" : "interpolation max: game present interval, one generated frame per frame") :
                                     g_uncapped ? "interpolation off: uncapped" : "interpolation off: game present interval"); was = m; }
     if (m == MFX_30 || game_holds_30()) return 1000000000ull / 30;   /* exactly 30 fps, by display ticks or by our own clock */
-    return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
+    if (hz <= 0) return 0;
+    uint64_t per = (uint64_t)itv * 1000000000ull / (uint64_t)hz;
+    /* A frame rate limit already sets hz (the own clock at 30 or 40); the game's present interval 2 on top halved it again
+       (limit 30 alternated 30 / 15 fps while the camera moved, 2026-10-23). Never slower than 30 fps here unless hz itself is. */
+    uint64_t floor30 = 1000000000ull / 30, one = 1000000000ull / (uint64_t)hz;
+    if (itv > 1 && per > floor30) per = one > floor30 ? one : floor30;
+    return per;
 }
 /* Exercise production policy, including the shrine's interval=2 and the
    legacy 30 FPS path. No sleep, present or GPU allocation is involved. */
