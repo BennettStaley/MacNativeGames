@@ -1297,7 +1297,7 @@ static void pt_mark(id cb, char kind, MTL4RenderPassDescriptor *d) {
     }
     if (g_pt_n >= PT_MAX - 1) return;
     [(id<MTL4CommandBuffer>)cb writeTimestampIntoHeap:g_pt_heap atIndex:(NSUInteger)g_pt_n];
-    pt_ent *p = &g_pt[g_pt_n++]; memset(p, 0, sizeof *p); p->kind = kind; p->draw0 = g_stat_draw; g_pt_key_pending = kind == 'R';
+    pt_ent *p = &g_pt[g_pt_n++]; memset(p, 0, sizeof *p); p->kind = kind; p->draw0 = g_stat_draw; g_pt_key_pending = kind == 'R' || kind == 'C';
     if (!d) return;
     for (int i = 0; i < 8; i++) {
         MTLRenderPassColorAttachmentDescriptor *a = d.colorAttachments[i]; if (!a.texture) continue;
@@ -1330,7 +1330,7 @@ static void pt_finish(id cb, TotkCommitOptions *o, uint64_t frame) {
         for (int k = 0; k < m && k < 40 && !fp; k++) { int i = ord[k]; const pt_ent *p = &ents[i]; uint64_t dn = (i + 1 < n ? ents[i + 1].draw0 : draws_end) - p->draw0;
             MLOG("[pass-gpu]   #%d %c %.3f ms draws %llu %ux%u fmt %u color %u depth %u load %u store %u %s ended-by %s", i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->nstore, p->key[0] ? p->key : "-", p->why ? p->why : "-"); }
         if (ff) { for (int i = 0; i + 1 < n; i++) { const pt_ent *p = &ents[i]; uint64_t dn = ents[i + 1].draw0 - p->draw0;
-                      fprintf(ff, "%llu\t%d\t%c\t%.4f\t%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%s\t%s\n", (unsigned long long)frame, i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->key[0] ? p->key : "-", p->why ? p->why : "-"); }
+                      fprintf(ff, "%llu\t%d\t%c\t%.4f\t%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%s\t%s\t%u\n", (unsigned long long)frame, i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->key[0] ? p->key : "-", p->why ? p->why : "-", p->nstore); }
                   fclose(ff); }
         free(ms); free(ord); free(ents);
     }];
@@ -2758,6 +2758,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "draw_log")) { extern _Atomic long g_draw_log; atomic_store(&g_draw_log, v); MLOG("[flag] draw_log: every draw and dispatch of the next %d frames", v); return; }
     if (!strcmp(name, "uw_log")) { extern _Atomic long g_uw_log; atomic_store(&g_uw_log, v); MLOG("[flag] uw_log: canvas draws of the next %d frames", v); return; }   // key 4 UI squeeze diagnostic
     if (!strcmp(name, "mfx_output")) { mfxup_output_set(v < 0 ? !mfxup_output_enabled() : v); return; }   // TOTK_MFX_OUTPUT at run time (the window output stage)
+    if (!strcmp(name, "udc")) { void mtl_udc_set(int on); mtl_udc_set(v); return; }   // TOTK_UDC at run time (same-run A/B)
     if (!strcmp(name, "pass_gpu")) {
         if (v < 0 || v > 120) { MLOG("[flag] pass_gpu requires 0..120 frames"); return; }
         atomic_store_explicit(&g_pt_request, v, memory_order_relaxed);
@@ -4564,6 +4565,25 @@ static disc_pend g_disc_pend[9]; static int g_ndisc_pend;
 static uint64_t g_dc_stat[6];   // attachments marked in an open pass, stored DontCare by a discard, loads made DontCare, empty passes, their attachments stored DontCare
 void mtl_store_dc_stats(uint64_t v[6]) { memcpy(v, g_dc_stat, sizeof g_dc_stat); }
 static int discard_level(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_DISCARD"); v = e ? atoi(e) : 1; if (v < 0) v = 0; if (v != 1) MLOG("TOTK_DISCARD=%d: %s", v, v ? "discards also make the next pass's load DontCare" : "NVN discards ignored"); } return v; }
+/* TOTK_UDC (default off, =1 on; live: input-file "flag udc <0|1>"; 2026-10-23, compiled only, not tried in game; turn
+   it on by default only after same-run on / off screenshots match): an attachment the pass loaded and none of
+   its draws wrote (colour write mask 0 and no fragment output for it, no depth / stencil write, no image writes in the
+   program) is stored DontCare: memory already holds those pixels, so the store only rewrote the same bytes. This is the
+   UDC piece of the TBDR bundle without its guards (DM_NVN_TBDR_UDC also turns off async shaders, layered passes and
+   mid-submission commits, which UDC itself does not need: a skipped draw writes nothing either way). Safety: every
+   Metal draw encoded into the pass must be accounted for, either by udc_note_draw (the game's draws) or by udc_mark_all
+   (the mid-pass clear quads, which write without going through it); when the pass encoded more draws than were
+   accounted for, nothing is skipped. Passes with block-compressed write-backs (g_nblk_wb) are left alone.
+   DM_NVN_UNWRITTEN_DC=0 still vetoes it. Measured at 1440p on the Sky Temple save: see docs/performance-followups.md. */
+static _Atomic int g_udc_ttk = -1;
+static uint64_t g_udc_noted, g_udc_noted0, g_udc_ttk_veto, g_udc_ttk_dead, g_udc_ttk_all, g_udc_ttk_bytes;
+static int udc_ttk_on(void) {
+    int v = atomic_load_explicit(&g_udc_ttk, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("TOTK_UDC"); v = e && !strcmp(e, "1"); atomic_store(&g_udc_ttk, v);
+        if (v) MLOG("TOTK_UDC=%d: attachments a pass loaded and never wrote %s", v, v ? "are stored DontCare (memory already holds them)" : "are stored as before"); }
+    return v;
+}
+void mtl_udc_set(int on) { atomic_store(&g_udc_ttk, on ? 1 : 0); MLOG("[flag] udc = %d (unwritten attachments stored %s)", on ? 1 : 0, on ? "DontCare" : "as before"); }
 static int empty_pass_dc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_EMPTY_PASS_DC"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_EMPTY_PASS_DC=0: empty render passes store their attachments"); } return v; }
 static void rt_sub(const p_set_rt *r, int k, uint64_t *ser, int *lv, int *sl);
 static unsigned g_sd_plain;   // TOTK: g_sd entries (bit i) written in this encoder by a draw that samples none of its attachments (att_unstored_read)
@@ -5246,7 +5266,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
                    (unsigned long)stt.width, (unsigned long)stt.height, pd.stencilAttachment.loadAction == MTLLoadActionClear ? "clear" : "load");
     }
     if (natt && nload == natt) g_pass_full_rw++;
-    g_nsd = 0; g_sd_plain = 0; g_sd_draw0 = g_enc_draws;
+    g_nsd = 0; g_sd_plain = 0; g_sd_draw0 = g_enc_draws; g_udc_noted0 = g_udc_noted;
     {
         for (int i = 0; i < R.rt.n && i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i]; if (!c.texture) continue;
             g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.color[i]->serial; g_sd[g_nsd].bytes = att_bytes(c.texture, c.level); g_sd[g_nsd].lv = (uint32_t)c.level; g_sd[g_nsd].sl = (uint32_t)(c.texture.textureType == MTLTextureType3D ? c.depthPlane : c.slice); g_sd[g_nsd].idx = i; g_sd[g_nsd].load = c.loadAction == MTLLoadActionLoad; g_sd[g_nsd].wrote = R.clear_c[i] != 0; g_nsd++;
@@ -6748,7 +6768,9 @@ static void noatt_dims(NSUInteger *w, NSUInteger *h) {
     if ((x1 < 1 || y1 < 1) && R.has_sc) { x1 = (double)R.sc.x + R.sc.w; y1 = (double)R.sc.y + R.sc.h; }
     *w = x1 < 1 ? 1 : x1 > 16384 ? 16384 : (NSUInteger)x1; *h = y1 < 1 ? 1 : y1 > 16384 ? 16384 : (NSUInteger)y1;
 }
+static void udc_mark_all(void) { g_udc_noted++; for (int i = 0; i < g_nsd; i++) { g_sd[i].wrote = 1; if (!g_sd[i].wwhy) g_sd[i].wwhy = 6; } }   // TOTK_UDC: a helper draw into the open pass (clear quads)
 static void udc_note_draw(NvProg *pr) {
+    g_udc_noted++;   // TOTK_UDC: this draw's writes are accounted for below
     if (R.has_rt) for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) { zskip_del(R.rt.color[i]->serial); g_zskip_cand_ok[i] = 0; }   // Zero-source set: once really drawn it is no longer all zeros
     /* TOTK (after D2R Mobile 44a6770): the program's image bindings and fragment colour mask are worked out once per program
        and kept on it (two loops over every binding of every stage on every draw before). */
@@ -9501,10 +9523,18 @@ static void sd_finish(void) {
     int tb_st = tbdr_piece(TB_STORE), tb_udc = tbdr_piece(TB_UDC);
     int empty = g_enc_draws == g_sd_draw0 && !g_nblk_wb && empty_pass_dc_on();
     if (empty) g_dc_stat[3]++;
-    if (!tb_st && !tb_udc) {   // All store pieces off: always write back (except sd_dead_ext)
-        for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i]; int ext = sd_dead_ext(t, empty);
+    if (!tb_st && !tb_udc) {   // All store pieces off: always write back (except sd_dead_ext and TOTK_UDC)
+        int udc = udc_ttk_on() && udc_on() && !g_nblk_wb;
+        if (udc && g_enc_draws - g_sd_draw0 > g_udc_noted - g_udc_noted0) { udc = 0; g_udc_ttk_veto++; }   // a draw not accounted for
+        for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i]; int ext = sd_dead_ext(t, empty), u = !ext && udc && t->load && !t->wrote;
             if (ext) { g_dc_stat[ext == 1 ? 1 : 4]++; g_bw_store -= t->bytes; }
-            enc_r_store(g_enc, t->depth, ext ? MTLStoreActionDontCare : MTLStoreActionStore, (NSUInteger)t->idx); }
+            if (u) { g_udc_ttk_dead++; g_udc_ttk_bytes += t->bytes; g_udc_saved_bytes += t->bytes; g_bw_store -= t->bytes; }
+            g_udc_ttk_all++;
+            enc_r_store(g_enc, t->depth, ext || u ? MTLStoreActionDontCare : MTLStoreActionStore, (NSUInteger)t->idx); }
+        if (udc && g_udc_ttk_all >= 20000) {
+            MLOG("[udc] last %llu attachment stores: %llu unwritten ones stored DontCare (%.0f MB not written back), %llu passes left alone (unaccounted draws)",
+                 (unsigned long long)g_udc_ttk_all, (unsigned long long)g_udc_ttk_dead, g_udc_ttk_bytes / 1048576.0, (unsigned long long)g_udc_ttk_veto);
+            g_udc_ttk_all = g_udc_ttk_dead = g_udc_ttk_bytes = g_udc_ttk_veto = 0; }
         g_nsd = 0; return; }
     uint8_t nst[9]; uint64_t tb_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (tb_st && sdx_decide(nst)) { for (int i = 0; i < g_nsd; i++) if (nst[i] == 2) g_sd[i].state = 2; else sd_need(&g_sd[i], nst[i] >> 2); }
@@ -11283,7 +11313,7 @@ static void clear_quad_core(id<MTL4RenderCommandEncoder> en, const uint32_t cfmt
     enc_r_viewport(en, (MTLViewport){0, 0, (double)tw, (double)th, 0, 1});
     enc_r_scissor(en, sc);
     enc_r_cull(en, MTLCullModeNone); enc_r_fill(en, MTLTriangleFillModeFill); enc_r_depth_bias(en, 0, 0, 0);
-    enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, 3);
+    udc_mark_all(); enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, 3);
 }
 static void clear_quad(const p_clear_color *c) {
     gpu_path_on("TOTK_GPU_MIDCLEAR", "mid-pass / partial-mask / scissored color clear"); BOTW_RT_DUP_CLEAR_TO_FIRST(c)
@@ -11333,7 +11363,7 @@ static void clear_ds_core(id<MTL4RenderCommandEncoder> en, const uint32_t cfmt[8
     if (g_enc_vis) { enc_r_visibility(en, MTLVisibilityResultModeDisabled, 0); g_enc_vis = 0; }
     enc_r_stencil_ref(en, c->stencil, c->stencil); enc_r_viewport(en, (MTLViewport){0, 0, (double)tw, (double)th, 0, 1}); enc_r_scissor(en, sc);
     enc_r_cull(en, MTLCullModeNone); enc_r_fill(en, MTLTriangleFillModeFill); enc_r_depth_bias(en, 0, 0, 0); enc_r_depth_clip(en, YES);
-    enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, 3);
+    udc_mark_all(); enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, 3);
 }
 static void clear_ds_quad(const p_clear_ds *c) {
     gpu_path_on("TOTK_GPU_MIDCLEAR", "mid-pass / masked / scissored depth-stencil clear");
@@ -12604,13 +12634,13 @@ static void dispatch(const p_dispatch *dp) {
     const uint16_t *tg = cs->rf.tg;
     if (!tg[0]) { RED_ONCE(29, "Compute shader lacks threadgroup size reflection"); return; }
     RP_WHY("dispatch"); rp_end();
-    int reuse = disp_reuse_on() && !pg_on();
+    int reuse = disp_reuse_on() && !pg_on() && !pt_active();   // TOTK_PASS_GPU frames: one encoder (one timing row, with its shader key) per dispatch
     id<MTLComputeCommandEncoder> ce;
     if (reuse) ce = disp_enc();
     else { if (g_blit) { enc_b_end(g_blit); g_blit = nil; } ce = pg_compute(); }
     enc_c_pso(ce, ps);
     g_dispatch_grid[0] = (uint32_t)dp->x; g_dispatch_grid[1] = (uint32_t)dp->y; g_dispatch_grid[2] = (uint32_t)dp->z;
-    encode_args(ce, cs, 5, 0);
+    encode_args(ce, cs, 5, 0); if (g_pt_key_pending) pt_note_key(cs->key);
     if (atomic_load(&g_draw_log) > 0) MLOG("[uw] F%llu pass %llu dispatch cs %.8s grid %dx%dx%d", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, cs->key, dp->x, dp->y, dp->z);
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
     if (!reuse) enc_c_end(ce);
