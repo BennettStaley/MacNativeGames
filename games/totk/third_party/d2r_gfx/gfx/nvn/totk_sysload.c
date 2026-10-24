@@ -75,7 +75,12 @@ int sysload_power_text(char *out, size_t n, const sysload_info *in) {
     else if (in->charger_w == 0) { SEP(); PUT("No charger"); }
     if (!isnan(in->bat_w)) {
         SEP();
-        if (in->bat_w <= -0.5) { PUT("Battery %.0f W draining", in->bat_w); drain = 1; }
+        if (in->bat_w <= -0.5) {
+            PUT("Battery %.0f W draining", in->bat_w); drain = 1;
+            if (in->left_min >= 600) PUT(", over 10 h left");
+            else if (in->left_min >= 60) PUT(", %d h %02d min left", in->left_min / 60, in->left_min % 60);
+            else if (in->left_min >= 0) PUT(", %d min left", in->left_min);
+        }
         else if (in->bat_w >= 0.5) PUT("Battery +%.0f W charging", in->bat_w);
         else PUT("Battery 0 W");
     }
@@ -220,16 +225,17 @@ static CFDictionaryRef prop_dict(io_object_t o, CFStringRef key) {
 }
 /* The battery controller's view: whole-Mac load and charger input (W, -1 = not known), battery power (W, + into it,
    NaN = no battery) and the charger's rating (W, 0 = none, -1 = not known). 0 on a Mac without a battery controller. */
-static int battery_power(double *sys_w, double *in_w, double *bat_w, int *charger_w) {
+static int battery_power(double *sys_w, double *in_w, double *bat_w, int *charger_w, double *left_wh) {
     static io_service_t batt; static int tried;
     if (!tried) { tried = 1; batt = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery")); }
     if (!batt) return 0;
-    *sys_w = *in_w = -1; *bat_w = NAN; *charger_w = -1;
+    *sys_w = *in_w = -1; *bat_w = NAN; *charger_w = -1; *left_wh = -1;
     CFDictionaryRef t = prop_dict(batt, CFSTR("PowerTelemetryData")); int64_t v;
     if (dict_num(t, CFSTR("SystemLoad"), &v) && v >= 0) *sys_w = v / 1000.0;
     if (dict_num(t, CFSTR("SystemPowerIn"), &v) && v >= 0) *in_w = v / 1000.0;
     if (t) CFRelease(t);
     int64_t ma, mv; if (prop_num(batt, CFSTR("Amperage"), &ma) && prop_num(batt, CFSTR("Voltage"), &mv)) *bat_w = (double)ma * (double)mv / 1e6;   // signed mA x mV
+    int64_t mah; if (prop_num(batt, CFSTR("AppleRawCurrentCapacity"), &mah) && mah > 0 && prop_num(batt, CFSTR("Voltage"), &mv) && mv > 0) *left_wh = (double)mah * (double)mv / 1e6;
     CFTypeRef ext = IORegistryEntryCreateCFProperty(batt, CFSTR("ExternalConnected"), kCFAllocatorDefault, 0);
     int plugged = ext && CFGetTypeID(ext) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)ext);
     if (ext) CFRelease(ext);
@@ -239,17 +245,19 @@ static int battery_power(double *sys_w, double *in_w, double *bat_w, int *charge
 }
 #else
 static int soc_energy(double *cpu_j, double *gpu_j) { (void)cpu_j; (void)gpu_j; return 0; }
-static int battery_power(double *sys_w, double *in_w, double *bat_w, int *charger_w) { (void)sys_w; (void)in_w; (void)bat_w; (void)charger_w; return 0; }
+static int battery_power(double *sys_w, double *in_w, double *bat_w, int *charger_w, double *left_wh) { (void)sys_w; (void)in_w; (void)bat_w; (void)charger_w; (void)left_wh; return 0; }
 #endif
 
 /* Averages over the last SYSLOAD_POWER_SECONDS of 0.5 s samples; NaN marks a sample without that value. */
 enum { PW_N = SYSLOAD_POWER_SECONDS * 2, PW_CPU = 0, PW_GPU, PW_SYS, PW_IN, PW_BAT, PW_K };
 static double g_pw[PW_K][PW_N]; static unsigned g_pw_n;
+enum { DR_N = SYSLOAD_DRAIN_SECONDS * 2 };
+static double g_drain[DR_N]; static unsigned g_drain_n;   // battery power over the longer window, for the time left
 static void power_sample(sysload_info *s, double dt) {
     double cj, gj, v[PW_K]; for (int k = 0; k < PW_K; k++) v[k] = NAN;
     if (soc_energy(&cj, &gj) && dt > 0) { v[PW_CPU] = cj / dt; v[PW_GPU] = gj / dt; }
-    int charger = -1;
-    if (battery_power(&v[PW_SYS], &v[PW_IN], &v[PW_BAT], &charger)) { if (v[PW_SYS] < 0) v[PW_SYS] = NAN; if (v[PW_IN] < 0) v[PW_IN] = NAN; }
+    int charger = -1; double left_wh = -1;
+    if (battery_power(&v[PW_SYS], &v[PW_IN], &v[PW_BAT], &charger, &left_wh)) { if (v[PW_SYS] < 0) v[PW_SYS] = NAN; if (v[PW_IN] < 0) v[PW_IN] = NAN; }
     else v[PW_SYS] = v[PW_IN] = v[PW_BAT] = NAN;
     unsigned slot = g_pw_n++ % PW_N;
     double avg[PW_K];
@@ -261,6 +269,10 @@ static void power_sample(sysload_info *s, double dt) {
     s->cpu_w = isnan(avg[PW_CPU]) ? -1 : avg[PW_CPU]; s->gpu_w = isnan(avg[PW_GPU]) ? -1 : avg[PW_GPU];
     s->sys_w = isnan(avg[PW_SYS]) ? -1 : avg[PW_SYS]; s->in_w = isnan(avg[PW_IN]) ? -1 : avg[PW_IN];
     s->bat_w = avg[PW_BAT]; s->charger_w = charger;
+    g_drain[g_drain_n++ % DR_N] = v[PW_BAT];
+    double dsum = 0; int dc = 0; for (unsigned i = 0; i < DR_N && i < g_drain_n; i++) if (!isnan(g_drain[i])) { dsum += g_drain[i]; dc++; }
+    double drain_w = dc ? -dsum / dc : 0;   // positive while draining
+    s->left_min = left_wh > 0 && drain_w >= 0.5 ? (int)(left_wh / drain_w * 60 + 0.5) : -1;
     s->have_power = s->cpu_w >= 0 || s->sys_w >= 0 || !isnan(s->bat_w);
 }
 

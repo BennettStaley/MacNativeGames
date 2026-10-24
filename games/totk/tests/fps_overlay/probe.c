@@ -199,14 +199,14 @@ int main(void) {
 
     /* The bottom-right load line: text, its glyphs, the widest line within the wider texture at every scale, the busy-time
        union of in-order command buffers, and one real sample of this machine (cores split into P and E, GPU known). */
-    sysload_info li = {4, 6, {55, 56, 55, 53}, {43, 29, 20, 12, 9, 7}, 99, 70, 47, "x", 0, -1, -1, -1, -1, -1, 0};
+    sysload_info li = {4, 6, {55, 56, 55, 53}, {43, 29, 20, 12, 9, 7}, 99, 70, 47, "x", 0, -1, -1, -1, -1, -1, -1, 0};
     sysload_text(line, sizeof line, &li);
     CHECK(!strcmp(line, "P 55% 56% 55% 53%  E 43% 29% 20% 12%  9%  7%  T 47%  GPU 99% (70%)"), "load line \"%s\"", line);
     li.gpu_sys = -1; li.gpu_game = -1; li.thread_max = -1; sysload_text(line, sizeof line, &li);
     CHECK(!strcmp(line, "P 55% 56% 55% 53%  E 43% 29% 20% 12%  9%  7%  GPU --"), "load line without GPU numbers \"%s\"", line);
     for (const char *c = "PEGUT%()"; *c; c++) CHECK(fps_overlay_has_glyph(*c), "no glyph for '%c' (load line)", *c);
     static uint8_t lpx[LOAD_OVERLAY_TEX_W * FPS_OVERLAY_TEX_H * 4];
-    sysload_info wide = {4, 6, {100, 100, 100, 100}, {100, 100, 100, 100, 100, 100}, 100, 100, 100, "x", 0, -1, -1, -1, -1, -1, 0};
+    sysload_info wide = {4, 6, {100, 100, 100, 100}, {100, 100, 100, 100, 100, 100}, 100, 100, 100, "x", 0, -1, -1, -1, -1, -1, -1, 0};
     char wl[128]; sysload_text(wl, sizeof wl, &wide);
     int unit = (int)strlen(wl) * 6 - 1 + 4;
     for (int s = 1; s <= FPS_OVERLAY_MAX_SCALE; s++) {
@@ -217,16 +217,24 @@ int main(void) {
     fps_overlay_raster_line_tex(wl, 0, 4, lpx, LOAD_OVERLAY_TEX_W, FPS_OVERLAY_TEX_H, &w, &h);
     CHECK(w == unit * 4, "the widest load line keeps scale 4 (1440p) in its texture: width %d", w);
     /* The power line: every value, a draining battery (highlighted), charging, no charger, nothing known. */
-    sysload_info pw = {0}; pw.have_power = 1; pw.cpu_w = 9.04; pw.gpu_w = 21.26; pw.sys_w = 42.4; pw.in_w = 36.2; pw.bat_w = -6.3; pw.charger_w = 100;
-    CHECK(sysload_power_text(line, sizeof line, &pw) == 1 && !strcmp(line, "CPU 9.0 W  GPU 21.3 W  Total 42 W  Charger 100 W (36 W in)  Battery -6 W draining"), "power line, draining \"%s\"", line);
+    char pline[128];   // the panel keeps 128 bytes per line (fps_overlay.c g_hud_text)
+    sysload_info pw = {0}; pw.have_power = 1; pw.cpu_w = 9.04; pw.gpu_w = 21.26; pw.sys_w = 42.4; pw.in_w = 36.2; pw.bat_w = -6.3; pw.charger_w = 100; pw.left_min = -1;
+    CHECK(sysload_power_text(pline, sizeof pline, &pw) == 1 && !strcmp(pline, "CPU 9.0 W  GPU 21.3 W  Total 42 W  Charger 100 W (36 W in)  Battery -6 W draining"), "power line, draining \"%s\"", pline);
+    pw.left_min = 125;
+    CHECK(sysload_power_text(pline, sizeof pline, &pw) == 1 && strstr(pline, "Battery -6 W draining, 2 h 05 min left"), "power line, time left \"%s\"", pline);
+    pw.left_min = 42;
+    CHECK(strstr((sysload_power_text(pline, sizeof pline, &pw), pline), "draining, 42 min left"), "power line, minutes left \"%s\"", pline);
+    pw.left_min = 900;
+    CHECK(strstr((sysload_power_text(pline, sizeof pline, &pw), pline), "draining, over 10 h left"), "power line, long time left \"%s\"", pline);
+    pw.left_min = -1;
     pw.bat_w = 3.2; pw.in_w = 46;
-    CHECK(sysload_power_text(line, sizeof line, &pw) == 0 && !strcmp(line, "CPU 9.0 W  GPU 21.3 W  Total 42 W  Charger 100 W (46 W in)  Battery +3 W charging"), "power line, charging \"%s\"", line);
+    CHECK(sysload_power_text(pline, sizeof pline, &pw) == 0 && !strcmp(pline, "CPU 9.0 W  GPU 21.3 W  Total 42 W  Charger 100 W (46 W in)  Battery +3 W charging"), "power line, charging \"%s\"", pline);
     pw.bat_w = -0.2;
-    CHECK(sysload_power_text(line, sizeof line, &pw) == 0 && strstr(line, "Battery 0 W"), "power line, battery held \"%s\"", line);
-    pw.charger_w = 0; pw.in_w = 0; pw.bat_w = -42.4;
-    CHECK(sysload_power_text(line, sizeof line, &pw) == 1 && strstr(line, "No charger  Battery -42 W draining"), "power line, on battery \"%s\"", line);
-    pw = (sysload_info){0}; pw.cpu_w = pw.gpu_w = pw.sys_w = pw.in_w = -1; pw.bat_w = NAN; pw.charger_w = -1; pw.have_power = 1;
-    CHECK(sysload_power_text(line, sizeof line, &pw) == -1 && !line[0], "power line with nothing known is empty \"%s\"", line);
+    CHECK(sysload_power_text(pline, sizeof pline, &pw) == 0 && strstr(pline, "Battery 0 W"), "power line, battery held \"%s\"", pline);
+    pw.charger_w = 0; pw.in_w = 0; pw.bat_w = -42.4; pw.left_min = 104;
+    CHECK(sysload_power_text(pline, sizeof pline, &pw) == 1 && strstr(pline, "No charger  Battery -42 W draining, 1 h 44 min left"), "power line, on battery \"%s\"", pline);
+    pw = (sysload_info){0}; pw.cpu_w = pw.gpu_w = pw.sys_w = pw.in_w = -1; pw.bat_w = NAN; pw.charger_w = -1; pw.left_min = -1; pw.have_power = 1;
+    CHECK(sysload_power_text(pline, sizeof pline, &pw) == -1 && !pline[0], "power line with nothing known is empty \"%s\"", pline);
     sysload_busy b = {0, 0};
     sysload_busy_add(&b, 1.0, 1.005); sysload_busy_add(&b, 1.005, 1.010); sysload_busy_add(&b, 1.008, 1.012); sysload_busy_add(&b, 1.020, 1.020);
     CHECK(b.busy > 0.01199 && b.busy < 0.01201, "busy union of 0-5, 5-10, 8-12 ms (and an empty one) is 12 ms, got %.6f s", b.busy);
