@@ -4711,7 +4711,7 @@ void ts_after(void);
 // ---------- Store lookahead: at pass end, decide from the later commands of the same submission whether each attachment's write-back is redundant ----------
 // On TBDR every attachment is written back to memory in full when the pass ends; Switch (Maxwell immediate-mode rendering) has no such cost. If an attachment is cleared in full before being read, the write-back is redundant (DontCare).
 // For the decision see mtl_sub_index / sdx_decide; only what can be proven within the same submission is accepted, and anything still undecided at the end of the submission is always written back.
-typedef struct { uint64_t disc; uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy; const char *wkey; int wslot; } sd_att;   // depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth
+typedef struct { uint64_t disc; uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy, nl; const char *wkey; int wslot; } sd_att;   // depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth
 static sd_att g_sd[9]; static int g_nsd;   // disc (TOTK_DISCARD): g_enc_draws + 1 when the game discarded the attachment in this pass, 0 if not
 static uint64_t g_sd_draw0;   // g_enc_draws when this encoder opened (TOTK_EMPTY_PASS_DC)
 /* TOTK_SPLIT_BARRIER: NVN Barrier() calls replayed so far (the game's own ordering requests), the bits of the last one and
@@ -4756,6 +4756,37 @@ static int udc_on(void) {
     if (g_udc_ab < 0) { const char *e = getenv("DM_NVN_UNWRITTEN_DC"); g_udc_ab = !(e && !strcmp(e, "0"));
         const char *a = getenv("DM_NVN_UDC_AB"); if (a && !strcmp(a, "1")) { g_udc_ab = 0; g_udc_ab_on = 0; } }
     return g_udc_ab || g_udc_ab_on;
+}
+/* TOTK_ULD (default off, =1 on; needs TOTK_UDC): colour attachments a pass loads and never writes are not loaded either.
+   TOTK_UDC already stores them DontCare, so with a DontCare load the tile never touches their memory: the lighting
+   passes after the G-buffer attach all four G-buffer targets but write one or two (about 88 MB loaded a pass at 1440p).
+   The load is decided when the pass opens, before its draws are known, so it is predicted: a pass is matched with the
+   same pass of earlier frames (attachment sizes, formats, levels, slices, depth, and its ordinal among this frame's passes
+   with those), and an attachment is not loaded once ULD_STREAK occurrences in a row loaded it and never wrote it.
+   A draw (or a partial clear) that would write a predicted attachment ends the pass first (RP_WHY uld-mispredict): the
+   pass so far stores that attachment DontCare (unwritten, memory intact), the next one loads it; the entry starts over.
+   Colour only: depth / stencil are read by the depth test without being written. Not with tile reads (TOTK_ATT_FB),
+   layered, merged, range or block-render passes. */
+#define ULD_TAB 2048
+#define ULD_STREAK 4
+typedef struct { uint64_t sig; uint8_t streak[8], hold[8]; } uld_ent;
+static uld_ent g_uld[ULD_TAB];
+static uld_ent *g_uld_cur;        // the open pass's entry (NULL: not predicted)
+static uint32_t g_uld_mask;       // g_sd indices loaded DontCare by prediction
+static uint64_t g_uld_skip, g_uld_skip_bytes, g_uld_miss, g_uld_bad, g_uld_passes;
+static int uld_fz_active(void);   // the readable-tile pass merge is on (g_fz, defined further down)
+static int uld_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ULD"); v = e && atoi(e) > 0;
+    if (v) MLOG("TOTK_ULD=1: colour attachments a pass loads and never writes (predicted from earlier frames) are not loaded"); } return v; }
+static uint64_t uld_mix(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); h *= 0xff51afd7ed558ccdull; return h ^ (h >> 33); }
+static uld_ent *uld_find(uint64_t base) {   // base + its ordinal among this frame's passes with the same base
+    static uint64_t frame = ~0ull; static uint64_t seen[256]; static uint16_t cnt[256]; static int n;
+    uint64_t f = atomic_load(&g_cur_frame); if (f != frame) { frame = f; n = 0; }
+    int k = 0; for (; k < n; k++) if (seen[k] == base) break;
+    if (k == n) { if (n == 256) return NULL; seen[n] = base; cnt[n++] = 0; }
+    uint64_t sig = uld_mix(base, cnt[k]++); if (!sig) sig = 1;
+    uld_ent *e = &g_uld[sig & (ULD_TAB - 1)];
+    if (e->sig != sig) { memset(e, 0, sizeof *e); e->sig = sig; }
+    return e;
 }
 // Diagnostic DM_NVN_TBDR=0: turns off all TBDR optimizations (store lookahead, load elision, same-target continuation, clear-only pass precondition, on-demand depth-stencil attachment); replay takes the plainest "attach all, load all, store all" path.
 // TOTK defaults to the conservative attachment/load/store path.
@@ -5454,6 +5485,25 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
                   pd.depthAttachment.storeAction = MTLStoreActionUnknown; }
         if (stt) { g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.depth->serial; g_sd[g_nsd].bytes = sb; g_sd[g_nsd].lv = (uint32_t)pd.stencilAttachment.level; g_sd[g_nsd].sl = (uint32_t)pd.stencilAttachment.slice; g_sd[g_nsd].idx = -1; g_sd[g_nsd].depth = 2; g_sd[g_nsd].load = pd.stencilAttachment.loadAction == MTLLoadActionLoad; g_sd[g_nsd].wrote = R.clear_s != 0; g_nsd++;
                    pd.stencilAttachment.storeAction = MTLStoreActionUnknown; }
+    }
+    g_uld_cur = NULL; g_uld_mask = 0;
+    if (uld_on() && udc_ttk_on() && udc_on() && !clear_only && !lay_n && !uld_fz_active() && !g_rt_range_active && !g_nblk_wb && !att_fb_on()) {   // TOTK_ULD
+        uint64_t b = (uint64_t)R.rt.n;
+        for (int i = 0; i < R.rt.n && i < 8; i++) { id<MTLTexture> t = pd.colorAttachments[i].texture; if (!t) continue;
+            b = uld_mix(b, ((uint64_t)i << 56) ^ ((uint64_t)t.pixelFormat << 40) ^ ((uint64_t)t.width << 20) ^ (uint64_t)t.height);
+            b = uld_mix(b, ((uint64_t)pd.colorAttachments[i].level << 32) | (uint32_t)pd.colorAttachments[i].slice); }
+        id<MTLTexture> dt = pd.depthAttachment.texture ? pd.depthAttachment.texture : pd.stencilAttachment.texture;
+        if (dt) b = uld_mix(b, ((uint64_t)dt.pixelFormat << 40) ^ ((uint64_t)dt.width << 20) ^ (uint64_t)dt.height);
+        uld_ent *e = uld_find(b);
+        if (e) { g_uld_cur = e; g_uld_passes++;
+            for (int j = 0; j < g_nsd; j++) { sd_att *t = &g_sd[j]; if (t->depth || t->idx < 0 || t->idx >= 8 || !t->load) continue;
+                if (e->streak[t->idx] >= ULD_STREAK + e->hold[t->idx] && pd.colorAttachments[t->idx].loadAction == MTLLoadActionLoad) {
+                    pd.colorAttachments[t->idx].loadAction = MTLLoadActionDontCare; t->nl = 1; g_uld_mask |= 1u << j;
+                    g_uld_skip++; g_uld_skip_bytes += t->bytes; g_bw_load -= t->bytes; } } }
+        if (g_uld_passes >= 20000) {
+            MLOG("[uld] last %llu passes: %llu loads predicted unneeded and skipped (%.0f MB not loaded), %llu passes ended early by a write to one, %llu written anyway",
+                 (unsigned long long)g_uld_passes, (unsigned long long)g_uld_skip, g_uld_skip_bytes / 1048576.0, (unsigned long long)g_uld_miss, (unsigned long long)g_uld_bad);
+            g_uld_passes = g_uld_skip = g_uld_skip_bytes = g_uld_miss = g_uld_bad = 0; }
     }
     memcpy(g_nt_pass_clear, R.clear_c, sizeof g_nt_pass_clear); memcpy(g_nt_pass_cc, R.cc, sizeof g_nt_pass_cc); g_nt_pass_draws = 0;
     memset(R.clear_c, 0, sizeof R.clear_c); R.clear_d = R.clear_s = 0;
@@ -7096,6 +7146,19 @@ static void noatt_dims(NSUInteger *w, NSUInteger *h) {
     if (S.has_vp) { x1 = ceil(fmax(S.vp[0][0], S.vp[0][0] + S.vp[0][2])); y1 = ceil(fmax(S.vp[0][1], S.vp[0][1] + S.vp[0][3])); }
     if ((x1 < 1 || y1 < 1) && R.has_sc) { x1 = (double)R.sc.x + R.sc.w; y1 = (double)R.sc.y + R.sc.h; }
     *w = x1 < 1 ? 1 : x1 > 16384 ? 16384 : (NSUInteger)x1; *h = y1 < 1 ? 1 : y1 > 16384 ? 16384 : (NSUInteger)y1;
+}
+static void uld_miss(int j) {   // TOTK_ULD: a write to attachment g_sd[j] of the open pass, which was not loaded
+    g_uld_miss++; if (g_uld_cur && g_sd[j].idx >= 0 && g_sd[j].idx < 8) { g_uld_cur->streak[g_sd[j].idx] = 0; if (g_uld_cur->hold[g_sd[j].idx] < 64) g_uld_cur->hold[g_sd[j].idx] += 8; }
+}
+static int uld_draw_writes(NvProg *pr) {   // 1 when this draw writes a colour attachment the open pass did not load (udc_note_draw's rule)
+    if (!pr) return 0;
+    uint32_t cm = pr->sh[1] ? pr->sh[1]->rf.color_mask : 0; int imgw = 0;
+    for (int st = 0; st < 6 && !imgw; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;
+        for (int i = 0; i < sh->rf.nb; i++) if (sh->rf.b[i].kind == NVN_RB_IMG && sh->rf.b[i].rw) { imgw = 1; break; } }
+    int hit = 0;
+    for (int j = 0; j < g_nsd; j++) { if (!(g_uld_mask >> j & 1)) continue; int x = g_sd[j].idx;
+        if (imgw || (x >= 0 && ((((S.chmask.mask >> (4 * x)) & 0xf)) || (cm >> x & 1)))) { uld_miss(j); hit = 1; } }
+    return hit;
 }
 static void udc_mark_all(void) { g_udc_noted++; for (int i = 0; i < g_nsd; i++) { g_sd[i].wrote = 1; if (!g_sd[i].wwhy) g_sd[i].wwhy = 6; } }   // TOTK_UDC: a helper draw into the open pass (clear quads)
 static void udc_note_draw(NvProg *pr) {
@@ -9791,6 +9854,7 @@ typedef struct {
     uint8_t cov2[8];                     // Physical attachments covered by the first draw of the later pass
 } fuse_t;
 static fuse_t g_fz; static uint64_t g_fz_n, g_fz_draws, g_fz_fallback;
+static int uld_fz_active(void) { return g_fz.active; }
 #include "totk_objmv.h"   // TOTK_OBJ_MOTION
 typedef struct { int idx; p_draw dw; p_draw_idx di; p_scissor sc; int has_sc; void *S_; uint8_t pm[8]; } defer_snap;   // pm: group P target index → logical color number of this draw (identity for its own draws; a composed mapping for absorbed upstream groups)
 typedef struct {
@@ -9950,7 +10014,12 @@ static void sd_finish(void) {
     if (!tb_st && !tb_udc) {   // All store pieces off: always write back (except sd_dead_ext and TOTK_UDC)
         int udc = udc_ttk_on() && udc_on() && !g_nblk_wb;
         if (udc && g_enc_draws - g_sd_draw0 > g_udc_noted - g_udc_noted0) { udc = 0; g_udc_ttk_veto++; }   // a draw not accounted for
-        for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i]; int ext = sd_dead_ext(t, empty), u = !ext && udc && t->load && !t->wrote;
+        if (g_uld_cur) for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i]; if (t->depth || t->idx < 0 || t->idx >= 8) continue;   // TOTK_ULD: learn
+            uint8_t *st = &g_uld_cur->streak[t->idx];
+            if (t->load && !t->wrote && udc) { if (*st < 250) (*st)++; } else *st = 0;
+            if (t->nl && t->wrote) { g_uld_bad++; RED_ONCE(123, "TOTK_ULD: an attachment loaded DontCare by prediction was written without ending the pass first"); } }
+        g_uld_cur = NULL; g_uld_mask = 0;
+        for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i]; int ext = sd_dead_ext(t, empty), u = !ext && ((udc && t->load && !t->wrote) || (t->nl && !t->wrote));
             if (ext) { g_dc_stat[ext == 1 ? 1 : 4]++; g_bw_store -= t->bytes; }
             if (u) { g_udc_ttk_dead++; g_udc_ttk_bytes += t->bytes; g_udc_saved_bytes += t->bytes; g_bw_store -= t->bytes; }
             g_udc_ttk_all++;
@@ -11805,6 +11874,7 @@ static void clear_quad(const p_clear_color *c) {
     const tex_t *t = R.rt.color[c->index];
     int f = R.rt.has_cview[c->index] && R.rt.cview[c->index].set_format ? R.rt.cview[c->index].format : t->d.format;
     if (cls_of(f)) MDIE("partial color clear of integer render target format %#x not implemented", f);
+    if (g_enc && g_uld_mask) for (int j = 0; j < g_nsd; j++) if ((g_uld_mask >> j & 1) && g_sd[j].idx == (int)c->index) { uld_miss(j); RP_WHY("uld-mispredict"); rp_end(); break; }   // TOTK_ULD
     id<MTL4RenderCommandEncoder> en = rp_begin(); if (!en) return;
     NSUInteger tw = g_pass.tw, th = g_pass.th; MTLScissorRect sc = {0, 0, tw, th};
     if (R.has_sc) { long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y < 0 ? 0 : R.sc.y, x1 = (long)R.sc.x + R.sc.w, y1 = (long)R.sc.y + R.sc.h;
@@ -12669,6 +12739,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!att_fb_on()) att_n = att_store_on() ? draw_att_reads(pr, att_rs) : 0;
     if (pc_kept && !att_n) {   // the two binding walks disagree (or the tile reads took only some): end the pass as without TOTK_PASS_CONTINUE
         PD("M %llu a draw in the continued pass samples an attachment (attachment reads not recognised): split here", g_stat_pass); RP_WHY("cont-samples-att"); rp_end(); pc_kept = 0; }
+    if (g_enc && g_uld_mask && uld_draw_writes(pr)) { RP_WHY("uld-mispredict"); rp_end(); }   // TOTK_ULD: this draw writes an attachment the pass did not load
     if (!(g_fz.active && g_fz.phase == 2) && att_unstored_read(att_rs, att_n) && !sb_note(pr, att_rs, att_n)) {
         static int once; if (!once++) MLOG("[totk] a draw samples an attachment its pass drew: the pass is stored first (first: pass %llu)", g_stat_pass);
         const char *why = pc_kept ? "cont-samples-drawn-att" : "samples-drawn-att";
