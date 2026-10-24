@@ -148,6 +148,8 @@ static int mfx_fixed_input(void) {
 static _Atomic int g_on, g_req;
 static void mfx_release(int all);
 static int g_bp_paused;   // mfx_present_tick: paused near the GPU memory budget
+static int g_dbg_live;    // the debug view without interpolation holds textures (mfx_debug_only)
+static int g_dbg_mem;     // the debug view without interpolation is held off near the GPU memory budget
 static int g_applied = 1; // 0: the mode last chosen (mfx_set) has not been turned on yet (mfx_interp_state: refused)
 static uint64_t g_mem_used, g_mem_budget;   // at the last present (mfx_present_tick)
 static unsigned g_last_w, g_last_h;         // the last output size interpolation ran at (mfx_need_bytes)
@@ -182,7 +184,7 @@ int mfx_latch(void) {
     int r = atomic_load(&g_req), was = atomic_load(&g_on);
     if (r == was) return 0;
     if (was == MFX_OFF && mfx_refuse(r)) return 0;   // it would not fit: never turned on (mfx_interp_state says so)
-    if (r != MFX_OFF) g_applied = 1;
+    if (r != MFX_OFF) { g_applied = 1; g_dbg_live = 0; }   // the debug view's motion / depth textures are remade at interpolation's sizes (ensure_out, ensure_fi)
     g.prev_ok = g.hist_ok = 0; g.scene_ok = g.cam_ok = 0; g.depth = nil; g.last_prepare_s = 0;   // the next interpolated pair starts fresh
     atomic_store(&g_on, r);
     MLOG("frame interpolation %s -> %s", mfx_mode_name(was), mfx_mode_name(r));
@@ -332,6 +334,83 @@ void mfx_note_camera(const float *c, int n) {
     g.cam_ok = c[56] > 0 && c[57] > c[56] && c[62] > 0 && c[70] > 0;   // near, far, aspect, vertical field of view (radians)
 }
 
+/* The motion kernel (mfx_mv), its argument tables and parameter buffers: made once, for interpolation or the debug view
+   alone (mfx_debug_only). g.rs must exist (a texture of ours was made first). */
+static void mv_pipeline(void) {
+    if (g.mv_ps) return;
+    NSError *e = nil;
+    static const char *src =
+        "#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct P { float4x4 reproj; float2 size; float2 inv_size; float yflip; float obj; float dyn, maxpx; float2 om_scale; float near, ztol, dilate, nf; };\n"
+        // view distance from a depth value (not reversed, infinite far plane: z = near / (1 - d)), in units of near
+        "static float vz(float d) { return 1.0 / max(1.0 - d, 1e-7); }\n"
+        // camera motion of depth pixel g (depth d0): where it was in the previous frame, in pixels of this texture. With
+        // TOTK_OBJ_MOTION the motion the G-buffer draw wrote there wins (an NDC delta in Metal clip space: y up,
+        // texture rows down); OBJMV_NONE (65000) or anything that large means none, the camera motion is used.
+        // The per-object motion is read at the same render-size texel the depth came from (TOTK_MFX_FIXED_INPUT: the
+        // resampled depth takes the texel under the pixel centre) and taken only where the view distance its draw
+        // stored (B) is the one of the final depth there within ztol: a draw that is not a motion draw (terrain, large
+        // meshes, border-emulated shaders) leaves the attachment alone, so the motion of an object it hides stays under it.
+        // With dyn, a pixel whose distance at that place in the previous frame is not what a still point would have
+        // had moved itself: no motion on screen. Still: within the 3x3 range of the previous depth there (1 % margin)
+        // where that depth is continuous (a slope), and within 1 % of one of the nine where it is not (an edge: the
+        // range of Link and the land behind him would take in any distance between them). Only a point in front of what
+        // was there moved itself; one behind it (farther than all nine) was hidden then (the land Link uncovers as he or
+        // the camera moves) and keeps the camera motion: zero there drew a dark Link-shaped trail beside him.
+        // The object's motion is dropped when it differs from the camera motion (before the still-world test) by more
+        // than maxpx pixels: such a jump is almost always a draw matched with another object (culling changed while turning).
+        "static float2 mv_at(uint2 g, float d0, texture2d<float, access::read> om, depth2d<float, access::read> pd, constant P &p) {\n"
+        "  float2 uv = (float2(g) + 0.5) * p.inv_size;\n"
+        "  float4 c = p.reproj * float4(uv.x * 2.0 - 1.0, p.yflip * (1.0 - uv.y * 2.0), d0 * 2.0 - 1.0, 1.0);\n"
+        "  float2 m = 0.0, cm = 0.0;\n"
+        "  if (c.w > 1e-7) {\n"
+        "    float2 n = c.xy / c.w, prev = float2(n.x * 0.5 + 0.5, 0.5 - 0.5 * p.yflip * n.y);\n"
+        "    m = (prev - uv) * p.size; cm = m;\n"
+        "    int2 q = int2(floor(prev * p.size));\n"
+        "    if (p.dyn > 0.5 && d0 < 1.0 && all(q >= 1) && all(q < int2(p.size) - 1)) {\n"
+        "      float ze = vz(c.z / c.w * 0.5 + 0.5), zmin = 3.4e38, zmax = 0.0; bool near = false;\n"
+        "      for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+        "        float z = vz(pd.read(uint2(q + int2(x, y)))); zmin = min(zmin, z); zmax = max(zmax, z); near = near || fabs(z - ze) <= ze * 0.01; }\n"
+        "      bool still = zmax <= zmin * 1.05 ? (ze >= zmin * 0.99 && ze <= zmax * 1.01) : near;\n"
+        "      if (!still && !(ze > zmax * 1.01)) m = 0.0;\n"
+        "    }\n"
+        "  }\n"
+        "  if (any(isnan(m)) || any(isinf(m))) m = 0.0;\n"
+        "  if (p.obj > 0.5 && d0 < 1.0) {\n"
+        "    uint2 oq = min(uint2((float2(g) + 0.5) * p.om_scale), uint2(om.get_width() - 1, om.get_height() - 1));\n"
+        "    float4 o = om.read(oq); float zd = p.near / max(1.0 - d0 * p.nf, 1e-7);   // nf = 1 - near / far\n"
+        "    if (all(abs(o.xy) < 16.0) && fabs(o.z - zd) <= zd * p.ztol) {\n"
+        "      float2 op = o.xy * float2(0.5, -0.5) * p.size; if (length(op - cm) <= p.maxpx) m = op; } }\n"
+        "  return m;\n"
+        "}\n"
+        // dilate (TOTK_MFX_MV_DILATE=1): the motion of the nearest depth of the 3x3 around the pixel (as FSR 2/3 hands
+        // its frame generation dilated motion), so a moving object's silhouette edge carries its motion, not the background's.
+        "kernel void mfx_mv(depth2d<float, access::read> d [[texture(0)]], texture2d<float, access::write> mv [[texture(1)]],\n"
+        "                   texture2d<float, access::read> om [[texture(2)]], depth2d<float, access::read> pd [[texture(3)]],\n"
+        "                   constant P &p [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {\n"
+        "  if (g.x >= uint(p.size.x) || g.y >= uint(p.size.y)) return;\n"
+        "  uint2 at = g; float d0 = d.read(g);\n"
+        "  if (p.dilate > 0.5) {\n"
+        "    int2 hi = int2(p.size) - 1;\n"
+        "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+        "      uint2 q = uint2(clamp(int2(g) + int2(x, y), int2(0), hi)); float dq = d.read(q); if (dq < d0) { d0 = dq; at = q; } }\n"
+        "  }\n"
+        "  mv.write(float4(mv_at(at, d0, om, pd, p), 0.0, 0.0), g);\n"
+        "}\n";
+    MTLCompileOptions *o = [MTLCompileOptions new]; o.mathMode = MTLMathModeSafe;
+    id<MTLLibrary> lib = [g.dev newLibraryWithSource:@(src) options:o error:&e];
+    id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"mfx_mv"] : nil;
+    g.mv_ps = fn ? [g.dev newComputePipelineStateWithFunction:fn error:&e] : nil;
+    if (!g.mv_ps) MDIE("motion vector kernel: %s", e.localizedDescription.UTF8String);
+    MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1; ad.maxTextureBindCount = 4;
+    for (int i = 0; i < MFX_OUT; i++) {
+        g.mv_args[i] = [g.dev newArgumentTableWithDescriptor:ad error:&e]; if (!g.mv_args[i]) MDIE("argument table: %s", e.localizedDescription.UTF8String);
+        g.mv_par[i] = [g.dev newBufferWithLength:256 options:MTLResourceStorageModeShared]; [g.rs addAllocation:g.mv_par[i]];
+    }
+    [g.rs commit];
+    g.fence = [g.dev newFence];
+    const char *yf = getenv("TOTK_MFX_YFLIP"); g.yflip = yf ? atof(yf) : 1.0;   // diagnostic: -1 tries the other clip-space y convention
+}
 static void ensure_fi(NSUInteger iw, NSUInteger ih) {
     if (g.fi && g.in_w == iw && g.in_h == ih && g.fi.colorTextureFormat == g.scene_fmt && g.fi.outputWidth == g.out_w && g.fi.outputHeight == g.out_h) return;
     NSError *e = nil;
@@ -357,79 +436,7 @@ static void ensure_fi(NSUInteger iw, NSUInteger ih) {
     drop(&g.mv); g.mv = mk(MTLPixelFormatRG16Float, iw, ih, MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead);
     drop(&g.pdepth); g.pdepth = mk(MTLPixelFormatDepth32Float, iw, ih, MTLTextureUsageShaderRead); g.pdepth_frame = 0;
     drop(&g.dz); if (mfx_fixed_input()) g.dz = mk(MTLPixelFormatDepth32Float, iw, ih, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
-    if (!g.mv_ps) {
-        static const char *src =
-            "#include <metal_stdlib>\nusing namespace metal;\n"
-            "struct P { float4x4 reproj; float2 size; float2 inv_size; float yflip; float obj; float dyn, maxpx; float2 om_scale; float near, ztol, dilate, nf; };\n"
-            // view distance from a depth value (not reversed, infinite far plane: z = near / (1 - d)), in units of near
-            "static float vz(float d) { return 1.0 / max(1.0 - d, 1e-7); }\n"
-            // camera motion of depth pixel g (depth d0): where it was in the previous frame, in pixels of this texture. With
-            // TOTK_OBJ_MOTION the motion the G-buffer draw wrote there wins (an NDC delta in Metal clip space: y up,
-            // texture rows down); OBJMV_NONE (65000) or anything that large means none, the camera motion is used.
-            // The per-object motion is read at the same render-size texel the depth came from (TOTK_MFX_FIXED_INPUT: the
-            // resampled depth takes the texel under the pixel centre) and taken only where the view distance its draw
-            // stored (B) is the one of the final depth there within ztol: a draw that is not a motion draw (terrain, large
-            // meshes, border-emulated shaders) leaves the attachment alone, so the motion of an object it hides stays under it.
-            // With dyn, a pixel whose distance at that place in the previous frame is not what a still point would have
-            // had moved itself: no motion on screen. Still: within the 3x3 range of the previous depth there (1 % margin)
-            // where that depth is continuous (a slope), and within 1 % of one of the nine where it is not (an edge: the
-            // range of Link and the land behind him would take in any distance between them). Only a point in front of what
-            // was there moved itself; one behind it (farther than all nine) was hidden then (the land Link uncovers as he or
-            // the camera moves) and keeps the camera motion: zero there drew a dark Link-shaped trail beside him.
-            // The object's motion is dropped when it differs from the camera motion (before the still-world test) by more
-            // than maxpx pixels: such a jump is almost always a draw matched with another object (culling changed while turning).
-            "static float2 mv_at(uint2 g, float d0, texture2d<float, access::read> om, depth2d<float, access::read> pd, constant P &p) {\n"
-            "  float2 uv = (float2(g) + 0.5) * p.inv_size;\n"
-            "  float4 c = p.reproj * float4(uv.x * 2.0 - 1.0, p.yflip * (1.0 - uv.y * 2.0), d0 * 2.0 - 1.0, 1.0);\n"
-            "  float2 m = 0.0, cm = 0.0;\n"
-            "  if (c.w > 1e-7) {\n"
-            "    float2 n = c.xy / c.w, prev = float2(n.x * 0.5 + 0.5, 0.5 - 0.5 * p.yflip * n.y);\n"
-            "    m = (prev - uv) * p.size; cm = m;\n"
-            "    int2 q = int2(floor(prev * p.size));\n"
-            "    if (p.dyn > 0.5 && d0 < 1.0 && all(q >= 1) && all(q < int2(p.size) - 1)) {\n"
-            "      float ze = vz(c.z / c.w * 0.5 + 0.5), zmin = 3.4e38, zmax = 0.0; bool near = false;\n"
-            "      for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
-            "        float z = vz(pd.read(uint2(q + int2(x, y)))); zmin = min(zmin, z); zmax = max(zmax, z); near = near || fabs(z - ze) <= ze * 0.01; }\n"
-            "      bool still = zmax <= zmin * 1.05 ? (ze >= zmin * 0.99 && ze <= zmax * 1.01) : near;\n"
-            "      if (!still && !(ze > zmax * 1.01)) m = 0.0;\n"
-            "    }\n"
-            "  }\n"
-            "  if (any(isnan(m)) || any(isinf(m))) m = 0.0;\n"
-            "  if (p.obj > 0.5 && d0 < 1.0) {\n"
-            "    uint2 oq = min(uint2((float2(g) + 0.5) * p.om_scale), uint2(om.get_width() - 1, om.get_height() - 1));\n"
-            "    float4 o = om.read(oq); float zd = p.near / max(1.0 - d0 * p.nf, 1e-7);   // nf = 1 - near / far\n"
-            "    if (all(abs(o.xy) < 16.0) && fabs(o.z - zd) <= zd * p.ztol) {\n"
-            "      float2 op = o.xy * float2(0.5, -0.5) * p.size; if (length(op - cm) <= p.maxpx) m = op; } }\n"
-            "  return m;\n"
-            "}\n"
-            // dilate (TOTK_MFX_MV_DILATE=1): the motion of the nearest depth of the 3x3 around the pixel (as FSR 2/3 hands
-            // its frame generation dilated motion), so a moving object's silhouette edge carries its motion, not the background's.
-            "kernel void mfx_mv(depth2d<float, access::read> d [[texture(0)]], texture2d<float, access::write> mv [[texture(1)]],\n"
-            "                   texture2d<float, access::read> om [[texture(2)]], depth2d<float, access::read> pd [[texture(3)]],\n"
-            "                   constant P &p [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {\n"
-            "  if (g.x >= uint(p.size.x) || g.y >= uint(p.size.y)) return;\n"
-            "  uint2 at = g; float d0 = d.read(g);\n"
-            "  if (p.dilate > 0.5) {\n"
-            "    int2 hi = int2(p.size) - 1;\n"
-            "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
-            "      uint2 q = uint2(clamp(int2(g) + int2(x, y), int2(0), hi)); float dq = d.read(q); if (dq < d0) { d0 = dq; at = q; } }\n"
-            "  }\n"
-            "  mv.write(float4(mv_at(at, d0, om, pd, p), 0.0, 0.0), g);\n"
-            "}\n";
-        MTLCompileOptions *o = [MTLCompileOptions new]; o.mathMode = MTLMathModeSafe;
-        id<MTLLibrary> lib = [g.dev newLibraryWithSource:@(src) options:o error:&e];
-        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"mfx_mv"] : nil;
-        g.mv_ps = fn ? [g.dev newComputePipelineStateWithFunction:fn error:&e] : nil;
-        if (!g.mv_ps) MDIE("motion vector kernel: %s", e.localizedDescription.UTF8String);
-        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1; ad.maxTextureBindCount = 4;
-        for (int i = 0; i < MFX_OUT; i++) {
-            g.mv_args[i] = [g.dev newArgumentTableWithDescriptor:ad error:&e]; if (!g.mv_args[i]) MDIE("argument table: %s", e.localizedDescription.UTF8String);
-            g.mv_par[i] = [g.dev newBufferWithLength:256 options:MTLResourceStorageModeShared]; [g.rs addAllocation:g.mv_par[i]];
-        }
-        [g.rs commit];
-        g.fence = [g.dev newFence];
-        const char *yf = getenv("TOTK_MFX_YFLIP"); g.yflip = yf ? atof(yf) : 1.0;   // diagnostic: -1 tries the other clip-space y convention
-    }
+    mv_pipeline();
     g.in_w = iw; g.in_h = ih; g.prev_ok = g.hist_ok = 0;
     MLOG("frame interpolator: depth / motion %lux%lu -> %lux%lu (scene format %lu, output RGBA8 sRGB, UI RGBA16F premultiplied)", (unsigned long)iw, (unsigned long)ih, (unsigned long)g.out_w, (unsigned long)g.out_h, (unsigned long)g.scene_fmt);
 }
@@ -490,6 +497,37 @@ static int camera_cut(void) {
     return sqrt(dx * dx + dy * dy + dz * dz) > 8.0 || f < cos(25.0 * M_PI / 180.0);
 }
 
+/* The reprojection this frame -> previous frame (previous view-projection times the inverse of this one); 0: singular. */
+static int mv_reproj(double m[16]) {
+    double vc[16], vp[16], ic[16];
+    for (int i = 0; i < 16; i++) { vc[i] = g.cam[12 + i]; vp[i] = g.prev_cam[12 + i]; }
+    if (!inv4(vc, ic)) return 0;
+    mul4(vp, ic, m);
+    return 1;
+}
+/* The motion kernel's parameters for slot s (g.mv_par[s]): reprojection m, the grid (g.mv's size), per-object motion
+   (obj), the still-world test, this frame's projection (cam_projection). */
+static void mv_params(int s, const double m[16], id<MTLTexture> depth, int obj) {
+    float *par = g.mv_par[s].contents;
+    for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) par[c * 4 + r] = (float)m[r * 4 + c];   // float4x4 is column-major
+    NSUInteger mw = g.mv.width, mh = g.mv.height;   // the motion kernel's grid: the render size, or the output size (TOTK_MFX_FIXED_INPUT)
+    par[16] = (float)mw; par[17] = (float)mh; par[18] = 1.0f / mw; par[19] = 1.0f / mh; par[20] = (float)g.yflip;
+    par[24] = (float)depth.width / mw; par[25] = (float)depth.height / mh;   // per-object motion is at the depth size
+    par[21] = obj ? 1.0f : 0.0f; g.enc_obj = obj; g.obj_frames += obj;
+    par[22] = atomic_load(&g_mv_dyn) && g.pdepth_frame && g.pdepth_frame == g.frames - 1 ? 1.0f : 0.0f;   // the previous game frame's depth is there
+    static double maxpct = -1;   // TOTK_OBJ_MOTION_MAXPCT: an object's own motion beyond this % of the width is a mismatch (default 3)
+    if (maxpct < 0) { const char *e = getenv("TOTK_OBJ_MOTION_MAXPCT"); maxpct = e ? atof(e) : 3.0; if (maxpct <= 0) maxpct = 1000; }
+    par[23] = (float)(maxpct * 0.01 * mw);
+    cam_projection();
+    /* TOTK_OBJ_MOTION_ZTOL (percent, default 2; 0: no check): the per-object motion only where the view distance its draw
+       stored is the final depth's, near / (1 - d (1 - near / far)) with this frame's planes. */
+    static double ztol = -1;
+    if (ztol < 0) { const char *e = getenv("TOTK_OBJ_MOTION_ZTOL"); ztol = e ? atof(e) : 2.0; if (ztol <= 0) ztol = 1e9;
+                    if (mfx_obj_motion_on()) MLOG("TOTK_OBJ_MOTION_ZTOL=%g%%: per-object motion only where its draw is the surface the depth shows", ztol); }
+    static int dilate = -1;
+    if (dilate < 0) { const char *e = getenv("TOTK_MFX_MV_DILATE"); dilate = e && atoi(e) > 0; if (dilate) MLOG("TOTK_MFX_MV_DILATE=1: motion of the nearest depth in each 3x3"); }
+    par[26] = (float)g.near_p; par[27] = (float)(ztol * 0.01); par[28] = dilate ? 1.0f : 0.0f; par[29] = (float)(g.far_p > g.near_p && g.near_p > 0 ? 1.0 - g.near_p / g.far_p : 1.0);
+}
 int mfx_frame_prepare(double frame_s) {
     g.frames++;
     id<MTLTexture> depth = g.depth;
@@ -510,30 +548,10 @@ int mfx_frame_prepare(double frame_s) {
         memcpy(g.prev_cam, g.cam, sizeof g.cam); g.cur ^= 1; g.prev_ok = 1; g.hist_ok = 0;
         return -1;
     }
-    double vc[16], vp[16], ic[16], m[16];
-    for (int i = 0; i < 16; i++) { vc[i] = g.cam[12 + i]; vp[i] = g.prev_cam[12 + i]; }
-    if (!inv4(vc, ic)) { g.skip_input++; g.prev_ok = g.hist_ok = 0; return -1; }
-    mul4(vp, ic, m);
+    double m[16];
+    if (!mv_reproj(m)) { g.skip_input++; g.prev_ok = g.hist_ok = 0; return -1; }
     int s = g.slot = (g.slot + 1) % MFX_OUT;
-    float *par = g.mv_par[s].contents;
-    for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) par[c * 4 + r] = (float)m[r * 4 + c];   // float4x4 is column-major
-    NSUInteger mw = g.mv.width, mh = g.mv.height;   // the motion kernel's grid: the render size, or the output size (TOTK_MFX_FIXED_INPUT)
-    par[16] = (float)mw; par[17] = (float)mh; par[18] = 1.0f / mw; par[19] = 1.0f / mh; par[20] = (float)g.yflip;
-    par[24] = (float)depth.width / mw; par[25] = (float)depth.height / mh;   // per-object motion is at the depth size
-    par[21] = obj ? 1.0f : 0.0f; g.enc_obj = obj; g.obj_frames += obj;
-    par[22] = atomic_load(&g_mv_dyn) && g.pdepth_frame && g.pdepth_frame == g.frames - 1 ? 1.0f : 0.0f;   // the previous game frame's depth is there
-    static double maxpct = -1;   // TOTK_OBJ_MOTION_MAXPCT: an object's own motion beyond this % of the width is a mismatch (default 3)
-    if (maxpct < 0) { const char *e = getenv("TOTK_OBJ_MOTION_MAXPCT"); maxpct = e ? atof(e) : 3.0; if (maxpct <= 0) maxpct = 1000; }
-    par[23] = (float)(maxpct * 0.01 * mw);
-    cam_projection();
-    /* TOTK_OBJ_MOTION_ZTOL (percent, default 2; 0: no check): the per-object motion only where the view distance its draw
-       stored is the final depth's, near / (1 - d (1 - near / far)) with this frame's planes. */
-    static double ztol = -1;
-    if (ztol < 0) { const char *e = getenv("TOTK_OBJ_MOTION_ZTOL"); ztol = e ? atof(e) : 2.0; if (ztol <= 0) ztol = 1e9;
-                    if (mfx_obj_motion_on()) MLOG("TOTK_OBJ_MOTION_ZTOL=%g%%: per-object motion only where its draw is the surface the depth shows", ztol); }
-    static int dilate = -1;
-    if (dilate < 0) { const char *e = getenv("TOTK_MFX_MV_DILATE"); dilate = e && atoi(e) > 0; if (dilate) MLOG("TOTK_MFX_MV_DILATE=1: motion of the nearest depth in each 3x3"); }
-    par[26] = (float)g.near_p; par[27] = (float)(ztol * 0.01); par[28] = dilate ? 1.0f : 0.0f; par[29] = (float)(g.far_p > g.near_p && g.near_p > 0 ? 1.0 - g.near_p / g.far_p : 1.0);
+    mv_params(s, m, depth, obj);
     g.enc_depth = depth;
     return s;
 }
@@ -580,6 +598,25 @@ static int dz_resample(id<MTL4CommandBuffer> cb, int s, id<MTLTexture> src) {
     [e endEncoding];
     return 1;
 }
+/* The motion kernel for slot s into cb (after the game's frame), then this frame's depth copied to g.pdepth for the next
+   frame's still-world test. Returns texture 2 of the kernel (the per-object motion target, or g.mv when none is used). */
+static id<MTLTexture> mv_encode(id<MTL4CommandBuffer> cb, int s, id<MTLTexture> depth) {
+    [g.mv_args[s] setTexture:depth.gpuResourceID atIndex:0]; [g.mv_args[s] setTexture:g.mv.gpuResourceID atIndex:1]; [g.mv_args[s] setAddress:g.mv_par[s].gpuAddress atIndex:0];
+    id<MTLTexture> om = g.enc_obj && g.obj ? g.obj : g.mv;   // without per-object motion the kernel never reads texture 2; any valid texture
+    [g.mv_args[s] setTexture:om.gpuResourceID atIndex:2];
+    [g.mv_args[s] setTexture:g.pdepth.gpuResourceID atIndex:3];
+    id<MTL4ComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];   // the game's frame is done
+    [e setComputePipelineState:g.mv_ps]; [e setArgumentTable:g.mv_args[s]];
+    [e dispatchThreads:MTLSizeMake(g.mv.width, g.mv.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    [e updateFence:g.fence afterEncoderStages:MTLStageDispatch];
+    // this frame's depth for the next one's still-world test, once the motion has read the previous one
+    [e barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+    [e copyFromTexture:depth toTexture:g.pdepth];
+    [e endEncoding];
+    g.pdepth_frame = g.frames;
+    return om;
+}
 void mfx_frame_abort(void) { g.enc_depth = nil; g.prev_ok = g.hist_ok = 0; g.skip_busy++; }
 NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> heap, NSUInteger stamp) {
     id<MTLTexture> depth = g.enc_depth; g.enc_depth = nil; g.last_depth = depth; g.last_slot = s;
@@ -595,20 +632,7 @@ NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> h
         if (!dz_resample(cb, s, depth)) { g.prev_ok = g.hist_ok = 0; }   // never expected; the motion kernel then reads past the smaller depth's edge
         else { depth = g.dz; g.last_depth = depth; }
     }
-    [g.mv_args[s] setTexture:depth.gpuResourceID atIndex:0]; [g.mv_args[s] setTexture:g.mv.gpuResourceID atIndex:1]; [g.mv_args[s] setAddress:g.mv_par[s].gpuAddress atIndex:0];
-    id<MTLTexture> om = g.enc_obj && g.obj ? g.obj : g.mv;   // without per-object motion the kernel never reads texture 2; any valid texture
-    [g.mv_args[s] setTexture:om.gpuResourceID atIndex:2];
-    [g.mv_args[s] setTexture:g.pdepth.gpuResourceID atIndex:3];
-    id<MTL4ComputeCommandEncoder> e = [cb computeCommandEncoder];
-    [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];   // the game's frame is done
-    [e setComputePipelineState:g.mv_ps]; [e setArgumentTable:g.mv_args[s]];
-    [e dispatchThreads:MTLSizeMake(g.mv.width, g.mv.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-    [e updateFence:g.fence afterEncoderStages:MTLStageDispatch];
-    // this frame's depth for the next one's still-world test, once the motion has read the previous one
-    [e barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
-    [e copyFromTexture:depth toTexture:g.pdepth];
-    [e endEncoding];
-    g.pdepth_frame = g.frames;
+    id<MTLTexture> om = mv_encode(cb, s, depth);
     if (heap) [cb writeTimestampIntoHeap:heap atIndex:stamp];   // after the motion vectors (which waited for the frame)
     id<MTL4FXFrameInterpolator> fi = g.fi;
     fi.colorTexture = g.scene[g.cur]; fi.prevColorTexture = g.scene[g.cur ^ 1]; fi.depthTexture = depth; fi.motionTexture = g.mv;
@@ -649,9 +673,10 @@ NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> h
    - depth: the G-buffer depth linearised with this frame's near / far (cam_projection), log scale from the near plane
      (white) to min(far, 4000 units) (black).
    - split: left third the picture, middle third motion, right third depth, white lines between.
-   One render pass per target (load, one full-screen triangle, store) in the interpolation command buffer, after MetalFX;
-   nothing is encoded or allocated while off. Frames that are not interpolated (first frame, camera cut, missing input)
-   show the plain picture, and nothing shows while interpolation is off (no motion or depth exist then). */
+   One render pass per target (load, one full-screen triangle, store) after MetalFX in the interpolation command buffer,
+   or after the motion kernel in a command buffer of its own while interpolation is off (mfx_debug_only: drawn over the
+   game's frame only, motion in pixels of the render size). Nothing is captured, encoded or allocated while the view is
+   off. Frames without motion (first frame, camera cut, missing input) show the plain picture. */
 static _Atomic int g_dbg = -1;
 int mfx_debug_view(void) {
     int v = atomic_load_explicit(&g_dbg, memory_order_relaxed);
@@ -660,7 +685,7 @@ int mfx_debug_view(void) {
     v = !e || !*e || !strcmp(e, "0") || !strcmp(e, "off") ? 0 : !strcmp(e, "motion") || !strcmp(e, "1") ? 1 :
         !strcmp(e, "depth") || !strcmp(e, "2") ? 2 : !strcmp(e, "split") || !strcmp(e, "3") ? 3 : -1;
     if (v < 0) { MLOG("[red] TOTK_MFX_DEBUG_VIEW must be off, motion, depth or split, got %s: off", e); v = 0; }
-    if (v) MLOG("TOTK_MFX_DEBUG_VIEW=%s: the interpolation inputs are drawn over the picture", e);
+    if (v) MLOG("TOTK_MFX_DEBUG_VIEW=%s: motion / depth drawn over the picture (with or without frame interpolation)", e);
     atomic_store(&g_dbg, v);
     return v;
 }
@@ -669,7 +694,7 @@ void mfx_debug_view_set(int v) {
     if (v < 0) v = (mfx_debug_view() + 1) % 4;
     if (v > 3) { MLOG("[flag] mfx_debug_view takes 0..3 (off, motion, depth, split; -1 cycles), got %d", v); return; }
     atomic_store(&g_dbg, v);
-    MLOG("[flag] mfx_debug_view = %d: %s%s", v, names[v], v && !mfx_enabled() ? " (shows once frame interpolation is on)" : "");
+    MLOG("[flag] mfx_debug_view = %d: %s%s", v, names[v], v && !mfx_enabled() ? " (frame interpolation off: depth and camera captured for the view alone)" : "");
 }
 static id<MTLRenderPipelineState> dbg_pipeline(MTLPixelFormat fmt) {
     for (int i = 0; i < 3; i++) if (g.dbg_ps[i] && g.dbg_fmt[i] == fmt) return g.dbg_ps[i];
@@ -735,29 +760,29 @@ static id<MTLRenderPipelineState> dbg_pipeline(MTLPixelFormat fmt) {
     MLOG("debug view pipeline for format %lu", (unsigned long)fmt);
     return ps;
 }
-NSArray *mfx_debug_encode(id<MTL4CommandBuffer> cb, int s, id<MTLTexture> present, const int crop[4]) {
-    int view = atomic_load_explicit(&g_dbg, memory_order_relaxed);
-    if (view < 0) view = mfx_debug_view();
-    if (!view || s < 0 || s >= MFX_OUT || !g.last_depth || !g.mv || !g.out[s] || !g.outv[s] || g.last_slot != s) return nil;
-    id<MTLTexture> depth = g.last_depth, om = g.last_om ? g.last_om : g.mv, targets[2] = {g.outv[s], present};
-    double n = g.near_p > 0 ? g.near_p : 0.1, f = g.far_p > n ? g.far_p : 1e7, shown = fmin(f, 4000.0);
-    NSMutableArray *res = [NSMutableArray arrayWithObjects:depth, g.mv, om, g.out[s], g.outv[s], nil];
-    for (int k = 0; k < 2; k++) {
+/* The view drawn over each of the n targets (crop applies to the last one, the game's frame) with the motion / depth /
+   per-object textures of slot s; what the GPU uses is appended to res. 0: no pipeline or encoder. */
+static int dbg_draw(id<MTL4CommandBuffer> cb, int s, int view, id<MTLTexture> depth, id<MTLTexture> om_used, id<MTLTexture> const *targets, int n,
+                    const int crop[4], NSMutableArray *res) {
+    id<MTLTexture> om = om_used ? om_used : g.mv;
+    double nr = g.near_p > 0 ? g.near_p : 0.1, f = g.far_p > nr ? g.far_p : 1e7, shown = fmin(f, 4000.0);
+    [res addObjectsFromArray:@[depth, g.mv, om]];
+    for (int k = 0; k < n; k++) {
         id<MTLTexture> t = targets[k]; if (!t) continue;
         double x = 0, y = 0, w = t.width, h = t.height;
-        if (k == 1 && crop && crop[2] > 0 && crop[3] > 0 && crop[0] >= 0 && crop[1] >= 0 &&
+        if (k == n - 1 && crop && crop[2] > 0 && crop[3] > 0 && crop[0] >= 0 && crop[1] >= 0 &&
             (NSUInteger)(crop[0] + crop[2]) <= t.width && (NSUInteger)(crop[1] + crop[3]) <= t.height) { x = crop[0]; y = crop[1]; w = crop[2]; h = crop[3]; }
-        id<MTLRenderPipelineState> ps = dbg_pipeline(t.pixelFormat); if (!ps) return nil;
+        id<MTLRenderPipelineState> ps = dbg_pipeline(t.pixelFormat); if (!ps) return 0;
         float *p = (float *)((char *)g.dbg_par[s].contents + k * 128);
-        p[0] = (float)x; p[1] = (float)y; p[2] = (float)w; p[3] = (float)h; p[4] = (float)depth.width; p[5] = (float)depth.height;
-        p[6] = (float)view; p[7] = g.last_om ? 1.0f : 0.0f;
+        p[0] = (float)x; p[1] = (float)y; p[2] = (float)w; p[3] = (float)h; p[4] = (float)g.mv.width; p[5] = (float)g.mv.height;
+        p[6] = (float)view; p[7] = om_used ? 1.0f : 0.0f;
         p[12] = (float)om.width / g.mv.width; p[13] = (float)om.height / g.mv.height;   // the per-object target's scale
-        p[8] = (float)((f - n) / (n * f)); p[9] = (float)(1.0 / f); p[10] = (float)n; p[11] = (float)(1.0 / log2(shown / n > 2 ? shown / n : 2));
+        p[8] = (float)((f - nr) / (nr * f)); p[9] = (float)(1.0 / f); p[10] = (float)nr; p[11] = (float)(1.0 / log2(shown / nr > 2 ? shown / nr : 2));
         MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
         rp.colorAttachments[0].texture = t; rp.colorAttachments[0].loadAction = MTLLoadActionLoad; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTL4RenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
-        if (!e) { MLOG("[red] debug view: no render encoder"); return nil; }
-        [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];   // after MetalFX and the game's frame
+        if (!e) { MLOG("[red] debug view: no render encoder"); return 0; }
+        [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];   // after MetalFX / the motion kernel and the game's frame
         id<MTL4ArgumentTable> a = g.dbg_args[s];
         [a setTexture:g.mv.gpuResourceID atIndex:0]; [a setTexture:depth.gpuResourceID atIndex:1]; [a setTexture:om.gpuResourceID atIndex:2];
         [a setAddress:g.dbg_par[s].gpuAddress + (uint64_t)k * 128 atIndex:0];
@@ -768,7 +793,85 @@ NSArray *mfx_debug_encode(id<MTL4CommandBuffer> cb, int s, id<MTLTexture> presen
         [res addObject:t];
     }
     [res addObject:g.dbg_par[s]];
-    static uint64_t said; if (!said++) MLOG("debug view %d drawn (motion / depth %lux%lu, near %g, farthest shown %g)", view, (unsigned long)depth.width, (unsigned long)depth.height, n, shown);
+    static uint64_t said; if (!said++) MLOG("debug view %d drawn (motion / depth %lux%lu, near %g, farthest shown %g)", view, (unsigned long)depth.width, (unsigned long)depth.height, nr, shown);
+    return 1;
+}
+NSArray *mfx_debug_encode(id<MTL4CommandBuffer> cb, int s, id<MTLTexture> present, const int crop[4]) {
+    int view = atomic_load_explicit(&g_dbg, memory_order_relaxed);
+    if (view < 0) view = mfx_debug_view();
+    if (!view || s < 0 || s >= MFX_OUT || !g.last_depth || !g.mv || !g.out[s] || !g.outv[s] || g.last_slot != s) return nil;
+    id<MTLTexture> targets[2] = {g.outv[s], present};
+    NSMutableArray *res = [NSMutableArray arrayWithObjects:g.out[s], nil];
+    return dbg_draw(cb, s, view, g.last_depth, g.last_om, targets, present ? 2 : 1, crop, res) ? res : nil;
+}
+/* The debug view with frame interpolation off (mfx_debug_only): nvn_mtl.m still takes the G-buffer depth and the camera
+   (mfx_pass_setup without the UI layer, the camera capture) and the per-object motion with TOTK_OBJ_MOTION; the motion
+   kernel runs at the depth's size into g.mv in a command buffer of its own after the game's frame, and the view is drawn
+   over the game's frame. No interpolator, scene / UI copies or output textures are made: only the motion texture and the
+   previous depth (8 bytes per render pixel, about 12 MB at 1600x900), plus the per-object target and position arenas with
+   TOTK_OBJ_MOTION. They are retired when the view is turned off (mfx_debug_release) and remade at their own sizes when
+   interpolation turns on (ensure_out / ensure_fi). Above MFX_BP_HIGH percent of the GPU memory budget nothing is made or
+   drawn (and what was made is released). Off: nothing is captured, made or encoded. */
+int mfx_debug_only(void) {
+    if (mfx_enabled()) return 0;
+    int view = atomic_load_explicit(&g_dbg, memory_order_relaxed);
+    if (view < 0) view = mfx_debug_view();
+    if (view && g_dbg_mem) {   // held off near the budget until the use at the last present is under MFX_BP_LOW percent
+        if (g_mem_budget && g_mem_used >= g_mem_budget / 100 * MFX_BP_LOW) return 0;
+        g_dbg_mem = 0; MLOG("back under %d%% of the GPU memory budget: the debug view is drawn again", MFX_BP_LOW);
+    }
+    return view;
+}
+int mfx_debug_release(void) {
+    if (!g_dbg_live || mfx_enabled()) return 0;
+    g_dbg_live = 0;
+    uint64_t b = obj_bytes(g.mv) + obj_bytes(g.pdepth) + obj_bytes(g.obj);
+    drop(&g.mv); drop(&g.pdepth); drop(&g.obj); g.pdepth_frame = 0;
+    g.depth = nil; g.enc_depth = nil; g.last_depth = nil; g.last_om = nil; g.prev_ok = g.hist_ok = 0; g.obj_ok = g.cam_ok = 0;
+    MLOG("debug view without interpolation off: %llu MB of motion / depth textures retired (released after %d presents)", (unsigned long long)(b >> 20), MFX_RETIRE_TICKS);
+    return 1;
+}
+int mfx_debug_prepare(void) {
+    if (mfx_enabled()) return -1;
+    g.frames++;
+    id<MTLTexture> depth = g.depth;
+    int obj = g.obj_ok && mfx_obj_motion_on() && g.obj && depth && g.obj.width == depth.width && g.obj.height == depth.height;
+    int cam_ok = g.cam_ok;
+    g.obj_ok = 0; g.cam_ok = 0; g.depth = nil;
+    if (g_mem_budget && g_mem_used > g_mem_budget / 100 * MFX_BP_HIGH) {
+        MLOG("near the GPU memory budget (%llu of %llu MB): the debug view is not drawn until the use is under %d%%", (unsigned long long)(g_mem_used >> 20), (unsigned long long)(g_mem_budget >> 20), MFX_BP_LOW);
+        g_dbg_mem = 1; g.prev_ok = 0;
+        return -1;   // mfx_debug_only is 0 from now on: the caller releases (mfx_debug_release, the position arenas)
+    }
+    g_dbg_live = 1;   // depth / camera capture and per-object motion run from here on: mfx_debug_release ends them
+    if (!cam_ok || !depth) { g.prev_ok = 0; return -1; }
+    if (!g.dev) g.dev = depth.device;   // set by ensure_out / mfx_obj_target otherwise, neither of which may have run
+    if (!g.mv || g.mv.width != depth.width || g.mv.height != depth.height) {
+        drop(&g.mv); g.mv = mk(MTLPixelFormatRG16Float, depth.width, depth.height, MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead);
+        drop(&g.pdepth); g.pdepth = mk(MTLPixelFormatDepth32Float, depth.width, depth.height, MTLTextureUsageShaderRead); g.pdepth_frame = 0;
+        mv_pipeline();
+        g.prev_ok = 0;
+        MLOG("debug view without frame interpolation: motion / depth %lux%lu", (unsigned long)depth.width, (unsigned long)depth.height);
+    }
+    if (!g.prev_ok || camera_cut()) { memcpy(g.prev_cam, g.cam, sizeof g.cam); g.prev_ok = 1; return -1; }
+    double m[16];
+    if (!mv_reproj(m)) { g.prev_ok = 0; return -1; }
+    int s = g.slot = (g.slot + 1) % MFX_OUT;
+    mv_params(s, m, depth, obj);
+    g.enc_depth = depth;
+    return s;
+}
+void mfx_debug_abort(void) { g.enc_depth = nil; g.prev_ok = 0; }
+NSArray *mfx_debug_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTLTexture> present, const int crop[4]) {
+    id<MTLTexture> depth = g.enc_depth; g.enc_depth = nil;
+    int view = mfx_debug_only();
+    if (!depth || !present || !view || s < 0 || s >= MFX_OUT || !g.mv) { g.prev_ok = 0; return nil; }
+    if (g.rs) [cb useResidencySet:g.rs];
+    id<MTLTexture> om = mv_encode(cb, s, depth);
+    id<MTLTexture> om_used = g.enc_obj && g.obj ? g.obj : nil;
+    NSMutableArray *res = [NSMutableArray arrayWithObjects:depth, g.mv, g.pdepth, om, g.mv_par[s], nil];
+    memcpy(g.prev_cam, g.cam, sizeof g.cam);
+    dbg_draw(cb, s, view, depth, om_used, &present, 1, crop, res);   // on failure the motion kernel's resources still go with the command buffer
     return res;
 }
 /* TOTK_MFX_MVLOG=<every n frames>: read the motion texture back after the interpolation and log its median and the

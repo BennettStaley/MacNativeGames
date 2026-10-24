@@ -51,6 +51,18 @@ void mfx_frame_abort(void);
 int mfx_debug_view(void);
 void mfx_debug_view_set(int view);   // < 0 cycles
 NSArray *mfx_debug_encode(id<MTL4CommandBuffer> cb, int slot, id<MTLTexture> present, const int crop[4]);
+/* The view with frame interpolation off (no interpolator or output textures). debug_only: nonzero (the view) while the
+   view is on and interpolation is off: the replay then takes the G-buffer depth, the camera and (TOTK_OBJ_MOTION) the
+   per-object motion; 0 also while held off near the GPU memory budget. At the game's present: debug_prepare returns the
+   slot or -1 (first frame, cut, missing input); debug_frame_encode (own command buffer, after the game's frame) runs the
+   motion kernel and draws the view over present, returning the resources to keep alive until completion (nil: nothing
+   encoded); debug_abort: a prepared frame not encoded. debug_release (every present while debug_only is 0 and
+   interpolation off): retires its textures; 1 = it held some (the caller then releases the position arenas). */
+int mfx_debug_only(void);
+int mfx_debug_prepare(void);
+NSArray *mfx_debug_frame_encode(id<MTL4CommandBuffer> cb, int slot, id<MTLTexture> present, const int crop[4]);
+void mfx_debug_abort(void);
+int mfx_debug_release(void);
 id<MTLTexture> mfx_output(int slot);   // RGBA8Unorm view of the sRGB output, like the swapchain textures
 void mfx_stats(char *out, size_t n);
 void mfx_mem_report(char *out, size_t n);   // memreport (diagnostic): textures, cached / retired interpolators
