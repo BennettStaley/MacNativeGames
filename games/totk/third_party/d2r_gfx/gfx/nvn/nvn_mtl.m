@@ -7162,7 +7162,11 @@ static int uld_draw_writes(NvProg *pr) {   // 1 when this draw writes a colour a
         if (imgw || (x >= 0 && ((((S.chmask.mask >> (4 * x)) & 0xf)) || (cm >> x & 1)))) { uld_miss(j); hit = 1; } }
     return hit;
 }
-static void udc_mark_all(void) { g_udc_noted++; for (int i = 0; i < g_nsd; i++) { g_sd[i].wrote = 1; if (!g_sd[i].wwhy) g_sd[i].wwhy = 6; } }   // TOTK_UDC: a helper draw into the open pass (clear quads)
+/* TOTK_UDC / TOTK_ULD: a helper clear quad writes colour attachment `index` (ds 0) or depth / stencil (ds 1) only; the
+   other attachments stay as they are (marking them written would store a colour attachment the pass did not load). */
+static void udc_mark_helper(int index, int ds) { g_udc_noted++;
+    for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i]; if (ds ? t->depth != 0 : (t->depth == 0 && t->idx == index)) { t->wrote = 1; if (!t->wwhy) t->wwhy = 6; } } }
+__attribute__((unused)) static void udc_mark_all(void) { g_udc_noted++; for (int i = 0; i < g_nsd; i++) { g_sd[i].wrote = 1; if (!g_sd[i].wwhy) g_sd[i].wwhy = 6; } }   // TOTK_UDC: a helper draw into the open pass (clear quads)
 static void udc_note_draw(NvProg *pr) {
     g_udc_noted++;   // TOTK_UDC: this draw's writes are accounted for below
     if (R.has_rt) for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) { zskip_del(R.rt.color[i]->serial); g_zskip_cand_ok[i] = 0; }   // Zero-source set: once really drawn it is no longer all zeros
@@ -11869,14 +11873,16 @@ static void clear_quad_core(id<MTL4RenderCommandEncoder> en, const uint32_t cfmt
     enc_r_viewport(en, (MTLViewport){0, 0, (double)tw, (double)th, 0, 1});
     enc_r_scissor(en, sc);
     enc_r_cull(en, MTLCullModeNone); enc_r_fill(en, MTLTriangleFillModeFill); enc_r_depth_bias(en, 0, 0, 0);
-    udc_mark_all(); enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, 3);
+    udc_mark_helper(index, 0); enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, 3);
 }
 static void clear_quad(const p_clear_color *c) {
     gpu_path_on("TOTK_GPU_MIDCLEAR", "mid-pass / partial-mask / scissored color clear"); BOTW_RT_DUP_CLEAR_TO_FIRST(c)
     const tex_t *t = R.rt.color[c->index];
     int f = R.rt.has_cview[c->index] && R.rt.cview[c->index].set_format ? R.rt.cview[c->index].format : t->d.format;
     if (cls_of(f)) MDIE("partial color clear of integer render target format %#x not implemented", f);
-    if (g_enc && g_uld_mask) for (int j = 0; j < g_nsd; j++) if ((g_uld_mask >> j & 1) && g_sd[j].idx == (int)c->index) { uld_miss(j); RP_WHY("uld-mispredict"); rp_end(); break; }   // TOTK_ULD
+    for (int pass = 0; pass < 2; pass++) {   // TOTK_ULD: before (an open pass) and after opening one: the cleared attachment must be loaded
+        if (g_enc && g_uld_mask) for (int j = 0; j < g_nsd; j++) if ((g_uld_mask >> j & 1) && g_sd[j].idx == (int)c->index) { uld_miss(j); RP_WHY("uld-mispredict"); rp_end(); break; }
+        if (!pass && !rp_begin()) return; }
     id<MTL4RenderCommandEncoder> en = rp_begin(); if (!en) return;
     NSUInteger tw = g_pass.tw, th = g_pass.th; MTLScissorRect sc = {0, 0, tw, th};
     if (R.has_sc) { long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y < 0 ? 0 : R.sc.y, x1 = (long)R.sc.x + R.sc.w, y1 = (long)R.sc.y + R.sc.h;
@@ -11920,7 +11926,7 @@ static void clear_ds_core(id<MTL4RenderCommandEncoder> en, const uint32_t cfmt[8
     if (g_enc_vis) { enc_r_visibility(en, MTLVisibilityResultModeDisabled, 0); g_enc_vis = 0; }
     enc_r_stencil_ref(en, c->stencil, c->stencil); enc_r_viewport(en, (MTLViewport){0, 0, (double)tw, (double)th, 0, 1}); enc_r_scissor(en, sc);
     enc_r_cull(en, MTLCullModeNone); enc_r_fill(en, MTLTriangleFillModeFill); enc_r_depth_bias(en, 0, 0, 0); enc_r_depth_clip(en, YES);
-    udc_mark_all(); enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, 3);
+    udc_mark_helper(-1, 1); enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, 3);
 }
 static void clear_ds_quad(const p_clear_ds *c) {
     gpu_path_on("TOTK_GPU_MIDCLEAR", "mid-pass / masked / scissored depth-stencil clear");
@@ -12788,6 +12794,9 @@ frz_plain:;
         mfx_snapshot_scene();   // TOTK_MFX: first UI draw into the canvas: copy the finished scene first
     if (!g_uw_ui && uw_on_canvas() && pr && pr->sh[0] && UW_UI_BEGINS(pr)) g_uw_ui = 1; BOTW_MFX_NO_UI_SCENE()   // key 4: the UI begins | BOTW key 2 (every draw, not part of the if): a frame without UI takes the canvas as its scene
     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
+    /* TOTK_ULD: the check above only sees passes already open; the draw that opens one meets its prediction here. If it
+       writes an attachment the pass just chose not to load, end that (empty) pass and open it again without prediction. */
+    if (en && g_uld_mask && uld_draw_writes(pr)) { RP_WHY("uld-mispredict"); rp_end(); en = rp_begin_ex(mode); }
     g_fd_dw = NULL; g_fd_di = NULL;
     if (!en) { g_draw_skip[8]++; return; }
     if (g_pass.mfx || g_pass.objmv || g_mfx.role) {   // TOTK_MFX: every draw into the canvas after the scene copy goes to the UI layer too
