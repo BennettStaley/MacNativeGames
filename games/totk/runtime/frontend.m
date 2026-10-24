@@ -9,6 +9,7 @@
 #include "game_version.h"
 #include "gamepad_layout.h"
 #include "../third_party/d2r_gfx/gfx/nvn/totk_mfx_mode.h"
+#include "../third_party/d2r_gfx/gfx/nvn/totk_vrr.h"
 int mfxup_output_enabled(void);
 static NSWindow *window;
 uint64_t dm_nvn_frame_count(void);   /* gfx/nvn/hle_nvn.c: game frames presented so far */
@@ -295,7 +296,34 @@ static _Atomic uint32_t windowDisplay;
 static _Atomic unsigned displayChanges;
 uint32_t runtime_front_display_id(void){return atomic_load(&windowDisplay);}
 unsigned runtime_front_display_changes(void){return atomic_load(&displayChanges);}
+/* Variable refresh (nvn_mtl.m vrr_eval, totk_vrr.h): whether the window is in full screen and its display's refresh
+   interval range (NSScreen minimumRefreshInterval / maximumRefreshInterval / displayUpdateGranularity, macOS 12), kept
+   here on the main thread for the renderer's threads. Updated when the window changes display, a display's settings
+   change, and on entering / leaving full screen. */
+static _Atomic int windowFullScreen;
+static _Atomic uint64_t refreshMinNs,refreshMaxNs,refreshGranNs;
+int runtime_front_vrr_info(double r[3]){r[0]=atomic_load(&refreshMinNs)/1e9;r[1]=atomic_load(&refreshMaxNs)/1e9;r[2]=atomic_load(&refreshGranNs)/1e9;return window?atomic_load(&windowFullScreen):-1;}
+static void note_refresh_range(const char *why){
+ NSScreen *s=window.screen;double mn=0,mx=0,g=0;
+ if(@available(macOS 12.0,*)){if(s){mn=s.minimumRefreshInterval;mx=s.maximumRefreshInterval;g=s.displayUpdateGranularity;}}
+ int fs=window&&(window.styleMask&NSWindowStyleMaskFullScreen);
+ uint64_t a=(uint64_t)llround(mn*1e9),b=(uint64_t)llround(mx*1e9),c=(uint64_t)llround(g*1e9);
+ int same=atomic_exchange(&refreshMinNs,a)==a&atomic_exchange(&refreshMaxNs,b)==b&atomic_exchange(&refreshGranNs,c)==c&atomic_exchange(&windowFullScreen,fs)==fs;
+ if(!same)fprintf(stderr,"[totk] refresh range %.2f..%.2f ms, granularity %.2f ms (%s); window %s: %s\n",mn*1e3,mx*1e3,g*1e3,mx-mn>1e-4?"variable refresh capable":"fixed refresh",fs?"full screen":"windowed",why);
+}
+/* Framerate.vrr = Auto (settings.c, and at launch): variable refresh needs full screen, so the window goes there on a
+   display that can do it. Never the other way: a player who leaves full screen stays windowed (the setting's row says
+   so). Test windows (background runs, TOTK_ASSUME_FOCUS) stay as they are. */
+void runtime_front_enter_full_screen(const char *why){
+ if(background_run()||assume_focus())return;
+ dispatch_async(dispatch_get_main_queue(),^{
+  if(!window||(window.styleMask&NSWindowStyleMaskFullScreen))return;
+  NSScreen *s=window.screen;double mn=0,mx=0;if(@available(macOS 12.0,*)){if(s){mn=s.minimumRefreshInterval;mx=s.maximumRefreshInterval;}}
+  if(mx-mn<1e-4){fprintf(stderr,"[totk] variable refresh: this display has a fixed refresh rate, staying windowed (%s)\n",why);return;}
+  fprintf(stderr,"[totk] variable refresh: entering full screen (%s)\n",why);[window toggleFullScreen:nil];});
+}
 static void note_screen(const char *why){
+ note_refresh_range(why);
  NSScreen *s=window.screen;NSNumber *n=s?s.deviceDescription[@"NSScreenNumber"]:nil;uint32_t d=n?n.unsignedIntValue:0;
  uint32_t old=atomic_exchange(&windowDisplay,d);int params=!strcmp(why,"display settings changed");
  if(old==d&&!params)return;
@@ -343,8 +371,8 @@ void runtime_front_resize_aspect(double ratio){
   fprintf(stderr,"[totk] save %s after %.2f s; quitting\n",runtime_fs_save_busy()?"still in progress (gave up)":"done",(runtime_now_ns()-t0)/1e9);_exit(0);});
 }
 -(void)windowDidResize:(NSNotification *)n{(void)n;front_sync_drawable();}
--(void)windowDidEnterFullScreen:(NSNotification *)n{(void)n;[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:window.isKeyWindow];}
--(void)windowDidExitFullScreen:(NSNotification *)n{(void)n;[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:NO];}
+-(void)windowDidEnterFullScreen:(NSNotification *)n{(void)n;note_refresh_range("entered full screen");[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:window.isKeyWindow];}
+-(void)windowDidExitFullScreen:(NSNotification *)n{(void)n;note_refresh_range("left full screen");[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:NO];}
 /* Whether any part of the window can be seen (TOTK, 2026-10-16 night): macOS stops the display link's callbacks for a
    fully covered window, so presents stop and per-picture measurements of that stretch are void; a test session's log
    says when (the user working in other apps covered the test windows of the frame interpolation tests). */
@@ -448,6 +476,7 @@ void runtime_front_run(void(*callback)(void)){
      invisible and untouchable for the user; the game's own "shot" command still captures the full picture. */
   if(background_run()){window.alphaValue=0.01;window.ignoresMouseEvents=YES;window.level=NSFloatingWindowLevel;[window orderFrontRegardless];}else if(assume_focus()){[window orderFrontRegardless];}else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
   note_screen("opened");
+  { const char *v=getenv("TOTK_VRR"); if(!v||strcmp(v,"0"))runtime_front_enter_full_screen("Variable refresh is Auto, at launch"); }
   [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){(void)n;note_screen("display settings changed");}];
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{note_occlusion(" 3 s after opening");});
   [TOTKCheatDb boot];   /* the community cheat list for the Cheats tab, in the background (runtime/cheat_db_fetch.h) */

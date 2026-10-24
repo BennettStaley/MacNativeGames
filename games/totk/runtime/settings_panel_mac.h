@@ -84,7 +84,7 @@ static NSString *settings_value_text(const SettingDef *d, int v) {
 void mtl_gpu_memory(uint64_t *used, uint64_t *budget);   /* nvn_mtl.m: allocated now, and the budget the game stops at */
 int mfx_obj_motion_on(void);   /* totk_mfx.h: TOTK_OBJ_MOTION=1, paused with interpolation */
 static double settings_gb(uint64_t b) { return b / 1073741824.0; }
-static BOOL settings_mem_row(const SettingDef *d) { return !strcmp(d->key, "graphics.interpolation") || !strcmp(d->key, "display.render_max"); }
+static BOOL settings_mem_row(const SettingDef *d) { return !strcmp(d->key, "graphics.interpolation") || !strcmp(d->key, "display.render_max") || !strcmp(d->key, "framerate.vrr"); }
 /* display.render_max: the GPU memory in use at 1800p / 4K, from the one measurement there is (docs/settings.md: an 18 GB
    M3 Pro at a 4K display resolution, 2026-10-21: 1800p up to 6.1 GB, 4K about 1.5 GB more). An estimate, not a promise. */
 static uint64_t settings_render_max_need(int v) { return v >= 2160 ? 7600ull << 20 : v >= 1800 ? 6100ull << 20 : 0; }
@@ -128,6 +128,20 @@ static NSString *settings_mem_note(const SettingDef *d, uint64_t used, uint64_t 
                     chosen, MFX_BP_MAX, also];
         }
         return nil;
+    }
+    if (!strcmp(d->key, "framerate.vrr")) {   /* variable refresh: active now, or why not (nvn_mtl.m vrr_eval), refreshed once a second */
+        if (!v) return nil;
+        *color = NSColor.secondaryLabelColor;
+        switch (mtl_vrr_state()) {
+        case MTL_VRR_ACTIVE: {
+            *color = NSColor.systemGreenColor; double f = mtl_vrr_target_fps();
+            return f > 0 ? [NSString stringWithFormat:@"Active: paced at %.0f fps, the display follows each frame", f] : @"Active: the display follows each frame";
+        }
+        case MTL_VRR_WINDOWED: *color = NSColor.systemOrangeColor; return @"Not active: windowed (variable refresh needs full screen)";
+        case MTL_VRR_FIXED: return @"Not active: this display has a fixed refresh rate";
+        case MTL_VRR_INTERP: *color = NSColor.systemOrangeColor; return @"Not active: off while frame interpolation is on";
+        default: return @"Not active yet: waiting for the game's first frame";
+        }
     }
     if (!strcmp(d->key, "display.render_max") && settings_mem_short(d, v, used, budget)) {
         *color = NSColor.systemOrangeColor;

@@ -134,7 +134,14 @@ int main(void) {
                settings_in_tab(settings_index("audio.volume"), 0), "Downloads on Content, effects on Graphics, audio on Game");
     }
     for (int i = 0; i < SETTINGS_COUNT; i++) expect(strncmp(SETTINGS[i].key, "cheats.", 7) != 0, "cheats are not settings: settings.txt and Reset all never hold them");
-    expect(SETTINGS_COUNT == 40, "40 settings");
+    expect(SETTINGS_COUNT == 41, "41 settings");
+    {   /* Variable refresh: Auto on the Mac (TOTK_VRR=auto), Off reads as TOTK_VRR=0, a Frame rate row */
+        const SettingDef *vr = &SETTINGS[settings_index("framerate.vrr")]; int a[SETTINGS_COUNT]; settings_defaults(a, 0);
+        expect(settings_index("framerate.vrr") >= 0 && !strcmp(vr->page, "Frame rate") && !strcmp(vr->env, "TOTK_VRR") && vr->apply == SET_LIVE &&
+               vr->platforms == SET_MAC && value(a, "framerate.vrr") == 1, "variable refresh: a live Mac setting, Auto by default");
+        expect(settings_parse_text("framerate.vrr = off\n", a) == 1 && value(a, "framerate.vrr") == 0 && !strcmp(settings_choice(vr, 0)->env, "0") &&
+               !strcmp(settings_choice(vr, 1)->env, "auto"), "variable refresh: off is TOTK_VRR=0, auto is TOTK_VRR=auto");
+    }
     { int a[SETTINGS_COUNT]; settings_defaults(a, 0);
       expect(value(a, "graphics.mfx_debug_view") == 0 && settings_parse_text("graphics.mfx_debug_view = split\n", a) == 1 &&
              value(a, "graphics.mfx_debug_view") == 3, "the motion / depth debug view is off by default and reads by its word"); }

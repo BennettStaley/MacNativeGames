@@ -104,6 +104,27 @@ int main(void) {
     acap_reset(&s, 60); run(&s, 5, 18, 3, 0); expect(s.k == 2, "18-21 ms on 60 Hz: 30 fps");
     acap_reset(&s, 60); run(&s, 30, 10, 3, 0); expect(s.k == 1, "10-13 ms on 60 Hz: 60 fps");
 
+    /* Variable refresh (avrr_*): a continuous target. The M3 Pro's built-in display: 1/120 .. 1/24 s, any interval. */
+    {
+        avrr_t r; avrr_reset(&r, 1.0 / 120, 1.0 / 24, 0, 120);
+        expect(r.lo == 30 && r.hi == 120 && r.fps == 120, "VRR 120 Hz: 30..120, starts at 120");
+        double t = 0, first = -1;
+        while (t < 20000) { double w = 12 + noise(), wall = fmax(w, 1000.0 / r.fps); avrr_frame(&r, w, wall, 0); t += wall; if (r.changed && first < 0) first = t; }
+        expect(r.fps == 70 && first > 0 && first < 2000, "VRR: 12-13 ms frames drop 120 -> 70 within 2 s and stay");
+        avrr_reset(&r, 1.0 / 120, 1.0 / 24, 0, 120); r.fps = 30; avrr_clear_window(&r);
+        t = 0; while (t < 15000) { double w = 7 + noise(), wall = fmax(w, 1000.0 / r.fps); avrr_frame(&r, w, wall, 0); t += wall; }
+        expect(r.fps >= 115, "VRR: 7-8 ms frames rise from 30 to 115+ within 15 s");
+        /* Granularity of one 120 Hz refresh: only 120 / 60 / 40 / 30 are exact, so 70 becomes 60. */
+        avrr_reset(&r, 1.0 / 120, 1.0 / 24, 1.0 / 120, 120);
+        expect(avrr_quant(&r, 70) == 60 && avrr_quant(&r, 45) == 40 && avrr_quant(&r, 120) == 120, "VRR: a granularity quantises the target");
+        /* The uncapped ceiling caps the range. */
+        avrr_reset(&r, 1.0 / 144, 1.0 / 48, 0, 120); expect(r.hi == 120 && r.lo == 48, "VRR 48..144 Hz under a 120 ceiling: 48..120");
+        /* A failed rise is remembered: frames that read fast at 60 but cost 15 ms at 70+ do not flap. */
+        avrr_reset(&r, 1.0 / 120, 1.0 / 24, 0, 120); r.fps = 60; avrr_clear_window(&r); int rises = 0;
+        for (t = 0; t < 120000; ) { double w = (r.fps <= 60 ? 12 : 15) + noise(), wall = fmax(w, 1000.0 / r.fps); avrr_frame(&r, w, wall, 0); t += wall; rises += r.changed > 0; }
+        expect(rises <= 4 && r.fps <= 60, "VRR: failed rises back off");
+    }
+
     if (failures) { fprintf(stderr, "autocap: %d failure(s)\n", failures); return 1; }
     printf("autocap: all checks passed\n");
     return 0;

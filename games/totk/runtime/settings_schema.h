@@ -57,6 +57,8 @@ static inline int settings_in_tab(int i, int tab);
 /* Auto (steady): the highest rate that divides the display's and that the game holds (totk_autocap.h). */
 static const SettingChoice SET_CAP[] = {{"Auto (steady)", "auto", "auto", -1}, {"30 fps", "30", "30", 30}, {"40 fps", "40", "40", 40},
                                         {"60 fps", "60", "60", 60}, {"120 fps", "120", "120", 120}, {"Display refresh rate", "display", "display", 0}};
+/* Variable refresh (nvn_mtl.m, totk_vrr.h; TOTK_VRR): Auto goes full screen on a ProMotion / Adaptive-Sync display. */
+static const SettingChoice SET_VRR[] = {{"Auto", "auto", "auto", 1}, {"Off", "off", "0", 0}};
 static const SettingChoice SET_INTERP[] = {{"Off", "off", "0", 0}, {"30 + 30", "interp30", "interp30", 1},
                                            {"Half the refresh rate", "half", "interp", 2}, {"Every frame", "max", "interpmax", 3}};
 /* Motion / depth from the render drawn over the picture (totk_mfx.m mfx_debug_encode / mfx_debug_frame_encode,
@@ -152,8 +154,10 @@ static const SettingDef SETTINGS[] = {
      "TOTK_FIXED_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_DYNRES, SET_N(SET_DYNRES), "Not on iPhone and iPad: their game code is fixed when the app is built.", NULL, 0},
     {"graphics.lod_bias", "Image", "Texture detail bias", "Below 0 picks sharper texture levels, in hundredths of a level; too low shimmers.",
      "TOTK_LOD_BIAS", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, -100, 0, 25, NULL, NULL, 0, NULL, NULL, 0},
-    {"framerate.cap", "Frame rate", "Frame rate limit", "The most frames a second the game draws. Auto picks the highest steady rate the game holds (120, 60, 40 or 30 on a 120 Hz display), so frames never alternate between one and two refreshes. 40 needs a 120 Hz display.",
+    {"framerate.cap", "Frame rate", "Frame rate limit", "The most frames a second the game draws. Auto picks the highest steady rate the game holds (120, 60, 40 or 30 on a 120 Hz display), so frames never alternate between one and two refreshes. In full screen on a display with variable refresh (ProMotion, Adaptive-Sync) Auto uses any rate in between instead, such as 77 fps, shown evenly. 40 needs a 120 Hz display.",
      "TOTK_UNCAPPED_HZ", SET_CHOICE, SET_LIVE, SET_ALL, -1, 0, 0, 0, 0, NULL, SET_CAP, SET_N(SET_CAP), NULL, NULL, 0},
+    {"framerate.vrr", "Frame rate", "Variable refresh (full screen)", "On a ProMotion or Adaptive-Sync display the screen refreshes when each frame is ready, so any frame rate is shown evenly instead of alternating one and two refreshes. Needs full screen: Auto enters it when turned on and at launch (leave it with the green button and the game stays windowed). Off while frame interpolation is on. The row says whether it is active now.",
+     "TOTK_VRR", SET_CHOICE, SET_LIVE, SET_MAC, 1, 0, 0, 0, 0, NULL, SET_VRR, SET_N(SET_VRR), "Mac only.", NULL, 0},
     {"interface.readout", "Interface", "Performance readout", "Frames per second and the game picture's size.",
      "TOTK_HINTS", SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"interface.readout_detail", "Interface", "Readout detail", "Detailed adds the average and the 1% low frame rate over the last 5 seconds.",

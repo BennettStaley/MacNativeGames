@@ -269,3 +269,22 @@ What stands out (not the game's own work):
   the first draw that writes an attachment whose load was skipped).
 
 - **In-game results, 2026-10-23 (M3 Pro, 2560x1440 render and output, user's world spot).** Baseline (UDC off): frame p50 17.3-17.6 ms, GPU 10.0-10.4 ms, NVN submit+present 7.4 ms: CPU-bound, the GPU idles ~7 ms a frame. `TOTK_UDC=1`: picture correct, made default. `TOTK_SPLIT_BARRIER=1`: no effect (about one samples-drawn-att split a frame, a non-8-bit format; nothing to skip), stays off. `TOTK_FENCE_LAG=2`: never engaged alone (every world submission has occlusion reports); with `TOTK_FIF_COUNTERS=1` every wait lagged, but frame p50 stayed ~18.4 ms and p95 rose to ~30 ms (stutter), so it stays off: the lag does not shorten the frame because the game thread itself (game logic plus submit) is the limit, not the wait for the GPU.
+
+## Variable refresh in full screen (2026-10-23, compiled only, not tried in game)
+
+Measured before on the M3 Pro's built-in 120 Hz XDR display: uncapped frame p50 12.4-14.8 ms, and the auto cap
+(120 / 60 / 40 / 30) held 60, because a rate between the divisors judders on the fixed grid. `framerate.vrr` /
+`TOTK_VRR` (default auto, docs/settings.md) now presents in full screen on a variable-refresh display without the
+display link and with `presentAfterMinimumDuration: 1 / target` (nvn_mtl.m `vrr_update`, `link_sync`; sources in
+`totk_vrr.h`: WWDC21 10147, OpenEmu, Apple developer forums thread 733033 on direct-to-display composition), and the
+auto cap aims at a continuous rate (`totk_autocap.h` `avrr_*`, tests/test_autocap.c). What to check in game:
+
+- Full screen, Auto: `[vrr] active: display min 8.33 ms max ...; target N fps` and `[auto-cap] variable refresh:`
+  lines; the target should settle around 65-75 fps in the scenes that held 60.
+- `on-screen pacing, variable refresh:` most intervals within 1 ms of the target and few on the 8.33 / 16.67 ms grid.
+  If they still sit on the grid, the layer is not composited straight to the display (an overlay over the game
+  layer, the cursor, the FPS corner panel) or macOS ignored the minimum duration.
+- Windowed / frame interpolation on: `[vrr] not active: ...` and the old pacing (display link, divisor auto cap).
+- Not done: present_ticks is not forced to 1 under VRR (the game's own present interval is kept, as the uncapped
+  mode already does), and the fixed-step auto cap without the uncapped mode (TOTK_UNCAPPED=0) keeps its divisors.
+

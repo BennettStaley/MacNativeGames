@@ -2560,6 +2560,7 @@ static void set_time_constraint(uint64_t period_ns);
 static void rt_comp_tick(uint64_t period_ns);
 static _Atomic int g_fps_limit;   // the settings menu's frame rate limit (TOTK_UNCAPPED_HZ as a number; 0 = none), present_ticks
 #include "totk_autocap.h"
+#include "totk_vrr.h"   /* variable refresh in full screen (nvn_mtl.m): Auto aims at a continuous rate (avrr_*) */
 static _Atomic int g_fps_auto;    // framerate.cap = auto (TOTK_UNCAPPED_HZ=auto): g_acap picks the refreshes per frame (totk_autocap.h)
 static _Atomic int g_acap_k;      // its choice, read by present_ticks (0 = none yet)
 static acap_t g_acap;             // present thread only
@@ -3010,7 +3011,23 @@ static void ka_auto_gpu(double gpu_ms) {   /* the GPU time of a frame 8 frames b
 static void acap_tick(double work_ms, double wall_ms, int skip) {
     static int active;
     int m = mfx_enabled();
-    if (!atomic_load(&g_fps_auto) || dm_detclock_enabled() || m == MFX_HALF || m == MFX_30 || game_holds_30() || g_paced_hz <= 0) { active = 0; return; }
+    static avrr_t vrr; static int vrr_on; static double vrr_r[3];
+    if (!atomic_load(&g_fps_auto) || dm_detclock_enabled() || m == MFX_HALF || m == MFX_30 || game_holds_30() || g_paced_hz <= 0) { active = 0; vrr_on = 0; return; }
+    /* Variable refresh (totk_vrr.h; the uncapped mode, the Mac default): the own clock runs at a continuous target and
+       each frame is presented after 1 / target, so no whole-refresh steps. The fixed-step choice starts over when it ends. */
+    if (g_uncapped && uncapped_now() && mtl_vrr_active()) {
+        double r[3]; mtl_vrr_range(r);
+        if (!vrr_on || memcmp(r, vrr_r, sizeof r) || vrr.hi > g_paced_hz) {
+            memcpy(vrr_r, r, sizeof r); avrr_reset(&vrr, r[0], r[1], r[2], g_paced_hz); vrr_on = 1; g_hz = vrr.fps;
+            LOG("[auto-cap] variable refresh: display min %.2f ms max %.2f ms granularity %.2f ms: any rate %d..%d fps%s; starts at %d fps",
+                r[0] * 1e3, r[1] * 1e3, r[2] * 1e3, vrr.lo, vrr.hi, r[2] > 0 ? " on the display's interval steps" : "", vrr.fps); }
+        int f = avrr_frame(&vrr, work_ms, wall_ms, skip);
+        if (vrr.changed) { g_hz = f;
+            LOG("[auto-cap] variable refresh: %s to %d fps (frame %.2f ms): frame time without pacing p90 %.2f / p95 %.2f ms over the last %.1f s, %s", vrr.changed < 0 ? "down" : "up",
+                f, 1000.0 / f, vrr.p90, vrr.p95, ACAP_WIN_MS / 1000, vrr.changed < 0 ? "more than 1 frame in 10 missed the target" : "the p95 fits a faster rate"); }
+        active = 0; return;
+    }
+    vrr_on = 0;
     if (!active || g_acap.hz != g_paced_hz || !atomic_load(&g_acap_k)) {
         int keep = g_acap.hz == g_paced_hz ? atomic_load(&g_acap_k) : 0;   /* back after interpolation: from the last choice */
         acap_reset(&g_acap, g_paced_hz); if (keep >= g_acap.kmin && keep <= g_acap.kmax) { g_acap.k = keep; acap_clear_window(&g_acap); }

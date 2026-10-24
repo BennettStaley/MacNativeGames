@@ -21,6 +21,7 @@
 #include "../tex/nvn_deswizzle_gpu.h"
 #include "totk_shader_rt.h"
 #include "totk_mfx.h"
+#include "totk_vrr.h"
 #include "totk_mfx_up.h"
 #include "totk_taa.h"
 #include "totk_sysload.h"
@@ -2857,6 +2858,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "skip_invisible")) { skv_set(v); return; }
     if (!strcmp(name, "mfx_upscale")) { mfxup_set(v < 0 ? !mfxup_enabled() : v); return; }   // TOTK_MFX_UPSCALE at run time (manual key 3 picture mode)
     if (!strcmp(name, "mfx_interp")) { mfx_set(v); return; }
+    if (!strcmp(name, "vrr")) { mtl_vrr_set(v); return; }   // TOTK_VRR at run time (setting framerate.vrr)
     if (!strcmp(name, "mfx_mv_dyn")) { mfx_set_mv_dyn(v); return; }
     if (!strcmp(name, "mfx_debug_view")) { mfx_debug_view_set(v); return; }   // TOTK_MFX_DEBUG_VIEW at run time (setting graphics.mfx_debug_view)
     if (!strcmp(name, "link_pause")) { void mtl_link_pause(int on); mtl_link_pause(v); MLOG("[flag] link_pause = %d (the display link stops calling back, as when the system stalls it)", v != 0); return; }   // tests the display-link rescue
@@ -14782,6 +14784,54 @@ int mtl_probe_anomaly(void) {
     atomic_store(&g_anom_requested, saved); res_remove(src);
     return checked;
 }
+/* TOTK: variable refresh (totk_vrr.h has the sources). Worked out at every game present (vrr_update): TOTK_VRR / the
+   setting, frame interpolation off, the window's display min != max refresh interval and the window in full screen
+   (runtime/frontend.m reports both from the main thread). While active, link_sync keeps the display link off (the
+   present thread takes its own drawables; nextDrawable throws while a display link is attached) and present_now
+   presents with presentAfterMinimumDuration: the frame's pacing period (1 / target fps), so a game at 77 fps is shown
+   every 13 ms instead of alternating 8.33 / 16.67 ms on the 120 Hz grid. displaySyncEnabled stays YES. Composition
+   straight to the display matters (Apple developer forums thread 733033: pacing was uneven until the cursor was
+   hidden); the cursor already hides itself in full screen (frontend.m) and nothing is drawn over the game layer. */
+__attribute__((weak)) int runtime_front_vrr_info(double r[3]) { r[0] = r[1] = r[2] = 0; return -1; }   // runtime/frontend.m; unknown on iOS and in the graphics unit tests
+static _Atomic int g_vrr_mode = -1;      // -1 not read yet; 0 off; 1 TOTK_VRR=1 (also windowed, for tests); 2 auto
+static _Atomic int g_vrr_state = -1;     // MTL_VRR_* of the last present (-1: none yet)
+static _Atomic uint64_t g_vrr_target_mfps;   // the last present's pacing rate in thousandths of a frame per second
+static int vrr_mode(void) {
+    int m = atomic_load(&g_vrr_mode);
+    if (m < 0) { const char *e = getenv("TOTK_VRR"); m = e && !strcmp(e, "0") ? 0 : e && !strcmp(e, "1") ? 1 : 2; atomic_store(&g_vrr_mode, m); }
+    return m;
+}
+void mtl_vrr_set(int on) { atomic_store(&g_vrr_mode, on ? 2 : 0); MLOG("[vrr] setting: %s", on ? "auto" : "off"); }
+int mtl_vrr_range(double r[3]) { return runtime_front_vrr_info(r); }
+static int vrr_eval(void) {
+    int m = vrr_mode(); double r[3]; int fs = runtime_front_vrr_info(r);
+    if (!m) return MTL_VRR_OFF;
+    if (mfx_enabled() != MFX_OFF) return MTL_VRR_INTERP;   // MetalFX interpolation keeps the fixed-refresh path
+    if (fs < 0 || r[1] <= 0) return MTL_VRR_UNKNOWN;
+    if (r[1] - r[0] < 1e-4) return MTL_VRR_FIXED;
+    if (!fs && m != 1) return MTL_VRR_WINDOWED;
+    return MTL_VRR_ACTIVE;
+}
+int mtl_vrr_state(void) { int s = atomic_load(&g_vrr_state); return s >= 0 ? s : vrr_eval(); }
+int mtl_vrr_active(void) { return atomic_load(&g_vrr_state) == MTL_VRR_ACTIVE; }
+double mtl_vrr_target_fps(void) { return atomic_load(&g_vrr_target_mfps) / 1000.0; }
+static const char *vrr_why(int s) {
+    return s == MTL_VRR_OFF ? "off (setting / TOTK_VRR=0)" : s == MTL_VRR_WINDOWED ? "windowed (variable refresh needs full screen)" :
+           s == MTL_VRR_FIXED ? "this display has a fixed refresh rate" : s == MTL_VRR_INTERP ? "off while frame interpolation is on" : "no window display known";
+}
+/* Game thread, at each present (period: this frame's pacing interval in seconds). One line per change of state or
+   target rate. */
+static void vrr_update(double period) {
+    int s = vrr_eval(), was = atomic_exchange(&g_vrr_state, s);
+    uint64_t mfps = period > 0 ? (uint64_t)llround(1000.0 / period) : 0;
+    uint64_t old = atomic_exchange(&g_vrr_target_mfps, mfps);
+    if (s == was && (s != MTL_VRR_ACTIVE || (old + 500) / 1000 == (mfps + 500) / 1000)) return;
+    double r[3]; runtime_front_vrr_info(r);
+    if (s == MTL_VRR_ACTIVE)
+        MLOG("[vrr] active: display min %.2f ms max %.2f ms granularity %.2f ms; target %.1f fps (presentAfterMinimumDuration %.2f ms, display link off; frame %llu)",
+             r[0] * 1e3, r[1] * 1e3, r[2] * 1e3, mfps / 1000.0, period * 1e3, (unsigned long long)atomic_load(&g_cur_frame));
+    else if (s != was) MLOG("[vrr] not active: %s (display min %.2f ms max %.2f ms; frame %llu)", vrr_why(s), r[0] * 1e3, r[1] * 1e3, (unsigned long long)atomic_load(&g_cur_frame));
+}
 /* TOTK: what the screen actually showed: the interval between the presentedTime of consecutive drawables, game frames and
    MetalFX interpolated ones alike. On a display of hz, an interval longer than 1.5 refreshes means the previous picture
    stayed up for an extra refresh (a judder: uncapped play at 85 fps on a 100 Hz display repeats about every seventh
@@ -14804,6 +14854,15 @@ static void cadence_note(double tt, int interp, double expect_ms) {
         int held = 0; for (int i = 0; i < N; i++) held += a[i] > 1.5 * tick;
         MLOG("on-screen pacing (last %d frames, up to frame %llu, display %d Hz): interval p50 %.2f / p95 %.2f / max %.2f ms; held one extra refresh or more %d times (%.1f%%); over the beat %d times (%.1f%%); of which interpolated frames %d; dropped by the system %llu",
              N, (unsigned long long)atomic_load(&g_cur_frame), hz, a[N / 2], a[N * 95 / 100], a[N - 1], held, 100.0 * held / N, beyond, 100.0 * beyond / N, ni, (unsigned long long)dropped);
+        /* Variable refresh: intervals bunched within 1 ms of the target (1 / target fps) prove the display follows the
+           frames; on the fixed grid they would sit at one or two refreshes (8.33 / 16.67 ms at 120 Hz). */
+        if (mtl_vrr_active()) {
+            int near = 0, grid = 0;
+            for (int i = 0; i < N; i++) { near += ex[i] > 0 && fabs(iv[i] - ex[i]) <= 1.0; grid += fabs(iv[i] - tick) <= 0.5 || fabs(iv[i] - 2 * tick) <= 0.5; }
+            double e[N]; memcpy(e, ex, sizeof e); qsort(e, N, sizeof *e, dcmp_mtl);
+            MLOG("on-screen pacing, variable refresh: target interval p50 %.2f ms (%.1f fps); within 1 ms of the target %d (%.1f%%); on the fixed %d Hz grid (1 or 2 refreshes, +-0.5 ms) %d (%.1f%%)",
+                 e[N / 2], e[N / 2] > 0 ? 1000.0 / e[N / 2] : 0, near, 100.0 * near / N, hz, grid, 100.0 * grid / N);
+        }
         n = ni = 0; dropped = 0;
     }
     pthread_mutex_unlock(&mu);
@@ -15255,6 +15314,7 @@ static void link_sync(void) {   // Called every frame by the game's present thre
     int want = g_dm_present_link;
     if (want < 0 || want > 2) { g_dm_present_link = applied == 3 ? 1 : applied; return; }
     if (want && mtl_fps_target() == 30) want = 3;   // Power-saving mode: display link at 30 Hz
+    if (mtl_vrr_active()) want = 0;   // TOTK variable refresh: the present thread takes its own drawables and presents after the frame's period (vrr_update)
     /* TOTK: the window moved to another display (or its mode changed): mode 1 asks for that display's rate. */
     static unsigned display_seen;
     if (want == applied && want == 1 && g_link && display_seen != mtl_display_changes()) {
@@ -15450,6 +15510,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     if (discard) return 0;   // Ticket number 0 = no pending present; the swapchain texture acquire does not wait
     if (t) { xv_check(t->serial, 0, 0, "present"); if (g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = t->serial; }
     static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, present_start);
+    vrr_update(period);   // TOTK: variable refresh on / off and its target, before link_sync takes the display link away
     link_sync();
     {   // Test switch DM_TEST_LINK_STALL=start seconds,duration seconds: counting from the first present, pause the display link at that point (imitating the display link not calling back while in the foreground) and release it when the duration is up. For verifying the fallback; not set in the product
         static double t0, at = -1, dur; static int st; double now = CACurrentMediaTime();

@@ -129,6 +129,28 @@ Limits and why:
   Auto steps aside (it resumes at its last choice when interpolation is turned off); with *Every frame* it limits the
   game frames as a fixed limit would. On a display the game does not wait for (the uncapped mode below 120 Hz) Auto
   moves the uncapped clock's ceiling instead (60 Hz: 60 or 30). The iPhone / iPad default stays the display rate.
+  In full screen on a display with variable refresh (below) Auto is not held to those steps: it aims at a continuous
+  rate, the one the window's 95th percentile frame time fits with 5 % to spare, in 5 fps steps between the display's
+  slowest rate (at least 30) and its fastest, and moves the uncapped clock there (frame times of 12.4-14.8 ms on the
+  M3 Pro give about 65-75 fps instead of 60). Down at once when more than 1 frame in 10 misses it, up after 3 s in which
+  the 95th percentile fits a rate at least one step faster; a failed rise backs off as above. Only a display that
+  reports an interval granularity (NSScreen `displayUpdateGranularity` > 0) has the rate rounded to its steps. Logged
+  as `[auto-cap] variable refresh: ...`. Fixed limits (60, 120, ...) are presented the same way at that rate.
+- **Variable refresh (full screen)** (`framerate.vrr`, `TOTK_VRR=auto|0|1`; Mac only, default *Auto*). On Apple silicon
+  with a variable-refresh display (the built-in ProMotion display of a 14" / 16" MacBook Pro, an Adaptive-Sync monitor)
+  and the game in full screen, the display refreshes when each frame is ready instead of on its fixed 120 Hz grid, so
+  a frame rate like 77 fps is shown at an even 13 ms instead of alternating 8.33 / 16.67 ms. The game presents
+  without the display link (whose frame rate range snaps to divisors of the maximum refresh) and holds each frame for
+  at least 1 / target fps (`presentAfterMinimumDuration`), as Apple describes in WWDC21 session 10147
+  ([Optimize for variable refresh rate displays](https://developer.apple.com/videos/play/wwdc2021/10147/)) and as
+  OpenEmu does (GameWindowController.swift / OpenEmuHelperApp.swift). A display supports it when NSScreen's minimum and
+  maximum refresh intervals differ. *Auto* enters full screen when it is turned on and at launch on such a display;
+  leaving full screen (green button, Ctrl-Cmd-F) is respected and the game simply stays on the fixed grid. The row
+  says whether it is active now or why not: windowed, a fixed-refresh display, or frame interpolation on (MetalFX
+  interpolation keeps the fixed-refresh timing it was built for). `TOTK_VRR=1` also tries it in a window (macOS only
+  honours it in full screen; for tests). The log says `[vrr] active: display min 8.33 ms max 41.67 ms granularity
+  0.00 ms; target 75.0 fps` at each change, and every 600 pictures `on-screen pacing, variable refresh: ...` counts
+  the intervals within 1 ms of the target against those on the 120 Hz grid.
 - **Performance readout**, and its **Readout detail**: *Simple* (`FPS 60  2560x1440`) or *Detailed*, which adds the
   average and the 1 % low over the last 5 seconds (`FPS 60  avg 59  1% low 48  2560x1440`). The 1 % low is the frame
   rate of the slowest 1 % of the game's frames in that window, so a single long hitch shows there while the average
