@@ -15191,7 +15191,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 #if TARGET_OS_SIMULATOR   // The iOS simulator SDK has no presentation-time callback and no minimum display duration (used only for picture acceptance, display-link ticks are not counted)
     (void)period; [dr present];
 #else
-    double expect_ms = period > 0 ? period * 1e3 / (mfx_enabled() ? 2 : 1) : 0;   // TOTK: the interval the pacing intends for this picture (cadence_note)
+    double expect_ms = period > 0 ? period * 1e3 / (mfx_enabled() && target_ts > 0 ? 2 : 1) : 0;   // TOTK: the interval the pacing intends for this picture (cadence_note); the display-link path passes the game frame's period, the present thread already half of it for each interpolated pair
     uint64_t pn = ticket;   // Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
     [dr addPresentedHandler:^(id<MTLDrawable> d) {   // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
         CFTimeInterval tt = d.presentedTime;
