@@ -4757,7 +4757,7 @@ static int udc_on(void) {
         const char *a = getenv("DM_NVN_UDC_AB"); if (a && !strcmp(a, "1")) { g_udc_ab = 0; g_udc_ab_on = 0; } }
     return g_udc_ab || g_udc_ab_on;
 }
-/* TOTK_ULD (default off, =1 on; needs TOTK_UDC): colour attachments a pass loads and never writes are not loaded either.
+/* TOTK_ULD (default on, =0 off; needs TOTK_UDC): colour attachments a pass loads and never writes are not loaded either.
    TOTK_UDC already stores them DontCare, so with a DontCare load the tile never touches their memory: the lighting
    passes after the G-buffer attach all four G-buffer targets but write one or two (about 88 MB loaded a pass at 1440p).
    The load is decided when the pass opens, before its draws are known, so it is predicted: a pass is matched with the
@@ -4776,7 +4776,7 @@ static uint32_t g_uld_mask;       // g_sd indices loaded DontCare by prediction
 static int g_uld_reopen;          // the next pass reopens one ended by a misprediction: no prediction, and it takes no ordinal (so the frame's later passes still match their entries in frames without the split)
 static uint64_t g_uld_skip, g_uld_skip_bytes, g_uld_miss, g_uld_bad, g_uld_passes;
 static int uld_fz_active(void);   // the readable-tile pass merge is on (g_fz, defined further down)
-static int uld_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ULD"); v = e && atoi(e) > 0;
+static int uld_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ULD"); v = !e || atoi(e) > 0;   // default on since 2026-10-23 (in-game: 0 written anyway)
     if (v) MLOG("TOTK_ULD=1: colour attachments a pass loads and never writes (predicted from earlier frames) are not loaded"); } return v; }
 static uint64_t uld_mix(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); h *= 0xff51afd7ed558ccdull; return h ^ (h >> 33); }
 static uld_ent *uld_find(uint64_t base) {   // base + its ordinal among this frame's passes with the same base
