@@ -4675,6 +4675,12 @@ void ts_after(void);
 typedef struct { uint64_t disc; uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy; const char *wkey; int wslot; } sd_att;   // depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth
 static sd_att g_sd[9]; static int g_nsd;   // disc (TOTK_DISCARD): g_enc_draws + 1 when the game discarded the attachment in this pass, 0 if not
 static uint64_t g_sd_draw0;   // g_enc_draws when this encoder opened (TOTK_EMPTY_PASS_DC)
+/* TOTK_SPLIT_BARRIER: NVN Barrier() calls replayed so far (the game's own ordering requests), the bits of the last one and
+   the OR of this frame's; g_sd_wseq[i] is g_nvbar_seq at g_sd[i]'s last write in this pass (its clear at pass open, or a
+   draw, udc_note_draw), so g_sd_wseq[i] != g_nvbar_seq means the game issued a barrier between that write and now. */
+static uint64_t g_nvbar_seq, g_sd_wseq[9]; static unsigned g_nvbar_bits, g_nvbar_frame_bits;
+static uint64_t g_sb_bar_n, g_sb_n[6], g_sb_skip, g_sb_frame0;   // barriers; samples-drawn-att splits by sb_classify class (sb_note); skipped
+static void sb_log_frame(void);
 /* TOTK_DISCARD=2 (opt-in): a discard while no pass is open makes the next pass's Load of that subresource DontCare. */
 typedef struct { uint64_t ser; int lv, sl, k; } disc_pend;   // k: colour index, 8 depth-stencil
 static disc_pend g_disc_pend[9]; static int g_ndisc_pend;
@@ -5004,6 +5010,7 @@ static void rp_end(void) { if (g_enc) {
     if (pass_cont_on()) { uint64_t f = atomic_load(&g_cur_frame); if (f >= g_pc_log_frame + 600) { g_pc_log_frame = f;
         MLOG("[totk] TOTK_PASS_CONTINUE: %llu render passes ended, %llu same-target continuations; sampling draws in a continued pass: %llu stayed in it, %llu still ended it (attachment drawn earlier in the pass)",
              (unsigned long long)g_stat_pass, (unsigned long long)g_rt_merge_n, (unsigned long long)g_pc_kept, (unsigned long long)g_pc_split); } }
+    sb_log_frame();   // TOTK_SPLIT_BARRIER counts
     if (att_fb_on()) { static uint64_t lf; uint64_t f = atomic_load(&g_cur_frame); if (f >= lf + 600) { lf = f;
         MLOG("[totk] [fb-fetch] through frame %llu: %llu draws read their own attachments from the tile (%llu of them kept a continued pass open), %llu sampling draws refused",
              (unsigned long long)f, (unsigned long long)g_fb_draws, (unsigned long long)g_fb_kept, (unsigned long long)g_fb_refused); } }
@@ -5374,6 +5381,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     }
     if (natt && nload == natt) g_pass_full_rw++;
     g_nsd = 0; g_sd_plain = 0; g_sd_draw0 = g_enc_draws;
+    for (int i = 0; i < 9; i++) g_sd_wseq[i] = g_nvbar_seq;   // TOTK_SPLIT_BARRIER: a clear at pass open is a write now
     {
         for (int i = 0; i < R.rt.n && i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i]; if (!c.texture) continue;
             g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.color[i]->serial; g_sd[g_nsd].bytes = att_bytes(c.texture, c.level); g_sd[g_nsd].lv = (uint32_t)c.level; g_sd[g_nsd].sl = (uint32_t)(c.texture.textureType == MTLTextureType3D ? c.depthPlane : c.slice); g_sd[g_nsd].idx = i; g_sd[g_nsd].load = c.loadAction == MTLLoadActionLoad; g_sd[g_nsd].wrote = R.clear_c[i] != 0; g_nsd++;
@@ -6971,6 +6979,8 @@ static void udc_note_draw(NvProg *pr) {
         else if (t->depth == 2 && S.ds.st && (S.st_wmask[0] || S.st_wmask[1])
                 && (S.ds.fail_f != NVN_STENCIL_OP_KEEP || S.ds.zfail_f != NVN_STENCIL_OP_KEEP || S.ds.zpass_f != NVN_STENCIL_OP_KEEP
                     || S.ds.fail_b != NVN_STENCIL_OP_KEEP || S.ds.zfail_b != NVN_STENCIL_OP_KEEP || S.ds.zpass_b != NVN_STENCIL_OP_KEEP)) { t->wrote = 1; t->wwhy = 5; }
+        else continue;
+        g_sd_wseq[i] = g_nvbar_seq;   // TOTK_SPLIT_BARRIER: written by this draw, after every barrier so far
     }
 }
 static void state_reset(void) {
@@ -10474,6 +10484,67 @@ static int att_unstored_read(const uint64_t *rs, int n) {
         if (has_ser(rs, n, g_sd[i].ser) && (!g_sd[i].load || (g_sd_plain >> i & 1))) return 1;
     return 0;
 }
+/* TOTK_SPLIT_BARRIER (default 0; idea and measurements from sunsssyc/Ryujinx_Optime e5d8c07 / 1417564): on the Switch a draw
+   that samples a render target of its own pass without a Barrier() since the write is served stale data, and the game issues
+   a real barrier (TextureBarrier / Barrier with INVALIDATE_TEXTURE) where it needs fresh pixels. So a samples-drawn-att split
+   is only needed when a barrier came between the attachment's last write and this read. =1 lets such a draw into the open
+   pass when every attachment it reads that is still only in tile memory: was loaded at pass open (the stale read then sees
+   the pass's starting contents), got no barrier since its last write, and is RGBA8 / BGRA8 (sRGB too). =2 also takes
+   attachments cleared at pass open (the stale read sees the previous contents of memory, not the clear). Ryujinx_Optime's
+   limits: RG11B10Float showed banding along the tile grid on water (a partial render flushes some tiles mid-pass), RGB10A2
+   excluded with it, R32Float (Ultrahand's depth / picking chain) broke grabbing; depth is never taken. Metal: the attachment
+   stays bound as a sampled texture of the same encoder, exactly as Ryujinx_Optime does; there is no intra-pass barrier
+   that makes tile contents visible to texture reads on Apple GPUs (memoryBarrierWithScope:RenderTargets is not supported
+   there), so the read sees memory: undefined by the Metal spec, the pass-start contents in practice. Not while a deferred /
+   cube-group / fused / layered / ranged pass is replayed (their draws are reordered against the barriers). */
+enum { SB_BAR = 1, SB_FMT = 2, SB_DEPTH = 4, SB_CLEARED = 8, SB_KIND = 16 };
+static int split_barrier(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_SPLIT_BARRIER"); v = e ? atoi(e) : 0;
+    if (v) MLOG("[experiment] TOTK_SPLIT_BARRIER=%d: a draw sampling an RGBA8 / BGRA8 attachment its pass drew stays in the pass unless the game issued a barrier since the write%s", v, v >= 2 ? " (cleared attachments too)" : ""); } return v; }
+static const char *sb_fmt_name(MTLPixelFormat pf) {
+    switch (pf) { case MTLPixelFormatRGBA8Unorm: return "RGBA8Unorm"; case MTLPixelFormatRGBA8Unorm_sRGB: return "RGBA8sRGB"; case MTLPixelFormatBGRA8Unorm: return "BGRA8Unorm";
+        case MTLPixelFormatBGRA8Unorm_sRGB: return "BGRA8sRGB"; case MTLPixelFormatR32Float: return "R32Float"; case MTLPixelFormatRGB10A2Unorm: return "RGB10A2Unorm";
+        case MTLPixelFormatRG11B10Float: return "RG11B10Float"; case MTLPixelFormatRGBA16Float: return "RGBA16Float"; case MTLPixelFormatRG16Float: return "RG16Float";
+        case MTLPixelFormatR16Float: return "R16Float"; case MTLPixelFormatR8Unorm: return "R8Unorm"; case MTLPixelFormatRG8Unorm: return "RG8Unorm"; default: return NULL; } }
+/* Why the attachments rs (the ones att_unstored_read stores for) cannot be read stale: SB_* bits, 0 = all can. */
+static unsigned sb_classify(const uint64_t *rs, int n, char *desc, size_t dn) {
+    unsigned why = 0; int o = 0; if (desc && dn) desc[0] = 0;
+    if (!g_enc) return SB_KIND | SB_CLEARED;   // a pending clear, no pass open
+    if (g_defer_replaying || g_cg.replaying || g_fz.active || g_lay.active || g_rt_range_active) why |= SB_KIND;
+    for (int i = 0; i < g_nsd; i++) { const sd_att *t = &g_sd[i];
+        if (!has_ser(rs, n, t->ser) || !(!t->load || (g_sd_plain >> i & 1))) continue;
+        int bar = g_sd_wseq[i] != g_nvbar_seq; const char *fn = "depth";
+        if (bar) why |= SB_BAR;
+        if (t->depth) why |= SB_DEPTH;
+        else {
+            if (!t->load) why |= SB_CLEARED;
+            int j = -1; for (int m = 0; m < R.rt.n && m < 8; m++) if (R.rt.color[m] && R.rt.color[m]->serial == t->ser) { j = m; break; }
+            id<MTLTexture> tx = j >= 0 ? tex_mtl(R.rt.color[j]) : nil; MTLPixelFormat pf = tx ? tx.pixelFormat : MTLPixelFormatInvalid;
+            fn = sb_fmt_name(pf); if (!fn) fn = "other";
+            if (pf != MTLPixelFormatRGBA8Unorm && pf != MTLPixelFormatRGBA8Unorm_sRGB && pf != MTLPixelFormatBGRA8Unorm && pf != MTLPixelFormatBGRA8Unorm_sRGB) why |= SB_FMT; }
+        if (desc && o < (int)dn - 48) o += snprintf(desc + o, dn - o, "%s%s:%s:b%d", o ? ";" : "", fn, t->load ? "load" : "clear", bar); }
+    return why;
+}
+/* Counts and logs a samples-drawn-att split point; returns 1 when TOTK_SPLIT_BARRIER lets the draw stay in the pass. Classes
+   (g_sb_n): 0 skippable, 1 barriered, 2 depth, 3 other format, 4 cleared 8-bit only, 5 pass kind / no pass. */
+static int sb_note(NvProg *pr, const uint64_t *rs, int n) {
+    char d[160]; unsigned why = sb_classify(rs, n, d, sizeof d); int mode = split_barrier();
+    int skip = mode && !(why & ~(mode >= 2 ? (unsigned)SB_CLEARED : 0u));
+    int cls = !why ? 0 : why & SB_KIND ? 5 : why & SB_BAR ? 1 : why & SB_DEPTH ? 2 : why & SB_FMT ? 3 : 4;
+    g_sb_n[cls]++; if (skip) g_sb_skip++;
+    static int nlog; if (nlog < 24 && getenv("TOTK_DEBUG_LOG")) { nlog++;
+        MLOG("[split-barrier] F%llu pass %llu fs %s reads [%s] class %d%s (last barrier bits %#x, %llu barriers so far)", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass,
+             pr && pr->sh[1] ? pr->sh[1]->key : "-", d, cls, skip ? " skipped" : "", g_nvbar_bits, (unsigned long long)g_nvbar_seq); }
+    PD("M %llu split-barrier reads [%s] class %d%s", g_stat_pass, d, cls, skip ? " skipped: stays in the pass" : "");
+    return skip;
+}
+static void sb_log_frame(void) {
+    uint64_t f = atomic_load(&g_cur_frame); if (f < g_sb_frame0 + 600) return;
+    double nf = (double)(f - g_sb_frame0);
+    MLOG("[totk] [split-barrier] frames %llu-%llu per frame: %.1f NVN barriers (bits seen %#x); samples-drawn-att points %.1f: unbarriered RGBA8/BGRA8 loaded %.1f, barriered %.1f, depth %.1f, other format %.1f, cleared 8-bit %.1f, pass kind %.1f; skipped %.1f (TOTK_SPLIT_BARRIER=%d)",
+         (unsigned long long)g_sb_frame0, (unsigned long long)f, g_sb_bar_n / nf, g_nvbar_frame_bits,
+         (g_sb_n[0] + g_sb_n[1] + g_sb_n[2] + g_sb_n[3] + g_sb_n[4] + g_sb_n[5]) / nf, g_sb_n[0] / nf, g_sb_n[1] / nf, g_sb_n[2] / nf, g_sb_n[3] / nf, g_sb_n[4] / nf, g_sb_n[5] / nf, g_sb_skip / nf, split_barrier());
+    g_sb_frame0 = f; memset(g_sb_n, 0, sizeof g_sb_n); g_sb_skip = g_sb_bar_n = 0; g_nvbar_frame_bits = 0;
+}
 /* TOTK_ATT_FB=1 (alias TOTK_FB_FETCH=1; default off): a draw whose fragment stage samples colour attachments of its own pass
    reads them from the tile ([[color(n)]], nvn_fbread.h) wherever the sampled texel is the fragment's own pixel, instead of
    the pass being stored and reopened first. Ported from upstream PR #155 (feeeei), extended to continued passes.
@@ -12440,7 +12511,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!att_fb_on()) att_n = att_store_on() ? draw_att_reads(pr, att_rs) : 0;
     if (pc_kept && !att_n) {   // the two binding walks disagree (or the tile reads took only some): end the pass as without TOTK_PASS_CONTINUE
         PD("M %llu a draw in the continued pass samples an attachment (attachment reads not recognised): split here", g_stat_pass); RP_WHY("cont-samples-att"); rp_end(); pc_kept = 0; }
-    if (!(g_fz.active && g_fz.phase == 2) && att_unstored_read(att_rs, att_n)) {
+    if (!(g_fz.active && g_fz.phase == 2) && att_unstored_read(att_rs, att_n) && !sb_note(pr, att_rs, att_n)) {
         static int once; if (!once++) MLOG("[totk] a draw samples an attachment its pass drew: the pass is stored first (first: pass %llu)", g_stat_pass);
         const char *why = pc_kept ? "cont-samples-drawn-att" : "samples-drawn-att";
         if (pc_kept) { g_pc_split++; pc_kept = 0; }
@@ -13627,7 +13698,8 @@ void mtl_exec(const uint8_t *p) {
             case OP_COPY_T2T: copy_t2t(a); break;
             case OP_CLEAR_TEX: clear_tex(a); break;
             case OP_DISPATCH: dispatch(a); break;
-            case OP_BARRIER: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;
+            case OP_BARRIER: g_nvbar_seq++; g_nvbar_bits = (unsigned)((const int32_t *)a)[0]; g_nvbar_frame_bits |= g_nvbar_bits; g_sb_bar_n++; break;   // TOTK_SPLIT_BARRIER: ordering still comes from the pass boundaries
+            case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;
             case OP_DISCARD_COLOR: discard_op(((const p_flag *)a)->value < 0 ? 8 : ((const p_flag *)a)->value); break;   // a negative index is ignored (8)
             case OP_DISCARD_DS: discard_op(-1); break;
             default: break;
