@@ -335,3 +335,6 @@ runtime, the iOS app and `tests/test_settings.c`.
 Test runs drive the menu's own code path through `TOTK_INPUT_FILE`: `set <key> <value>` changes a setting as the menu
 does (`set display.scale 50`, `set graphics.aa smaa`), `menu` opens or closes the Mac menu, `menukey <Mac key code>`
 presses a key in it (`menukey 12`, Q, from the first tab opens the last one, Tools), and `settings-shot <png>` saves the Mac menu as a picture.
+
+### Frame rate tab (2026-10-23 layout)
+In order: **Frame rate limit** (Auto fastest steady, 30, 40, 60, 80 with variable refresh, 120, Unlimited), **Variable refresh (full screen)** (Auto / Off; the row says whether it is active and at what rate), **Frame interpolation** (Off, On, 30 + 30, Every frame), **Per-object motion** (with interpolation; restart, recompiles shaders once) and **Motion / depth debug view**. With variable refresh and interpolation On, the game runs at half the shown rate on the display's steps: on the built-in XDR (4.17 ms steps) game 60 / 40 / 30 is shown at 120 / 80 / 60; Auto picks the highest the game holds, a fixed limit is the shown rate.

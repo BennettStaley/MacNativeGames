@@ -134,7 +134,7 @@ int main(void) {
                settings_in_tab(settings_index("audio.volume"), 0), "Downloads on Content, effects on Graphics, audio on Game");
     }
     for (int i = 0; i < SETTINGS_COUNT; i++) expect(strncmp(SETTINGS[i].key, "cheats.", 7) != 0, "cheats are not settings: settings.txt and Reset all never hold them");
-    expect(SETTINGS_COUNT == 41, "41 settings");
+    expect(SETTINGS_COUNT == 42, "42 settings");
     {   /* Variable refresh: Auto on the Mac (TOTK_VRR=auto), Off reads as TOTK_VRR=0, a Frame rate row */
         const SettingDef *vr = &SETTINGS[settings_index("framerate.vrr")]; int a[SETTINGS_COUNT]; settings_defaults(a, 0);
         expect(settings_index("framerate.vrr") >= 0 && !strcmp(vr->page, "Frame rate") && !strcmp(vr->env, "TOTK_VRR") && vr->apply == SET_LIVE &&

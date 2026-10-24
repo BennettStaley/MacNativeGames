@@ -55,12 +55,12 @@ static inline int settings_tab_sections(int tab) { int n = 0; for (int i = 0; i 
 static inline int settings_in_tab(int i, int tab);
 
 /* Auto (steady): the highest rate that divides the display's and that the game holds (totk_autocap.h). */
-static const SettingChoice SET_CAP[] = {{"Auto (steady)", "auto", "auto", -1}, {"30 fps", "30", "30", 30}, {"40 fps", "40", "40", 40},
-                                        {"60 fps", "60", "60", 60}, {"120 fps", "120", "120", 120}, {"Display refresh rate", "display", "display", 0}};
+static const SettingChoice SET_CAP[] = {{"Auto (fastest steady)", "auto", "auto", -1}, {"30 fps", "30", "30", 30}, {"40 fps", "40", "40", 40},
+                                        {"60 fps", "60", "60", 60}, {"80 fps (variable refresh)", "80", "80", 80}, {"120 fps", "120", "120", 120}, {"Unlimited", "display", "display", 0}};
 /* Variable refresh (nvn_mtl.m, totk_vrr.h; TOTK_VRR): Auto goes full screen on a ProMotion / Adaptive-Sync display. */
 static const SettingChoice SET_VRR[] = {{"Auto", "auto", "auto", 1}, {"Off", "off", "0", 0}};
-static const SettingChoice SET_INTERP[] = {{"Off", "off", "0", 0}, {"30 + 30", "interp30", "interp30", 1},
-                                           {"Half the refresh rate", "half", "interp", 2}, {"Every frame", "max", "interpmax", 3}};
+static const SettingChoice SET_INTERP[] = {{"Off", "off", "0", 0}, {"30 + 30 (shown at 60)", "interp30", "interp30", 1},
+                                           {"On", "half", "interp", 2}, {"Every frame (unpaced, testing)", "max", "interpmax", 3}};
 /* Motion / depth from the render drawn over the picture (totk_mfx.m mfx_debug_encode / mfx_debug_frame_encode,
    TOTK_MFX_DEBUG_VIEW), with frame interpolation on or off. The key graphics.mfx_debug_view stays for saved settings. */
 static const SettingChoice SET_MFX_DEBUG[] = {{"Off", "off", NULL, 0}, {"Motion", "motion", "motion", 1}, {"Depth", "depth", "depth", 2},
@@ -112,12 +112,6 @@ static const SettingChoice SET_PRESET[] = {{"Custom", "custom", NULL, SET_PRESET
 static const SettingDef SETTINGS[] = {
     {"graphics.preset", "Image", "Preset", "Balanced is the game's own look. Sets the render scale, anti-aliasing, sharpening, filtering, shadows, render distance and frame rate limit together. Changing one of them shows Custom.",
      NULL, SET_CHOICE, SET_LIVE, SET_ALL, SET_PRESET_BALANCED, SET_PRESET_BALANCED, 0, 0, 0, NULL, SET_PRESET, SET_N(SET_PRESET), NULL, NULL, 0},
-    {"graphics.interpolation", "Frame rate", "Frame interpolation", "MetalFX makes a frame between two game frames. On the Mac, near the GPU memory limit it pauses (resuming once memory frees up, off for the session after 3 pauses), and a mode that would not fit is marked in the list and not turned on. The row says when the chosen mode is not running.",
-     "TOTK_MFX", SET_CHOICE, SET_LIVE, SET_MAC | SET_IPAD, 0, 0, 0, 0, 0, NULL, SET_INTERP, SET_N(SET_INTERP),
-     "Not tested on iPhone yet.", NULL, 0},
-    {"graphics.mfx_debug_view", "Frame rate", "Motion / depth debug view", "Draws the motion and depth taken from the game's render over the picture: motion (direction as colour, brighter is faster, outlined where per-object motion was used), depth (near is bright), or the picture, motion and depth side by side. Works with frame interpolation on or off; with it on, this is what MetalFX is given.",
-     "TOTK_MFX_DEBUG_VIEW", SET_CHOICE, SET_LIVE, SET_MAC | SET_IPAD, 0, 0, 0, 0, 0, NULL, SET_MFX_DEBUG, SET_N(SET_MFX_DEBUG),
-     "Not tested on iPhone yet.", NULL, 0},
     {"display.output", "Display", "Display resolution", "The size of the finished picture. Text, icons and menus are drawn at this size, so they stay sharp; the 3D world is drawn at the render resolution below and stretched to fill it. Display native is your screen's own pixels.",
      NULL, SET_CHOICE, SET_LIVE, SET_MAC, 1080, 1080, 0, 0, 0, NULL, SET_OUTPUT, SET_N(SET_OUTPUT), "iPhone and iPad show 720p.", NULL, 0},
     {"display.custom_width", "Display", "Custom width", "The output's width in pixels; the height follows at 16:9.",
@@ -152,12 +146,20 @@ static const SettingDef SETTINGS[] = {
      "TOTK_RENDER_DISTANCE", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 10, 300, 10, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.dynamic_res", "World detail", "Dynamic resolution", "The game lowers the 3D world to 90 or 80 % of the render resolution when frames run long; Off keeps it at 100 %, sharper but slower in busy places (version 1.4.3).",
      "TOTK_FIXED_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_DYNRES, SET_N(SET_DYNRES), "Not on iPhone and iPad: their game code is fixed when the app is built.", NULL, 0},
+    {"framerate.cap", "Frame rate", "Frame rate limit", "How many frames a second the game draws. Auto picks the fastest rate the game holds steadily: with variable refresh (below) 120, 80, 60 or 48 on the built-in display; without it 120, 60, 40 or 30 on a 120 Hz display, so frames never alternate between one and two refreshes. 80 fps is even only with variable refresh. Unlimited draws as fast as it can (uneven on a fixed-refresh display). With frame interpolation the limit is what you see: the game runs at half of it.",
+     "TOTK_UNCAPPED_HZ", SET_CHOICE, SET_LIVE, SET_ALL, -1, 0, 0, 0, 0, NULL, SET_CAP, SET_N(SET_CAP), NULL, NULL, 0},
+    {"framerate.vrr", "Frame rate", "Variable refresh (full screen)", "On a ProMotion or Adaptive-Sync display the screen refreshes when each frame is ready, so rates such as 80 fps are shown evenly. Needs full screen: Auto enters it when turned on and at launch (leave it with the green button and the game stays windowed). Works with frame interpolation (On). The row says whether it is active now and at what rate.",
+     "TOTK_VRR", SET_CHOICE, SET_LIVE, SET_MAC, 1, 0, 0, 0, 0, NULL, SET_VRR, SET_N(SET_VRR), "Mac only.", NULL, 0},
+    {"graphics.interpolation", "Frame rate", "Frame interpolation", "MetalFX makes a picture between every two game frames, so you see twice the game's rate (for example game 40, shown 80). On: paced with the frame rate limit and variable refresh. 30 + 30: game at 30, shown at 60. Every frame: unpaced, for testing. Near the GPU memory limit it pauses (resuming once memory frees up, off for the session after 3 pauses); a mode that would not fit is marked and not turned on. The row says when the chosen mode is not running.",
+     "TOTK_MFX", SET_CHOICE, SET_LIVE, SET_MAC | SET_IPAD, 0, 0, 0, 0, 0, NULL, SET_INTERP, SET_N(SET_INTERP),
+     "Not tested on iPhone yet.", NULL, 0},
+    {"graphics.obj_motion", "Frame rate", "Per-object motion", "With frame interpolation, moving characters, animals and props get their own motion instead of only the camera's, so they smear less in the made-up pictures. Costs a little GPU time; the first start after turning it on compiles the game's shaders again (a few minutes).",
+     "TOTK_OBJ_MOTION", SET_BOOL, SET_RESTART, SET_MAC, 0, 0, 0, 1, 1, NULL, NULL, 0, "Mac only for now.", NULL, 0},
+    {"graphics.mfx_debug_view", "Frame rate", "Motion / depth debug view", "Draws the motion and depth taken from the game's render over the picture: motion (direction as colour, brighter is faster, outlined where per-object motion was used), depth (near is bright), or the picture, motion and depth side by side. Works with frame interpolation on or off; with it on, this is what MetalFX is given.",
+     "TOTK_MFX_DEBUG_VIEW", SET_CHOICE, SET_LIVE, SET_MAC | SET_IPAD, 0, 0, 0, 0, 0, NULL, SET_MFX_DEBUG, SET_N(SET_MFX_DEBUG),
+     "Not tested on iPhone yet.", NULL, 0},
     {"graphics.lod_bias", "Image", "Texture detail bias", "Below 0 picks sharper texture levels, in hundredths of a level; too low shimmers.",
      "TOTK_LOD_BIAS", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, -100, 0, 25, NULL, NULL, 0, NULL, NULL, 0},
-    {"framerate.cap", "Frame rate", "Frame rate limit", "The most frames a second the game draws. Auto picks the highest steady rate the game holds (120, 60, 40 or 30 on a 120 Hz display), so frames never alternate between one and two refreshes. In full screen on a display with variable refresh (ProMotion, Adaptive-Sync) Auto uses any rate in between instead, such as 77 fps, shown evenly. 40 needs a 120 Hz display.",
-     "TOTK_UNCAPPED_HZ", SET_CHOICE, SET_LIVE, SET_ALL, -1, 0, 0, 0, 0, NULL, SET_CAP, SET_N(SET_CAP), NULL, NULL, 0},
-    {"framerate.vrr", "Frame rate", "Variable refresh (full screen)", "On a ProMotion or Adaptive-Sync display the screen refreshes when each frame is ready, so any frame rate is shown evenly instead of alternating one and two refreshes. Needs full screen: Auto enters it when turned on and at launch (leave it with the green button and the game stays windowed). Off while frame interpolation is on. The row says whether it is active now.",
-     "TOTK_VRR", SET_CHOICE, SET_LIVE, SET_MAC, 1, 0, 0, 0, 0, NULL, SET_VRR, SET_N(SET_VRR), "Mac only.", NULL, 0},
     {"interface.readout", "Interface", "Performance readout", "Frames per second and the game picture's size.",
      "TOTK_HINTS", SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"interface.readout_detail", "Interface", "Readout detail", "Detailed adds the average and the 1% low frame rate over the last 5 seconds.",

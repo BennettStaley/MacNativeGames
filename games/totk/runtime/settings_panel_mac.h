@@ -135,11 +135,12 @@ static NSString *settings_mem_note(const SettingDef *d, uint64_t used, uint64_t 
         switch (mtl_vrr_state()) {
         case MTL_VRR_ACTIVE: {
             *color = NSColor.systemGreenColor; double f = mtl_vrr_target_fps();
+            if (f > 0 && mfx_interp_state() == MFX_STATE_ON) return [NSString stringWithFormat:@"Active: game %.0f fps, shown at %.0f fps with frame interpolation", f, 2 * f];
             return f > 0 ? [NSString stringWithFormat:@"Active: paced at %.0f fps, the display follows each frame", f] : @"Active: the display follows each frame";
         }
         case MTL_VRR_WINDOWED: *color = NSColor.systemOrangeColor; return @"Not active: windowed (variable refresh needs full screen)";
         case MTL_VRR_FIXED: return @"Not active: this display has a fixed refresh rate";
-        case MTL_VRR_INTERP: *color = NSColor.systemOrangeColor; return @"Not active: off while frame interpolation is on";
+        case MTL_VRR_INTERP: *color = NSColor.systemOrangeColor; return @"Not active: this interpolation mode needs a fixed refresh (choose On)";
         default: return @"Not active yet: waiting for the game's first frame";
         }
     }

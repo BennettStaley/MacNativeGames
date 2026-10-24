@@ -14812,7 +14812,7 @@ int mtl_vrr_range(double r[3]) { return runtime_front_vrr_info(r); }
 static int vrr_eval(void) {
     int m = vrr_mode(); double r[3]; int fs = runtime_front_vrr_info(r);
     if (!m) return MTL_VRR_OFF;
-    if (mfx_enabled() != MFX_OFF) return MTL_VRR_INTERP;   // MetalFX interpolation keeps the fixed-refresh path
+    { int mm = mfx_enabled(); if (mm != MFX_OFF && mm != MFX_HALF) return MTL_VRR_INTERP; }   // interpolation at half the refresh rate runs under variable refresh (hle_nvn.c acap_tick, g_vrr_ihz); 30+30 and max keep the fixed-refresh path
     if (fs < 0 || r[1] <= 0) return MTL_VRR_UNKNOWN;
     if (r[1] - r[0] < 1e-4) return MTL_VRR_FIXED;
     if (!fs && m != 1) return MTL_VRR_WINDOWED;
@@ -15379,7 +15379,8 @@ static void *present_main(void *arg) {
         int hz = mtl_display_hz(); double tick = 1.0 / (hz > 0 ? hz : 60);   // TOTK: the window's display, followed when it moves
         pthread_mutex_lock(&g_pq_mu); int behind = g_pq_read < g_pq_in; pthread_mutex_unlock(&g_pq_mu);
         int show_interp = it.interp >= 0 && !behind;
-        if (show_interp) { @autoreleasepool { (void)present_now(&it.t, fmin(it.period / 2, tick), it.frame, ticket, it.crop, nil, 0, it.interp); } }
+        /* Under variable refresh each picture stays up exactly half a game frame (both halves are on the display's steps). */
+        if (show_interp) { @autoreleasepool { (void)present_now(&it.t, mtl_vrr_active() ? it.period / 2 : fmin(it.period / 2, tick), it.frame, ticket, it.crop, nil, 0, it.interp); } }
         @autoreleasepool { submitted = present_now(&it.t, show_interp ? it.period / 2 : it.period, it.frame, ticket, it.crop, nil, 0, -1); }
         pthread_mutex_lock(&g_pq_mu); g_classic_busy = 0; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
         if (!submitted) {

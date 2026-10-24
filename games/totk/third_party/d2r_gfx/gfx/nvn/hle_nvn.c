@@ -2563,6 +2563,7 @@ static _Atomic int g_fps_limit;   // the settings menu's frame rate limit (TOTK_
 #include "totk_vrr.h"   /* variable refresh in full screen (nvn_mtl.m): Auto aims at a continuous rate (avrr_*) */
 static _Atomic int g_fps_auto;    // framerate.cap = auto (TOTK_UNCAPPED_HZ=auto): g_acap picks the refreshes per frame (totk_autocap.h)
 static _Atomic int g_acap_k;      // its choice, read by present_ticks (0 = none yet)
+static _Atomic int g_vrr_ihz;     // frame interpolation under variable refresh: the game's rate, shown at twice that (0 = not in use)
 static acap_t g_acap;             // present thread only
 static uint64_t g_pace_wait_ns;   // our pacing wait inside this frame's acquires (display-link tick / own clock), left out of the auto cap's frame time
 static int g_uncapped;   // TOTK_UNCAPPED configured, see present_cfg; suspended while frame interpolation paces the game (uncapped_now)
@@ -3012,6 +3013,25 @@ static void acap_tick(double work_ms, double wall_ms, int skip) {
     static int active;
     int m = mfx_enabled();
     static avrr_t vrr; static int vrr_on; static double vrr_r[3];
+    /* Frame interpolation (half the refresh rate) under variable refresh: the game runs at N and each of its frames is shown
+       as an interpolated picture plus the game picture, half a game frame each. Both halves must be on the display's
+       interval steps, so the game's choices are 1 / (2 * (min + n * granularity)): 60, 40, 30 on the built-in XDR (120, 80,
+       60 shown); 40 / 80 cannot be paced evenly on a fixed 120 Hz display. Auto picks the highest the game holds; a fixed
+       limit L shows L (game L / 2) or the nearest valid rate below. */
+    static avrr_t vi; static int vi_on; static double vi_r[3];
+    if (m == MFX_HALF && !game_holds_30() && !dm_detclock_enabled() && mtl_vrr_active() && g_paced_hz > 0) {
+        double r[3]; mtl_vrr_range(r);
+        int autoc = atomic_load(&g_fps_auto), lim = atomic_load(&g_fps_limit), f;
+        if (!vi_on || memcmp(r, vi_r, sizeof r)) {
+            memcpy(vi_r, r, sizeof r); avrr_reset(&vi, 2 * r[0], 2 * r[1], 2 * r[2], g_paced_hz / 2); vi_on = 1;
+            LOG("[auto-cap] interpolation under variable refresh: game %d..%d fps on the display's steps (shown at twice that); starts at %d", vi.lo, vi.hi, vi.fps); }
+        if (autoc) { f = avrr_frame(&vi, work_ms, wall_ms, skip);
+            if (vi.changed) LOG("[auto-cap] interpolation under variable refresh: %s to game %d fps, shown at %d (frame %.2f ms): p90 %.2f / p95 %.2f ms", vi.changed < 0 ? "down" : "up", f, 2 * f, 1000.0 / f, vi.p90, vi.p95); }
+        else f = avrr_quant(&vi, lim > 0 ? lim / 2 : vi.hi);
+        if (atomic_exchange(&g_vrr_ihz, f) != f && !autoc) LOG("[auto-cap] interpolation under variable refresh: limit %d: game %d fps, shown at %d", lim, f, 2 * f);
+        active = 0; vrr_on = 0; return;
+    }
+    if (vi_on) { vi_on = 0; atomic_store(&g_vrr_ihz, 0); }
     if (!atomic_load(&g_fps_auto) || dm_detclock_enabled() || m == MFX_HALF || m == MFX_30 || game_holds_30() || g_paced_hz <= 0) { active = 0; vrr_on = 0; return; }
     /* Variable refresh (totk_vrr.h; the uncapped mode, the Mac default): the own clock runs at a continuous target and
        each frame is presented after 1 / target, so no whole-refresh steps. The fixed-step choice starts over when it ends. */
@@ -3088,7 +3108,7 @@ static unsigned present_ticks(const win_t *o) {   /* display ticks per game fram
        mfx_own_clock). Held here and not only by the game's controller, because the code carries the 60 FPS patch (the
        controller may choose 1); the real-time frame step keeps game speed right. Uncapped interpolation paces as uncapped. */
     int m = mfx_enabled();
-    if (m == MFX_HALF && !game_holds_30()) return 2;
+    if (m == MFX_HALF && !game_holds_30()) return atomic_load(&g_vrr_ihz) > 0 ? 1 : 2;   /* under variable refresh: our own period (acap_tick) */
     if (m == MFX_30 || game_holds_30()) { int hz = g_paced_hz > 0 ? g_paced_hz : 60; return (unsigned)(hz >= 45 ? (hz + 15) / 30 : 1); }
     unsigned t = g_display_mode || (uncapped_now() && !dm_detclock_enabled() && uncapped_interval_on()) || o->interval <= 0 ? 1u : (unsigned)o->interval;
     /* The settings menu's frame rate limit when the display paces the game (a 120 Hz display is never uncapped): at least
@@ -3109,6 +3129,7 @@ static uint64_t present_period(const win_t *o) {
                                     m == MFX_MAX ? (g_uncapped ? "interpolation max: uncapped, one generated frame per frame" : "interpolation max: game present interval, one generated frame per frame") :
                                     g_uncapped ? "interpolation off: uncapped" : "interpolation off: game present interval"); was = m; }
     if (m == MFX_30 || game_holds_30()) return 1000000000ull / 30;   /* exactly 30 fps, by display ticks or by our own clock */
+    { int vih = atomic_load(&g_vrr_ihz); if (m == MFX_HALF && vih > 0) return 1000000000ull / (uint64_t)vih; }   /* interpolation under variable refresh */
     if (hz <= 0) return 0;
     uint64_t per = (uint64_t)itv * 1000000000ull / (uint64_t)hz;
     /* A frame rate limit already sets hz (the own clock at 30 or 40); the game's present interval 2 on top halved it again
