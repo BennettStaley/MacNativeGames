@@ -4118,6 +4118,39 @@ static int pkg_hot_cool(NvPkg *pk, const tex_t *t, uint64_t *h, int clean) {
     return 1;
 }
 static void pkg_unpurge(NvPkg *pk);
+/* TOTK_RT_USAGE_LOG (default 1, =0 off): which usage flags the large render targets (both sides >= 512: G-buffer, scene
+   and post-process targets) are created with, and which large textures are ever bound to an image slot. Apple GPUs skip
+   lossless compression for textures with ShaderWrite, PixelFormatView or Unknown usage (Apple, "Optimizing texture
+   data"); tex_desc adds ShaderWrite for every NVN IMAGE-flagged texture, so these lines show whether any large target
+   carries ShaderWrite without ever being written as an image. One line per distinct size / format / usage, at most 40
+   of each kind. */
+static int rt_usage_log_on(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_RT_USAGE_LOG"); on = !e || atoi(e) != 0; }
+    return on;
+}
+static void rt_usage_note_create(const tex_t *t, id<MTLTexture> mt) {
+    if (!rt_usage_log_on() || !mt || mt.width < 512 || mt.height < 512 || !(mt.usage & MTLTextureUsageRenderTarget)) return;
+    static uint64_t seen[40]; static int n; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t k = (uint64_t)mt.width | (uint64_t)mt.height << 15 | (uint64_t)mt.pixelFormat << 30 | (uint64_t)mt.usage << 42 | (uint64_t)(t->d.flags & NVN_TEXTURE_FLAGS_IMAGE ? 1 : 0) << 62;
+    pthread_mutex_lock(&mu);
+    int i = 0; while (i < n && seen[i] != k) i++;
+    int fresh = i == n && n < 40; if (fresh) seen[n++] = k;
+    pthread_mutex_unlock(&mu);
+    if (fresh) MLOG("[rt-usage] create ser=%llu %lux%lu target %d Metal format %lu NVN format %#x flags %#x usage %#lx (%s%s%s%s)%s", (unsigned long long)t->serial,
+                    (unsigned long)mt.width, (unsigned long)mt.height, (int)t->d.target, (unsigned long)mt.pixelFormat, t->d.format, t->d.flags, (unsigned long)mt.usage,
+                    mt.usage & MTLTextureUsageShaderRead ? "read " : "", mt.usage & MTLTextureUsageRenderTarget ? "rt " : "", mt.usage & MTLTextureUsageShaderWrite ? "WRITE " : "",
+                    mt.usage & MTLTextureUsagePixelFormatView ? "PFV" : "",
+                    mt.usage & (MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView) ? ": no lossless compression" : ": lossless compression allowed");
+}
+static void rt_usage_note_image_bind(int tid, unsigned long long ser, id<MTLTexture> t) {
+    if (!rt_usage_log_on() || !t || t.width < 512 || t.height < 512) return;
+    static void *seen[40]; static int n;   // the submit thread only
+    void *k = (__bridge void *)t; int i = 0; while (i < n && seen[i] != k) i++;
+    if (i < n || n >= 40) return;
+    seen[n++] = k;
+    MLOG("[rt-usage] image bind tid=%d ser=%llu %lux%lu Metal format %lu usage %#lx", tid, ser,
+         (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, (unsigned long)t.usage);
+}
 static id<MTLTexture> tex_mtl(const tex_t *ct) {
     tex_t *t = (tex_t *)ct; BOTW_TEX_FOLLOW(t)
     if (!t || !t->serial) return nil;
@@ -4220,6 +4253,7 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
         res_add(mt);
         stor_publish(t, mt);
+        rt_usage_note_create(t, mt);
     }
     serial_put(t->serial, mt);
     if (serial_is_dead(t->serial)) dead_put_note(t->serial);
@@ -5689,6 +5723,39 @@ static int totk_preserve_invariance(void) {
              e && *e ? ", TOTK_PRESERVE_INVARIANCE=1" : ", for TOTK_OBJ_MOTION; TOTK_PRESERVE_INVARIANCE=0 turns it off");
     return atomic_load(&v);
 }
+/* TOTK_FRAG_MATH=safe|relaxed|fast (default: whatever TOTK_MATH_MODE gives every stage, i.e. safe): the math mode of
+   translated libraries without a vertex function (fragment and compute shaders). Vertex functions keep TOTK_MATH_MODE:
+   the depth prepass and the G-buffer pass draw with an EQUAL depth test from different vertex functions, so their
+   positions must stay bit-identical (and fast math broke the tile-light vertex shader). Fragment and compute shaders only
+   colour pixels, so a relaxed or fast mode there cannot break the depth test, but it can change pixels slightly: it is a
+   measurement switch, not a default (the image must stay the base game's). Compile options are part of Metal's own cache
+   key, so the first launch with another fragment mode compiles every fragment / compute shader and pipeline again (the
+   vertex shaders keep their precompiled libraries); the pipeline archive moves to a folder of its own (par_dir).
+   Returns 0 safe, 1 relaxed, 2 fast. */
+static int totk_frag_math_mode(void) {
+    static _Atomic int v = -1; int m = atomic_load(&v);
+    if (m >= 0) return m;
+    const char *e = getenv("TOTK_FRAG_MATH");
+    m = totk_math_mode();
+    if (e && *e) {
+        if (!strcmp(e, "safe")) m = 0; else if (!strcmp(e, "relaxed")) m = 1; else if (!strcmp(e, "fast")) m = 2;
+        else MDIE("TOTK_FRAG_MATH=%s: expected safe, relaxed or fast", e);
+    }
+    int expect = -1;
+    if (atomic_compare_exchange_strong(&v, &expect, m) && m != totk_math_mode())
+        MLOG("[experiment] TOTK_FRAG_MATH=%s: fragment and compute shaders use %s math, vertex shaders keep %s (fragment libraries compiled at runtime, pipeline archive in its own folder)",
+             e, m == 2 ? "fast" : m == 1 ? "relaxed" : "safe", totk_math_mode() == 2 ? "fast" : totk_math_mode() == 1 ? "relaxed" : "safe");
+    return atomic_load(&v);
+}
+static int totk_frag_math_differs(void) { return totk_frag_math_mode() != totk_math_mode(); }
+/* A translated library with no vertex function (SPIR-V Cross puts the qualifier at the start of a line). A library with
+   both stages counts as vertex: its vertex function must keep the vertex math mode. */
+static int msl_no_vertex(const char *s, size_t n) {
+    static const char k[] = "\nvertex ";
+    if (!s) return 0;
+    if (n >= 7 && !memcmp(s, "vertex ", 7)) return 0;
+    return !memmem(s, n, k, sizeof k - 1);
+}
 static MTLCompileOptions *totk_precise_opts(void) {
     /* Made once and published only when complete: the warm-up compiles on several threads (2026-10-18), and a thread must
        never get the options before mathMode is set (that would compile with fast math). */
@@ -5703,12 +5770,57 @@ static MTLCompileOptions *totk_precise_opts(void) {
     });
     return o;
 }
+/* The options for a library without a vertex function: totk_precise_opts with TOTK_FRAG_MATH's math mode. */
+static MTLCompileOptions *totk_frag_opts(void) {
+    static MTLCompileOptions *o; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (!totk_frag_math_differs()) { o = totk_precise_opts(); return; }
+        MTLCompileOptions *x = [totk_precise_opts() copy];
+        int m = totk_frag_math_mode();
+        if (@available(macOS 15.0, *)) x.mathMode = m == 2 ? MTLMathModeFast : m == 1 ? MTLMathModeRelaxed : MTLMathModeSafe;
+        else x.fastMathEnabled = m == 2;
+        o = x;
+    });
+    return o;
+}
+static MTLCompileOptions *totk_opts_for(NSString *src) {
+    if (!totk_frag_math_differs() || !src) return totk_precise_opts();
+    const char *c = src.UTF8String;
+    return c && msl_no_vertex(c, strlen(c)) ? totk_frag_opts() : totk_precise_opts();
+}
+/* TOTK_FADD_INLINE (default 0, =1 on; measurement): SPIR-V Cross writes NoContraction adds as a call to
+       template<typename T> [[clang::optnone]] T spvFAdd(T l, T r) { return fma(T(1), l, r); }
+   (4,571 of 33,275 cached shaders, all fragment). optnone keeps the add from being fused with the multiply before it,
+   but it also makes every use a real noinline call in the AIR (seen with xcrun metal -emit-llvm), which blocks the
+   front end's optimisation across it (loop unrolling, CSE, hoisting). The replacement is an inline add under
+   `#pragma clang fp contract(off)`: the fadd carries no contract flag, and fma(1, l, r) is exactly round(l + r), so the
+   result is the same bits. Checked on the GPU (M-series, 2026-10-23) over 4M scalar and 16M vec4 products a*b + c built
+   to expose fusion: the inline form gave the separately rounded result every time, in safe and in fast math mode, while
+   a plain inline add (control) fused 99.7% of them in fast mode. Cost: the text changes, so Metal's cache misses once on
+   these shaders and their pipelines (the precompiled shader-libs are keyed by the unmodified source and stay in use). */
+static int msl_fadd_inline_on(void) {
+    static _Atomic int v = -1; int m = atomic_load(&v);
+    if (m >= 0) return m;
+    const char *e = getenv("TOTK_FADD_INLINE"); m = e && atoi(e) != 0;
+    int expect = -1;
+    if (atomic_compare_exchange_strong(&v, &expect, m) && m) MLOG("[experiment] TOTK_FADD_INLINE=1: SPIR-V Cross's optnone spvFAdd compiled as an inline uncontracted add (pipeline archive in its own folder)");
+    return atomic_load(&v);
+}
+static NSString *msl_fadd_inline(NSString *src) {
+    int on = msl_fadd_inline_on();
+    static NSString *from = @"[[clang::optnone]] T spvFAdd(T l, T r)\n{\n    return fma(T(1), l, r);\n}",
+                    *to = @"static inline __attribute__((always_inline)) T spvFAdd(T l, T r)\n{\n#pragma clang fp contract(off)\n    return l + r;\n}";
+    if (!on || !src || ![src containsString:@"[[clang::optnone]] T spvFAdd("]) return src;
+    return [src stringByReplacingOccurrencesOfString:from withString:to];
+}
 /* Compile translated MSL with the precise options. The system compiler service (MTLCompilerService) can be stopped under
    memory pressure in the middle of a compile (iPad, 2026-10-18: "Compilation failed due to an interrupted connection:
    XPC_ERROR_CONNECTION_INTERRUPTED" while the shader warm-up was running); it restarts on the next request, so such a
    failure is retried instead of being taken as a broken shader. */
-static id<MTLLibrary> totk_msl_library(NSString *src, NSError **err) {
+static id<MTLLibrary> totk_msl_library(NSString *src_in, NSError **err) {
     NSError *e = nil;
+    NSString *src = msl_fadd_inline(src_in);   // TOTK_FADD_INLINE
+    MTLCompileOptions *opts = totk_opts_for(src);   // TOTK_FRAG_MATH: fragment / compute libraries may use another math mode
     int fast = totk_msl_fast_mask();
     if (fast && src) {   // TOTK_MSL_FAST: compile the rewritten text; should it not compile, the original is compiled below
         static _Atomic int n, divs, kept, calls, failed;
@@ -5718,7 +5830,7 @@ static id<MTLLibrary> totk_msl_library(NSString *src, NSError **err) {
             NSString *fs = [[NSString alloc] initWithBytesNoCopy:r length:strlen(r) encoding:NSUTF8StringEncoding freeWhenDone:YES];
             id<MTLLibrary> lib = nil;
             for (int attempt = 1; fs; attempt++) {
-                lib = [g_dev newLibraryWithSource:fs options:totk_precise_opts() error:&e];
+                lib = [g_dev newLibraryWithSource:fs options:opts error:&e];
                 if (lib || ![e.localizedDescription containsString:@"XPC_ERROR_CONNECTION_INTERRUPTED"] || attempt == 4) break;
                 usleep((useconds_t)attempt * 100000);
             }
@@ -5730,7 +5842,7 @@ static id<MTLLibrary> totk_msl_library(NSString *src, NSError **err) {
         }
     }
     for (int attempt = 1;; attempt++) {
-        id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:&e];
+        id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:opts error:&e];
         BOOL interrupted = !lib && [e.localizedDescription containsString:@"XPC_ERROR_CONNECTION_INTERRUPTED"];
         if (lib || !interrupted || attempt == 4) { if (err) *err = e; return lib; }
         MLOG("[red] Shader compiler service connection interrupted (attempt %d), retrying in %d ms", attempt, attempt * 100);
@@ -5902,6 +6014,7 @@ static _Atomic uint64_t g_rt_prebuilt, g_rt_compiled;   // TOTK: translated vari
    whose path has another length (measured: a full 4.5-minute warm-up again); these files move with the app. */
 static NSString *shader_lib_prebuilt_path(NSData *src) {
     if (totk_math_mode() || totk_msl_fast_mask() || totk_preserve_invariance()) return nil;   // built with safe math (totk_precise_opts) from the unmodified source, without preserveInvariance
+    if (totk_frag_math_differs() && msl_no_vertex(src.bytes, src.length)) return nil;   // TOTK_FRAG_MATH: a fragment / compute library in another math mode
     static NSString *dir; static dispatch_once_t once; dispatch_once(&once, ^{   // TOTK_SHADER_LIBS: the app's game-data store (launcher.m)
         const char *libs = getenv("TOTK_SHADER_LIBS"); dir = libs && *libs ? @(libs) : exe_rel("shader-libs"); });
     unsigned char md[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(src.bytes, (CC_LONG)src.length, md);
@@ -5935,7 +6048,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
         // iOS: the variant precompiled on the Mac (ios/tools/build_metallibs.sh, same options) if it came in shaders.pack;
         // those are safe-math builds, so another TOTK_MATH_MODE compiles the source instead
         NSString *rt_lib = totk_rt_file([pc stringByAppendingString:@".metallib"]);
-        if (!totk_math_mode() && !totk_msl_fast_mask() && !totk_preserve_invariance() && [NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("[red] Failed to load precompiled shader library %s: %s (compiling at runtime instead)", pc.UTF8String, e.localizedDescription.UTF8String); else atomic_fetch_add(&g_rt_prebuilt, 1); }
+        if (!totk_math_mode() && !totk_msl_fast_mask() && !totk_preserve_invariance() && !(stage != 0 && totk_frag_math_differs()) && [NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("[red] Failed to load precompiled shader library %s: %s (compiling at runtime instead)", pc.UTF8String, e.localizedDescription.UTF8String); else atomic_fetch_add(&g_rt_prebuilt, 1); }
         }
         if (!lib) { NSData *raw = [NSData dataWithContentsOfFile:rt_src options:0 error:&e];
 #if !TARGET_OS_IPHONE
@@ -9115,6 +9228,7 @@ static inline __attribute__((always_inline)) void ea_bind_loop(NvShader *sh, int
             int tid = reg < 32 ? (int)(S.img[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
             if (diag && passdump()) PD("W %llu st%d reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "real" : "dummy", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
+            if (t) rt_usage_note_image_bind(tid, tid < g_ntreg ? (unsigned long long)g_treg[tid].t.serial : 0ull, t);
             if (t && !(t.usage & MTLTextureUsageShaderWrite)) { RED_ONCE(32, "texture bound to an image slot lacks write usage (texture id %d)", tid); t = nil; }
             if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
             slots[aid] = trid;
