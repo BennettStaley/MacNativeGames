@@ -4722,7 +4722,7 @@ static disc_pend g_disc_pend[9]; static int g_ndisc_pend;
 static uint64_t g_dc_stat[6];   // attachments marked in an open pass, stored DontCare by a discard, loads made DontCare, empty passes, their attachments stored DontCare
 void mtl_store_dc_stats(uint64_t v[6]) { memcpy(v, g_dc_stat, sizeof g_dc_stat); }
 static int discard_level(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_DISCARD"); v = e ? atoi(e) : 1; if (v < 0) v = 0; if (v != 1) MLOG("TOTK_DISCARD=%d: %s", v, v ? "discards also make the next pass's load DontCare" : "NVN discards ignored"); } return v; }
-/* TOTK_UDC (default off, =1 on; live: input-file "flag udc <0|1>"; 2026-10-23, compiled only, not tried in game; turn
+/* TOTK_UDC (default on since 2026-10-23 after an in-game check, =0 off; live: input-file "flag udc <0|1>"; turn
    it on by default only after same-run on / off screenshots match): an attachment the pass loaded and none of
    its draws wrote (colour write mask 0 and no fragment output for it, no depth / stencil write, no image writes in the
    program) is stored DontCare: memory already holds those pixels, so the store only rewrote the same bytes. This is the
@@ -4736,7 +4736,7 @@ static _Atomic int g_udc_ttk = -1;
 static uint64_t g_udc_noted, g_udc_noted0, g_udc_ttk_veto, g_udc_ttk_dead, g_udc_ttk_all, g_udc_ttk_bytes;
 static int udc_ttk_on(void) {
     int v = atomic_load_explicit(&g_udc_ttk, memory_order_relaxed);
-    if (v < 0) { const char *e = getenv("TOTK_UDC"); v = e && !strcmp(e, "1"); atomic_store(&g_udc_ttk, v);
+    if (v < 0) { const char *e = getenv("TOTK_UDC"); v = !e || strcmp(e, "0"); atomic_store(&g_udc_ttk, v);
         if (v) MLOG("TOTK_UDC=%d: attachments a pass loaded and never wrote %s", v, v ? "are stored DontCare (memory already holds them)" : "are stored as before"); }
     return v;
 }

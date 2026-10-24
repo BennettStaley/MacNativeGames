@@ -253,7 +253,7 @@ What stands out (not the game's own work):
 - `TOTK_PASS_GPU` now gives each compute dispatch its own row with its shader key (dispatches are not merged into one
   encoder in profiled frames), and `TOTK_PASS_GPU_FILE` rows gain the number of attachments stored as the last column.
 
-- **Unwritten attachments are not written back (`TOTK_UDC=1`, default off; live `flag udc 0|1` in the input file; compiled
+- **Unwritten attachments are not written back (`TOTK_UDC`, default on since 2026-10-23 after an in-game picture check, `=0` off; live `flag udc 0|1` in the input file; compiled
   only, not tried in game).** The UDC piece of the TBDR bundle without its guards: an attachment the pass loaded and none
   of its draws wrote (colour write mask 0 and no fragment output for it, no depth / stencil write, no image writes in the
   program) is stored DontCare, since memory already holds those pixels. Every Metal draw in the pass must be accounted
@@ -267,3 +267,5 @@ What stands out (not the game's own work):
   with two `udc 0` ones, the scene moves). Default on only if the shots match. Next step if it pays: skip the Load as well
   for attachments a pass will not write (needs a lookahead, or last frame's result for the same pass with a split before
   the first draw that writes an attachment whose load was skipped).
+
+- **In-game results, 2026-10-23 (M3 Pro, 2560x1440 render and output, user's world spot).** Baseline (UDC off): frame p50 17.3-17.6 ms, GPU 10.0-10.4 ms, NVN submit+present 7.4 ms: CPU-bound, the GPU idles ~7 ms a frame. `TOTK_UDC=1`: picture correct, made default. `TOTK_SPLIT_BARRIER=1`: no effect (about one samples-drawn-att split a frame, a non-8-bit format; nothing to skip), stays off. `TOTK_FENCE_LAG=2`: never engaged alone (every world submission has occlusion reports); with `TOTK_FIF_COUNTERS=1` every wait lagged, but frame p50 stayed ~18.4 ms and p95 rose to ~30 ms (stutter), so it stays off: the lag does not shorten the frame because the game thread itself (game logic plus submit) is the limit, not the wait for the GPU.
