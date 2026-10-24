@@ -193,13 +193,14 @@ static void bg_gate(void) {
     MLOG("App not in the foreground: GPU submission was paused for %.1f s, resuming now", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9);
 }
 static void ubc_wait_all(void);
+static int par_chain_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o);   // TOTK_PAR_ENCODE (nvn_par_encode.h): suspended chunks committed with the replay's command buffer
 static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) {
     ubc_wait_all();   // TOTK_UB_COPY_THREAD: uniform copies queued before this commit are in memory before the GPU can read them
     bg_gate();
     gpu_budget_check("commit command buffer");
     atomic_fetch_add(&g_q4_inflight, 1);
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; if (atomic_fetch_sub(&g_q4_inflight, 1) == 1 && g_ka_idle) dispatch_semaphore_signal(g_ka_idle); }];
-    if (!nogpu()) { id<MTL4CommandBuffer> buffers[] = {cb}; [g_q4 commit:buffers count:1 options:o]; return; }
+    if (!nogpu()) { if (par_chain_commit(cb, o)) return; id<MTL4CommandBuffer> buffers[] = {cb}; [g_q4 commit:buffers count:1 options:o]; return; }
     for (MTL4CommitFeedbackHandler h in o->handlers) h(nil);
 }
 static void cb_commit(id<MTLCommandBuffer> cb) { bg_gate(); if (!nogpu()) [cb commit]; }
@@ -1205,6 +1206,7 @@ void mtl_sub_begin(void) {
 }
 
 static void rp_end(void);
+static void par_pass_begin(void); static void par_pass_end(void);   // TOTK_PAR_ENCODE measurement (nvn_par_encode.h)
 /* TOTK: why the open render pass is ending, set just before the rp_end / rp_flush that ends it (consumed by rp_end): the
    pass dump's 'W' line and the TOTK_PASS_GPU rows name it. "other" = a site that sets none. */
 static const char *g_end_why;
@@ -5068,6 +5070,7 @@ static void rp_end(void) { if (g_enc) {
     if (att_fb_on()) { static uint64_t lf; uint64_t f = atomic_load(&g_cur_frame); if (f >= lf + 600) { lf = f;
         MLOG("[totk] [fb-fetch] through frame %llu: %llu draws read their own attachments from the tile (%llu of them kept a continued pass open), %llu sampling draws refused",
              (unsigned long long)f, (unsigned long long)g_fb_draws, (unsigned long long)g_fb_kept, (unsigned long long)g_fb_refused); } }
+    par_pass_end();
     sd_finish(); enc_r_end(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_pc_merged = 0; g_lay.active = 0;
     /* Diagnostic: inspect each full-size HDR render target immediately after its
        producer pass, on the same Metal 4 queue and before later passes reuse it. */
@@ -5485,6 +5488,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     args_dirty_all();
     g_stat_pass++;
     g_pass_draw0 = g_stat_draw;
+    par_pass_begin();
     if (totk_tl_on()) totk_tl(TL_PASS_BEGIN, g_stat_pass, 0);   // TOTK_TIMELINE: draws per pass
     if (lay_n) { g_lay.active = 1; g_lay.base = g_lay.cur = lay_first; g_lay.count = lay_n; if (g_cg_force_layers) g_lay.cur = g_cg_cur;
         if (!g_lay.passes++) MLOG("[totk] layered pass: first one covers layers %d-%d of a %lux%lu level", lay_first, lay_first + lay_n - 1, (unsigned long)g_pass.tw, (unsigned long)g_pass.th);
@@ -12510,7 +12514,9 @@ static int mfxup_draw(NvProg *pr) {
 #include "totk_post.h"
 #include "nvn_cube_group.h"
 #include "nvn_lazy_clear.h"
+#include "nvn_par_encode.h"   // TOTK_PAR_ENCODE: parallel encoding of the G-buffer pass, step 1
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
+    par_draw();
     if (!S.prog) { RED_ONCE(18, "No program bound before draw"); g_draw_skip[0]++; return; }
     g_prog_for_draw = 1; __unsafe_unretained NvProg *pr = prog_get(S.prog); g_prog_for_draw = 0;
     if (pr && pr->missing && async_shaders()) { shader_predict_maybe(); prog_resolve(pr, draw_may_skip(pr)); }

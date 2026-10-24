@@ -304,6 +304,15 @@ probe-metal-semantics:
 	xcrun clang -fobjc-arc -O1 -Wall -Wextra -Werror tests/metal_semantics/probe.m -framework Metal -framework Foundation -o build/metal-semantics-probe
 	$(GAME_SLOT_RUN) build/metal-semantics-probe | tee analysis/metal-semantics-probe.log
 
+.PHONY: probe-par-encode
+# TOTK_PAR_ENCODE (2026-10-23): one render pass split into chunks encoded on several threads with Metal 4 suspend / resume,
+# one command buffer and allocator per chunk, committed together; must match the serial encode exactly. The layout that
+# faults (work after the resuming pass in the last chunk's command buffer) is described in the probe's header, not run here.
+probe-par-encode:
+	@mkdir -p build analysis
+	xcrun clang -fobjc-arc -O1 -Wall -Wextra -Werror tests/par_encode/probe.m -framework Metal -framework Foundation -o build/par-encode-probe
+	for k in 2 4 8; do $(GAME_SLOT_RUN) build/par-encode-probe $$k 1 || exit 1; done | tee analysis/probe-par-encode.json
+
 .PHONY: probe-bc1astc
 # BC1 -> ASTC 4x4 transcoding for GPUs without BC (iPhone A15/A16), checked through Metal's ASTC decoder; CPU and GPU agree.
 probe-bc1astc:
