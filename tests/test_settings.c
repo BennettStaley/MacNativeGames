@@ -23,7 +23,7 @@ int main(void) {
     settings_defaults(v, 1);
     expect(value(v, "framerate.cap") == 0 && value(v, "interface.shader_counter") == 0, "iOS defaults: display rate, no shader counter");
     settings_defaults(v, 0);
-    expect(value(v, "framerate.cap") == -1 && value(v, "audio.volume") == 100, "Mac defaults: the auto frame rate limit");
+    expect(value(v, "framerate.cap") == 80 && value(v, "graphics.interpolation") == 2 && value(v, "audio.volume") == 100, "Mac defaults: limit 80 with frame interpolation On");
     {   /* Auto (steady): its word in settings.txt and in TOTK_UNCAPPED_HZ, the fixed limits still read */
         int a[SETTINGS_COUNT]; settings_defaults(a, 1);
         expect(settings_parse_text("framerate.cap = auto\n", a) == 1 && value(a, "framerate.cap") == -1, "auto by its word");
@@ -40,7 +40,7 @@ int main(void) {
     expect(value(v, "framerate.cap") == 60, "a choice by its word");
     expect(value(v, "audio.volume") == 45, "a range is rounded down to its step");
     expect(value(v, "interface.readout") == 0, "off, with a trailing comment");
-    expect(value(v, "graphics.interpolation") == 0, "a bad word keeps the default");
+    expect(value(v, "graphics.interpolation") == 2, "a bad word keeps the default (On on the Mac)");
     expect(value(v, "interface.touch_opacity") == 100, "a range is clamped");
 
     settings_defaults(v, 0);
