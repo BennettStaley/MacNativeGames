@@ -34,7 +34,7 @@ void fps_overlay_text(const fps_overlay_info *info, char *out, size_t n);   /* "
    (compact only) and load lines are
    not drawn into the picture but published here, and the window's corner panel (runtime/frontend.m) shows them with the
    shortcuts in one small box. */
-enum { HUD_FPS, HUD_SHADER, HUD_PSO, HUD_LOAD, HUD_LINES };
+enum { HUD_FPS, HUD_SHADER, HUD_PSO, HUD_LOAD, HUD_POWER, HUD_LINES };   // HUD_POWER: compact panel only (totk_sysload.h); runtime.h HUD_LINE_COUNT matches HUD_LINES
 int hud_compact(void);
 void hud_publish(int line, const char *text, int highlight);
 int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* 0: the line was never published (hidden or not known yet) */
@@ -65,3 +65,5 @@ int fps_overlay_detail(void);
 /* The same for interpolated frames shown (n counts them); fps_overlay_gen_value() is that rate, or -1. */
 void fps_overlay_note_gen(uint64_t n, double now_s);
 int fps_overlay_gen_value(void);
+
+_Static_assert(HUD_LINES == 5, "runtime/runtime.h HUD_LINE_COUNT");

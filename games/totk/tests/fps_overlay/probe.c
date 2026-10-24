@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 static int failures, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
@@ -170,18 +171,18 @@ int main(void) {
     CHECK(fps_overlay_avg_value() == 60 && fps_overlay_low_value() == 60, "merged presents: average %d, 1%% low %d (each frame its half)", fps_overlay_avg_value(), fps_overlay_low_value());
     {
         char ft[128];
-        fps_overlay_text(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 1, 59, 48}, ft, sizeof ft);
+        fps_overlay_text(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 1, 59, 48, 0, 0}, ft, sizeof ft);
         CHECK(!strcmp(ft, "FPS 60  avg 59  1% low 48  2560x1440"), "detailed line \"%s\"", ft);
-        fps_overlay_text(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 1, -1, -1}, ft, sizeof ft);
+        fps_overlay_text(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 1, -1, -1, 0, 0}, ft, sizeof ft);
         CHECK(!strcmp(ft, "FPS 60  avg --  1% low --  2560x1440"), "detailed line before a measurement \"%s\"", ft);
-        fps_overlay_text(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 0, 59, 48}, ft, sizeof ft);
+        fps_overlay_text(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 0, 59, 48, 0, 0}, ft, sizeof ft);
         CHECK(!strcmp(ft, "FPS 60  2560x1440"), "simple line \"%s\" (detail off hides the numbers)", ft);
         int simple, detailed;
-        fps_overlay_raster(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 0, 0, 0}, 2, px, &simple, &h);
-        fps_overlay_raster(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 1, 59, 48}, 2, px, &detailed, &h);
+        fps_overlay_raster(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 0, 0, 0, 0, 0}, 2, px, &simple, &h);
+        fps_overlay_raster(&(fps_overlay_info){60, 2560, 1440, 0, 0, 0, 1, 59, 48, 0, 0}, 2, px, &detailed, &h);
         CHECK(detailed > simple + 60, "detailed box %d wider than simple %d", detailed, simple);
         for (int s = 1; s <= FPS_OVERLAY_MAX_SCALE; s++) {
-            fps_overlay_raster(&(fps_overlay_info){999, 99999, 99999, 1, 5000, 1, 1, 999, 999}, s, px, &w, &h);
+            fps_overlay_raster(&(fps_overlay_info){999, 99999, 99999, 1, 5000, 1, 1, 999, 999, 0, 0}, s, px, &w, &h);
             CHECK(w > 0 && w <= FPS_OVERLAY_TEX_W && h <= FPS_OVERLAY_TEX_H && outside_dirty(w, h) == 0, "longest detailed line at scale %d: box %dx%d", s, w, h);
         }
     }
@@ -198,14 +199,14 @@ int main(void) {
 
     /* The bottom-right load line: text, its glyphs, the widest line within the wider texture at every scale, the busy-time
        union of in-order command buffers, and one real sample of this machine (cores split into P and E, GPU known). */
-    sysload_info li = {4, 6, {55, 56, 55, 53}, {43, 29, 20, 12, 9, 7}, 99, 70, 47, "x"};
+    sysload_info li = {4, 6, {55, 56, 55, 53}, {43, 29, 20, 12, 9, 7}, 99, 70, 47, "x", 0, -1, -1, -1, -1, -1, 0};
     sysload_text(line, sizeof line, &li);
     CHECK(!strcmp(line, "P 55% 56% 55% 53%  E 43% 29% 20% 12%  9%  7%  T 47%  GPU 99% (70%)"), "load line \"%s\"", line);
     li.gpu_sys = -1; li.gpu_game = -1; li.thread_max = -1; sysload_text(line, sizeof line, &li);
     CHECK(!strcmp(line, "P 55% 56% 55% 53%  E 43% 29% 20% 12%  9%  7%  GPU --"), "load line without GPU numbers \"%s\"", line);
     for (const char *c = "PEGUT%()"; *c; c++) CHECK(fps_overlay_has_glyph(*c), "no glyph for '%c' (load line)", *c);
     static uint8_t lpx[LOAD_OVERLAY_TEX_W * FPS_OVERLAY_TEX_H * 4];
-    sysload_info wide = {4, 6, {100, 100, 100, 100}, {100, 100, 100, 100, 100, 100}, 100, 100, 100, "x"};
+    sysload_info wide = {4, 6, {100, 100, 100, 100}, {100, 100, 100, 100, 100, 100}, 100, 100, 100, "x", 0, -1, -1, -1, -1, -1, 0};
     char wl[128]; sysload_text(wl, sizeof wl, &wide);
     int unit = (int)strlen(wl) * 6 - 1 + 4;
     for (int s = 1; s <= FPS_OVERLAY_MAX_SCALE; s++) {
@@ -215,6 +216,17 @@ int main(void) {
     }
     fps_overlay_raster_line_tex(wl, 0, 4, lpx, LOAD_OVERLAY_TEX_W, FPS_OVERLAY_TEX_H, &w, &h);
     CHECK(w == unit * 4, "the widest load line keeps scale 4 (1440p) in its texture: width %d", w);
+    /* The power line: every value, a draining battery (highlighted), charging, no charger, nothing known. */
+    sysload_info pw = {0}; pw.have_power = 1; pw.cpu_w = 9.04; pw.gpu_w = 21.26; pw.sys_w = 42.4; pw.in_w = 36.2; pw.bat_w = -6.3; pw.charger_w = 100;
+    CHECK(sysload_power_text(line, sizeof line, &pw) == 1 && !strcmp(line, "CPU 9.0 W  GPU 21.3 W  Total 42 W  Charger 100 W (36 W in)  Battery -6 W draining"), "power line, draining \"%s\"", line);
+    pw.bat_w = 3.2; pw.in_w = 46;
+    CHECK(sysload_power_text(line, sizeof line, &pw) == 0 && !strcmp(line, "CPU 9.0 W  GPU 21.3 W  Total 42 W  Charger 100 W (46 W in)  Battery +3 W charging"), "power line, charging \"%s\"", line);
+    pw.bat_w = -0.2;
+    CHECK(sysload_power_text(line, sizeof line, &pw) == 0 && strstr(line, "Battery 0 W"), "power line, battery held \"%s\"", line);
+    pw.charger_w = 0; pw.in_w = 0; pw.bat_w = -42.4;
+    CHECK(sysload_power_text(line, sizeof line, &pw) == 1 && strstr(line, "No charger  Battery -42 W draining"), "power line, on battery \"%s\"", line);
+    pw = (sysload_info){0}; pw.cpu_w = pw.gpu_w = pw.sys_w = pw.in_w = -1; pw.bat_w = NAN; pw.charger_w = -1; pw.have_power = 1;
+    CHECK(sysload_power_text(line, sizeof line, &pw) == -1 && !line[0], "power line with nothing known is empty \"%s\"", line);
     sysload_busy b = {0, 0};
     sysload_busy_add(&b, 1.0, 1.005); sysload_busy_add(&b, 1.005, 1.010); sysload_busy_add(&b, 1.008, 1.012); sysload_busy_add(&b, 1.020, 1.020);
     CHECK(b.busy > 0.01199 && b.busy < 0.01201, "busy union of 0-5, 5-10, 8-12 ms (and an empty one) is 12 ms, got %.6f s", b.busy);
@@ -228,6 +240,8 @@ int main(void) {
     CHECK(got && real.thread_max >= 80 && !strcmp(real.thread_name, "probe-spin"), "the spinning thread is the busiest: %d%% (%s)", real.thread_max, real.thread_name);
     atomic_store(&g_spin_stop, 1); pthread_join(spin, NULL);
     if (got) { sysload_text(line, sizeof line, &real); fprintf(stderr, "this machine now: %s (busiest thread %s)\n", line, real.thread_name); }
+    CHECK(got && real.have_power && real.cpu_w > 0 && real.cpu_w < 200 && real.gpu_w >= 0 && real.gpu_w < 200, "a real power sample: CPU %.2f W, GPU %.2f W (IOReport)", real.cpu_w, real.gpu_w);
+    if (got && sysload_power_text(line, sizeof line, &real) >= 0) fprintf(stderr, "this machine's power now: %s\n", line);
 
     printf("{\"status\":\"%s\",\"probe\":\"probe-fps-overlay\",\"checked\":%d,\"failures\":%d,\"scope\":\"5x7 glyph pixels (ASCII lines), the system-font FPS box (MetalFX label, box growth, text colour, nothing outside the box), box bounds for values -1..5000 and screen sizes at scales 1..%d, scale choice, game-present and interpolated-frame rate measurement, FPS 50+50 form, Readout detail (average and 1%% low over the last 5 s: steady, hitches, merged presents; the detailed line and its box), bottom-right load line (text, glyphs, width, GPU busy union, busiest thread found, one real sample), shader collection box text / glyphs / bounds / highlight; negative controls flip one pixel and ask for a missing glyph\"}\n",
            failures ? "fail" : "pass", checks, failures, FPS_OVERLAY_MAX_SCALE);

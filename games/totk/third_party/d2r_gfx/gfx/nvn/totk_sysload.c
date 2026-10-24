@@ -3,7 +3,10 @@
 //   device tree's "cluster-type" (E cores have the lowest logical ids on Apple silicon; that is the fallback);
 // - the GPU's own utilisation: IOAccelerator PerformanceStatistics "Device Utilization %" (what Activity Monitor's GPU
 //   history shows; our keep-alive fills the GPU's idle gaps, so it reads near 100 % while the game runs);
-// - the game's GPU share: the union of our command buffers' GPU intervals (sysload_note_gpu) per wall time.
+// - the game's GPU share: the union of our command buffers' GPU intervals (sysload_note_gpu) per wall time;
+// - power (user, 2026-10-23): CPU and GPU energy from IOReport's "Energy Model" group (libIOReport, loaded with dlopen: a
+//   private library, so a missing symbol only hides those two values), and the battery controller's own measurements
+//   (AppleSmartBattery: whole-Mac load, charger input, battery current), averaged over SYSLOAD_POWER_SECONDS.
 // It never touches the game threads; reading the device tree / IOKit happens on its own thread.
 #include "totk_sysload.h"
 #include <TargetConditionals.h>
@@ -18,7 +21,9 @@
 #if TARGET_OS_OSX
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+#include <dlfcn.h>
 #endif
+#include <math.h>
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static sysload_info g_cur;
@@ -55,6 +60,29 @@ void sysload_text(char *out, size_t n, const sysload_info *in) {
     if (in->gpu_game >= 0) PUT(" (%d%%)", in->gpu_game);
     #undef PUT
     if (n) out[n - 1 < o ? n - 1 : o] = 0;
+}
+
+int sysload_power_text(char *out, size_t n, const sysload_info *in) {
+    size_t o = 0; int drain = 0;
+    if (n) out[0] = 0;
+    if (!in->have_power) return -1;
+    #define PUT(...) do { int k = snprintf(out + o, o < n ? n - o : 0, __VA_ARGS__); if (k > 0) o += (size_t)k; } while (0)
+    #define SEP() do { if (o) PUT("  "); } while (0)
+    if (in->cpu_w >= 0) { SEP(); PUT("CPU %.1f W", in->cpu_w); }
+    if (in->gpu_w >= 0) { SEP(); PUT("GPU %.1f W", in->gpu_w); }
+    if (in->sys_w >= 0) { SEP(); PUT("Total %.0f W", in->sys_w); }
+    if (in->charger_w > 0) { SEP(); PUT("Charger %d W", in->charger_w); if (in->in_w >= 0) PUT(" (%.0f W in)", in->in_w); }
+    else if (in->charger_w == 0) { SEP(); PUT("No charger"); }
+    if (!isnan(in->bat_w)) {
+        SEP();
+        if (in->bat_w <= -0.5) { PUT("Battery %.0f W draining", in->bat_w); drain = 1; }
+        else if (in->bat_w >= 0.5) PUT("Battery +%.0f W charging", in->bat_w);
+        else PUT("Battery 0 W");
+    }
+    #undef SEP
+    #undef PUT
+    if (n) out[n - 1 < o ? n - 1 : o] = 0;
+    return o ? drain : -1;
 }
 
 int sysload_get(sysload_info *out) {
@@ -124,6 +152,118 @@ static int gpu_util(void) {
 static int gpu_util(void) { return -1; }
 #endif
 
+/* Power sources (see the top). Each returns 0 when it has nothing. */
+#if TARGET_OS_OSX
+typedef void *ior_sub;
+static struct {
+    int state;   // 0 not tried, 1 ready, -1 unavailable
+    CFMutableDictionaryRef (*copy_channels)(CFStringRef, CFStringRef, uint64_t, uint64_t, uint64_t);
+    ior_sub (*create_sub)(void *, CFMutableDictionaryRef, CFMutableDictionaryRef *, uint64_t, CFTypeRef);
+    CFDictionaryRef (*samples)(ior_sub, CFMutableDictionaryRef, CFTypeRef);
+    CFDictionaryRef (*delta)(CFDictionaryRef, CFDictionaryRef, CFTypeRef);
+    int64_t (*int_value)(CFDictionaryRef, int32_t);
+    CFStringRef (*name)(CFDictionaryRef), (*unit)(CFDictionaryRef);
+    ior_sub sub; CFMutableDictionaryRef subbed; CFDictionaryRef last;
+} g_ior;
+/* CPU and GPU energy in joules since the previous call (the first call only takes the starting sample). */
+static int soc_energy(double *cpu_j, double *gpu_j) {
+    if (g_ior.state < 0) return 0;
+    if (!g_ior.state) {
+        g_ior.state = -1;
+        void *h = dlopen("/usr/lib/libIOReport.dylib", RTLD_NOW | RTLD_LOCAL); if (!h) return 0;
+        g_ior.copy_channels = dlsym(h, "IOReportCopyChannelsInGroup"); g_ior.create_sub = dlsym(h, "IOReportCreateSubscription");
+        g_ior.samples = dlsym(h, "IOReportCreateSamples"); g_ior.delta = dlsym(h, "IOReportCreateSamplesDelta");
+        g_ior.int_value = dlsym(h, "IOReportSimpleGetIntegerValue"); g_ior.name = dlsym(h, "IOReportChannelGetChannelName");
+        g_ior.unit = dlsym(h, "IOReportChannelGetUnitLabel");
+        if (!g_ior.copy_channels || !g_ior.create_sub || !g_ior.samples || !g_ior.delta || !g_ior.int_value || !g_ior.name || !g_ior.unit) return 0;
+        CFMutableDictionaryRef ch = g_ior.copy_channels(CFSTR("Energy Model"), NULL, 0, 0, 0); if (!ch) return 0;
+        g_ior.sub = g_ior.create_sub(NULL, ch, &g_ior.subbed, 0, NULL); CFRelease(ch);
+        if (!g_ior.sub || !g_ior.subbed) return 0;
+        g_ior.last = g_ior.samples(g_ior.sub, g_ior.subbed, NULL); if (!g_ior.last) return 0;
+        g_ior.state = 1;
+        return 0;
+    }
+    CFDictionaryRef cur = g_ior.samples(g_ior.sub, g_ior.subbed, NULL); if (!cur) return 0;
+    CFDictionaryRef d = g_ior.delta(g_ior.last, cur, NULL);
+    CFRelease(g_ior.last); g_ior.last = cur;
+    if (!d) return 0;
+    int got = 0; *cpu_j = *gpu_j = 0;
+    CFArrayRef arr = CFDictionaryGetValue(d, CFSTR("IOReportChannels"));
+    for (CFIndex i = 0; arr && CFGetTypeID(arr) == CFArrayGetTypeID() && i < CFArrayGetCount(arr); i++) {
+        CFDictionaryRef c = CFArrayGetValueAtIndex(arr, i); CFStringRef nm = g_ior.name(c); if (!nm) continue;
+        int is_cpu = CFStringCompare(nm, CFSTR("CPU Energy"), 0) == kCFCompareEqualTo, is_gpu = CFStringCompare(nm, CFSTR("GPU Energy"), 0) == kCFCompareEqualTo;
+        if (!is_cpu && !is_gpu) continue;
+        char u[8] = "mJ"; CFStringRef us = g_ior.unit(c); if (us) CFStringGetCString(us, u, sizeof u, kCFStringEncodingUTF8);
+        double scale = !strcmp(u, "nJ") ? 1e-9 : !strcmp(u, "uJ") ? 1e-6 : !strcmp(u, "J") ? 1 : 1e-3;
+        double j = (double)g_ior.int_value(c, 0) * scale;
+        if (is_cpu) *cpu_j = j; else *gpu_j = j;
+        got |= is_cpu ? 1 : 2;
+    }
+    CFRelease(d);
+    return got == 3;
+}
+
+static int dict_num(CFDictionaryRef d, CFStringRef key, int64_t *v) {
+    CFTypeRef n = d ? CFDictionaryGetValue(d, key) : NULL;
+    return n && CFGetTypeID(n) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)n, kCFNumberSInt64Type, v);
+}
+static int prop_num(io_object_t o, CFStringRef key, int64_t *v) {
+    CFTypeRef n = IORegistryEntryCreateCFProperty(o, key, kCFAllocatorDefault, 0);
+    int ok = n && CFGetTypeID(n) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)n, kCFNumberSInt64Type, v);
+    if (n) CFRelease(n);
+    return ok;
+}
+static CFDictionaryRef prop_dict(io_object_t o, CFStringRef key) {
+    CFTypeRef d = IORegistryEntryCreateCFProperty(o, key, kCFAllocatorDefault, 0);
+    if (d && CFGetTypeID(d) != CFDictionaryGetTypeID()) { CFRelease(d); d = NULL; }
+    return d;
+}
+/* The battery controller's view: whole-Mac load and charger input (W, -1 = not known), battery power (W, + into it,
+   NaN = no battery) and the charger's rating (W, 0 = none, -1 = not known). 0 on a Mac without a battery controller. */
+static int battery_power(double *sys_w, double *in_w, double *bat_w, int *charger_w) {
+    static io_service_t batt; static int tried;
+    if (!tried) { tried = 1; batt = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery")); }
+    if (!batt) return 0;
+    *sys_w = *in_w = -1; *bat_w = NAN; *charger_w = -1;
+    CFDictionaryRef t = prop_dict(batt, CFSTR("PowerTelemetryData")); int64_t v;
+    if (dict_num(t, CFSTR("SystemLoad"), &v) && v >= 0) *sys_w = v / 1000.0;
+    if (dict_num(t, CFSTR("SystemPowerIn"), &v) && v >= 0) *in_w = v / 1000.0;
+    if (t) CFRelease(t);
+    int64_t ma, mv; if (prop_num(batt, CFSTR("Amperage"), &ma) && prop_num(batt, CFSTR("Voltage"), &mv)) *bat_w = (double)ma * (double)mv / 1e6;   // signed mA x mV
+    CFTypeRef ext = IORegistryEntryCreateCFProperty(batt, CFSTR("ExternalConnected"), kCFAllocatorDefault, 0);
+    int plugged = ext && CFGetTypeID(ext) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)ext);
+    if (ext) CFRelease(ext);
+    if (!plugged) { *charger_w = 0; *in_w = 0; }
+    else { CFDictionaryRef a = prop_dict(batt, CFSTR("AdapterDetails")); if (dict_num(a, CFSTR("Watts"), &v) && v > 0) *charger_w = (int)v; if (a) CFRelease(a); }
+    return 1;
+}
+#else
+static int soc_energy(double *cpu_j, double *gpu_j) { (void)cpu_j; (void)gpu_j; return 0; }
+static int battery_power(double *sys_w, double *in_w, double *bat_w, int *charger_w) { (void)sys_w; (void)in_w; (void)bat_w; (void)charger_w; return 0; }
+#endif
+
+/* Averages over the last SYSLOAD_POWER_SECONDS of 0.5 s samples; NaN marks a sample without that value. */
+enum { PW_N = SYSLOAD_POWER_SECONDS * 2, PW_CPU = 0, PW_GPU, PW_SYS, PW_IN, PW_BAT, PW_K };
+static double g_pw[PW_K][PW_N]; static unsigned g_pw_n;
+static void power_sample(sysload_info *s, double dt) {
+    double cj, gj, v[PW_K]; for (int k = 0; k < PW_K; k++) v[k] = NAN;
+    if (soc_energy(&cj, &gj) && dt > 0) { v[PW_CPU] = cj / dt; v[PW_GPU] = gj / dt; }
+    int charger = -1;
+    if (battery_power(&v[PW_SYS], &v[PW_IN], &v[PW_BAT], &charger)) { if (v[PW_SYS] < 0) v[PW_SYS] = NAN; if (v[PW_IN] < 0) v[PW_IN] = NAN; }
+    else v[PW_SYS] = v[PW_IN] = v[PW_BAT] = NAN;
+    unsigned slot = g_pw_n++ % PW_N;
+    double avg[PW_K];
+    for (int k = 0; k < PW_K; k++) {
+        g_pw[k][slot] = v[k];
+        double sum = 0; int c = 0; for (unsigned i = 0; i < PW_N && i < g_pw_n; i++) if (!isnan(g_pw[k][i])) { sum += g_pw[k][i]; c++; }
+        avg[k] = c ? sum / c : NAN;
+    }
+    s->cpu_w = isnan(avg[PW_CPU]) ? -1 : avg[PW_CPU]; s->gpu_w = isnan(avg[PW_GPU]) ? -1 : avg[PW_GPU];
+    s->sys_w = isnan(avg[PW_SYS]) ? -1 : avg[PW_SYS]; s->in_w = isnan(avg[PW_IN]) ? -1 : avg[PW_IN];
+    s->bat_w = avg[PW_BAT]; s->charger_w = charger;
+    s->have_power = s->cpu_w >= 0 || s->sys_w >= 0 || !isnan(s->bat_w);
+}
+
 /* The busiest thread of this process over the last interval: CPU time (user + system) per thread from thread_info, kept by
    thread id between samples; % of one core. Threads seen for the first time are skipped (no earlier time). */
 enum { MAX_THREADS = 512 };
@@ -176,6 +316,7 @@ static void *sampler(void *arg) {
     int ncpu = cpu_ticks(b0, t0); char kind[SYSLOAD_MAX_CORES]; classify(ncpu, kind);
     char tname[32]; (void)busiest_thread(0, tname);   // the first thread times
     double w0 = now_s(), g0; pthread_mutex_lock(&g_mu); g0 = g_busy.busy; pthread_mutex_unlock(&g_mu);
+    { double cj, gj; (void)soc_energy(&cj, &gj); }   // the starting energy sample
     for (unsigned k = 1;; k++) {
         usleep(500000);
         int nc = cpu_ticks(b1, t1);
@@ -184,13 +325,15 @@ static void *sampler(void *arg) {
         s.thread_max = busiest_thread((w1 - w0) * 1e6, s.thread_name);
         double gp = w1 > w0 ? (g1 - g0) / (w1 - w0) * 100 : -1;
         s.gpu_game = gp < 0 ? -1 : gp > 100 ? 100 : (int)(gp + 0.5);
+        power_sample(&s, w1 - w0);
         for (int i = 0; i < nc && i < ncpu; i++) {
             uint64_t db = b1[i] - b0[i], dt = t1[i] - t0[i]; int v = dt ? (int)((db * 100 + dt / 2) / dt) : 0;
             if (kind[i] == 'P' && s.np < SYSLOAD_MAX_CORES) s.p[s.np++] = v; else if (s.ne < SYSLOAD_MAX_CORES) s.e[s.ne++] = v;
         }
         pthread_mutex_lock(&g_mu); g_cur = s; g_have = nc > 0; pthread_mutex_unlock(&g_mu);
         memcpy(b0, b1, sizeof b0); memcpy(t0, t1, sizeof t0); w0 = w1; g0 = g1;
-        if (k % 60 == 0) { char t[128]; sysload_text(t, sizeof t, &s); fprintf(stderr, "[totk-gfx] [load] %s (T is the busiest thread: %s; parentheses show the game's own GPU work, excluding keep-alive)\n", t, s.thread_name); }   // every 30 s
+        if (k % 60 == 0) { char t[128]; sysload_text(t, sizeof t, &s); fprintf(stderr, "[totk-gfx] [load] %s (T is the busiest thread: %s; parentheses show the game's own GPU work, excluding keep-alive)\n", t, s.thread_name);
+                             if (sysload_power_text(t, sizeof t, &s) >= 0) fprintf(stderr, "[totk-gfx] [power] %s (%d s averages)\n", t, SYSLOAD_POWER_SECONDS); }   // every 30 s
     }
     return NULL;
 }

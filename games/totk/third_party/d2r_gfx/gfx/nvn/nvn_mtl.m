@@ -14524,7 +14524,11 @@ static int load_overlay_prepare(int slot, MTLViewport vp, MTLViewport *ovp, floa
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     static uint8_t px[LOAD_OVERLAY_TEX_W * FPS_OVERLAY_TEX_H * 4];
     char text[96]; sysload_text(text, sizeof text, &li);
-    if (hud_compact()) { hud_publish(HUD_LOAD, text, 0); return 0; }
+    if (hud_compact()) {
+        hud_publish(HUD_LOAD, text, 0);
+        char pw[160]; int drain = sysload_power_text(pw, sizeof pw, &li); if (drain >= 0) hud_publish(HUD_POWER, pw, drain);   // yellow while the battery drains
+        return 0;
+    }
     int scale = fps_overlay_scale(vp.height);
     pthread_mutex_lock(&mu);
     if (g_load_key[slot].scale != scale || strcmp(g_load_key[slot].text, text)) {

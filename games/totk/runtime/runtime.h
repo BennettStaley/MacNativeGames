@@ -130,7 +130,8 @@ void runtime_time_speed_set(int percent);       /* runtime/world_patch.h: time o
 void runtime_render_distance_set(int percent);   /* runtime/world_patch.h: the camera's far clip 50..300 % live (1.4.3), 100 = the game's own */
 void runtime_front_resize_aspect(double ratio);   /* Mac: resize the window to a selected picture ratio */
 int hud_compact(void);   /* gfx/nvn/fps_overlay.c: the overlay lines go to the window's corner panel (TOTK_HUD=corners: in the picture) */
-int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line 0..3: FPS, shaders, render pipelines, load; 0 = not published */
+enum { HUD_LINE_COUNT = 5 };   /* fps_overlay.h HUD_LINES */
+int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line 0..4: FPS, shaders, render pipelines, load, power; 0 = not published */
 
 void *runtime_account_override(const char *name);
 
