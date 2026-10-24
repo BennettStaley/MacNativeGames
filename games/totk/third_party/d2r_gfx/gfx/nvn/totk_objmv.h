@@ -1,4 +1,4 @@
-// TOTK_OBJ_MOTION=1 (default 0; only with TOTK_MFX frame interpolation): per-object motion vectors. Included once by
+// TOTK_OBJ_MOTION=1 (default 0; only with TOTK_MFX frame interpolation or the motion / depth debug view): per-object motion vectors. Included once by
 // nvn_mtl.m (after the readable-tile merge state); not a standalone header.
 /* The game renders no velocity buffer (FXAA + FSR1), so frame interpolation had camera motion only and smeared Link,
    NPCs, cloth and foliage. As in NVIDIA RTX Remix (dxvk-remix rtx_draw_call_tracker / rtx_instance_manager), the opaque

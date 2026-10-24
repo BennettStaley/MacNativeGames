@@ -4997,8 +4997,17 @@ static void canvas_learn(MTL4RenderPassDescriptor *pd) {
             g_mfx.last_c0 = t0->serial;
     }
 }
-static void mfx_pass_setup(MTL4RenderPassDescriptor *pd) {
-    canvas_learn(pd);
+/* Our residency set (mfx_residency: scene / UI / motion / per-object textures) on the game's queue, once it exists: the
+   G-buffer pass writes the per-object motion target, the canvas passes the UI layer. */
+static void mfx_queue_residency(void) {
+    static int added; if (added) return;
+    id<MTLResidencySet> rs = mfx_residency(); if (!rs) return;
+    [g_q4 addResidencySet:rs]; added = 1;
+}
+/* ui 0: the debug view with interpolation off (mfx_debug_only): only the G-buffer depth, the camera and the per-object
+   motion are taken; no canvas search, no UI layer. */
+static void mfx_pass_setup(MTL4RenderPassDescriptor *pd, int ui) {
+    if (ui) canvas_learn(pd);
     const tex_t *t0 = R.rt.n > 0 ? R.rt.color[0] : NULL;
     id<MTLTexture> c0 = t0 ? pd.colorAttachments[0].texture : nil;
     id<MTLTexture> dt = pd.depthAttachment.texture;
@@ -5007,7 +5016,8 @@ static void mfx_pass_setup(MTL4RenderPassDescriptor *pd) {
         if (nc >= 3) { mfx_note_depth(dt); om_note_depth(dt); g_mfx.depth_done = 1; g_mfx.want_cam = 1; }
     }
     om_pass_setup(pd);   // TOTK_OBJ_MOTION: the motion attachment of passes into the G-buffer depth
-    if (t0 && c0 && g_mfx.scene_done && g_mfx.canvas == t0->serial && R.rt.n <= 7 && pd.colorAttachments[0].level == 0 && !pd.colorAttachments[7].texture) {
+    if (g_pass.objmv) mfx_queue_residency();
+    if (ui && t0 && c0 && g_mfx.scene_done && g_mfx.canvas == t0->serial && R.rt.n <= 7 && pd.colorAttachments[0].level == 0 && !pd.colorAttachments[7].texture) {
         MTLRenderPassColorAttachmentDescriptor *a7 = pd.colorAttachments[7];
         a7.texture = mfx_ui_target(g_dev, c0.width, c0.height);
         a7.loadAction = g_mfx.ui_cleared ? MTLLoadActionLoad : MTLLoadActionClear; a7.clearColor = MTLClearColorMake(0, 0, 0, 0); a7.storeAction = MTLStoreActionStore;
@@ -5085,7 +5095,7 @@ static void mfx_snapshot_scene(void) {
     id<MTLTexture> c = tex_mtl(R.rt.color[0]);
     if (!c || c.textureType != MTLTextureType2D || c.mipmapLevelCount < 1) { g_mfx.scene_done = 1; return; }
     id<MTLTexture> sc = mfx_scene_target(g_dev, c.width, c.height, c.pixelFormat);
-    static int rs_added; if (!rs_added) { [g_q4 addResidencySet:mfx_residency()]; rs_added = 1; }
+    mfx_queue_residency();
     id<MTL4ComputeCommandEncoder> b = blit();
     enc_b_copy_texture(b, c, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(c.width, c.height, 1), sc, 0, 0, MTLOriginMake(0, 0, 0));
     enc_b_end(g_blit); g_blit = nil;
@@ -5285,8 +5295,11 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
       void ts_note(id pd, NSUInteger nc); ts_note(pd, (NSUInteger)R.rt.n); }
     ser_gate();
     if (taa_pass(pd) == 2) g_mfx.want_cam = 1;   // TOTK_TAA: the G-buffer pass found; its first draw gives the camera
-    if (mfx_enabled()) mfx_pass_setup(pd);   // TOTK: MetalFX scene / UI attachments, G-buffer depth
-    else if (uw_ratio() || g_pp_sharpen || g_pp_aa >= 2 || g_fx_hud) canvas_learn(pd);   // key 4: the canvas the UI is squeezed in; picture settings: the canvas they process; hide the HUD: the canvas its draws go to
+    if (mfx_enabled()) mfx_pass_setup(pd, 1);   // TOTK: MetalFX scene / UI attachments, G-buffer depth
+    else {
+        if (mfx_debug_only()) mfx_pass_setup(pd, 0);   // the motion / depth debug view without interpolation: G-buffer depth, camera, per-object motion
+        if (uw_ratio() || g_pp_sharpen || g_pp_aa >= 2 || g_fx_hud) canvas_learn(pd);
+    }   // key 4: the canvas the UI is squeezed in; picture settings: the canvas they process; hide the HUD: the canvas its draws go to
     g_enc = enc_r_begin(pd);
     args_dirty_all();
     g_stat_pass++;
@@ -14886,9 +14899,45 @@ static int mfx_present_frame_body(const tex_t *t, double period, int discard, co
 static int mfx_present_frame(const tex_t *t, double period, int discard, const int crop[4]) {
     @autoreleasepool { return mfx_present_frame_body(t, period, discard, crop); }
 }
+/* The motion / depth debug view with interpolation off (mfx_debug_only, totk_mfx.h): the motion kernel and the view over
+   the presented texture in a command buffer of the interpolation pool (GPU order: after this frame, before its present). */
+static void mfx_debug_present(const tex_t *t, int discard, const int crop[4]) {
+    @autoreleasepool {
+        int slot = mfx_debug_prepare();
+        if (slot >= 0) {
+            int a = -1; for (int i = 0; i < 3 && a < 0; i++) if (!atomic_load(&g_mfx_busy[i])) a = i;
+            id<MTLTexture> present = t ? tex_mtl(t) : nil;
+            if (a < 0 || discard || nogpu() || !present) mfx_debug_abort();
+            else {
+                if (!g_mfx_alloc[a]) { g_mfx_alloc[a] = [g_dev newCommandAllocator]; g_mfx_cb[a] = [g_dev newCommandBuffer]; }
+                [g_mfx_alloc[a] reset];
+                id<MTL4CommandBuffer> cb = g_mfx_cb[a];
+                [cb beginCommandBufferWithAllocator:g_mfx_alloc[a]];
+                NSArray *res = mfx_debug_frame_encode(cb, slot, present, crop);
+                [cb endCommandBuffer];
+                if (res.count) {
+                    atomic_store(&g_mfx_busy[a], 1);
+                    TotkCommitOptions *o = [TotkCommitOptions new];
+                    [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
+                        if (!res.count) MDIE("invalid debug view resource lifetime payload");   // holds the motion / depth / per-object textures until completion
+                        sysload_note_gpu(f.GPUStartTime, f.GPUEndTime);
+                        if (f.error) MLOG("[red] [mfx] debug view command buffer error: %s", f.error.description.UTF8String);
+                        atomic_store(&g_mfx_busy[a], 0); }];
+                    q4_commit(cb, o);
+                }
+            }
+        }
+        g_mfx.depth_done = g_mfx.want_cam = 0;
+        om_frame_end();   // TOTK_OBJ_MOTION: this frame's draws become the previous frame's
+    }
+}
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     taa_frame_end();   // TOTK_TAA: next frame's jitter, this frame's depth and camera forgotten (also while off: key 5)
     int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard, crop) : -1;
+    if (!mfx_enabled()) {   // the motion / depth debug view without interpolation; its textures and arenas go once it is off
+        if (mfx_debug_only()) mfx_debug_present(t, discard, crop);
+        else if (mfx_debug_release()) { g_mfx.depth_done = g_mfx.want_cam = 0; om_release(); }
+    }
     if (g_dev) mfx_present_tick((uint64_t)g_dev.currentAllocatedSize, gpu_budget_bytes());   // TOTK_MFX: retired resources released; paused near the GPU memory budget
     if (mfx_latch() && !mfx_enabled()) { g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = 0; BOTW_MFX_FRAME_RESET() om_release(); }   // key 2 / flag mfx_interp / budget pause: the next frame is fully on or off; per-object motion's arenas released
     if (t && !mfx_enabled() && (uw_ratio() || g_pp_sharpen || g_pp_aa >= 2 || g_fx_hud)) uw_note_present(t);   // key 4 / sharpen: the canvas search (TOTK_MFX does it in mfx_present_frame)

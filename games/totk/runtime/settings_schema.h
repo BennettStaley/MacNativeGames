@@ -59,7 +59,8 @@ static const SettingChoice SET_CAP[] = {{"Auto (steady)", "auto", "auto", -1}, {
                                         {"60 fps", "60", "60", 60}, {"120 fps", "120", "120", 120}, {"Display refresh rate", "display", "display", 0}};
 static const SettingChoice SET_INTERP[] = {{"Off", "off", "0", 0}, {"30 + 30", "interp30", "interp30", 1},
                                            {"Half the refresh rate", "half", "interp", 2}, {"Every frame", "max", "interpmax", 3}};
-/* What MetalFX is given, drawn over the picture (totk_mfx.m mfx_debug_encode, TOTK_MFX_DEBUG_VIEW). Needs frame interpolation. */
+/* Motion / depth from the render drawn over the picture (totk_mfx.m mfx_debug_encode / mfx_debug_frame_encode,
+   TOTK_MFX_DEBUG_VIEW), with frame interpolation on or off. The key graphics.mfx_debug_view stays for saved settings. */
 static const SettingChoice SET_MFX_DEBUG[] = {{"Off", "off", NULL, 0}, {"Motion", "motion", "motion", 1}, {"Depth", "depth", "depth", 2},
                                               {"Split (picture, motion, depth)", "split", "split", 3}};
 /* Display (settings.c display_apply): the output is the 16:9 picture the game composes, text and icons included (live up to
@@ -111,7 +112,7 @@ static const SettingDef SETTINGS[] = {
     {"graphics.interpolation", "Frame rate", "Frame interpolation", "MetalFX makes a frame between two game frames. On the Mac, near the GPU memory limit it pauses (resuming once memory frees up, off for the session after 3 pauses), and a mode that would not fit is marked in the list and not turned on. The row says when the chosen mode is not running.",
      "TOTK_MFX", SET_CHOICE, SET_LIVE, SET_MAC | SET_IPAD, 0, 0, 0, 0, 0, NULL, SET_INTERP, SET_N(SET_INTERP),
      "Not tested on iPhone yet.", NULL, 0},
-    {"graphics.mfx_debug_view", "Frame rate", "Interpolation debug view", "Shows what frame interpolation is given: motion (direction as colour, brighter is faster, outlined where per-object motion was used), depth (near is bright), or the picture, motion and depth side by side. Needs frame interpolation on.",
+    {"graphics.mfx_debug_view", "Frame rate", "Motion / depth debug view", "Draws the motion and depth taken from the game's render over the picture: motion (direction as colour, brighter is faster, outlined where per-object motion was used), depth (near is bright), or the picture, motion and depth side by side. Works with frame interpolation on or off; with it on, this is what MetalFX is given.",
      "TOTK_MFX_DEBUG_VIEW", SET_CHOICE, SET_LIVE, SET_MAC | SET_IPAD, 0, 0, 0, 0, 0, NULL, SET_MFX_DEBUG, SET_N(SET_MFX_DEBUG),
      "Not tested on iPhone yet.", NULL, 0},
     {"display.output", "Display", "Display resolution", "The size of the finished picture. Text, icons and menus are drawn at this size, so they stay sharp; the 3D world is drawn at the render resolution below and stretched to fill it. Display native is your screen's own pixels.",
