@@ -142,7 +142,7 @@ static inline int avrr_quant(const avrr_t *s, int fps) {
     if (fps < s->lo) fps = s->lo;
     if (s->gran_s > 0 && s->min_s > 0) {
         double steps = (1.0 / fps - s->min_s) / s->gran_s; long n = (long)steps; if (steps - n > 1e-6) n++; if (n < 0) n = 0;
-        int q = (int)(1.0 / (s->min_s + n * s->gran_s) + 1e-6);
+        int q = (int)(1.0 / (s->min_s + n * s->gran_s) + 0.5);   /* nearest: 1 / 16.67 ms is 59.99, which truncated to 59 and paced 16.95 ms, off the display's steps */
         fps = q < s->lo ? s->lo : q;
     }
     return fps;
