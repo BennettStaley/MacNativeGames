@@ -28,9 +28,9 @@ typedef struct { uint64_t off; uint32_t original, replacement; } Patch;
      +48   aspect, 4 x 32 (aspect_patch.h)          +176  cloth/hair clock (19 words, to +252)
      +256  high-FPS trampoline bounce (20)          +288  field of view, 2 x 48 (aspect_patch.h)
      +384  render resolution + pick kick (32)       +416  world: time of day, render distance x 2 (3 x 32)
-     +512  fog (48)                                 +560  shadow resolution (32), to +592 */
+     +512  fog (48)                                 +560  shadow resolution (40), to +600 */
 enum { CLOTH_STUB_AT = 176, BOUNCE_STUB_AT = 256, FOV_STUB_AT = 288, RENDER_VENEER = 384, WORLD_STUBS = 416,
-       FOG_STUB_AT = 512, SHADOW_STUB_AT = 560, STUBS_END = 592 };
+       FOG_STUB_AT = 512, SHADOW_STUB_AT = 560, STUBS_END = 600 };
 static const Patch fps60[] = {
     {0x2db204, 0x6b08015f, 0x7100055f},
     {0x2db208, 0x1a89b10a, 0x1a9fa52a},
@@ -300,8 +300,8 @@ void runtime_game_patches(Module *m) {
     { static const uint64_t sites[] = {0x628c3c, 0xb4342c};
       static const uint32_t want[] = {0xbd413e60 /* ldr s0, [x19, #0x13c] */, 0xbd4066c0 /* ldr s0, [x22, #0x64] */};
       fov_install(m, "1.4.3", sites, want, 2, ((m->text_end + 15) & ~15ULL) + FOV_STUB_AT, (m->file_size + 0x3fff) & ~0x3fffULL); }
-    /* Fog density and shadow resolution (aspect_patch.h): text padding from +512 (fog, one 48-byte stub; the shadow's 32-byte
-       stub from +560, to +592), data page +80 (fog) and +84 (shadow). Always in on the Mac and in the iOS export. */
+    /* Fog density and shadow resolution (aspect_patch.h): text padding from +512 (fog, one 48-byte stub; the shadow's 40-byte
+       stub from +560, to +600), data page +80 (fog) and +84 (shadow). Always in on the Mac and in the iOS export. */
     { static const uint64_t sites[] = {0xd3050};
       static const uint32_t want[] = {0x1e211e49 /* fcsel s9, s18, s1, ne */};
       fog_install(m, "1.4.3", sites, want, 1, ((m->text_end + 15) & ~15ULL) + FOG_STUB_AT, (m->file_size + 0x3fff) & ~0x3fffULL); }

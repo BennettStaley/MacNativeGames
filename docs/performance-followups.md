@@ -205,3 +205,62 @@ Sky Temple save copy, the user's settings (4K output, 1800p scene cap, frame cap
   - **Budget:** at every present, above 95% of the GPU memory budget interpolation and per-object motion are paused (`[mfx] near the GPU memory budget: interpolation paused (…)`); the pause also evicts the interpolator cache. It resumes when the use plus what the pause freed (measured after the release) is under 85% (`back under 85% … interpolation resumed`); after three pauses it stays off for the session (key 2 turns it on again; any user change ends a pause). `gpu_budget_check` tolerates an overrun of at most 5% while the pause releases memory (`… over the budget … while frame interpolation is released; going on`) instead of the immediate FATAL; beyond that, or with interpolation already off, it stops as before.
   - **Per-object motion storage:** indexed draws store only the vertex range their indices use (min / max index, scanned once per index buffer / count / type and again every 600 frames), not the whole bound vertex buffer (often a large shared pool range). Draws of more than `TOTK_OBJ_MOTION_DRAW_MAX` positions (vertices x instances, default 65536: terrain, big static meshes, dense instanced foliage) store nothing and keep the camera motion, which is exact for whatever does not move independently of the camera. Arenas start at 3 x 16 MiB and double at the end of a frame that did not fit, up to `TOTK_OBJ_MOTION_MB` (default 64); a growth loses one frame of object motion. The 600-frame line now also gives `over N positions (camera motion)`, the arena size and the index ranges scanned.
   - **Check in game:** change the output resolution with interpolation on and look for the size-change and release lines, with `GPU allocated` in the menu meter settling back; in the world, `over the arena` should be near 0 and `matched` most of the stored draws. If foliage or large animated meshes lose motion, raise `TOTK_OBJ_MOTION_DRAW_MAX`. Not done: classifying draws as static from their stored motion (a draw whose motion equals the camera reprojection for N frames stops storing, rechecked every K frames) needs the reprojection in the vertex variant and a GPU-written flag per draw read back by the CPU; it is the next step if the vertex cap leaves too much out.
+
+## Per-pass GPU cost at 1440p (2026-10-23, M3 Pro, Sky Temple save copy, measured once)
+
+`TOTK_PASS_GPU` through the input file (`flag pass_gpu 3`), 2560x1440 render and output, frame interpolation off, time of
+day paused, Great Sky Island in daylight. The machine was heavily loaded by other builds (load average about 50), so CPU
+frame times from this run mean nothing; the GPU timestamps are per encoder and hold. Sum of all encoders: 9.1–10.5 ms a
+frame. Formats are Metal pixel format numbers (70 RGBA8, 71 RGBA8 sRGB, 92 RG11B10F, 55 R32F, 65 RG16F, 115 RGBA16F;
+depth 252 D32F, 250 D16). "att / ld" = colour attachments / attachments loaded (depth included).
+
+| # in frame | Shader key (first draw's fragment) | Size | ms | Draws | att / ld | What it looks like |
+|---|---|---|---|---|---|---|
+| 26 | 16060269 | 2560x1440 | 1.13–1.15 | ~2040 | 4 / 5 | G-buffer (4 x RGBA8 + D32F) |
+| 37 | 61315f71 | 2560x1440 | 0.41–0.63 | 2 | 5 / 6 | full-screen lighting step, loads every G-buffer attachment |
+| 32 | 7d1b1cac | 2560x1440 | 0.46–0.49 | 129 | 5 / 6 | lighting / decals after the G-buffer (`samples-drawn-att` split) |
+| 88 | 233dfb93 | 2560x1440 | 0.47–0.49 | 12 | 1 / 1 | RG11B10 HDR pass with D16 depth |
+| 33 | ecbe4aa4 | 2560x1440 | 0.42–0.43 | 23–25 | 5 / 6 | lighting step |
+| 74 | 37bb03a9 | 1280x720 | 0.40–0.42 | 6 | 8 / 9 | half-res pass with 8 colour attachments, all loaded |
+| 38–41 | 607bd409 | 800x800 (sun shadow cascades) | 0.51 in all | ~1250 | depth only | shadow maps; also 0.51 at 200x200 (0.25x), so geometry bound |
+| 114 | ac58fc18 | 2560x1440 | 0.34 | 1 | 1 / 2 | full-screen RG11B10 |
+| 31 | 6c9c49ac | 2560x1440 | 0.31–0.35 | 16 | 5 / 6 | lighting step (0.08 at render distance 10 %) |
+| 22 | 1a0a8caa | 2560x1440 | 0.16–0.25 | 104 | 4 / 2 | first G-buffer part, ended by a dispatch |
+| 76 | b73ad57d | 2560x1440 | 0.19–0.25 | 17 | 5 / 6 | |
+| 91 | 23d54406 | 2560x1440 | 0.22–0.24 | 1 | 1 / 1 | full-screen RG11B10 |
+| 78 | 679c5257 | 1280x720 | 0.19–0.22 | 3 | 8 / 9 | half-res, 8 attachments |
+| 116 | (ours, no game draw) | 2560x1440 | 0.18 | 0 | 1 / 1 | post-processing after the game's last pass |
+| 93 | 18b730fa | 2560x1440 | 0.16–0.17 | 5 | 1 / 2 | depth of field composite |
+| 113 | 22a61cb1 | 2560x1440 | 0.14–0.17 | 1 | 1 / 0 | full-screen RG11B10 |
+| 118 | dd3d1e0e | 3840x2160 | 0.14–0.16 | 1 | 1 / 1 | final composite into a 4K target while the output is 1440p |
+| 0 | (clear only) | 2560x1440 | 0.15–0.21 | 0 | 1 / 0 | clear-only pass, first in the command buffer |
+| compute | (12 dispatch encoders) | | 0.3–0.8 in all | | | |
+
+What stands out (not the game's own work):
+
+- **Every attachment is loaded and stored.** The TBDR pieces are off in TOTK (`DM_NVN_TBDR`), so a pass stores every
+  attachment it has, written or not. The lighting steps after the G-buffer (#31, #32, #33, #37, #76) each attach the four
+  G-buffer targets, an R32F target and depth at 1440p (about 88 MB per pass to load and as much to store), and the half-res
+  passes #74 / #78 attach eight. #37 draws 2 full-screen triangles and costs 0.4–0.6 ms. New switch `TOTK_UDC=1` (below).
+- **The last composite runs at 3840x2160 with a Load** (#118, 0.15 ms) while the output is 1440p: the output texture is
+  sized for the maximum output (headroom), and the whole 4K target is loaded and stored. Not changed yet: a smaller target
+  when the output is smaller, or a DontCare load when the composite covers what is shown, would save most of it.
+- **Shadow maps are draw bound**: 0.25x and 4x of the side cost the same (0.51 ms); the shadow resolution setting is a
+  quality choice, not a speed one. Render distance 10 % saved about 1.2 ms (per-pass sum 9.8 → 8.5 ms), mostly in #31 / #32.
+- `TOTK_PASS_GPU` now gives each compute dispatch its own row with its shader key (dispatches are not merged into one
+  encoder in profiled frames), and `TOTK_PASS_GPU_FILE` rows gain the number of attachments stored as the last column.
+
+- **Unwritten attachments are not written back (`TOTK_UDC=1`, default off; live `flag udc 0|1` in the input file; compiled
+  only, not tried in game).** The UDC piece of the TBDR bundle without its guards: an attachment the pass loaded and none
+  of its draws wrote (colour write mask 0 and no fragment output for it, no depth / stencil write, no image writes in the
+  program) is stored DontCare, since memory already holds those pixels. Every Metal draw in the pass must be accounted
+  for: the game's draws through `udc_note_draw`, the mid-pass clear quads through `udc_mark_all` (they mark every
+  attachment written); a pass that encoded more draws than were accounted for keeps all its stores. Passes with
+  block-compressed write-backs are left alone; `DM_NVN_UNWRITTEN_DC=0` still vetoes it. Log every 20000 stores: `[udc]
+  last N attachment stores: M unwritten ones stored DontCare (X MB not written back), K passes left alone`. Expected: the
+  lighting steps above get cheaper (one store per unwritten attachment per pass). To test: same run, `flag udc 0` /
+  `flag udc 1` alternating with `flag pass_gpu 3` and `shot <png>` after each, compare #31–#37 / #74 / #78 and the shots
+  (a wrong result would show as stale or missing lighting or decals, or areas going black; null-control the shots
+  with two `udc 0` ones, the scene moves). Default on only if the shots match. Next step if it pays: skip the Load as well
+  for attachments a pass will not write (needs a lookahead, or last frame's result for the same pass with a split before
+  the first draw that writes an attachment whose load was skipped).
