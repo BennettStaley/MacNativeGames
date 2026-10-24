@@ -4773,6 +4773,7 @@ typedef struct { uint64_t sig; uint8_t streak[8], hold[8]; } uld_ent;
 static uld_ent g_uld[ULD_TAB];
 static uld_ent *g_uld_cur;        // the open pass's entry (NULL: not predicted)
 static uint32_t g_uld_mask;       // g_sd indices loaded DontCare by prediction
+static int g_uld_reopen;          // the next pass reopens one ended by a misprediction: no prediction, and it takes no ordinal (so the frame's later passes still match their entries in frames without the split)
 static uint64_t g_uld_skip, g_uld_skip_bytes, g_uld_miss, g_uld_bad, g_uld_passes;
 static int uld_fz_active(void);   // the readable-tile pass merge is on (g_fz, defined further down)
 static int uld_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ULD"); v = e && atoi(e) > 0;
@@ -5487,7 +5488,8 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
                    pd.stencilAttachment.storeAction = MTLStoreActionUnknown; }
     }
     g_uld_cur = NULL; g_uld_mask = 0;
-    if (uld_on() && udc_ttk_on() && udc_on() && !clear_only && !lay_n && !uld_fz_active() && !g_rt_range_active && !g_nblk_wb && !att_fb_on()) {   // TOTK_ULD
+    int uld_reopen = g_uld_reopen; g_uld_reopen = 0;
+    if (!uld_reopen && uld_on() && udc_ttk_on() && udc_on() && !clear_only && !lay_n && !uld_fz_active() && !g_rt_range_active && !g_nblk_wb && !att_fb_on()) {   // TOTK_ULD
         uint64_t b = (uint64_t)R.rt.n;
         for (int i = 0; i < R.rt.n && i < 8; i++) { id<MTLTexture> t = pd.colorAttachments[i].texture; if (!t) continue;
             b = uld_mix(b, ((uint64_t)i << 56) ^ ((uint64_t)t.pixelFormat << 40) ^ ((uint64_t)t.width << 20) ^ (uint64_t)t.height);
@@ -7148,7 +7150,7 @@ static void noatt_dims(NSUInteger *w, NSUInteger *h) {
     *w = x1 < 1 ? 1 : x1 > 16384 ? 16384 : (NSUInteger)x1; *h = y1 < 1 ? 1 : y1 > 16384 ? 16384 : (NSUInteger)y1;
 }
 static void uld_miss(int j) {   // TOTK_ULD: a write to attachment g_sd[j] of the open pass, which was not loaded
-    g_uld_miss++; if (g_uld_cur && g_sd[j].idx >= 0 && g_sd[j].idx < 8) { g_uld_cur->streak[g_sd[j].idx] = 0; if (g_uld_cur->hold[g_sd[j].idx] < 64) g_uld_cur->hold[g_sd[j].idx] += 8; }
+    g_uld_miss++; g_uld_reopen = 1; if (g_uld_cur && g_sd[j].idx >= 0 && g_sd[j].idx < 8) { g_uld_cur->streak[g_sd[j].idx] = 0; if (g_uld_cur->hold[g_sd[j].idx] < 64) g_uld_cur->hold[g_sd[j].idx] += 8; }
 }
 static int uld_draw_writes(NvProg *pr) {   // 1 when this draw writes a colour attachment the open pass did not load (udc_note_draw's rule)
     if (!pr) return 0;
