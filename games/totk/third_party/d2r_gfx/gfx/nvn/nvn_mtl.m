@@ -5163,16 +5163,18 @@ static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const v
    target with the presented texture's aspect ratio before a pass into a presented texture: 1920x1080 docked, 1280x720 in
    handheld mode, where the final pass scales it to the 1920x1080 swapchain), notes the G-buffer depth (three or more
    colour targets and a D32F depth of their size) and, once the scene is copied, adds the UI attachment to canvas passes. */
+static uint32_t g_canvas_w, g_canvas_h;   // size of the last canvas candidate (g_mfx.last_c0), for the logs
 static void canvas_learn(MTL4RenderPassDescriptor *pd) {
     const tex_t *t0 = R.rt.n > 0 ? R.rt.color[0] : NULL;
     id<MTLTexture> c0 = t0 ? pd.colorAttachments[0].texture : nil;
     if (t0 && c0 && g_mfx.swap_w) {
         int to_swap = 0; for (int i = 0; i < g_mfx.nswap; i++) to_swap |= g_mfx.swap[i] == t0->serial;
         if (to_swap) {
-            if (g_mfx.last_c0 && g_mfx.canvas != g_mfx.last_c0) { g_mfx.canvas = g_mfx.last_c0; MLOG("[mfx] canvas: texture %llu (%ux%u), copied to presented texture %llu", (unsigned long long)g_mfx.canvas, g_mfx.swap_w, g_mfx.swap_h, (unsigned long long)t0->serial); }
+            /* The first size is the canvas's own; this used to print the presented texture's (3840x2160 for a 2560x1440 canvas). */
+            if (g_mfx.last_c0 && g_mfx.canvas != g_mfx.last_c0) { g_mfx.canvas = g_mfx.last_c0; MLOG("[mfx] canvas: texture %llu (%ux%u), copied to presented texture %llu (%ux%u)", (unsigned long long)g_mfx.canvas, g_canvas_w, g_canvas_h, (unsigned long long)t0->serial, g_mfx.swap_w, g_mfx.swap_h); }
         } else if (c0.width >= 640 && fabs((double)c0.width * g_mfx.swap_h / ((double)c0.height * g_mfx.swap_w) - 1) < 0.01 && pd.colorAttachments[0].level == 0 &&
                    MFX_CANVAS_FMT_OK(c0.pixelFormat) && !pd.depthAttachment.texture)
-            g_mfx.last_c0 = t0->serial;
+            { g_mfx.last_c0 = t0->serial; g_canvas_w = (uint32_t)c0.width; g_canvas_h = (uint32_t)c0.height; }
     }
 }
 /* Our residency set (mfx_residency: scene / UI / motion / per-object textures) on the game's queue, once it exists: the
@@ -12584,6 +12586,10 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
             uint64_t h = 0; for (int i = 0; i < f->rf.nb && !h; i++) if (f->rf.b[i].kind == NVN_RB_TEX && f->rf.b[i].reg < 128) h = S.tex[1][f->rf.b[i].reg];
             if (h) { fx_from = R.rt.color[0]->serial; fx_to = h; PD("N %llu skipping FXAA: readers of ser=%llu now read ser=%llu", g_stat_pass, (unsigned long long)fx_from, (unsigned long long)h_ser(h)); return; } }
         else if (fx_from && !strncmp(f->key, "52aac1f2306b8fc5", 16)) { for (int r = 0; r < 128; r++) if (S.tex[1][r] && h_ser(S.tex[1][r]) == fx_from) S.tex[1][r] = fx_to; TEX_CHANGED(1); fx_from = 0; } } }
+    /* Both hooks were lost in the upstream merge 2b15fd3 (2026-10-22), which left Hide the HUD, depth of field / lens flare
+       off, bloom strength and aa_mode 1-3 doing nothing (hud_n stayed 0 while the flag toggled). */
+    if (pp_aa_draw(pr)) return;   // aa_mode 1-3: the game's FXAA draw replaced by ours (totk_post.h)
+    if (fx_draw(pr)) return;   // hide the HUD, depth of field off: the draw is left out; bloom strength (totk_post.h)
     { static uint64_t bloomq_frame; if (bloomq_frame != atomic_load(&g_cur_frame)) { bloomq_frame = atomic_load(&g_cur_frame); bloomq_reset(); }
       if (bloomq_enabled() && tbdr_on() && !g_defer_replaying && pr->sh[1]) {
         NvShader *f = pr->sh[1]; uint64_t tgt = 0; int lv, sl;

@@ -49,6 +49,7 @@ static struct {
     uint64_t aa_n, aa_kept[6], cas_n, canvas_aa_n, frames, last_aa_n;
     id<MTLRenderPipelineState> scale_ps[4]; MTLPixelFormat scale_pf[4];   // pp_zero with the multiplying blend (bloom strength)
     uint64_t hud_n, dof_n, bloom_n, bloom_kept, flare_n;
+    int hud_diag; uint64_t hud_diag_frame;   // Hide the HUD diagnostic: draws left to log after a toggle to hidden
 } g_postfx;
 
 static int pp_flag(const char *name, int v) {
@@ -111,6 +112,9 @@ static void pp_latch(void) {
                  hud ? "hidden" : "shown", dof ? "on" : "off", bloom, flare ? "on" : "off", (unsigned long long)atomic_load(&g_cur_frame) + 1,
                  (unsigned long long)g_postfx.hud_n, (unsigned long long)g_postfx.dof_n, (unsigned long long)g_postfx.bloom_n,
                  (unsigned long long)g_postfx.bloom_kept, (unsigned long long)g_postfx.flare_n);
+        if (hud && !g_fx_hud) { g_postfx.hud_diag = 6; g_postfx.hud_diag_frame = atomic_load(&g_cur_frame) + 1;
+            MLOG("[pp] HUD hidden: canvas texture %llu (%ux%u), presented textures %d (%ux%u), UI begun %d", (unsigned long long)g_mfx.canvas,
+                 g_canvas_w, g_canvas_h, g_mfx.nswap, g_mfx.swap_w, g_mfx.swap_h, g_uw_ui); }
         g_fx_hud = hud; g_fx_dof = dof; g_fx_bloom = bloom; g_fx_flare = flare;
     }
     if (an != atomic_load(&g_pp_aniso) || lb != atomic_load(&g_pp_lodb)) {
@@ -341,6 +345,21 @@ static int fx_is_flare(const char *vs, const char *fs) {
 static int fx_draw(__unsafe_unretained NvProg *pr) {
     if (!pr || g_defer_replaying) return 0;
     __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
+    /* Diagnostic, once per toggle to hidden: the first six draws that go to the canvas or use a UI vertex shader, with what
+       the match below makes of them; 120 frames with none: said once. */
+    if (g_fx_hud && g_postfx.hud_diag > 0 && vs) {
+        int on = uw_on_canvas(), ui = uw_ui_vs(vs->key);
+        uint64_t tgt = R.rt.n > 0 && R.rt.color[0] ? R.rt.color[0]->serial : 0, f = atomic_load(&g_cur_frame);
+        if (on || ui) {
+            g_postfx.hud_diag--;
+            MLOG("[pp] HUD diag F%llu: vs %.16s target %llu (canvas %llu): on canvas %d, UI shader %d, UI begun %d, TOTK_MFX UI shader %d -> %s",
+                 (unsigned long long)f, vs->key, (unsigned long long)tgt, (unsigned long long)g_mfx.canvas, on, ui, g_uw_ui, mfx_ui_vs(vs->key),
+                 on && ui && (g_uw_ui || mfx_ui_vs(vs->key)) ? "masked" : "drawn");
+        } else if (f > g_postfx.hud_diag_frame + 120) {
+            g_postfx.hud_diag = 0;
+            MLOG("[pp] HUD diag: 120 frames without a draw into the canvas (texture %llu) or with a UI vertex shader", (unsigned long long)g_mfx.canvas);
+        }
+    }
     if (g_fx_hud && vs && uw_on_canvas() && uw_ui_vs(vs->key) && (g_uw_ui || mfx_ui_vs(vs->key))) {
         /* Drawn, with every colour write masked off (draw() puts the mask back) rather than left out: a masked UI draw
            does everything but write pixels (occlusion queries counting over it see the same samples), and the first
